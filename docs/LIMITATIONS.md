@@ -3,9 +3,20 @@
 The things this system does not do, cannot do, or has not proven. Kept current: an item may be
 removed only when a test exists showing it is no longer true.
 
-**Status: Phase 0.** No code exists yet, so at this moment the honest summary is: *everything*
-is a limitation. The list below is the set of limitations that will still be true when v1 is
-complete.
+**Status: Phase 1.** A single-node, in-memory key-value store exists. Nothing else does.
+
+### True right now, and temporary
+
+| Limitation | Removed in |
+|---|---|
+| **No durability at all.** `MemStore` holds everything in a Go map. Process exit loses the entire database. The CLI prints a notice on every mutating command so this cannot be mistaken. | Phase 2 (WAL) |
+| No persistence, no SSTables, no compaction, no Bloom filters | Phases 3–4 |
+| No networking, no cluster, no replication, no consensus | Phases 7–9 |
+| Memory is bounded only by the host: there is no eviction and no flush-to-disk, so a large dataset will OOM | Phase 3 (memtable flush) |
+| `dkv put` cannot carry a maximum-size (1 MiB) value, because `ARG_MAX` is 1 MiB on macOS and the kernel rejects the exec. `dkv shell` can. This is an OS limit, not a dkv limit. | not applicable — use `dkv shell`, or the HTTP API from Phase 15 |
+| The interactive shell cannot express keys containing whitespace, because it splits on whitespace. The one-shot form and the Go API can. | Phase 15 (HTTP API) |
+
+### The list below is what will still be true when v1 is complete.
 
 ---
 

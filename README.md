@@ -4,10 +4,10 @@ A sharded, Raft-replicated key-value store with an LSM-tree storage engine, writ
 scratch in Go. No Raft library, no embedded database, no consensus service. The storage
 engine and the consensus implementation are the project.
 
-> **Status: Phase 0 of 25 — specification complete, implementation not started.**
-> This README will grow as phases land. Right now it would be dishonest to show benchmark
-> numbers, a feature list, or a demo, because none of them exist yet. See
-> [docs/ROADMAP.md](docs/ROADMAP.md) for what is done and what is not.
+> **Status: Phase 1 of 25 — single-node, in-memory key-value store and CLI.**
+> There is no persistence, no cluster, no replication and no consensus yet, and this README
+> will not show benchmark numbers or a demo until they exist. See
+> [docs/ROADMAP.md](docs/ROADMAP.md) for exactly what is done and what is not.
 
 ---
 
@@ -37,6 +37,58 @@ Claim a guarantee it has not verified. Specifically:
   including the ones that are inherent (no Byzantine tolerance, no liveness under full
   asynchrony) and the ones that are a choice (no dynamic membership, no transactions).
 
+## Quickstart
+
+Requires Go 1.27+.
+
+```bash
+make build
+./bin/dkv shell
+```
+
+```
+dkv> put user:123 Adi
+OK
+dkv> get user:123
+Adi
+dkv> delete user:123
+OK
+dkv> get user:123
+(not found)
+dkv> exit
+```
+
+One-shot form, with exit codes a script can branch on
+(`0` ok, `1` not found, `2` usage, `3` invalid input, `4` internal):
+
+```bash
+./bin/dkv put user:123 Adi
+./bin/dkv get user:123
+./bin/dkv delete user:123
+```
+
+**Phase 1 is in-memory**: each invocation gets a fresh store, so state does not survive
+process exit. The CLI says so on every mutating command. Durability arrives in Phase 2.
+Full CLI contract: [docs/CLI.md](docs/CLI.md).
+
+## API semantics
+
+The `storage.Store` contract, settled now because the LSM engine that replaces the
+in-memory implementation in Phase 3 must not change any of it:
+
+| Question | Answer |
+|---|---|
+| Does `Get` return a copy or internal memory? | A fresh copy. Mutating it cannot affect stored data. |
+| Does `Put` copy its input? | Yes, both key and value. The caller may reuse its buffers immediately. |
+| Is `DELETE` idempotent? | Yes, and it never reports whether the key existed — an LSM deletes by writing a tombstone without reading, so promising existence here would mean breaking that promise later. |
+| Maximum key / value size | 4 KiB / 1 MiB, enforced identically by `Put`, `Get` and `Delete`. |
+| Are keys case-sensitive? | Yes. Keys are opaque bytes compared bytewise, with no normalisation; whitespace, newlines, NULs and invalid UTF-8 are all valid keys. |
+| Is an empty value the same as no key? | No. An empty value is a present key; `Get` returns a zero-length non-nil slice with a nil error. |
+| Concurrency guarantee | Safe for concurrent use; each operation is atomic with respect to every other. No atomicity *across* operations — no transactions, no CAS, no batches. |
+
+These are numbered INV-A1..A9 in [docs/INVARIANTS.md](docs/INVARIANTS.md) and enforced by a
+conformance suite that the Phase 3 engine will inherit unchanged.
+
 ## Documentation
 
 | Document | What it covers |
@@ -49,15 +101,23 @@ Claim a guarantee it has not verified. Specifically:
 | [DECISIONS.md](docs/DECISIONS.md) | ADRs — what was chosen, what was rejected, what it costs |
 | [LIMITATIONS.md](docs/LIMITATIONS.md) | What it does not do |
 | [ROADMAP.md](docs/ROADMAP.md) | 25 phases, exit criteria, and why the order is what it is |
+| [CLI.md](docs/CLI.md) | Command surface, exit codes, stream discipline, shell behaviour |
 
 ## Development
 
 Requires Go 1.27+.
 
 ```bash
-make check     # gofmt + go vet + go test -race  — the gate every phase must pass
+make check     # gofmt + gitignore guard + go vet + go test -race — the phase gate
 make build
 make test
+make race
+```
+
+Extended fuzzing of the storage round-trip contract:
+
+```bash
+go test ./internal/storage -run=Fuzz -fuzz=FuzzPutGetRoundTrip -fuzztime=60s
 ```
 
 ## License

@@ -4,8 +4,37 @@ Every invariant here is (a) stated precisely enough to be falsifiable, (b) assig
 (c) bound to the test that checks it. An invariant with no test is marked `UNVERIFIED` and is
 not allowed to be cited as a guarantee anywhere else in the docs.
 
-Status column: `PLANNED` (Phase 0), `VERIFIED` (a test exists and passes), `VIOLATED` (a test
-exists and fails — the implementation is broken and the phase is not done).
+Status column: `PLANNED` (no test yet), `VERIFIED` (a test exists and passes), `VIOLATED` (a
+test exists and fails — the implementation is broken and the phase is not done).
+
+The list grows as subsystems land. A phase that establishes a new guarantee adds its
+invariants here rather than asserting the guarantee in prose somewhere else.
+
+---
+
+## API semantics (Phase 1)
+
+These constrain the `storage.Store` contract itself, independently of which implementation
+backs it. They are enforced by `internal/storage/store_conformance_test.go`, a suite
+parameterised over a `Store` constructor — so the Phase 3 LSM engine inherits every one of
+them and cannot quietly change client-visible behaviour.
+
+| ID | Invariant | Checked by | Status |
+|---|---|---|---|
+| INV-A1 | No aliasing in either direction: `Put` copies the caller's key and value, and `Get` returns a fresh copy. A caller cannot mutate stored data except through `Put`/`Delete`, and cannot corrupt another reader's result. | `PutCopiesInput`, `GetReturnsCopy`, `TestConcurrentGetsReturnIndependentCopies` | VERIFIED |
+| INV-A2 | `Delete` is idempotent and never reports whether the key existed. | `DeleteMissingKeyIsIdempotent`, `DeleteIsRepeatable` | VERIFIED |
+| INV-A3 | Each operation is atomic with respect to every other operation on the same store: no `Get` ever observes a partially-applied `Put`. | `TestConcurrentWritersSameKey` (torn-value detector), `TestConcurrentReadersDuringWrites` | VERIFIED |
+| INV-A4 | An empty value is a *present* key. It is distinguishable from an absent key by the error, never by the nil-ness of the returned slice — `Get` never returns `(nil, nil)`. | `EmptyValueIsStorable` | VERIFIED |
+| INV-A5 | Keys are opaque byte strings compared bytewise: no normalisation, case-sensitive, and whitespace / newlines / NULs / invalid UTF-8 are all valid and round-trip exactly. | `KeysAreOpaqueBytes`, `KeysAreCaseSensitive`, `FuzzPutGetRoundTrip` | VERIFIED |
+| INV-A6 | Validation is uniform across operations: a key rejected by `Put` is rejected identically by `Get` and `Delete`, so an oversized key is an error rather than a silent no-op. | `KeySizeLimit` | VERIFIED |
+| INV-A7 | Every failure is an `*OpError` wrapping exactly one sentinel, reachable by `errors.Is`, naming the operation and a safely-escaped key. The CLI's error-to-exit-code mapping is total. | `ErrorsCarryOperationAndKey`, `TestCLIExitCodes`, `TestCLIClosedStoreIsInternalError` | VERIFIED |
+| INV-A8 | A rejected operation has no effect: a `Put` that fails validation or a cancelled context leaves the store unchanged. | `ValueSizeLimit`, `CancelledContextRejected` | VERIFIED |
+| INV-A9 | A closed store is permanently closed: every operation returns `ErrClosed`, `Close` is idempotent, and closing concurrently with in-flight operations neither panics nor races. | `ClosedStoreRejectsOperations`, `TestConcurrentCloseDuringOperations`, `TestConcurrentCloseIsIdempotent` | VERIFIED |
+
+Note on INV-A3: under the current `sync.RWMutex` a torn value is impossible by construction.
+The test is not redundant — it exists so that a later sharded or lock-free memtable cannot
+break the guarantee silently. It was confirmed to have teeth by mutation testing (removing
+the write lock makes the race detector fire).
 
 ---
 
