@@ -1103,3 +1103,62 @@ func assertMatchesReference(t *testing.T, s storage.Store, ref reference, key st
 		t.Fatalf("%s: Get(%q) = %q, want %q", where, key, got, want)
 	}
 }
+
+// TestDamageAfterOpenIsReportedNotSwallowed damages an SSTable underneath a
+// running store, so the damage is found at read time rather than at startup.
+//
+// This is the failure mode worth guarding hardest: a Get that cannot read the
+// file it needs must say so. Returning ErrNotFound would be indistinguishable
+// from an honest answer, and a store that quietly forgets keys when a block
+// goes bad is worse than one that refuses to serve.
+func TestDamageAfterOpenIsReportedNotSwallowed(t *testing.T) {
+	dir := t.TempDir()
+	opts := lsmOpts(storage.DefaultMemTableSize)
+
+	s := openLSM(t, dir, opts)
+	defer func() { _ = s.Close() }()
+
+	const n = 200
+	for i := 0; i < n; i++ {
+		mustPut(t, s, fmt.Sprintf("key%04d", i), "value")
+	}
+	mustFlush(t, s)
+	assertValue(t, s, "key0000", "value") // fine before the damage
+
+	// Corrupt a data block behind the store's back.
+	path := filepath.Join(dir, "000001.sst")
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b [1]byte
+	if _, err := f.ReadAt(b[:], 24); err != nil {
+		t.Fatal(err)
+	}
+	b[0] ^= 0xff
+	if _, err := f.WriteAt(b[:], 24); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var sawCorrupt bool
+	for i := 0; i < n; i++ {
+		_, err := s.Get(context.Background(), []byte(fmt.Sprintf("key%04d", i)))
+		switch {
+		case err == nil:
+			// This key's block was not the damaged one.
+		case errors.Is(err, storage.ErrCorrupt):
+			sawCorrupt = true
+		case errors.Is(err, storage.ErrNotFound):
+			t.Fatalf("Get(key%04d) reported the key absent from a damaged file; "+
+				"corruption must never be presented as 'key not found'", i)
+		default:
+			t.Fatalf("Get(key%04d) = %v, want ErrCorrupt", i, err)
+		}
+	}
+	if !sawCorrupt {
+		t.Fatal("no read reached the damaged block; the test is not exercising what it claims")
+	}
+}
