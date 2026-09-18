@@ -4,8 +4,9 @@ Every invariant here is (a) stated precisely enough to be falsifiable, (b) assig
 (c) bound to the test that checks it. An invariant with no test is marked `UNVERIFIED` and is
 not allowed to be cited as a guarantee anywhere else in the docs.
 
-Status column: `PLANNED` (no test yet), `VERIFIED` (a test exists and passes), `VIOLATED` (a
-test exists and fails — the implementation is broken and the phase is not done).
+Status column: `PLANNED` (no test yet), `VERIFIED` (a test exists and passes), `PARTIAL` (a
+test establishes part of the statement and the rest is named explicitly), `VIOLATED` (a test
+exists and fails — the implementation is broken and the phase is not done).
 
 The list grows as subsystems land. A phase that establishes a new guarantee adds its
 invariants here rather than asserting the guarantee in prose somewhere else.
@@ -42,11 +43,11 @@ the write lock makes the race detector fire).
 
 | ID | Invariant | Checked by | Status |
 |---|---|---|---|
-| INV-S1 | After any crash and restart, the recovered state equals the state produced by applying some **prefix** of the submitted write sequence. Every acknowledged write is inside that prefix, and the prefix has no holes. (Corrected in Phase 2 — see the note below.) | `TestCrashRecoveryAcknowledgedWritesSurvive`, `TestCrashRecoveryMidWriteStormYieldsAPrefix`, `TestReplayReconstructsIdenticalState` | VERIFIED (process kill only) |
-| INV-S2 | WAL replay is deterministic: replaying the same log bytes any number of times yields identical state, and replay never alters the log. | `TestReplayIsDeterministic`, `TestRecoveryIsIdempotent` | VERIFIED |
+| INV-S1 | After any crash and restart, the recovered state equals the state produced by applying some **prefix** of the submitted write sequence. Every acknowledged write is inside that prefix, and the prefix has no holes. (Corrected in Phase 2 — see the note below.) | `TestCrashRecoveryAcknowledgedWritesSurvive`, `TestCrashRecoveryMidWriteStormYieldsAPrefix`, `TestReplayReconstructsIdenticalState`; Phase 3: `TestLSMCrashMidWriteStormYieldsAPrefix`, `TestCrashDuringFlush`, `TestLSMRepeatedCrashes` | VERIFIED (process kill only) |
+| INV-S2 | WAL replay is deterministic: replaying the same log bytes any number of times yields identical state, and replay never alters the log. | `TestReplayIsDeterministic`, `TestRecoveryIsIdempotent`; Phase 3: `TestRecoveryIsDeterministic`, `TestCrashWithOverwritesAndDeletesAcrossFiles` | VERIFIED |
 | INV-S3 | A deleted key never reappears — at any level, after any number of compactions, across restarts. (Tombstones are only dropped at the bottom-most level.) | Phase 4 compaction tests | PLANNED |
 | INV-S4 | Sequence numbers are assigned deterministically in apply order, so two replicas that applied the same log prefix hold byte-identical logical state. | Phase 12 replica-comparison | PLANNED |
-| INV-S5 | A reader holding a version never observes a partially-installed SSTable set. Compaction's version swap is atomic. | Phase 4 concurrent read-during-compaction test (`-race`) | PLANNED |
+| INV-S5 | A reader holding a version never observes a partially-installed SSTable set. Compaction's version swap is atomic. | Phase 3 covers the flush half — see INV-L4. Compaction's swap: Phase 4 concurrent read-during-compaction test (`-race`) | PARTIAL (flush only) |
 | INV-S6 | The MANIFEST is the sole authority on which files are live. Files on disk but absent from it are orphans and are deleted; files in it but absent from disk are a fatal error. | Phase 4 crash-during-compaction test | PLANNED |
 | INV-S7 | A Bloom filter never returns "absent" for a key that is present (zero false negatives). | Phase 4 bloom test over a large corpus | PLANNED |
 | INV-S8 | Damage that a crash cannot explain aborts startup; a torn tail in the newest segment truncates and continues. Never the reverse. A refused open modifies nothing. | `TestBadChecksumInMiddleRecordIsRefused`, `TestCorruptionInAnOlderSegmentIsRefused`, `TestBadChecksumInFinalRecordIsRepaired`, `TestTruncatedFinalPayloadIsRepaired` | VERIFIED |
@@ -88,6 +89,43 @@ Enforced by `internal/record`, `internal/storage/wal` and `internal/storage/wals
 | INV-W8 | A malformed payload — unknown record kind, unknown operation kind, bad lengths, trailing bytes — is refused, never guessed at. | `TestDecodeBatchRejectsMalformedPayloads`, `TestUnknownRecordKindIsRefused`, `TestMalformedBatchPayloadIsRefused` | VERIFIED |
 | INV-W9 | Every append completes a `write(2)` before returning, in every sync mode, so an acknowledged write survives process death even with fsync disabled. | `TestCrashWithSyncOffStillRecoversFromThePageCache` | VERIFIED |
 | INV-W10 | A durability failure latches: once a flush has failed, no further append is acknowledged. | asserted in `wal.append`; no fault-injection test yet | PLANNED |
+
+## LSM storage engine (Phase 3)
+
+Enforced by `internal/storage/ikey`, `internal/storage/memtable`,
+`internal/storage/sstable`, `internal/storage/lsmstore.go` and
+`tests/integration/lsm_crash_test.go`.
+
+| ID | Invariant | Checked by | Status |
+|---|---|---|---|
+| INV-L1 | The memtable iterates in internal-key order — user key ascending, then sequence number descending — so the newest version of a key is always the first one a scan reaches, and a flush can write a sorted SSTable in one forward pass with no sort step. | `TestOrderedIteration`, `TestVersionsOfOneKeyAreNewestFirst`, `TestLargeTableOrdering`, `TestOrdering` (ikey) | VERIFIED |
+| INV-L2 | Sequence assignment is deterministic: exactly one number per mutation, assigned in log order, and never consumed by a read, a rejected operation, or applied-index metadata. Replaying the same log re-derives the identical numbering, which is what makes "this mutation is already in an SSTable" decidable. | `TestSequenceNumbersAreAssignedOnePerMutation`, `TestSequenceNumbersSurviveRestart`, `TestRecoveryIsDeterministic` | VERIFIED (single node) |
+| INV-L3 | An SSTable that opens is structurally sound, and any damage to one is detected rather than acted on: bad magic, bad footer fields, overflowing extents, an index disagreeing with the data region, malformed varints and failed block checksums are all refused. | `TestRandomSingleByteDamageIsAlwaysDetected` (every byte of a real file flipped in turn), `TestCorruptFooterFieldsAreRefused`, `TestFooterOverflowIsRefused`, `TestCorruptIndexBlockIsRefused`, `TestMalformedVarintsAreRefused`, `TestIndexDisagreeingWithDataIsRefused`, `TestBadMagicIsAFormatError` | VERIFIED |
+| INV-L4 | A partially written SSTable is never visible. A flush writes to a temporary name, fsyncs, renames, then fsyncs the directory, so the final name either does not exist or names a complete, fsynced file; and publication adds the table and drops the immutable memtable in one critical section, so every mutation is in exactly one source at every instant. | `TestCrashDuringFlush` (real SIGKILL inside the SSTable write, with the window it hit verified rather than assumed), `TestOrphanTempFileIsSwept`, `TestConcurrentReadsAcrossFlushPublication` (`-race`) | VERIFIED (process kill) |
+| INV-L5 | A lookup resolves correctly across the memtable, the immutable memtables and every SSTable: the newest version of a key wins, and a newer tombstone hides an older value rather than falling through to it. | `TestTombstoneHidesOlderValueAcrossSSTables`, `TestNewestValueWinsAcrossSSTables`, `TestOverwriteAndDeleteInterleavedAcrossManyFiles`, `TestKeyPresentOnlyInTheOldestFile`, `TestAgainstReferenceModel` | VERIFIED |
+| INV-L6 | Recovery composes the SSTables and the WAL without applying a mutation twice and without dropping one: mutations already covered by a table are skipped, the rest are replayed, and the result is the state that existed before the crash. | `TestLSMCrashBeforeAnyFlush`, `TestLSMCrashAfterFlush` (asserts the skipped/replayed counts, not only the values), `TestReopenAfterCleanClose`, `TestReopenWithEverythingFlushed`, `TestLSMReopenAcrossManySessions` | VERIFIED (process kill) |
+| INV-L7 | Corruption is never presented as absence. A read that cannot decode the file it needs returns an error; it never returns `ErrNotFound`. | `TestCorruptDataBlockIsRefusedNotReportedAsMissing`, `TestDamageAfterOpenIsReportedNotSwallowed` | VERIFIED |
+| INV-L8 | An incoherent file set aborts startup rather than being worked around: a gap in the SSTable numbering, overlapping sequence ranges, an empty table, or tables covering sequence numbers the log never held are all refused. | `TestGapInSSTableNumberingIsRefused`, `TestSSTableAheadOfTheLogIsRefused`, `TestCorruptSSTableRefusesToOpen`, `TestTruncatedSSTableRefusesToOpen` | VERIFIED |
+| INV-L9 | Replacing the Phase 2 map with the LSM engine changed no client-visible semantic: INV-A1..A9 hold for `LSMStore`, including in a configuration where every single mutation becomes its own SSTable. | `TestLSMStoreConformance`, `TestLSMStoreConformanceAcrossSSTables`, `TestLSMStoreConcurrency`, `TestLSMStoreConcurrencyAcrossSSTables`, `TestFlushEveryWriteReallyFlushes` | VERIFIED |
+
+### Note on INV-L4 and what the concurrency test can and cannot show
+
+`TestConcurrentReadsAcrossFlushPublication` was confirmed to have teeth by mutation testing:
+splitting publication into two critical sections **with a 200 µs gap** makes all twelve
+readers fail. Splitting it with no artificial delay does **not** reliably fail, because the
+window is nanoseconds wide and readers rarely land in it.
+
+So the honest statement is: atomicity comes from the code — one critical section — and the
+test guards against that shape changing, not against an arbitrarily narrow race. It is
+recorded here rather than left implied, because a concurrency test that cannot fail is worse
+than no test at all.
+
+### Note on INV-S5 being PARTIAL
+
+Phase 3 establishes the half of INV-S5 that exists: a reader never observes a partial
+SSTable file, and a flush's version change is atomic. The other half — that a *compaction's*
+version swap is atomic while it rewrites and unlinks files under live readers — has nothing
+to test against until Phase 4 introduces compaction.
 
 ## Raft
 

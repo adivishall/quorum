@@ -1,7 +1,9 @@
 # ARCHITECTURE
 
-Status: **Phase 0 — specification only.** Nothing in this document is implemented yet.
-Every claim here is a *design intent*. `docs/LIMITATIONS.md` and the per-phase reports
+Status: **specification.** Every claim here is a *design intent* for the finished system,
+not a description of what exists. As of Phase 3 the storage layer — WAL, memtable, SSTables,
+recovery — is real (`docs/WAL.md`, `docs/LSM.md`); everything about sharding, replication,
+consensus and networking is still design. `docs/LIMITATIONS.md` and the per-phase reports
 record what is actually true of the code at any point in time.
 
 ---

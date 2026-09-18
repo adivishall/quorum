@@ -19,7 +19,7 @@ Legend: ☐ not started · ◐ in progress · ☑ complete and verified
 | 0 | Architecture & spec | `docs/*` for architecture, design, consistency, failure model, invariants | Formats, protocols, and invariants are specified precisely enough to be implemented against and falsified | ☑ |
 | 1 | Single-node KV | `internal/storage` in-memory engine, `cmd/dkv` CLI | Concurrency-safe PUT/GET/DELETE, `-race` clean, error taxonomy defined | ☑ INV-A1..A9 |
 | 2 | Write-ahead log | segmented WAL, CRC, replay, torn-tail repair | SIGKILL-and-recover test passes; corruption tests pass | ☑ INV-S1 (process kill), S2, S8, W1–W9 |
-| 3 | MemTable + SSTable | skip list, SST writer/reader, flush, multi-level read path | Reads correct across memtable + N SSTables; restart-safe | ☐ |
+| 3 | MemTable + SSTable | skip list, SST writer/reader, flush, multi-level read path | Reads correct across memtable + N SSTables; restart-safe | ☑ INV-L1..L9; INV-S5 partial (flush only) |
 | 4 | Bloom + compaction | bloom filters, size-tiered compaction, MANIFEST | INV-S3, S5, S6, S7 verified; crash-during-compaction test passes | ☐ |
 | 5 | Storage benchmarks | `bench/`, `docs/BENCHMARKS.md` | Reproducible numbers with recorded hardware/config; no fabricated figures | ☐ |
 | 6 | Sharding | consistent hash ring, shard metadata, routing | INV-C1, C2, C3 verified; ring visualization | ☐ |

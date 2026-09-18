@@ -6,12 +6,15 @@ Quorum is currently implementing its durable storage engine. No Raft library, no
 database, no consensus service — the storage engine and the consensus implementation are
 the project, and they are being built in that order.
 
-> **Status: Phase 2 of 25 — single-node store with a durable write-ahead log.**
+> **Status: Phase 3 of 25 — single-node durable LSM storage engine.**
 >
-> **Implemented:** a single-node key-value store whose acknowledged writes survive the
-> process being killed.
-> **Not implemented:** LSM storage engine, sharding, replication, Raft, clustering. See
-> [docs/ROADMAP.md](docs/ROADMAP.md) for exactly what is done and what is not.
+> **Implemented:** a single-node key-value store with a write-ahead log, an ordered
+> memtable, immutable on-disk SSTables, flush, and restart recovery across the two.
+> Acknowledged writes survive the process being killed, including a kill during a flush.
+>
+> **Not implemented:** Bloom filters, compaction, a MANIFEST, sharding, replication, Raft,
+> a distributed cluster, linearizable reads, an HTTP API, a dashboard. Those are Phases 4
+> and later. See [docs/ROADMAP.md](docs/ROADMAP.md) for exactly what is done and what is not.
 >
 > The binary is still called `dkv`; that is the command name, not the project name.
 
@@ -25,9 +28,34 @@ replicated, when it is committed, and where the bytes physically land.
 
 ```
 client ─▶ HTTP API ─▶ router ─▶ shard leader ─▶ Raft ─▶ LSM engine
-                                                          │
-                                       WAL ─▶ MemTable ─▶ SSTable ─▶ compaction
+          └──────────── not built yet ────────────┘      └─ Phase 3 ─┘
 ```
+
+## What exists today
+
+```
+                       ┌──────────── implemented, Phase 3 ────────────┐
+Put / Delete ─────────▶│  WAL  ──▶  MemTable  ──▶  SSTable (immutable) │
+Get ──────────────────▶│  MemTable ▸ immutable MemTables ▸ SSTables    │
+                       └──────────────────────────────────────────────┘
+
+                       ┌──────────────── not implemented ─────────────┐
+                       │  Bloom filters · compaction · MANIFEST       │ Phase 4
+                       │  sharding · replication · Raft · HTTP API    │ Phases 6+
+                       └──────────────────────────────────────────────┘
+```
+
+A write is appended to the log before it becomes visible in memory. When the memtable
+reaches its size limit it is frozen and written out as an immutable, checksummed SSTable —
+temporary name, fsync, rename, fsync the directory — so a reader can never see a partially
+written file. A read consults the memtable, then any frozen memtable, then each SSTable
+newest first, and stops at the first version it finds, including a tombstone.
+
+On restart, the SSTables are verified, the WAL is replayed, and the mutations the tables
+already cover are skipped. That works because sequence numbers are assigned deterministically
+in log order, so replay re-derives exactly the numbering the original writes received.
+
+The details, including what each crash window leaves on disk: [docs/LSM.md](docs/LSM.md).
 
 ## The one thing this project refuses to do
 
@@ -74,8 +102,8 @@ One-shot form, with exit codes a script can branch on
 ```
 
 **The CLI is in-memory**: each invocation gets a fresh store, so state does not survive
-process exit. The CLI says so on every mutating command. Durability arrives in Phase 2.
-Full CLI contract: [docs/CLI.md](docs/CLI.md).
+process exit. The CLI says so on every mutating command. The storage layer is durable; the
+CLI is not wired to it until Phase 15. Full CLI contract: [docs/CLI.md](docs/CLI.md).
 
 ## Durability, stated exactly
 
@@ -111,6 +139,24 @@ durability, and it is why `batch` is the default.
 > so `dkv` remains ephemeral even though the storage layer is not. That wiring belongs to
 > Phase 15.
 
+### The storage engine, stated exactly
+
+An acknowledged write also survives a crash **during a flush**. That is tested the same way:
+a child process fills a memtable, reports that every write returned `nil`, starts writing the
+SSTable, and is destroyed mid-write. The test then classifies what the crash actually left on
+disk — a partial `*.sst.tmp`, a published `*.sst`, or neither — and fails if the mid-flush
+window was never hit, because a crash test that never hits its window passes for the wrong
+reason.
+
+What is **not** claimed:
+
+| | |
+|---|---|
+| Bloom filters | The SSTable format reserves a filter block; Phase 3 writes it **empty**. No read is accelerated by it. |
+| Compaction | None. The file count grows without bound, and so does read cost (~1.5 µs per SSTable consulted, measured). |
+| MANIFEST | None. The live file set is inferred from the directory and every SSTable is read in full at startup. |
+| Power-loss durability | Untested in every mode, as in Phase 2. |
+
 ## API semantics
 
 The `storage.Store` contract, settled now because the LSM engine that replaces the
@@ -127,7 +173,9 @@ in-memory implementation in Phase 3 must not change any of it:
 | Concurrency guarantee | Safe for concurrent use; each operation is atomic with respect to every other. No atomicity *across* operations — no transactions, no CAS, no batches. |
 
 These are numbered INV-A1..A9 in [docs/INVARIANTS.md](docs/INVARIANTS.md) and enforced by a
-conformance suite that the Phase 3 engine will inherit unchanged.
+conformance suite that the Phase 3 LSM engine inherited unchanged — including in a
+configuration where every single mutation becomes its own SSTable, so that no assertion in
+it is being answered out of memory.
 
 ## Documentation
 
@@ -143,6 +191,7 @@ conformance suite that the Phase 3 engine will inherit unchanged.
 | [ROADMAP.md](docs/ROADMAP.md) | 25 phases, exit criteria, and why the order is what it is |
 | [CLI.md](docs/CLI.md) | Command surface, exit codes, stream discipline, shell behaviour |
 | [WAL.md](docs/WAL.md) | Record format, segmentation, sync modes, append path, replay, corruption policy, what crash testing established |
+| [LSM.md](docs/LSM.md) | Internal keys, sequence numbers, memtable, SSTable format, flush and its crash windows, the read path, recovery without a MANIFEST, measurements |
 
 ## Development
 

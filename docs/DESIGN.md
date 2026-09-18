@@ -161,6 +161,27 @@ num_entries   u64 | magic u64 = 0x444B565353543031  ("DKVSST01")
 ```
 The magic is checked first on open; a wrong magic is a format/version error, not corruption.
 
+> **Phase 3 clarifications.** Implementing the SSTable exposed four points the Phase 0 text
+> left underspecified. None changes the layout; each makes an ambiguous rule decidable.
+>
+> 1. **The footer is little-endian**, like §2's framing and every other on-disk format here.
+>    Phase 0 did not say. One consequence worth knowing before reaching for a hex dump: the
+>    magic constant spells "DKVSST01" read big-endian, so its bytes appear reversed on disk.
+>    The constant kept its original spelling through the rename to Quorum deliberately;
+>    churning a format constant for cosmetic reasons is what format versioning exists to
+>    prevent.
+> 2. **"~4 KiB target, then rounded up to the next entry boundary"** means the block is
+>    closed once it *reaches* the target. It therefore overshoots by up to one entry, and an
+>    entry larger than the target — a 1 MiB value — is never split across blocks.
+> 3. **The filter block is written with length zero until Phase 4.** `filter_length == 0`
+>    means "no filter; consult the file directly". It is not a filter that always answers
+>    "maybe", and no Phase 3 read is accelerated by it. Its checksum is still written and
+>    verified, so no region of the file is left uncovered by a check.
+> 4. **The ordering function lives in `internal/storage/ikey`, not `storage`.** §1 called it
+>    `storage.Compare`; the memtable and the SSTable both need it, and both are subpackages
+>    of `storage`, so putting it there would be an import cycle. Same function, same
+>    ordering, different package.
+
 ---
 
 ## 5. Bloom filter

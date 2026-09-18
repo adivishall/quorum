@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"testing"
 
 	"github.com/adivishall/quorum/internal/storage"
@@ -1161,4 +1162,94 @@ func TestDamageAfterOpenIsReportedNotSwallowed(t *testing.T) {
 	if !sawCorrupt {
 		t.Fatal("no read reached the damaged block; the test is not exercising what it claims")
 	}
+}
+
+// TestConcurrentReadsAcrossFlushPublication aims at the one instant where a
+// reader could see an inconsistent file set: publication, where the SSTable is
+// added and the immutable memtable is dropped.
+//
+// If those two happened in separate critical sections, a reader between them
+// would find the key in neither and report ErrNotFound for a key that has
+// existed continuously. That is the failure this test is shaped to catch, and
+// it is why the readers treat ErrNotFound as a hard failure rather than a
+// tolerable outcome.
+func TestConcurrentReadsAcrossFlushPublication(t *testing.T) {
+	const (
+		readers = 12
+		rounds  = 400
+	)
+	dir := t.TempDir()
+	// Small enough that writes trigger flushes on their own, and the test
+	// also forces them.
+	s := openLSM(t, dir, lsmOpts(2048))
+	defer func() { _ = s.Close() }()
+
+	ctx := context.Background()
+	key := []byte("hot")
+
+	written := make(map[string]bool, rounds+1)
+	for i := 0; i <= rounds; i++ {
+		written[fmt.Sprintf("v%04d", i)] = true
+	}
+	if err := s.Put(ctx, key, []byte("v0000")); err != nil {
+		t.Fatalf("seed Put: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(done)
+		for i := 1; i <= rounds; i++ {
+			if err := s.Put(ctx, key, []byte(fmt.Sprintf("v%04d", i))); err != nil {
+				t.Errorf("Put %d: %v", i, err)
+				return
+			}
+			// Padding, so the memtable keeps crossing its threshold, plus an
+			// explicit flush to make publication happen constantly.
+			if err := s.Put(ctx, []byte(fmt.Sprintf("filler%04d", i)), bytes.Repeat([]byte("x"), 128)); err != nil {
+				t.Errorf("Put filler %d: %v", i, err)
+				return
+			}
+			if i%20 == 0 {
+				if err := s.Flush(); err != nil {
+					t.Errorf("Flush: %v", err)
+					return
+				}
+			}
+		}
+	}()
+
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				got, err := s.Get(ctx, key)
+				if err != nil {
+					t.Errorf("Get during a flush: %v (the key has existed continuously; "+
+						"ErrNotFound here would mean a reader fell between the SSTable being "+
+						"published and the memtable being dropped)", err)
+					return
+				}
+				if !written[string(got)] {
+					t.Errorf("Get returned %q, which was never written", got)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := len(s.SSTables()); got < 5 {
+		t.Fatalf("only %d SSTables were produced; the test did not exercise publication", got)
+	}
+	t.Logf("%d readers ran across %d SSTable publications", readers, len(s.SSTables()))
 }

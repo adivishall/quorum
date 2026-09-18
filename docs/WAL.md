@@ -23,15 +23,21 @@ before you do it. Then any crash leaves the system in a state that the log can e
 
 ## 2. What this is not
 
-Phase 2 is a WAL and nothing else. There is **no memtable, no SSTable, no compaction, no
-Bloom filter, no log truncation**. Consequences, stated plainly because they are real:
+This document describes a write-ahead log and nothing else. There is no memtable, no
+SSTable, no compaction, no Bloom filter and no log truncation *in it*.
 
-- The whole live data set is held in memory. A dataset larger than RAM will not fit.
-- The whole log is replayed on every open. Startup time grows with total bytes ever written,
-  not with the size of the live data set.
+**Phase 3 update.** The memtable and SSTables now exist above the log
+(`docs/LSM.md`), so the first of Phase 2's two consequences is gone and the second is not:
 
-Both are fixed by the memtable/SSTable engine in Phase 3 and log truncation in Phase 4. They
-are documented in `docs/LIMITATIONS.md` as current limitations, not as design decisions.
+- ~~The whole live data set is held in memory.~~ Fixed: the memtable is flushed to immutable
+  SSTables at `Options.MemTableSize`, and recovery replays only the portion of the log those
+  tables do not already cover.
+- The whole log is still replayed on every open, because **nothing truncates the WAL yet**.
+  Startup time still grows with total bytes ever written. Phase 4's MANIFEST log number is
+  what retires segments a flush has superseded.
+
+Both were, and the second still is, documented in `docs/LIMITATIONS.md` as current
+limitations rather than design decisions.
 
 ---
 
@@ -301,7 +307,7 @@ data to have reached the physical device, which no userspace test on a laptop ca
 
 | Limitation | Removed in |
 |---|---|
-| Entire live data set held in memory | Phase 3 (memtable + SSTables) |
+| ~~Entire live data set held in memory~~ | **removed in Phase 3** (memtable + SSTables, `docs/LSM.md`) |
 | Entire log replayed on every open; startup grows with total bytes ever written | Phase 4 (truncation via the MANIFEST log number) |
 | No log truncation, so the WAL grows without bound | Phase 4 |
 | Segments missing from the *start* of the sequence are undetectable | Phase 4 (MANIFEST log number) |
