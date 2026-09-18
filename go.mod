@@ -1,3 +1,3 @@
-module github.com/adivishall/distributed-kv
+module github.com/adivishall/quorum
 
 go 1.27.1

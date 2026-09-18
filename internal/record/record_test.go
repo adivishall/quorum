@@ -7,7 +7,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/adivishall/distributed-kv/internal/record"
+	"github.com/adivishall/quorum/internal/record"
 )
 
 // encodeAll frames a sequence of records into one buffer.

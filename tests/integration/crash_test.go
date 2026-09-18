@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adivishall/distributed-kv/internal/storage"
-	"github.com/adivishall/distributed-kv/internal/storage/wal"
+	"github.com/adivishall/quorum/internal/storage"
+	"github.com/adivishall/quorum/internal/storage/wal"
 )
 
 // The child process is this same test binary, re-executed with these variables

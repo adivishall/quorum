@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/adivishall/distributed-kv/internal/storage"
+	"github.com/adivishall/quorum/internal/storage"
 )
 
 // newMemStore adapts MemStore to the conformance suite. When the Phase 3 LSM

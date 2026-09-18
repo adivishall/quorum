@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/adivishall/distributed-kv/internal/record"
-	"github.com/adivishall/distributed-kv/internal/storage/wal"
+	"github.com/adivishall/quorum/internal/record"
+	"github.com/adivishall/quorum/internal/storage/wal"
 )
 
 // writeRawSegment writes a segment file from hand-framed records, so a test can

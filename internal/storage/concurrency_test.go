@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/adivishall/distributed-kv/internal/storage"
+	"github.com/adivishall/quorum/internal/storage"
 )
 
 // These tests are only fully meaningful under `go test -race`. Without the race

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/adivishall/distributed-kv/internal/record"
+	"github.com/adivishall/quorum/internal/record"
 )
 
 // SyncMode selects when the WAL flushes to stable storage. The three modes and
@@ -25,7 +25,7 @@ const (
 	// is the default.
 	SyncBatch SyncMode = iota
 	// SyncOff never calls fsync. Data reaches the kernel but is never flushed
-	// on dkv's initiative. Test-only.
+	// on Quorum's initiative. Test-only.
 	SyncOff
 	// SyncAlways flushes before every append returns.
 	SyncAlways

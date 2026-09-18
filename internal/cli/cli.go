@@ -1,4 +1,4 @@
-// Package cli implements the dkv command-line interface.
+// Package cli implements Quorum's dkv command-line interface.
 //
 // The command logic lives here rather than in cmd/dkv so that it can be tested
 // directly: App takes its streams and its Store as fields, and Run returns an
@@ -15,8 +15,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/adivishall/distributed-kv/internal/storage"
-	"github.com/adivishall/distributed-kv/internal/version"
+	"github.com/adivishall/quorum/internal/storage"
+	"github.com/adivishall/quorum/internal/version"
 )
 
 // Exit codes. These are a public contract: a script may branch on them, so
@@ -61,7 +61,7 @@ type App struct {
 // with a confusing "token too long" rather than working.
 const maxLineSize = storage.DefaultMaxKeySize + storage.DefaultMaxValueSize + 64
 
-const usageText = `dkv - distributed key-value store (phase 1: single node, in-memory)
+const usageText = `dkv - Quorum, a distributed key-value database (this CLI is in-memory only)
 
 Usage:
   dkv put <key> <value>     store value under key

@@ -1,4 +1,4 @@
-// Command dkv is the dkv command-line client.
+// Command dkv is Quorum's command-line client.
 //
 // Phase 1: the store is in-process and in-memory, so state does not survive
 // this process. Phase 2 adds a write-ahead log and a data directory; Phase 7
@@ -10,8 +10,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/adivishall/distributed-kv/internal/cli"
-	"github.com/adivishall/distributed-kv/internal/storage"
+	"github.com/adivishall/quorum/internal/cli"
+	"github.com/adivishall/quorum/internal/storage"
 )
 
 func main() {

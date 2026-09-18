@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/adivishall/distributed-kv/internal/storage/wal"
+	"github.com/adivishall/quorum/internal/storage/wal"
 )
 
 // These benchmarks exist to make the cost of each sync mode visible and

@@ -1,12 +1,19 @@
-# dkv — a distributed key-value store
+# Quorum
 
-A sharded, Raft-replicated key-value store with an LSM-tree storage engine, written from
-scratch in Go. No Raft library, no embedded database, no consensus service. The storage
-engine and the consensus implementation are the project.
+A distributed key-value database built from scratch in Go.
+
+Quorum is currently implementing its durable storage engine. No Raft library, no embedded
+database, no consensus service — the storage engine and the consensus implementation are
+the project, and they are being built in that order.
 
 > **Status: Phase 2 of 25 — single-node store with a durable write-ahead log.**
-> There is no LSM engine, no cluster, no replication and no consensus yet. See
+>
+> **Implemented:** a single-node key-value store whose acknowledged writes survive the
+> process being killed.
+> **Not implemented:** LSM storage engine, sharding, replication, Raft, clustering. See
 > [docs/ROADMAP.md](docs/ROADMAP.md) for exactly what is done and what is not.
+>
+> The binary is still called `dkv`; that is the command name, not the project name.
 
 ---
 
@@ -66,7 +73,7 @@ One-shot form, with exit codes a script can branch on
 ./bin/dkv delete user:123
 ```
 
-**Phase 1 is in-memory**: each invocation gets a fresh store, so state does not survive
+**The CLI is in-memory**: each invocation gets a fresh store, so state does not survive
 process exit. The CLI says so on every mutating command. Durability arrives in Phase 2.
 Full CLI contract: [docs/CLI.md](docs/CLI.md).
 

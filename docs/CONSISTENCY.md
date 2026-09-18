@@ -9,11 +9,11 @@ claims are backed by passing tests and which are not.
 
 ## 1. The model in one paragraph
 
-`dkv` targets **linearizable single-key operations**. `PUT`, `GET`, and `DELETE` on a single
+Quorum targets **linearizable single-key operations**. `PUT`, `GET`, and `DELETE` on a single
 key behave as if they took effect instantaneously at some point between the client's request
 and the client's response, consistent with real time. There are no transactions, no multi-key
 atomicity, and no snapshot isolation. Under a network partition, the minority side becomes
-**unavailable** for that shard rather than serving stale or divergent data — `dkv` is CP in
+**unavailable** for that shard rather than serving stale or divergent data — Quorum is CP in
 the CAP sense, per shard.
 
 ---

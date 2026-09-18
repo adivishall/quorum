@@ -8,7 +8,7 @@ record what is actually true of the code at any point in time.
 
 ## 1. What this system is
 
-`dkv` is a distributed, replicated, sharded key-value store. It supports exactly three
+Quorum is a distributed, replicated, sharded key-value store. It supports exactly three
 logical operations on opaque byte keys and values:
 
 ```

@@ -9,9 +9,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/adivishall/distributed-kv/internal/record"
-	"github.com/adivishall/distributed-kv/internal/storage"
-	"github.com/adivishall/distributed-kv/internal/storage/wal"
+	"github.com/adivishall/quorum/internal/record"
+	"github.com/adivishall/quorum/internal/storage"
+	"github.com/adivishall/quorum/internal/storage/wal"
 )
 
 // newWALStore adapts WALStore to the shared suites.

@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/adivishall/distributed-kv/internal/storage/wal"
+	"github.com/adivishall/quorum/internal/storage/wal"
 )
 
 // walDirName is the WAL subdirectory of the data directory. Phase 3 adds

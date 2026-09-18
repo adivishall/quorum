@@ -1,4 +1,4 @@
-// Package version reports build identity for the dkv binaries.
+// Package version reports build identity for Quorum's binaries.
 package version
 
 // Version is the semantic version of this build.

@@ -1,4 +1,4 @@
-// Package storage implements dkv's local key-value storage.
+// Package storage implements Quorum's local key-value storage.
 //
 // Phase 1 provides a single in-memory implementation, MemStore. Later phases
 // replace it with the write-ahead log / memtable / SSTable engine described in
@@ -12,7 +12,7 @@ package storage
 import (
 	"context"
 
-	"github.com/adivishall/distributed-kv/internal/storage/wal"
+	"github.com/adivishall/quorum/internal/storage/wal"
 )
 
 // Default limits. These match docs/DESIGN.md §1 so that the in-memory store and
@@ -56,7 +56,7 @@ func (o Options) validate() error {
 	return nil
 }
 
-// Store is dkv's local key-value store.
+// Store is Quorum's local key-value store.
 //
 // # Ownership of byte slices
 //

@@ -6,7 +6,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/adivishall/distributed-kv/internal/storage/wal"
+	"github.com/adivishall/quorum/internal/storage/wal"
 )
 
 func TestBatchRoundTrip(t *testing.T) {

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/adivishall/distributed-kv/internal/storage"
+	"github.com/adivishall/quorum/internal/storage"
 )
 
 // newStoreFunc builds a fresh, empty Store with the given options.

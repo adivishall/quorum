@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/adivishall/distributed-kv/internal/record"
-	"github.com/adivishall/distributed-kv/internal/storage/wal"
+	"github.com/adivishall/quorum/internal/record"
+	"github.com/adivishall/quorum/internal/storage/wal"
 )
 
 // Sentinel errors returned by every Store implementation.

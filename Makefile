@@ -1,4 +1,4 @@
-# dkv — distributed key-value store
+# Quorum — a distributed key-value database
 #
 # Paths are quoted throughout because the checkout directory may contain spaces.
 

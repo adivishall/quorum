@@ -61,7 +61,7 @@ func parseSegmentName(name string) (uint64, bool) {
 // along with the number of entries that were ignored because they are not
 // segment files.
 //
-// A gap in the sequence is an error. Nothing in dkv deletes a WAL segment yet,
+// A gap in the sequence is an error. Nothing in Quorum deletes a WAL segment yet,
 // so a missing segment means a segment was removed from underneath us, and
 // every record it held is gone. Replaying the surviving segments would produce
 // a state that never existed — a later write applied without the earlier one it

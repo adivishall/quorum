@@ -1,4 +1,4 @@
-// Package wal implements dkv's storage-engine write-ahead log.
+// Package wal implements Quorum's storage-engine write-ahead log.
 //
 // The WAL is the only thing standing between an acknowledged write and a
 // process that stops existing. Every mutation is appended here, as one framed
@@ -14,7 +14,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/adivishall/distributed-kv/internal/record"
+	"github.com/adivishall/quorum/internal/record"
 )
 
 // Record kinds within a WAL file (docs/DESIGN.md §3). The namespace is local to

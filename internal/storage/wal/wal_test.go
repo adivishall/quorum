@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adivishall/distributed-kv/internal/record"
-	"github.com/adivishall/distributed-kv/internal/storage/wal"
+	"github.com/adivishall/quorum/internal/record"
+	"github.com/adivishall/quorum/internal/storage/wal"
 )
 
 // ---------------------------------------------------------------- helpers

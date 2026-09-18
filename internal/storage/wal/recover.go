@@ -6,7 +6,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/adivishall/distributed-kv/internal/record"
+	"github.com/adivishall/quorum/internal/record"
 )
 
 // Handler receives records during replay, in the exact order they were

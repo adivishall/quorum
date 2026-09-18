@@ -1,4 +1,4 @@
-// Package record implements dkv's on-disk record framing.
+// Package record implements Quorum's on-disk record framing.
 //
 // One framing format serves three different logs — the storage engine's
 // write-ahead log, the Raft log, and the MANIFEST (docs/DESIGN.md §2). They are
