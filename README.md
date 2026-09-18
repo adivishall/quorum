@@ -4,9 +4,8 @@ A sharded, Raft-replicated key-value store with an LSM-tree storage engine, writ
 scratch in Go. No Raft library, no embedded database, no consensus service. The storage
 engine and the consensus implementation are the project.
 
-> **Status: Phase 1 of 25 — single-node, in-memory key-value store and CLI.**
-> There is no persistence, no cluster, no replication and no consensus yet, and this README
-> will not show benchmark numbers or a demo until they exist. See
+> **Status: Phase 2 of 25 — single-node store with a durable write-ahead log.**
+> There is no LSM engine, no cluster, no replication and no consensus yet. See
 > [docs/ROADMAP.md](docs/ROADMAP.md) for exactly what is done and what is not.
 
 ---
@@ -71,6 +70,40 @@ One-shot form, with exit codes a script can branch on
 process exit. The CLI says so on every mutating command. Durability arrives in Phase 2.
 Full CLI contract: [docs/CLI.md](docs/CLI.md).
 
+## Durability, stated exactly
+
+An acknowledged write survives the **process being destroyed**. That is tested, not asserted:
+`tests/integration/crash_test.go` starts a real child process, has it perform writes that each
+return `nil`, kills it with `SIGKILL` — no flush, no `Close`, no deferred functions — verifies
+it really died by signal, then reopens the directory and checks every write is there.
+
+| `wal.sync` | Survives SIGKILL | Survives OS crash / power loss |
+|---|---|---|
+| `off` | **yes** (tested) | no |
+| `batch` (default) | **yes** (tested) | may lose up to 100 ms or 1 MiB — *untested* |
+| `sync` | **yes** (tested) | claimed via `F_FULLFSYNC`, **not tested** |
+
+The row that teaches the most is the first one. `sync=off` loses nothing on SIGKILL — because
+`write(2)` had already handed the bytes to the kernel, and the kernel outlives the process.
+**Process death is not power loss**, and no test here proves power-loss durability for any
+mode. `docs/WAL.md` §9 spells out what was and was not established.
+
+Cost of each mode, measured on an Apple M4 (100-byte values, indicative only — Phase 5 does
+benchmarking properly):
+
+| Mode | ns/append | approx. appends/s |
+|---|---|---|
+| `off` | 3,879 | 258,000 |
+| `batch` | 5,456 | 183,000 |
+| `sync` | 3,870,493 | 258 |
+
+A device-level flush per write costs roughly **700×**. That is the honest price of power-loss
+durability, and it is why `batch` is the default.
+
+> **The CLI is not wired to a data directory yet** — it still constructs an in-memory store,
+> so `dkv` remains ephemeral even though the storage layer is not. That wiring belongs to
+> Phase 15.
+
 ## API semantics
 
 The `storage.Store` contract, settled now because the LSM engine that replaces the
@@ -102,16 +135,19 @@ conformance suite that the Phase 3 engine will inherit unchanged.
 | [LIMITATIONS.md](docs/LIMITATIONS.md) | What it does not do |
 | [ROADMAP.md](docs/ROADMAP.md) | 25 phases, exit criteria, and why the order is what it is |
 | [CLI.md](docs/CLI.md) | Command surface, exit codes, stream discipline, shell behaviour |
+| [WAL.md](docs/WAL.md) | Record format, segmentation, sync modes, append path, replay, corruption policy, what crash testing established |
 
 ## Development
 
 Requires Go 1.27+.
 
 ```bash
-make check     # gofmt + gitignore guard + go vet + go test -race — the phase gate
+make check        # gofmt + gitignore guard + go vet + go test -race — the phase gate
 make build
 make test
 make race
+make integration  # real-process SIGKILL crash recovery tests
+make bench        # indicative WAL measurements
 ```
 
 Extended fuzzing of the storage round-trip contract:

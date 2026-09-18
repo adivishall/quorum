@@ -16,13 +16,17 @@ import (
 // happens, never in when write(2) happens.
 type SyncMode int
 
+// SyncBatch is deliberately the zero value. A caller that forgets to set a
+// mode gets the documented default rather than the test-only one; the
+// alternative ordering makes "I left the struct empty" silently mean "never
+// flush", which is the single worst default a write-ahead log could have.
 const (
-	// SyncOff never calls fsync. Data reaches the kernel but is never flushed
-	// on dkv's initiative. Test-only.
-	SyncOff SyncMode = iota
 	// SyncBatch calls fsync periodically, bounded by time and by bytes. This
 	// is the default.
-	SyncBatch
+	SyncBatch SyncMode = iota
+	// SyncOff never calls fsync. Data reaches the kernel but is never flushed
+	// on dkv's initiative. Test-only.
+	SyncOff
 	// SyncAlways flushes before every append returns.
 	SyncAlways
 )

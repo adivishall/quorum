@@ -3,17 +3,25 @@
 The things this system does not do, cannot do, or has not proven. Kept current: an item may be
 removed only when a test exists showing it is no longer true.
 
-**Status: Phase 1.** A single-node, in-memory key-value store exists. Nothing else does.
+**Status: Phase 2.** A single-node key-value store with a durable write-ahead log exists.
+Nothing else does.
 
 ### True right now, and temporary
 
 | Limitation | Removed in |
 |---|---|
-| **No durability at all.** `MemStore` holds everything in a Go map. Process exit loses the entire database. The CLI prints a notice on every mutating command so this cannot be mistaken. | Phase 2 (WAL) |
-| No persistence, no SSTables, no compaction, no Bloom filters | Phases 3–4 |
+| **The entire live data set is held in memory.** The WAL makes writes durable; it does not make them fit on disk. A dataset larger than RAM will not fit. | Phase 3 (memtable + SSTables) |
+| **The entire log is replayed on every open.** Startup time is proportional to total bytes ever written, not to the live data set. | Phase 4 (truncation) |
+| **The WAL grows without bound.** Nothing reclaims segments. | Phase 4 |
+| **Power-loss durability is claimed for `sync` mode but untested, and untested for every other mode.** The crash tests destroy a real process with SIGKILL, which only proves data reached the kernel. | not testable here — see `docs/WAL.md` §9 |
+| Segments missing from the *start* of the WAL sequence are undetectable (gaps in the middle are refused) | Phase 4 (MANIFEST log number) |
+| A length field corrupted within the 64 MiB range can cause a torn-tail/corruption misclassification in the newest segment | inherent to this framing; `docs/WAL.md` §8 |
+| `sync` mode serialises writers behind the device flush (~3.9 ms/append measured on an M4) | Phase 5, if group commit is measured to be worth it |
+| No SSTables, no compaction, no Bloom filters | Phases 3–4 |
 | No networking, no cluster, no replication, no consensus | Phases 7–9 |
 | Memory is bounded only by the host: there is no eviction and no flush-to-disk, so a large dataset will OOM | Phase 3 (memtable flush) |
 | `dkv put` cannot carry a maximum-size (1 MiB) value, because `ARG_MAX` is 1 MiB on macOS and the kernel rejects the exec. `dkv shell` can. This is an OS limit, not a dkv limit. | not applicable — use `dkv shell`, or the HTTP API from Phase 15 |
+| The CLI is still in-memory-only: it does not yet open a data directory, so `dkv` remains ephemeral even though the storage layer is not | Phase 15 (CLI wiring) |
 | The interactive shell cannot express keys containing whitespace, because it splits on whitespace. The one-shot form and the Go API can. | Phase 15 (HTTP API) |
 
 ### The list below is what will still be true when v1 is complete.

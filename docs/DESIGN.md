@@ -63,6 +63,25 @@ Recovery policy, stated precisely because "handles corruption" is meaningless ot
 There is no resynchronization scan. A corrupt record in the middle of a log is data loss,
 and the system's job is to say so loudly, not to paper over it.
 
+> **Phase 2 clarifications.** Implementing this exposed three points the Phase 0 text left
+> underspecified. None changes the format; each makes an ambiguous rule decidable.
+>
+> 1. **"The final record" means the record whose extent reaches EOF**, not the last record
+>    the reader happened to reach. A checksum failure is classified as a torn tail only when
+>    `offset + 9 + length == filesize`; if bytes follow, the record was completed and
+>    something later damaged it, and truncating there would discard the valid records after
+>    it. This is sound whenever the length field survived — the residual ambiguity is
+>    documented in `docs/WAL.md` §8.
+> 2. **An all-zero 9-byte header is handled explicitly.** It can never be something we wrote
+>    (a legitimate empty record stores `crc32c = 0x45727635`, never `0`). Resolved by
+>    scanning the remainder: zeros all the way to EOF is a tail; zeros followed by real data
+>    is damage. Without this rule the classification depended on how many zero bytes happened
+>    to be present.
+> 3. **A failed read latches.** Once the reader reports a problem it returns that same error
+>    forever. The underlying stream has already consumed the bad record's bytes, so a
+>    subsequent read would return whatever followed as if it were the next record — accidental
+>    resynchronization, which this section forbids.
+
 ---
 
 ## 3. WAL (engine write-ahead log)
@@ -71,11 +90,16 @@ Segmented files `wal/%06d.log`. Record kinds:
 
 | kind | payload |
 |---|---|
-| `0x01 WriteBatch` | `count uvarint`, then `count ×` { `kind u8`, `key len+bytes`, `value len+bytes` (absent for tombstone) } |
+| `0x01 WriteBatch` | `count uvarint`, then `count ×` { `kind u8`, `key len+bytes`, `value len+bytes` (absent for tombstone) }. **Phase 2: all lengths are uvarint**, matching §1; `kind` uses §1's value types (`0x00` tombstone, `0x01` value). |
 | `0x02 AppliedIndex` | `raftIndex u64`, `raftTerm u64` |
 
 A write batch is one record, so a batch is atomic with respect to crash: either the whole
 CRC'd record replays or none of it does.
+
+**Segment size (Phase 2):** the rotation threshold is **16 MiB**, and records are never split
+across segments, so a segment may exceed it by up to one record. Phase 0 did not specify a
+value; 16 MiB is a deliberate middle choice, not a measurement, and is documented as such in
+`docs/WAL.md` §4.
 
 ### What "durable" means here
 

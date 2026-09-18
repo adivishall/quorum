@@ -42,14 +42,52 @@ the write lock makes the race detector fire).
 
 | ID | Invariant | Checked by | Status |
 |---|---|---|---|
-| INV-S1 | After any crash and restart, the recovered state equals the state implied by the durable log prefix. No acknowledged write is missing; no unacknowledged write appears. | Phase 2 crash tests (SIGKILL + replay + compare) | PLANNED |
-| INV-S2 | WAL replay is deterministic: replaying the same log bytes any number of times, from any starting point, yields identical state. | Phase 2 repeated-recovery test | PLANNED |
+| INV-S1 | After any crash and restart, the recovered state equals the state produced by applying some **prefix** of the submitted write sequence. Every acknowledged write is inside that prefix, and the prefix has no holes. (Corrected in Phase 2 — see the note below.) | `TestCrashRecoveryAcknowledgedWritesSurvive`, `TestCrashRecoveryMidWriteStormYieldsAPrefix`, `TestReplayReconstructsIdenticalState` | VERIFIED (process kill only) |
+| INV-S2 | WAL replay is deterministic: replaying the same log bytes any number of times yields identical state, and replay never alters the log. | `TestReplayIsDeterministic`, `TestRecoveryIsIdempotent` | VERIFIED |
 | INV-S3 | A deleted key never reappears — at any level, after any number of compactions, across restarts. (Tombstones are only dropped at the bottom-most level.) | Phase 4 compaction tests | PLANNED |
 | INV-S4 | Sequence numbers are assigned deterministically in apply order, so two replicas that applied the same log prefix hold byte-identical logical state. | Phase 12 replica-comparison | PLANNED |
 | INV-S5 | A reader holding a version never observes a partially-installed SSTable set. Compaction's version swap is atomic. | Phase 4 concurrent read-during-compaction test (`-race`) | PLANNED |
 | INV-S6 | The MANIFEST is the sole authority on which files are live. Files on disk but absent from it are orphans and are deleted; files in it but absent from disk are a fatal error. | Phase 4 crash-during-compaction test | PLANNED |
 | INV-S7 | A Bloom filter never returns "absent" for a key that is present (zero false negatives). | Phase 4 bloom test over a large corpus | PLANNED |
-| INV-S8 | A CRC failure in the middle of a log aborts startup; a CRC failure in the final record truncates and continues. Never the reverse. | Phase 2 corruption tests | PLANNED |
+| INV-S8 | Damage that a crash cannot explain aborts startup; a torn tail in the newest segment truncates and continues. Never the reverse. A refused open modifies nothing. | `TestBadChecksumInMiddleRecordIsRefused`, `TestCorruptionInAnOlderSegmentIsRefused`, `TestBadChecksumInFinalRecordIsRepaired`, `TestTruncatedFinalPayloadIsRepaired` | VERIFIED |
+
+### Note on INV-S1 — a Phase 0 invariant that was wrong
+
+As written in Phase 0, INV-S1 said "no unacknowledged write appears". **That is not
+achievable by any write-ahead log**, and the error was mine in Phase 0 rather than a defect
+found in Phase 2.
+
+A crash between the log append and the acknowledgement leaves a record that is durable but
+was never acknowledged, and replay will apply it. There is no way to avoid this without
+making the log write and the client response atomic, which is impossible across a network or
+a process boundary. It is the same phenomenon as `docs/CONSISTENCY.md` C4: a client that
+times out genuinely cannot know whether its write took effect.
+
+The invariant has been restated as what is both achievable and actually useful: the recovered
+state is a **prefix** of the submitted sequence, every acknowledged write is inside it, and
+there are no holes. "No holes" is the load-bearing part — a hole would mean replay skipped a
+record, which is exactly the failure the corruption policy exists to prevent.
+
+The VERIFIED marker carries the qualifier **(process kill only)**. The crash tests destroy a
+real process with SIGKILL. They do not test OS crash or power loss, and INV-S1 is therefore
+not established against those failures in any sync mode.
+
+## Write-ahead log (Phase 2)
+
+Enforced by `internal/record`, `internal/storage/wal` and `internal/storage/walstore.go`.
+
+| ID | Invariant | Checked by | Status |
+|---|---|---|---|
+| INV-W1 | The order mutations reach the log is exactly the order they reach memory, so the state after a restart equals the state before it. | `TestWriteOrderMatchesLogOrder` | VERIFIED |
+| INV-W2 | A batch is atomic with respect to a crash: it is one checksummed record, so either every operation in it replays or none does. | `TestBatchRoundTrip`, `TestMultiOperationBatch`, `TestTruncatedFinalPayloadIsRepaired` | VERIFIED |
+| INV-W3 | A mutation that the log rejected is never published in memory. In-memory state is always a subset of what the log contains. | `TestFailedWriteIsNotPublished` | VERIFIED |
+| INV-W4 | A record is never split across segments, so each segment can be replayed independently. | `TestLargeRecordNearFramingLimit` | VERIFIED |
+| INV-W5 | A refused recovery leaves the log byte-for-byte unmodified, so the data remains available to investigate. | `TestBadChecksumInMiddleRecordIsRefused` | VERIFIED |
+| INV-W6 | A missing segment is refused rather than replayed around. | `TestSegmentGapIsRefused` | VERIFIED |
+| INV-W7 | The framing reader never resynchronises: after any failure it stays failed and returns no further records. | `TestReaderStopsAtFirstProblem`, `TestReaderIsStickyAfterTornTail` | VERIFIED |
+| INV-W8 | A malformed payload — unknown record kind, unknown operation kind, bad lengths, trailing bytes — is refused, never guessed at. | `TestDecodeBatchRejectsMalformedPayloads`, `TestUnknownRecordKindIsRefused`, `TestMalformedBatchPayloadIsRefused` | VERIFIED |
+| INV-W9 | Every append completes a `write(2)` before returning, in every sync mode, so an acknowledged write survives process death even with fsync disabled. | `TestCrashWithSyncOffStillRecoversFromThePageCache` | VERIFIED |
+| INV-W10 | A durability failure latches: once a flush has failed, no further append is acknowledged. | asserted in `wal.append`; no fault-injection test yet | PLANNED |
 
 ## Raft
 

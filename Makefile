@@ -6,7 +6,7 @@ GO      ?= go
 PKGS    := ./...
 BIN     := bin
 
-.PHONY: all build test race vet fmt fmtcheck checkignore tidy clean check
+.PHONY: all build test race vet fmt fmtcheck checkignore integration bench tidy clean check
 
 all: check
 
@@ -21,6 +21,14 @@ test:
 ## race — unit tests under the race detector (required before every phase commit)
 race:
 	$(GO) test -race $(PKGS)
+
+## integration — multi-process tests, including real SIGKILL crash recovery
+integration:
+	$(GO) test -race -count=1 -v ./tests/integration/
+
+## bench — indicative measurements; Phase 5 is where benchmarking is done properly
+bench:
+	$(GO) test -run='^$$' -bench=. -benchtime=2000x ./internal/storage/...
 
 ## vet — static analysis
 vet:
