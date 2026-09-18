@@ -1,0 +1,29 @@
+# binaries
+/bin/
+/dist/
+dkv
+dkvd
+dkvbench
+
+# test / runtime data
+*.test
+/data/
+/tmp/
+*.sst
+*.log
+!docs/*.log
+coverage.out
+coverage.html
+
+# benchmark output
+/bench/results/*.json
+/bench/results/*.csv
+
+# dashboard
+/dashboard/node_modules/
+/dashboard/dist/
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/
