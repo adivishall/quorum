@@ -19,6 +19,9 @@ jobs:
       - name: gofmt
         run: make fmtcheck
 
+      - name: gitignore does not exclude source
+        run: make checkignore
+
       - name: go vet
         run: make vet
 

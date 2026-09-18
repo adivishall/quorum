@@ -6,7 +6,7 @@ GO      ?= go
 PKGS    := ./...
 BIN     := bin
 
-.PHONY: all build test race vet fmt fmtcheck lint tidy clean check
+.PHONY: all build test race vet fmt fmtcheck checkignore tidy clean check
 
 all: check
 
@@ -35,12 +35,16 @@ fmtcheck:
 	@out="$$(gofmt -l . | grep -v '^dashboard/' || true)"; \
 	if [ -n "$$out" ]; then echo "unformatted files:"; echo "$$out"; exit 1; fi
 
+## checkignore — fail if .gitignore excludes real source (see scripts/check-ignore.sh)
+checkignore:
+	@./scripts/check-ignore.sh
+
 ## tidy — sync go.mod
 tidy:
 	$(GO) mod tidy
 
 ## check — the gate every phase must pass
-check: fmtcheck vet race
+check: fmtcheck checkignore vet race
 
 clean:
 	rm -rf "$(BIN)" coverage.out coverage.html

@@ -1,7 +1,6 @@
 # binaries
 /bin/
 /dist/
-dkv
 dkvd
 dkvbench
 
