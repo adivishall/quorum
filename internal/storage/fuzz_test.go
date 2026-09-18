@@ -6,7 +6,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/adivishal/dkv/internal/storage"
+	"github.com/adivishall/distributed-kv/internal/storage"
 )
 
 // FuzzPutGetRoundTrip asserts the central storage contract over arbitrary

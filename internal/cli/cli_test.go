@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/adivishal/dkv/internal/cli"
-	"github.com/adivishal/dkv/internal/storage"
+	"github.com/adivishall/distributed-kv/internal/cli"
+	"github.com/adivishall/distributed-kv/internal/storage"
 )
 
 // harness runs CLI invocations against one store, capturing streams per call.

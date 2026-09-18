@@ -15,8 +15,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/adivishal/dkv/internal/storage"
-	"github.com/adivishal/dkv/internal/version"
+	"github.com/adivishall/distributed-kv/internal/storage"
+	"github.com/adivishall/distributed-kv/internal/version"
 )
 
 // Exit codes. These are a public contract: a script may branch on them, so

@@ -10,8 +10,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/adivishal/dkv/internal/cli"
-	"github.com/adivishal/dkv/internal/storage"
+	"github.com/adivishall/distributed-kv/internal/cli"
+	"github.com/adivishall/distributed-kv/internal/storage"
 )
 
 func main() {
