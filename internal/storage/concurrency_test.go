@@ -17,14 +17,38 @@ import (
 // detector they verify the observable contract; with it, they also verify the
 // absence of unsynchronised access. `make race` is the gate.
 
-// TestConcurrentWritersDistinctKeys checks that parallel writes to disjoint
+// runConcurrency exercises the concurrency contract against an implementation.
+//
+// Like the conformance suite, it is parameterised rather than written against a
+// single type: the durability layer must not change the concurrency semantics,
+// and the Phase 3 engine will inherit these tests too.
+func runConcurrency(t *testing.T, newStore newStoreFunc) {
+	t.Helper()
+	tests := []struct {
+		name string
+		fn   func(t *testing.T, newStore newStoreFunc)
+	}{
+		{"WritersDistinctKeys", testConcurrentWritersDistinctKeys},
+		{"WritersSameKey", testConcurrentWritersSameKey},
+		{"ReadersDuringWrites", testConcurrentReadersDuringWrites},
+		{"MixedOperations", testConcurrentMixedOperations},
+		{"GetsReturnIndependentCopies", testConcurrentGetsReturnIndependentCopies},
+		{"CloseDuringOperations", testConcurrentCloseDuringOperations},
+		{"CloseIsIdempotent", testConcurrentCloseIsIdempotent},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) { tc.fn(t, newStore) })
+	}
+}
+
+// testConcurrentWritersDistinctKeys checks that parallel writes to disjoint
 // keys all land, none are lost, and none corrupt each other.
-func TestConcurrentWritersDistinctKeys(t *testing.T) {
+func testConcurrentWritersDistinctKeys(t *testing.T, newStore newStoreFunc) {
 	const (
 		writers      = 8
 		opsPerWriter = 500
 	)
-	s := newMemStore(t, storage.DefaultOptions())
+	s := newStore(t, storage.DefaultOptions())
 	ctx := context.Background()
 
 	var wg sync.WaitGroup
@@ -59,21 +83,21 @@ func TestConcurrentWritersDistinctKeys(t *testing.T) {
 	}
 }
 
-// TestConcurrentWritersSameKey is the torn-value test. Every writer writes a
+// testConcurrentWritersSameKey is the torn-value test. Every writer writes a
 // large value made entirely of its own ID byte. A reader that ever observes a
 // value containing two different bytes has seen a partially-applied write,
 // which would violate the per-operation atomicity documented on storage.Store.
 //
 // Under the current RWMutex this cannot happen. The test exists so that a
 // future sharded or lock-free rewrite cannot silently break the guarantee.
-func TestConcurrentWritersSameKey(t *testing.T) {
+func testConcurrentWritersSameKey(t *testing.T, newStore newStoreFunc) {
 	const (
 		writers   = 8
 		readers   = 4
 		rounds    = 300
 		valueSize = 8 << 10 // large enough that a memcpy could realistically tear
 	)
-	s := newMemStore(t, storage.DefaultOptions())
+	s := newStore(t, storage.DefaultOptions())
 	ctx := context.Background()
 	key := []byte("contended")
 
@@ -144,15 +168,15 @@ func TestConcurrentWritersSameKey(t *testing.T) {
 	}
 }
 
-// TestConcurrentReadersDuringWrites runs many readers against a key whose value
+// testConcurrentReadersDuringWrites runs many readers against a key whose value
 // is being continuously rewritten. Every read must return one of the values
 // that was actually written — never a mixture, never a partial value.
-func TestConcurrentReadersDuringWrites(t *testing.T) {
+func testConcurrentReadersDuringWrites(t *testing.T, newStore newStoreFunc) {
 	const (
 		readers = 16
 		rounds  = 1000
 	)
-	s := newMemStore(t, storage.DefaultOptions())
+	s := newStore(t, storage.DefaultOptions())
 	ctx := context.Background()
 	key := []byte("hot")
 
@@ -206,20 +230,20 @@ func TestConcurrentReadersDuringWrites(t *testing.T) {
 	wg.Wait()
 }
 
-// TestConcurrentMixedOperations runs puts, gets, and deletes simultaneously
+// testConcurrentMixedOperations runs puts, gets, and deletes simultaneously
 // over a shared key space. The checkable invariant under full concurrency is
 // not "which value is present" — that is genuinely nondeterministic and
 // asserting it would be asserting a race. It is: every Get either succeeds with
 // a value that some Put actually wrote, or fails with exactly ErrNotFound.
 // Anything else (a torn value, a foreign value, a surprising error class)
 // is a real defect.
-func TestConcurrentMixedOperations(t *testing.T) {
+func testConcurrentMixedOperations(t *testing.T, newStore newStoreFunc) {
 	const (
 		workers  = 12
 		opsEach  = 800
 		keySpace = 64
 	)
-	s := newMemStore(t, storage.DefaultOptions())
+	s := newStore(t, storage.DefaultOptions())
 	ctx := context.Background()
 
 	valid := make(map[string]bool, keySpace)
@@ -267,13 +291,13 @@ func TestConcurrentMixedOperations(t *testing.T) {
 	wg.Wait()
 }
 
-// TestConcurrentGetsReturnIndependentCopies checks that the copy-on-read
+// testConcurrentGetsReturnIndependentCopies checks that the copy-on-read
 // contract holds under concurrency: two goroutines reading the same key must
 // not receive slices backed by the same array, or one mutating its result
 // would corrupt the other's.
-func TestConcurrentGetsReturnIndependentCopies(t *testing.T) {
+func testConcurrentGetsReturnIndependentCopies(t *testing.T, newStore newStoreFunc) {
 	const goroutines = 16
-	s := newMemStore(t, storage.DefaultOptions())
+	s := newStore(t, storage.DefaultOptions())
 	ctx := context.Background()
 	key := []byte("shared")
 	original := bytes.Repeat([]byte("o"), 1024)
@@ -316,17 +340,14 @@ func TestConcurrentGetsReturnIndependentCopies(t *testing.T) {
 	}
 }
 
-// TestConcurrentCloseDuringOperations closes the store while operations are in
+// testConcurrentCloseDuringOperations closes the store while operations are in
 // flight. Every in-flight operation must either succeed or fail cleanly with
 // ErrClosed. It must never panic (MemStore drops its map on Close) and must
 // never trip the race detector.
-func TestConcurrentCloseDuringOperations(t *testing.T) {
+func testConcurrentCloseDuringOperations(t *testing.T, newStore newStoreFunc) {
 	const workers = 8
 
-	s, err := storage.NewMemStore(storage.DefaultOptions())
-	if err != nil {
-		t.Fatalf("NewMemStore: %v", err)
-	}
+	s := newStore(t, storage.DefaultOptions())
 	ctx := context.Background()
 	for i := 0; i < 64; i++ {
 		if err := s.Put(ctx, keyN(i), valN(i)); err != nil {
@@ -380,12 +401,9 @@ func TestConcurrentCloseDuringOperations(t *testing.T) {
 	}
 }
 
-// TestConcurrentCloseIsIdempotent races several Close calls against each other.
-func TestConcurrentCloseIsIdempotent(t *testing.T) {
-	s, err := storage.NewMemStore(storage.DefaultOptions())
-	if err != nil {
-		t.Fatalf("NewMemStore: %v", err)
-	}
+// testConcurrentCloseIsIdempotent races several Close calls against each other.
+func testConcurrentCloseIsIdempotent(t *testing.T, newStore newStoreFunc) {
+	s := newStore(t, storage.DefaultOptions())
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	for i := 0; i < 8; i++ {

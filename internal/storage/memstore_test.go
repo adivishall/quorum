@@ -24,6 +24,10 @@ func TestMemStoreConformance(t *testing.T) {
 	runConformance(t, newMemStore)
 }
 
+func TestMemStoreConcurrency(t *testing.T) {
+	runConcurrency(t, newMemStore)
+}
+
 func TestNewMemStoreRejectsInvalidOptions(t *testing.T) {
 	cases := []struct {
 		name string
