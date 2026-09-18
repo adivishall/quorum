@@ -4,6 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+
+	"github.com/adivishall/distributed-kv/internal/record"
+	"github.com/adivishall/distributed-kv/internal/storage/wal"
 )
 
 // Sentinel errors returned by every Store implementation.
@@ -36,6 +39,20 @@ var (
 
 	// ErrInvalidOptions means Options failed validation at construction time.
 	ErrInvalidOptions = errors.New("invalid options")
+
+	// ErrCorrupt means on-disk data could not be trusted and the store refused
+	// to open rather than serving a state that may be silently missing writes.
+	//
+	// This is deliberately the same error value as record.ErrCorrupt, so a
+	// caller has one sentinel to test whether the damage was caught by a
+	// framing checksum, by payload decoding, or by a structural check such as
+	// a missing WAL segment.
+	ErrCorrupt = record.ErrCorrupt
+
+	// ErrIO means the filesystem failed. The underlying error is preserved in
+	// the message; it is not part of the API, because the set of errors a
+	// filesystem can produce is open-ended and platform-specific.
+	ErrIO = errors.New("i/o error")
 )
 
 // OpError wraps a sentinel error with the operation and key that produced it.
@@ -83,4 +100,23 @@ func SafeKey(key []byte) string {
 		return strconv.Quote(string(key))
 	}
 	return fmt.Sprintf("%s...(%d bytes)", strconv.Quote(string(key[:maxDisplayKey])), len(key))
+}
+
+// classify maps an error from a lower layer onto the storage taxonomy.
+//
+// The mapping is total: corruption and closure keep their identity, and
+// anything else becomes ErrIO with the cause preserved in the message. Nothing
+// falls through unclassified, because an unclassified error at this boundary
+// would reach the CLI as an internal error with no useful category.
+func classify(op string, key []byte, err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, ErrCorrupt):
+		return opErr(op, key, err)
+	case errors.Is(err, wal.ErrClosed), errors.Is(err, ErrClosed):
+		return opErr(op, key, ErrClosed)
+	default:
+		return opErr(op, key, fmt.Errorf("%w: %v", ErrIO, err))
+	}
 }

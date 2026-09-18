@@ -9,7 +9,11 @@
 // shared conformance tests in store_conformance_test.go.
 package storage
 
-import "context"
+import (
+	"context"
+
+	"github.com/adivishall/distributed-kv/internal/storage/wal"
+)
 
 // Default limits. These match docs/DESIGN.md §1 so that the in-memory store and
 // the eventual on-disk engine reject exactly the same inputs; a key accepted in
@@ -26,6 +30,10 @@ type Options struct {
 	// MaxValueSize is the largest permitted value, in bytes. Must be >= 0;
 	// zero would permit only empty values, which is legal but useless.
 	MaxValueSize int
+
+	// WAL configures durability. It is ignored by MemStore, which has none.
+	// Its zero value is the documented default (batch sync, 16 MiB segments).
+	WAL wal.Options
 }
 
 // DefaultOptions returns the limits from docs/DESIGN.md §1.
@@ -33,6 +41,7 @@ func DefaultOptions() Options {
 	return Options{
 		MaxKeySize:   DefaultMaxKeySize,
 		MaxValueSize: DefaultMaxValueSize,
+		WAL:          wal.DefaultOptions(),
 	}
 }
 
