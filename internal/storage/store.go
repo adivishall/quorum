@@ -12,6 +12,7 @@ package storage
 import (
 	"context"
 
+	"github.com/adivishall/quorum/internal/storage/sstable"
 	"github.com/adivishall/quorum/internal/storage/wal"
 )
 
@@ -21,6 +22,16 @@ import (
 const (
 	DefaultMaxKeySize   = 4 << 10 // 4 KiB
 	DefaultMaxValueSize = 1 << 20 // 1 MiB
+
+	// DefaultMemTableSize is the memtable's flush threshold in bytes. It
+	// bounds how much data a restart has to replay from the WAL and how much
+	// memory the engine holds for unflushed writes. 4 MiB is the LevelDB
+	// write-buffer default and is a deliberate middle choice, not a measured
+	// one: small enough that a flush is quick and a restart is cheap, large
+	// enough that a workload of small values does not produce a file per
+	// handful of keys. Phase 5 is where a number earns the right to be called
+	// tuned.
+	DefaultMemTableSize = 4 << 20 // 4 MiB
 )
 
 // Options configures a Store.
@@ -34,6 +45,21 @@ type Options struct {
 	// WAL configures durability. It is ignored by MemStore, which has none.
 	// Its zero value is the documented default (batch sync, 16 MiB segments).
 	WAL wal.Options
+
+	// MemTableSize is the byte threshold at which LSMStore flushes its
+	// memtable to an SSTable. Zero selects DefaultMemTableSize. Ignored by
+	// MemStore and WALStore, neither of which has a memtable.
+	MemTableSize int64
+
+	// BlockSize is the SSTable data-block target in bytes. Zero selects
+	// sstable.DefaultBlockSize (docs/DESIGN.md §4).
+	BlockSize int
+
+	// MemTableSeed seeds the skip list's height generator. Zero selects the
+	// package default. It exists so that a test can pin the structure the
+	// memtable builds; it cannot change what the memtable contains or the
+	// order it iterates in, only the tower heights.
+	MemTableSeed uint64
 }
 
 // DefaultOptions returns the limits from docs/DESIGN.md §1.
@@ -42,6 +68,23 @@ func DefaultOptions() Options {
 		MaxKeySize:   DefaultMaxKeySize,
 		MaxValueSize: DefaultMaxValueSize,
 		WAL:          wal.DefaultOptions(),
+		MemTableSize: DefaultMemTableSize,
+		BlockSize:    sstable.DefaultBlockSize,
+	}
+}
+
+// applyLSMDefaults fills in the LSM-specific zero values.
+//
+// It is separate from validate so that a caller can keep building Options the
+// way Phase 1 and Phase 2 code does — MaxKeySize and MaxValueSize only — and
+// still get a working engine. The conformance suite constructs Options that
+// way, and it must keep passing unchanged.
+func (o *Options) applyLSMDefaults() {
+	if o.MemTableSize <= 0 {
+		o.MemTableSize = DefaultMemTableSize
+	}
+	if o.BlockSize <= 0 {
+		o.BlockSize = sstable.DefaultBlockSize
 	}
 }
 
@@ -51,6 +94,9 @@ func (o Options) validate() error {
 		return opErr("open", nil, ErrInvalidOptions)
 	}
 	if o.MaxValueSize < 0 {
+		return opErr("open", nil, ErrInvalidOptions)
+	}
+	if o.MemTableSize < 0 || o.BlockSize < 0 {
 		return opErr("open", nil, ErrInvalidOptions)
 	}
 	return nil

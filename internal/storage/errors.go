@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/adivishall/quorum/internal/record"
+	"github.com/adivishall/quorum/internal/storage/sstable"
 	"github.com/adivishall/quorum/internal/storage/wal"
 )
 
@@ -114,6 +115,14 @@ func classify(op string, key []byte, err error) error {
 		return nil
 	case errors.Is(err, ErrCorrupt):
 		return opErr(op, key, err)
+	case errors.Is(err, sstable.ErrBadMagic):
+		// docs/DESIGN.md §4 separates "not one of our files / a format we do
+		// not know" from "our file, damaged". The distinction is worth keeping
+		// in the diagnosis, and the sstable sentinel preserves it. At this
+		// boundary both collapse to ErrCorrupt, because what the store does
+		// about them is identical: refuse to open rather than serve a state
+		// that may be silently missing writes.
+		return opErr(op, key, fmt.Errorf("%w: %v", ErrCorrupt, err))
 	case errors.Is(err, wal.ErrClosed), errors.Is(err, ErrClosed):
 		return opErr(op, key, ErrClosed)
 	default:
