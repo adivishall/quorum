@@ -23,13 +23,15 @@ import (
 // set. TestMain notices them and runs the child instead of the test suite,
 // which avoids shipping a helper command just for testing.
 const (
-	envDir   = "DKV_CRASH_DIR"
-	envMode  = "DKV_CRASH_MODE"  // "burst" or "stream"
-	envSync  = "DKV_CRASH_SYNC"  // "off", "batch", "sync"
-	envCount = "DKV_CRASH_COUNT" // burst mode: how many keys to write
+	envDir    = "DKV_CRASH_DIR"
+	envMode   = "DKV_CRASH_MODE"   // see runWALChild and runLSMChild
+	envSync   = "DKV_CRASH_SYNC"   // "off", "batch", "sync"
+	envCount  = "DKV_CRASH_COUNT"  // how many keys to write
+	envEngine = "DKV_CRASH_ENGINE" // "wal" (Phase 2) or "lsm" (Phase 3)
+	envMemTbl = "DKV_CRASH_MEMTBL" // lsm: memtable flush threshold in bytes
 
 	readyLine   = "READY"
-	childTimout = 30 * time.Second
+	childTimout = 60 * time.Second
 )
 
 func TestMain(m *testing.M) {
@@ -47,8 +49,19 @@ func valueFor(i int) string { return fmt.Sprintf("value-%08d", i) }
 // runChild performs writes and then waits to be killed. It never exits on its
 // own: if it did, the test would be measuring a graceful shutdown.
 func runChild() {
-	dir := os.Getenv(envDir)
+	switch os.Getenv(envEngine) {
+	case "", "wal":
+		runWALChild()
+	case "lsm":
+		runLSMChild()
+	default:
+		fmt.Fprintf(os.Stderr, "child: unknown engine %q\n", os.Getenv(envEngine))
+		os.Exit(2)
+	}
+}
 
+// childOptions builds the store options from the environment.
+func childOptions() storage.Options {
 	mode, err := wal.ParseSyncMode(os.Getenv(envSync))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "child: %v\n", err)
@@ -56,6 +69,36 @@ func runChild() {
 	}
 	opts := storage.DefaultOptions()
 	opts.WAL.SyncMode = mode
+	if v := os.Getenv(envMemTbl); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "child: bad memtable size: %v\n", err)
+			os.Exit(2)
+		}
+		opts.MemTableSize = n
+	}
+	return opts
+}
+
+func childCount() int {
+	n, err := strconv.Atoi(os.Getenv(envCount))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "child: bad count: %v\n", err)
+		os.Exit(2)
+	}
+	return n
+}
+
+// announceReady tells the parent every write so far returned nil. It is what
+// makes the parent's assertion about ACKNOWLEDGED writes meaningful.
+func announceReady() {
+	fmt.Println(readyLine)
+	_ = os.Stdout.Sync()
+}
+
+func runWALChild() {
+	dir := os.Getenv(envDir)
+	opts := childOptions()
 
 	s, err := storage.OpenWALStore(dir, opts)
 	if err != nil {
@@ -68,11 +111,7 @@ func runChild() {
 
 	switch os.Getenv(envMode) {
 	case "burst":
-		n, err := strconv.Atoi(os.Getenv(envCount))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "child: bad count: %v\n", err)
-			os.Exit(2)
-		}
+		n := childCount()
 		for i := 0; i < n; i++ {
 			if err := s.Put(ctx, []byte(keyFor(i)), []byte(valueFor(i))); err != nil {
 				fmt.Fprintf(os.Stderr, "child: Put %d: %v\n", i, err)
@@ -86,12 +125,10 @@ func runChild() {
 		// Every Put above returned nil. Announcing readiness only now is what
 		// makes the parent's assertion meaningful: it is checking that
 		// ACKNOWLEDGED writes survived, not that some writes happened to.
-		fmt.Println(readyLine)
-		_ = os.Stdout.Sync()
+		announceReady()
 
 	case "stream":
-		fmt.Println(readyLine)
-		_ = os.Stdout.Sync()
+		announceReady()
 		for i := 0; ; i++ {
 			if err := s.Put(ctx, []byte(keyFor(i)), []byte(valueFor(i))); err != nil {
 				fmt.Fprintf(os.Stderr, "child: Put %d: %v\n", i, err)
@@ -115,6 +152,14 @@ type child struct {
 
 func startChild(t *testing.T, dir, mode string, sync wal.SyncMode, count int) *child {
 	t.Helper()
+	return startChildEnv(t, dir, mode, sync, count, nil)
+}
+
+// startChildEnv launches the child with extra environment settings, so the
+// Phase 3 tests can select the LSM engine and its memtable size without
+// duplicating the process plumbing.
+func startChildEnv(t *testing.T, dir, mode string, sync wal.SyncMode, count int, extra []string) *child {
+	t.Helper()
 
 	cmd := exec.Command(os.Args[0])
 	cmd.Env = append(os.Environ(),
@@ -123,6 +168,7 @@ func startChild(t *testing.T, dir, mode string, sync wal.SyncMode, count int) *c
 		envSync+"="+sync.String(),
 		envCount+"="+strconv.Itoa(count),
 	)
+	cmd.Env = append(cmd.Env, extra...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatalf("StdoutPipe: %v", err)
