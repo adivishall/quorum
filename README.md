@@ -6,15 +6,16 @@ Quorum is currently implementing its durable storage engine. No Raft library, no
 database, no consensus service — the storage engine and the consensus implementation are
 the project, and they are being built in that order.
 
-> **Status: Phase 3 of 25 — single-node durable LSM storage engine.**
+> **Status: Phase 4 of 25 — single-node durable LSM-backed key-value store.**
 >
-> **Implemented:** a single-node key-value store with a write-ahead log, an ordered
-> memtable, immutable on-disk SSTables, flush, and restart recovery across the two.
-> Acknowledged writes survive the process being killed, including a kill during a flush.
+> **Implemented:** a write-ahead log, an ordered memtable, immutable on-disk SSTables, Bloom
+> filters, size-tiered compaction, crash-safe MANIFEST-based file publication, and restart
+> recovery across all of it. Acknowledged writes survive the process being killed, including a
+> kill during a flush and a kill during a compaction.
 >
-> **Not implemented:** Bloom filters, compaction, a MANIFEST, sharding, replication, Raft,
-> a distributed cluster, linearizable reads, an HTTP API, a dashboard. Those are Phases 4
-> and later. See [docs/ROADMAP.md](docs/ROADMAP.md) for exactly what is done and what is not.
+> **Not implemented:** sharding, replication, Raft, a distributed cluster, linearizable reads,
+> networking, an HTTP API, a dashboard. Those are Phases 6 and later. See
+> [docs/ROADMAP.md](docs/ROADMAP.md) for exactly what is done and what is not.
 >
 > The binary is still called `dkv`; that is the command name, not the project name.
 
@@ -34,28 +35,40 @@ client ─▶ HTTP API ─▶ router ─▶ shard leader ─▶ Raft ─▶ LSM 
 ## What exists today
 
 ```
-                       ┌──────────── implemented, Phase 3 ────────────┐
-Put / Delete ─────────▶│  WAL  ──▶  MemTable  ──▶  SSTable (immutable) │
-Get ──────────────────▶│  MemTable ▸ immutable MemTables ▸ SSTables    │
-                       └──────────────────────────────────────────────┘
+                    ┌─────────────── implemented, Phase 4 ───────────────┐
+Put / Delete ──────▶│  WAL ──▶ MemTable ──▶ SSTable(L0) ──▶ compaction   │
+Get ───────────────▶│  MemTable ▸ immutable MemTables ▸ SSTables          │
+                    │             (each gated by a Bloom filter)          │
+                    │  MANIFEST decides which files are the database      │
+                    └────────────────────────────────────────────────────┘
 
-                       ┌──────────────── not implemented ─────────────┐
-                       │  Bloom filters · compaction · MANIFEST       │ Phase 4
-                       │  sharding · replication · Raft · HTTP API    │ Phases 6+
-                       └──────────────────────────────────────────────┘
+                    ┌──────────────── not implemented ───────────────────┐
+                    │  sharding · replication · Raft · networking        │ Phases 6+
+                    │  HTTP API · dashboard                              │ Phases 15+
+                    └────────────────────────────────────────────────────┘
 ```
 
-A write is appended to the log before it becomes visible in memory. When the memtable
-reaches its size limit it is frozen and written out as an immutable, checksummed SSTable —
-temporary name, fsync, rename, fsync the directory — so a reader can never see a partially
-written file. A read consults the memtable, then any frozen memtable, then each SSTable
-newest first, and stops at the first version it finds, including a tombstone.
+A write is appended to the log before it becomes visible in memory. When the memtable reaches its
+size limit it is frozen and written out as an immutable, checksummed SSTable — temporary name,
+fsync, rename, fsync the directory, then one fsynced MANIFEST record — so a reader can never see a
+partially written file, and a file is part of the database at exactly one instant. A read consults
+the memtable, then any frozen memtable, then each SSTable newest first, skipping any whose Bloom
+filter says the key is definitely absent, and stops at the first version it finds, including a
+tombstone.
 
-On restart, the SSTables are verified, the WAL is replayed, and the mutations the tables
-already cover are skipped. That works because sequence numbers are assigned deterministically
-in log order, so replay re-derives exactly the numbering the original writes received.
+In the background, compaction merges each level into the next, dropping superseded versions and —
+only where nothing older could still hold a value — tombstones. It runs concurrently with reads and
+writes and synchronises only to publish its result.
 
-The details, including what each crash window leaves on disk: [docs/LSM.md](docs/LSM.md).
+On restart, the MANIFEST says which files are live, each is cross-checked against the metadata the
+MANIFEST records for it, anything on disk it does not name is deleted as an orphan, and the WAL is
+replayed with the mutations the tables already cover skipped. That works because sequence numbers
+are assigned deterministically in log order, so replay re-derives exactly the numbering the
+original writes received.
+
+The details, including what every crash window leaves on disk: [docs/LSM.md](docs/LSM.md),
+[docs/BLOOM.md](docs/BLOOM.md), [docs/COMPACTION.md](docs/COMPACTION.md),
+[docs/MANIFEST.md](docs/MANIFEST.md).
 
 ## The one thing this project refuses to do
 
@@ -148,19 +161,41 @@ disk — a partial `*.sst.tmp`, a published `*.sst`, or neither — and fails if
 window was never hit, because a crash test that never hits its window passes for the wrong
 reason.
 
+An acknowledged write also survives a crash **during a compaction**, tested the same way: a child
+process builds four SSTables, starts a compaction, and is destroyed mid-merge. The test classifies
+what the crash actually left on disk by reading the MANIFEST — not by asking the engine — and
+requires that the mid-compaction window was really hit.
+
 What is **not** claimed:
 
 | | |
 |---|---|
-| Bloom filters | The SSTable format reserves a filter block; Phase 3 writes it **empty**. No read is accelerated by it. |
-| Compaction | None. The file count grows without bound, and so does read cost (~1.5 µs per SSTable consulted, measured). |
-| MANIFEST | None. The live file set is inferred from the directory and every SSTable is read in full at startup. |
-| Power-loss durability | Untested in every mode, as in Phase 2. |
+| Power-loss durability | Untested in every mode, for the WAL and now the MANIFEST alike. The crash tests destroy a process, which proves the bytes reached the kernel, not the platter. |
+| Performance | The numbers below and in `docs/BLOOM.md`, `docs/COMPACTION.md` and `docs/MANIFEST.md` are development measurements on one laptop. Phase 5 owns benchmarking; nothing here may be quoted as a result. |
+| WAL truncation | The log is still never truncated, so startup replays every mutation ever written even though compaction absorbed most of them. The MANIFEST records `SetLogNumber` and does not act on it. |
+| Startup corruption detection | Startup no longer reads every data block, so damage inside one is found at the read that needs it rather than at open. It is still found, and still reported as corruption rather than as a missing key. `VerifySSTablesOnOpen` restores the old behaviour. |
+
+### What Bloom filters and compaction actually bought
+
+Development measurements, go1.27.1 / darwin-arm64, same data and same workload in both arms
+(`docs/BLOOM.md` §5). Indicative only:
+
+| | Filter disabled (Phase 3) | Filter enabled |
+|---|---|---|
+| Data blocks read, 4,000 lookups over 17 SSTables | 52,329 | **2,395** |
+| p50 / p95 / p99 lookup | 11.0 / 19.2 / 22.1 µs | **1.4 / 2.6 / 3.3 µs** |
+
+95.4% of block reads avoided, for a filter costing exactly 10.00 bits per key (2.33% of the file).
+One compaction then turned 12 files and 12,000 entries into 1 file and 2,471 entries
+(`docs/COMPACTION.md` §8).
+
+The figure worth keeping is the block count, not the microseconds: it is a property of the
+algorithm, whereas the timings are a property of this laptop's page cache.
 
 ## API semantics
 
-The `storage.Store` contract, settled now because the LSM engine that replaces the
-in-memory implementation in Phase 3 must not change any of it:
+The `storage.Store` contract, settled in Phase 1 because nothing since — the WAL, the LSM engine,
+Bloom filters, compaction or the MANIFEST — has been allowed to change any of it:
 
 | Question | Answer |
 |---|---|
@@ -191,7 +226,10 @@ it is being answered out of memory.
 | [ROADMAP.md](docs/ROADMAP.md) | 25 phases, exit criteria, and why the order is what it is |
 | [CLI.md](docs/CLI.md) | Command surface, exit codes, stream discipline, shell behaviour |
 | [WAL.md](docs/WAL.md) | Record format, segmentation, sync modes, append path, replay, corruption policy, what crash testing established |
-| [LSM.md](docs/LSM.md) | Internal keys, sequence numbers, memtable, SSTable format, flush and its crash windows, the read path, recovery without a MANIFEST, measurements |
+| [LSM.md](docs/LSM.md) | Internal keys, sequence numbers, memtable, SSTable format, flush and its crash windows, the read path, measurements |
+| [BLOOM.md](docs/BLOOM.md) | Filter format, the hash and why it is that one, what may and may not be eliminated, measured false-positive rate and work avoided |
+| [COMPACTION.md](docs/COMPACTION.md) | Size-tiered policy, the streaming k-way merge, version and tombstone elimination, every publication crash window, concurrency |
+| [MANIFEST.md](docs/MANIFEST.md) | Why a directory scan cannot work, the edit format, the publication protocol, orphan and corruption policy, startup |
 
 ## Development
 

@@ -45,11 +45,11 @@ the write lock makes the race detector fire).
 |---|---|---|---|
 | INV-S1 | After any crash and restart, the recovered state equals the state produced by applying some **prefix** of the submitted write sequence. Every acknowledged write is inside that prefix, and the prefix has no holes. (Corrected in Phase 2 — see the note below.) | `TestCrashRecoveryAcknowledgedWritesSurvive`, `TestCrashRecoveryMidWriteStormYieldsAPrefix`, `TestReplayReconstructsIdenticalState`; Phase 3: `TestLSMCrashMidWriteStormYieldsAPrefix`, `TestCrashDuringFlush`, `TestLSMRepeatedCrashes` | VERIFIED (process kill only) |
 | INV-S2 | WAL replay is deterministic: replaying the same log bytes any number of times yields identical state, and replay never alters the log. | `TestReplayIsDeterministic`, `TestRecoveryIsIdempotent`; Phase 3: `TestRecoveryIsDeterministic`, `TestCrashWithOverwritesAndDeletesAcrossFiles` | VERIFIED |
-| INV-S3 | A deleted key never reappears — at any level, after any number of compactions, across restarts. (Tombstones are only dropped at the bottom-most level.) | Phase 4 compaction tests | PLANNED |
+| INV-S3 | A deleted key never reappears — at any level, after any number of compactions, across restarts. (Tombstones are only dropped at the bottom-most level; see INV-C4 for what "bottom-most" means in this engine.) | `TestDeletedKeyNeverReappearsAfterCompaction`, `TestTombstoneIsNotDroppedWhileAnOlderFileCouldHoldTheValue`, `TestTombstoneSurvivesManyCompactionGenerations`, `TestDeleteThenRewriteSurvivesCompaction`, `TestCrashDuringCompactionNeverLosesADelete`, `TestTombstoneIsKeptWhenNotBottomMost`, `TestDroppedTombstoneStillSuppressesOlderVersions` | VERIFIED |
 | INV-S4 | Sequence numbers are assigned deterministically in apply order, so two replicas that applied the same log prefix hold byte-identical logical state. | Phase 12 replica-comparison | PLANNED |
-| INV-S5 | A reader holding a version never observes a partially-installed SSTable set. Compaction's version swap is atomic. | Phase 3 covers the flush half — see INV-L4. Compaction's swap: Phase 4 concurrent read-during-compaction test (`-race`) | PARTIAL (flush only) |
-| INV-S6 | The MANIFEST is the sole authority on which files are live. Files on disk but absent from it are orphans and are deleted; files in it but absent from disk are a fatal error. | Phase 4 crash-during-compaction test | PLANNED |
-| INV-S7 | A Bloom filter never returns "absent" for a key that is present (zero false negatives). | Phase 4 bloom test over a large corpus | PLANNED |
+| INV-S5 | A reader holding a version never observes a partially-installed SSTable set. Compaction's version swap is atomic. | `TestReadsDuringCompactionSeeACoherentFileSet` (`-race`), `TestWritesAndFlushesDuringCompaction`, `TestFlushDuringCompactionIsNotLost`; flush half: INV-L4 | VERIFIED |
+| INV-S6 | The MANIFEST is the sole authority on which files are live. Files on disk but absent from it are orphans and are deleted; files in it but absent from disk are a fatal error. | `TestManifestRecordsTheLiveFileSet`, `TestOrphanSSTableIsDeletedAtStartup`, `TestReferencedButMissingSSTableIsFatal`, `TestSSTablesWithoutACurrentFileAreRefused`, `TestCompactionInputsLeftOnDiskAreSweptAsOrphans`, `TestCompactionOutputWithoutAManifestRecordIsIgnored`, `TestCrashDuringCompaction` | VERIFIED |
+| INV-S7 | A Bloom filter never returns "absent" for a key that is present (zero false negatives). | `TestZeroFalseNegativesOverALargeCorpus`, `TestZeroFalseNegativesForRandomByteKeys`, `FuzzFilterHasNoFalseNegatives`, `TestFilterNeverSkipsAPresentKey`, `TestTombstonedKeysAreInTheFilter`, `TestFalsePositiveRateIsNearTheoretical` | VERIFIED |
 | INV-S8 | Damage that a crash cannot explain aborts startup; a torn tail in the newest segment truncates and continues. Never the reverse. A refused open modifies nothing. | `TestBadChecksumInMiddleRecordIsRefused`, `TestCorruptionInAnOlderSegmentIsRefused`, `TestBadChecksumInFinalRecordIsRepaired`, `TestTruncatedFinalPayloadIsRepaired` | VERIFIED |
 
 ### Note on INV-S1 — a Phase 0 invariant that was wrong
@@ -120,12 +120,93 @@ test guards against that shape changing, not against an arbitrarily narrow race.
 recorded here rather than left implied, because a concurrency test that cannot fail is worse
 than no test at all.
 
-### Note on INV-S5 being PARTIAL
+### Note on INV-S5 becoming fully VERIFIED in Phase 4
 
-Phase 3 establishes the half of INV-S5 that exists: a reader never observes a partial
-SSTable file, and a flush's version change is atomic. The other half — that a *compaction's*
-version swap is atomic while it rewrites and unlinks files under live readers — has nothing
-to test against until Phase 4 introduces compaction.
+Phase 3 established the flush half: a reader never observes a partial SSTable file, and a flush's
+version change is atomic (INV-L4). Phase 4 adds the half that was PLANNED — a compaction's swap,
+performed while it rewrites and unlinks files under live readers.
+
+What makes it hold is the immutable, reference-counted version
+(`internal/storage/lsmversion.go`): a read acquires the current version once and holds it for the
+whole operation, publication is a single pointer swap, and a retired file is unlinked only once no
+live version holds it. `TestReadsDuringCompactionSeeACoherentFileSet` treats `ErrNotFound` as a hard
+failure for keys that exist continuously, which is precisely the symptom a two-step publication
+would produce.
+
+The same honesty note as INV-L4 applies: the window is nanoseconds wide, so the test guards the
+*shape* of the code — one critical section, one pointer — rather than proving an arbitrarily narrow
+race cannot occur.
+
+### Note on INV-L3 and INV-L8 after Phase 4
+
+Two Phase 3 invariants had clauses that the MANIFEST superseded. Neither guarantee was dropped;
+both moved, and the moves are recorded here rather than left for someone to discover.
+
+**INV-L3 — when data-block damage is detected.** Phase 3 read every block of every SSTable at
+startup, because a file's sequence range had nowhere on disk to live and recovering it meant reading
+the file. The MANIFEST records it, so startup now cross-checks each file's footer against the
+MANIFEST's record of it (entry count and size, recorded independently) and does not read data blocks.
+Damage inside a data block is therefore found at the read that needs that block rather than at open.
+It is still found, and still reported as corruption rather than as a missing key — which is INV-L7
+and is unchanged. `Options.VerifySSTablesOnOpen` restores the Phase 3 behaviour, and
+`TestCorruptSSTableRefusesToOpen` pins both halves so neither can drift silently.
+
+**INV-L8 — SSTable numbering gaps.** Phase 3 refused a gap in the file numbering, because with the
+directory as the authority a missing file was indistinguishable from data loss. Phase 4 allows gaps:
+a compaction allocates a file number before it knows whether it will produce output, so a
+no-output compaction legitimately leaves one unused. The check is superseded by a stronger one —
+INV-S6's "a referenced file that is missing is fatal" — which catches the condition the numbering
+gap was a proxy for, and catches it precisely.
+
+## Bloom filters, compaction and the MANIFEST (Phase 4)
+
+Enforced by `internal/storage/bloom`, `internal/storage/compaction`,
+`internal/storage/manifest`, `internal/storage/lsmcompact.go`,
+`internal/storage/lsmversion.go` and `tests/integration/lsm_crash_test.go`.
+
+| ID | Invariant | Checked by | Status |
+|---|---|---|---|
+| INV-B1 | A Bloom filter's "no" is authoritative and its "yes" means nothing: the filter may only ever eliminate a file from a lookup, and a lookup it eliminates performs no block I/O at all. A file with no filter answers "maybe" for every key, so a filterless file is consulted in full rather than skipped. | `TestFilterSkipsAbsentKeysWithoutReadingBlocks` (asserts `skips + blockReads == probes`), `TestZeroValueFilterFailsSafe`, `TestFilterlessFileIsHandledExplicitly`, `TestFilterSkipsFilesForAbsentKeys`, `TestMixedFilterAndFilterlessFilesResolveCorrectly` | VERIFIED |
+| INV-B2 | A filter that cannot be decoded, or whose block fails its checksum, is corruption — never silently treated as "this file has no filter", and never as "the key is absent". The filter encoding carries no checksum of its own; the block's `crc32c` is what protects it. | `TestDecodeRejectsMalformedFilters`, `TestCorruptFilterIsRefusedNotIgnored` (every byte of the filter block), `TestMalformedFilterEncodingIsRefused` (checksum recomputed, so only strict decoding catches it), `TestCorruptFilterChecksumIsRefused`, `FuzzDecodeIsTotal` | VERIFIED |
+| INV-C1 | Compaction preserves logical state exactly: for every key, the value a lookup returns before a compaction is the value it returns after it, and after any number of compactions and restarts. | `TestAgainstReferenceModelWithCompaction` (3 configurations, compared after every operation and after restarts), `TestCompactedStateSurvivesRestart`, `TestManyCompactionGenerationsWithRestarts`, `TestAgainstReferenceModel` (merge-level, 80 generated file sets) | VERIFIED |
+| INV-C2 | The merge is streaming: its memory is one cursor per input plus fixed buffers, never proportional to the data being merged. | Structural — `compaction.Merger` holds a heap of cursors with reused key/value buffers and no accumulation. `TestLargeMergeStaysOrdered` merges 32,000 entries across 8 files. **Not** independently measured; see the note below. | PARTIAL |
+| INV-C3 | An input that fails partway through stops the compaction and is reported. A source that stopped because a block failed its checksum is never mistaken for one that finished, so a compaction cannot produce a structurally perfect, silently truncated output. | `TestInputFailureStopsTheMergeAndIsReported`, `TestInputFailureAtPositioningIsReported` | VERIFIED |
+| INV-C4 | A tombstone is dropped only when the compaction's input set contains the oldest live data in the database — i.e. when no live file outside the input set holds a lower sequence number. Otherwise it is retained even though it is the newest version of its key. This is `docs/DESIGN.md` §7's "bottom-most level" rule expressed in the ordering this engine actually has. | `TestTombstoneIsKeptWhenNotBottomMost`, `TestTombstoneIsDroppedOnlyWhenBottomMost`, `TestTombstoneIsNotDroppedWhileAnOlderFileCouldHoldTheValue` (asserts the retention count, not just the read), `TestDroppedTombstoneStillSuppressesOlderVersions` | VERIFIED |
+| INV-C5 | Live SSTables have pairwise-disjoint sequence ranges, which is what makes "the first source holding any version of the key wins" correct. A flush and a compaction each preserve it, and a file set that violates it aborts startup rather than being read. | `checkCoherentFileSet` at every open, asserted by `TestAutomaticFlushOnMemTableSize`, `TestL0TriggerMergesAllOfLevelZero`; violation refused by `TestOverlappingInputsAreRefused` (merge level) and the Phase 3 overlap tests | VERIFIED |
+| INV-C6 | A file that appears while a compaction is running — a concurrent flush's output — is neither deleted by that compaction nor lost from the MANIFEST. A compaction deletes exactly the inputs it named. | `TestFlushDuringCompactionIsNotLost`, `TestWritesAndFlushesDuringCompaction` | VERIFIED |
+| INV-C7 | A compaction whose output is empty publishes a deletion rather than an empty SSTable, and the input files cease to exist. | `TestCompactionThatDropsEverythingLeavesNoFile` | VERIFIED |
+| INV-M1 | A MANIFEST version edit is atomic with respect to a crash: it is one checksummed record, so either the whole file-set change replays or none of it does. There is no state in which a compaction's output and its inputs are simultaneously live. | `TestTornFinalRecordIsRepaired`, `TestEditRoundTripCarriesEveryField`, `TestCrashDuringCompaction`; ADR-010 | VERIFIED (process kill) |
+| INV-M2 | Damage a crash cannot explain aborts startup; a torn final record truncates and continues. A refused recovery leaves the manifest byte-for-byte unmodified. Identical to INV-S8's policy for the WAL. | `TestDamageInTheMiddleIsRefused`, `TestTornFinalRecordIsRepaired`, `TestUnknownRecordKindIsRefused`, `TestMalformedEditPayloadIsRefused`, `TestIncoherentHistoryIsRefused`, `TestEmptyManifestIsRefused`, `TestGarbageInCurrentIsRefused`, `TestCurrentNamingAMissingManifestIsRefused`, `TestCorruptManifestIsRefused` | VERIFIED |
+| INV-M3 | Recovery time tracks current state, not total history: a fresh MANIFEST holding a full snapshot is installed on every open and superseded ones are deleted, so replay is one snapshot plus one session's edits. | `TestManifestIsReinstalledOnEveryOpen` (asserts the edit count on the following recovery), `TestRemoveObsoleteKeepsOnlyTheLiveManifest` | VERIFIED |
+| INV-M4 | A data directory holding SSTables but no `CURRENT` is refused, not adopted. Nothing on the filesystem distinguishes a Phase 3 database from a Phase 4 one whose `CURRENT` was lost, and adopting silently would reduce INV-S6 to a suggestion. | `TestSSTablesWithoutACurrentFileAreRefused` (both the refusal and the explicit opt-in), `TestEmptyDirectoryBootstrapsAManifest` | VERIFIED |
+| INV-M5 | Startup validates each referenced file against the MANIFEST's independent record of its size and entry count, so a disagreement between the two is caught without reading a data block. | `TestManifestDisagreeingWithAFileIsRefused`, `TestStartupDoesNotFullyScanByDefault` (asserts zero data-block reads by default and non-zero with `VerifySSTablesOnOpen`) | VERIFIED |
+
+### Note on INV-C2 being PARTIAL
+
+The merge is streaming by construction: `compaction.Merger` holds a heap of one cursor per input,
+each with a key and value buffer it reuses on every advance, and accumulates nothing. Reading the
+code establishes it, and `TestLargeMergeStaysOrdered` exercises 32,000 entries across 8 files
+without incident.
+
+What no test does is **measure** that memory stays flat as the input grows — an allocation or
+peak-RSS assertion across input sizes. Until one exists, the honest status is PARTIAL: the property
+is true of the code as written, and nothing would catch a future change that started buffering.
+Marking it VERIFIED would be turning "we read the code" into "we proved it".
+
+### Note on INV-M1's qualifier
+
+`(process kill)` carries the same meaning as it does for INV-S1 and INV-L4: the crash tests destroy
+a real process with SIGKILL, which establishes that the bytes reached the kernel. Power loss is
+untested for the MANIFEST exactly as it is for the WAL, and for the same reason
+(`docs/FAILURE_MODEL.md` §4).
+
+Two of the publication protocol's five crash windows are a few microseconds wide — between the
+rename and the MANIFEST append, and between that append and the unlink — so a sleep-and-kill reaches
+them only by luck and `TestCrashDuringCompaction` does not require it. They are covered
+deterministically instead, by constructing the exact on-disk state
+(`TestCompactionOutputWithoutAManifestRecordIsIgnored`,
+`TestCompactionInputsLeftOnDiskAreSweptAsOrphans`). That is weaker evidence than a real crash and is
+labelled as such.
 
 ## Raft
 

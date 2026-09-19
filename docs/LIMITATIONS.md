@@ -3,22 +3,27 @@
 The things this system does not do, cannot do, or has not proven. Kept current: an item may be
 removed only when a test exists showing it is no longer true.
 
-**Status: Phase 3.** A single-node key-value store with a durable write-ahead log and an
-LSM storage engine — memtable, immutable SSTables, flush, restart recovery — exists. Nothing
+**Status: Phase 4.** A single-node key-value store with a durable write-ahead log and an
+LSM storage engine — memtable, immutable SSTables with Bloom filters, flush, size-tiered
+compaction, crash-safe MANIFEST-based file publication, restart recovery — exists. Nothing
 distributed does.
 
 ### True right now, and temporary
 
 | Limitation | Removed in |
 |---|---|
-| **No Bloom filters.** A lookup consults every SSTable, so read cost grows linearly with the file count (~1.5 µs per file consulted, measured — `docs/LSM.md` §10). The SSTable format reserves a filter block and Phase 3 writes it **empty**; nothing is accelerated by it. | Phase 4 |
-| **No compaction.** The SSTable count grows without bound, and so does read cost and space used by superseded versions. | Phase 4 |
-| **No MANIFEST.** The live file set is inferred from the directory, and every SSTable is read in full at startup to recover the sequence range it covers, because there is nowhere on disk to record it. Startup cost is proportional to total bytes on disk. | Phase 4 |
-| **The entire log is replayed on every open.** Nothing truncates the WAL, so startup also scans every mutation ever written. | Phase 4 (`SetLogNumber`) |
-| **The WAL grows without bound.** Nothing reclaims segments. | Phase 4 |
-| **Power-loss durability is claimed for `sync` mode but untested, and untested for every other mode.** The crash tests destroy a real process with SIGKILL, which only proves data reached the kernel. | not testable here — see `docs/WAL.md` §9 |
-| The flush is synchronous: the writer that triggers it pays for it and other writers wait. Readers do not. | Phase 5, if measured to matter |
-| Segments missing from the *start* of the WAL sequence are undetectable (gaps in the middle are refused). SSTables ahead of the log **are** detected. | Phase 4 (MANIFEST log number) |
+| **The entire log is replayed on every open.** Nothing truncates the WAL, so startup scans every mutation ever written even though compaction absorbed most of them long ago. The MANIFEST has a `SetLogNumber` field and Phase 4 records it without acting on it. | a later phase |
+| **The WAL grows without bound.** Nothing reclaims segments. | a later phase |
+| **Power-loss durability is claimed for `sync` mode but untested, and untested for every other mode.** The crash tests destroy a real process with SIGKILL, which only proves data reached the kernel. This now covers the MANIFEST too. | not testable here — see `docs/WAL.md` §9 |
+| **Damage inside an SSTable data block is found at the read that needs it, not at startup.** Phase 3 read every block of every file at open, because a file's sequence range had nowhere else to live; the MANIFEST records it, so startup cross-checks footers instead. The damage is still found and still reported as corruption rather than as a missing key. `Options.VerifySSTablesOnOpen` restores the Phase 3 behaviour. | deliberate trade — `docs/MANIFEST.md` §6 |
+| **Compaction has no rate limit and no I/O budget**, so it competes freely with foreground reads and writes. | Phase 5, if measured to matter |
+| **One compaction at a time**, and a compaction's output is a single file however large, so one SSTable's size grows with the dataset. `sstable.MaxMetaBlockSize` (256 MiB of filter or index) is the practical ceiling on a single file. | deferred — `docs/COMPACTION.md` §10 |
+| **Tombstone dropping is conservative**: it uses the input set's position in the global sequence ordering rather than per-key range checks, so some tombstones outlive their usefulness and cost space. | deferred — the correct-but-conservative rule is the one that is easy to prove |
+| A MANIFEST grows within one session (one record per flush and per compaction) and is only compacted by reopening, which installs a fresh one holding a snapshot. | deferred — a within-session rotation threshold would be the fix |
+| A Phase 3 data directory (SSTables with no `CURRENT`) needs an explicit `Options.AdoptLegacySSTables` to open. | deliberate — `docs/MANIFEST.md` §8 |
+| `bitsPerKey` is global rather than per level, and filters are rebuilt from scratch on every compaction. | deferred; a measurement would have to justify per-level tuning |
+| The flush is synchronous: the writer that triggers it pays for it and other writers wait. Readers do not. Compaction, unlike the flush, does run in the background. | Phase 5, if measured to matter |
+| Segments missing from the *start* of the WAL sequence are undetectable (gaps in the middle are refused). SSTables ahead of the log **are** detected. | a later phase (MANIFEST log number) |
 | A length field corrupted within the 64 MiB range can cause a torn-tail/corruption misclassification in the newest segment | inherent to this framing; `docs/WAL.md` §8 |
 | `sync` mode serialises writers behind the device flush (~3.9 ms/append measured on an M4) | Phase 5, if group commit is measured to be worth it |
 | No networking, no cluster, no replication, no consensus | Phases 7–9 |
@@ -41,7 +46,7 @@ distributed does.
 | No range scans / iterators in the client API | Not needed; would complicate the consistency story | ADR-008 |
 | No authentication, authorization, or TLS | Out of scope; the project is about storage and consensus | — |
 | No compression, no block cache, no prefix compression | Deferred until a benchmark justifies them | DESIGN §11 |
-| No leveled compaction | Size-tiered first, with measurements | ADR-007 |
+| No leveled compaction | Size-tiered first, with measurements. Implemented in Phase 4; the comparison that would justify changing is Phase 5's | ADR-007 |
 | No leader leases | Would require a clock-drift assumption | ADR-004 |
 
 ## Inherent / not claimable
@@ -69,10 +74,10 @@ rather than estimated:
 - Maximum value size: 1 MiB (enforced limit, `docs/DESIGN.md` §1)
 - Maximum key size: 4 KiB (enforced limit)
 
-Phase 3 collected development measurements while building the engine (`docs/LSM.md` §10).
-They are deliberately not repeated here and are not scale limits: nothing about the
-environment was controlled or recorded, and Phase 5 is where a number earns the right to be
-quoted.
+Phases 3 and 4 collected development measurements while building the engine (`docs/LSM.md` §10,
+`docs/BLOOM.md` §5, `docs/COMPACTION.md` §8, `docs/MANIFEST.md` §9). They are deliberately not
+repeated here and are not scale limits: nothing about the environment was controlled or recorded,
+and Phase 5 is where a number earns the right to be quoted.
 
 ## Not production-ready
 

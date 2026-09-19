@@ -1,12 +1,25 @@
 # LSM STORAGE ENGINE
 
-Status: **Phase 3 — implemented and verified.** Every property stated here is bound to a test
-named in `docs/INVARIANTS.md`. Where something is *not* established, this document says so
-rather than leaving it to be assumed.
+Status: **implemented and verified.** Every property stated here is bound to a test named in
+`docs/INVARIANTS.md`. Where something is *not* established, this document says so rather than
+leaving it to be assumed.
 
 This document covers the memtable, the SSTable, the flush, the read path and recovery.
 The write-ahead log underneath it all is `docs/WAL.md`; the formats are `docs/DESIGN.md`
 §1 and §4.
+
+> **What Phase 4 changed.** This document was written for Phase 3, and three of the things it
+> described as absent now exist. The sections below are updated, but the short version is:
+>
+> - The filter block is **no longer empty** — `docs/BLOOM.md`. §6 is updated.
+> - **Compaction exists** — `docs/COMPACTION.md`. The SSTable count is bounded, and superseded
+>   versions and tombstones are eventually dropped.
+> - **The MANIFEST exists and is the only authority on the live file set** — `docs/MANIFEST.md`.
+>   §8 described a Phase 3 mechanism that has been replaced, and says so.
+>
+> What did **not** change: the internal-key encoding (§3), sequence-number semantics (§4), the
+> memtable (§5), the flush's crash contract (§7), and the read path's "first source wins" argument
+> (§9). Those are the Phase 3 foundations Phase 4 builds on, and they are unmodified.
 
 ---
 
@@ -63,11 +76,17 @@ On disk:
 
 ```
 <data-dir>/
+  CURRENT             names the live MANIFEST (docs/MANIFEST.md)
+  MANIFEST-000007     the authoritative live file set
   wal/000001.log      the write-ahead log (docs/WAL.md)
-  000001.sst          SSTables, numbered in flush order
+  000001.sst          SSTables, numbered in creation order
   000002.sst
-  000003.sst.tmp      a flush that was interrupted; deleted at startup
+  000003.sst.tmp      a flush or compaction interrupted; deleted at startup
 ```
+
+A file on disk is part of the database only if the MANIFEST names it. Since Phase 4 the numbering
+may contain gaps, because a compaction reserves a number before it knows whether it will produce
+output.
 
 ---
 
@@ -213,18 +232,21 @@ is little-endian its bytes appear reversed in a hex dump. The constant kept its 
 spelling through the rename to Quorum deliberately — churning a format constant for cosmetic
 reasons is what format versioning exists to prevent.
 
-### The filter block is empty
+### The filter block
 
-The layout reserves a filter block because the on-disk format must be stable before files
-exist that later versions have to read. **Phase 3 writes it with length zero.**
+Phase 3 wrote this block with length zero. **Phase 4 fills it with a real Bloom filter** —
+`k u8 | m u32 | bits`, over the file's distinct user keys. The format, the hash, the sizing and
+the measurements are `docs/BLOOM.md`; what matters here is how the read path uses it:
 
-A zero-length filter means *this file carries no filter; consult it directly*. It is not a
-filter that always answers "maybe", and **no read in Phase 3 is accelerated by it**. Bloom
-filters are a Phase 4 deliverable and INV-S7 stays PLANNED until then.
+- `filter_length == 0` still means *this file carries no filter; consult it directly*. Every Phase 3
+  file, and any file written with `DisableBloomFilter`, reads exactly as before.
+- A filter may only ever **eliminate** a file. It never confirms one and never supplies a value.
+- A filter that fails to decode is `ErrCorrupt` at open, not a downgrade to "no filter".
 
-Its checksum is still written and still verified at open. A region of the file that no check
-covers is a region where damage goes unnoticed, and "corruption is detected" would then be
-true only of the parts that happened to be looked at.
+Its checksum is written and verified either way. A region of the file that no check covers is a
+region where damage goes unnoticed — and it matters more now than it did in Phase 3, because the
+filter encoding carries no checksum of its own, so the block's `crc32c` is the only thing standing
+between a flipped bit and a filter that answers "definitely absent" for a key that is present.
 
 ### What the reader validates
 
@@ -306,13 +328,24 @@ reopens a store is exercising the recovery path, not only the crash tests.
 
 ---
 
-## 8. Discovering SSTables at startup — a Phase 3 mechanism
+## 8. Discovering SSTables at startup — SUPERSEDED BY THE MANIFEST
+
+> **This section describes a Phase 3 mechanism that no longer runs.** Phase 4 implements the
+> MANIFEST (`docs/MANIFEST.md`), which is now the sole authority on the live file set (INV-S6).
+> Startup reads `CURRENT`, replays the MANIFEST, opens the files it names and cross-checks each one
+> against the metadata it records. Directory contents no longer decide anything: an unreferenced
+> `*.sst` is an orphan and is deleted.
+>
+> The section is kept rather than deleted because the reasoning is still the clearest statement of
+> *why* the MANIFEST is necessary, and because the two costs it lists are the ones Phase 4 removed
+> — which is how you can tell the MANIFEST earned its keep. A Phase 3 directory can still be
+> opened, once, with `Options.AdoptLegacySSTables`, which runs exactly the procedure below.
 
 `docs/DESIGN.md` §6 gives the real answer: a MANIFEST that is the single authority on which
-files are live, carrying each file's key range and sequence range. **That is Phase 4.**
-Phase 3 needs an answer now, and it must not be an unsafe one.
+files are live, carrying each file's key range and sequence range. **That was Phase 4.**
+Phase 3 needed an answer without one, and it must not be an unsafe one.
 
-What Phase 3 does:
+What Phase 3 did:
 
 1. **Delete every `*.sst.tmp`.** A temp file is the signature of a crash during a flush.
    It is never read, so deleting it cannot lose anything the WAL does not still hold.
@@ -326,24 +359,25 @@ What Phase 3 does:
 6. **Refuse if the tables are ahead of the log.** Tables covering sequence numbers the log
    never held means the log was truncated or replaced.
 
-### What this costs, stated rather than hidden
+### What this cost, stated rather than hidden
 
-- **Startup reads every SSTable in full.** The sequence range has nowhere on disk to live
-  until the MANIFEST exists, so it is recomputed. The alternative — encoding it in the file
-  name — would mean trusting a name that nothing verifies, which is exactly the "unsafe
-  file-selection behaviour" this phase was told not to invent.
-- **The WAL is still never truncated**, so it holds every mutation ever written and replay
-  still scans all of it. Phase 4's `SetLogNumber` is what retires segments a flush has
-  superseded.
+- **Startup read every SSTable in full.** The sequence range had nowhere on disk to live until the
+  MANIFEST existed, so it was recomputed. The alternative — encoding it in the file name — would
+  mean trusting a name that nothing verifies, which is exactly the "unsafe file-selection
+  behaviour" that phase was told not to invent.
+  **Removed in Phase 4:** the MANIFEST records the range, and startup reads **zero data blocks**
+  (`docs/MANIFEST.md` §9). The cost of that is that data-block damage is found at read time
+  instead of at open, which `Options.VerifySSTablesOnOpen` reverses.
+- **The WAL was never truncated**, so it held every mutation ever written and replay scanned all of
+  it. **Not removed in Phase 4.** `SetLogNumber` exists in the MANIFEST and is recorded, but
+  nothing acts on it yet, so this is still true and still listed in `docs/LIMITATIONS.md`.
 
-Both are removed by Phase 4. Neither is a design; both are the price of not having the
-MANIFEST yet, and they are listed in `docs/LIMITATIONS.md` as such.
+### The gap this mechanism did not close
 
-### The gap this mechanism does not close
-
-Phase 3 can detect tables that are *ahead* of the log. It cannot detect a **missing oldest
+Phase 3 could detect tables that are *ahead* of the log. It could not detect a **missing oldest
 WAL segment**, because nothing records which segment number the log begins at — the same
-limitation `docs/WAL.md` §10 already carries, and the same MANIFEST field that fixes it.
+limitation `docs/WAL.md` §10 carries. Phase 4 added the field that would fix it and does not yet
+use it, so **the gap is unchanged**.
 
 ---
 
@@ -391,11 +425,16 @@ environment is controlled or recorded, and no number here may be quoted anywhere
 | `Get` across 17 SSTables | ~25 µs/op |
 | Reopen: verify 17 SSTables + replay 50,000 mutations | ~8.4 ms |
 
+> The read figures below are **pre-Bloom and pre-compaction**. `docs/BLOOM.md` §5 and
+> `docs/COMPACTION.md` §8 measure the same shapes with Phase 4's mechanisms in place; the
+> 17-SSTable lookup in particular went from ~11 µs to ~1.4 µs at p50.
+
 **The one observation worth recording.** A lookup costs roughly 1.5 µs per SSTable consulted,
 and the count of SSTables grows without bound because nothing merges them. That is the
 expected shape of an LSM tree with no filters and no compaction, it is the bottleneck, and it
-is measured rather than assumed. Phase 4's Bloom filters remove most of the per-file cost and
-compaction removes most of the files. Nothing is being redesigned around it now.
+is measured rather than assumed. Phase 4's Bloom filters removed most of the per-file cost and
+compaction removed most of the files — that prediction is the one Phase 4 then checked, and
+`docs/BLOOM.md` §5 records the result: 95.4% of block reads avoided.
 
 ---
 
@@ -403,12 +442,13 @@ compaction removes most of the files. Nothing is being redesigned around it now.
 
 | Limitation | Removed in |
 |---|---|
-| No Bloom filters: every SSTable is consulted on a miss | Phase 4 |
-| No compaction: SSTable count grows without bound, and so does read cost | Phase 4 |
-| No MANIFEST: the live file set is inferred from the directory, and each file is fully read at startup to recover its sequence range | Phase 4 |
-| The WAL is never truncated, so replay still scans every mutation ever written | Phase 4 |
-| Segments missing from the *start* of the WAL are undetectable | Phase 4 (MANIFEST log number) |
-| The flush is synchronous: writers wait on it, readers do not | Phase 5, if measured to matter |
+| ~~No Bloom filters~~ — **done in Phase 4**, `docs/BLOOM.md` | — |
+| ~~No compaction~~ — **done in Phase 4**, `docs/COMPACTION.md` | — |
+| ~~No MANIFEST~~ — **done in Phase 4**, `docs/MANIFEST.md`; startup now reads zero data blocks | — |
+| The WAL is never truncated, so replay still scans every mutation ever written | a later phase |
+| Segments missing from the *start* of the WAL are undetectable | a later phase (MANIFEST log number) |
+| Damage inside a data block is found at the read that needs it, not at startup, unless `Options.VerifySSTablesOnOpen` is set | deliberate trade — `docs/MANIFEST.md` §6 |
+| The flush is synchronous: writers wait on it, readers do not. Compaction, unlike the flush, runs in the background | Phase 5, if measured to matter |
 | No block cache; the OS page cache is doing that job | deliberate, `docs/DESIGN.md` §11 |
 | No prefix compression, no restart points, no compression | deliberate, `docs/DESIGN.md` §11 |
 | Corrupted SSTables are detected, never repaired | v1; repair is re-sync from a leader, and there is no leader yet |
@@ -441,10 +481,11 @@ compaction removes most of the files. Nothing is being redesigned around it now.
 
 - **Power-loss durability, in any mode.** The crash tests destroy a process. That proves the
   bytes reached the kernel, not the platter. `docs/FAILURE_MODEL.md` §4.
-- **Tombstone survival through compaction** (INV-S3). There is no compaction to survive.
-- **Atomic version installation under compaction** (INV-S5). Phase 3's publication is atomic
-  and tested under `-race`, but the hard case is a version swap while a compaction rewrites
-  files, which Phase 4 introduces.
-- **MANIFEST authority** (INV-S6) and **Bloom filter correctness** (INV-S7). Neither exists.
 - **Cross-replica sequence determinism** (INV-S4). Established for one node replaying its own
   log; the replica comparison needs Phase 12.
+
+Four items that were listed here as unestablished in Phase 3 are now established, by Phase 4:
+**tombstone survival through compaction** (INV-S3), **atomic version installation under
+compaction** (INV-S5), **MANIFEST authority** (INV-S6) and **Bloom filter zero false negatives**
+(INV-S7). Each is bound to tests in `docs/INVARIANTS.md`; the reasoning is in
+`docs/COMPACTION.md`, `docs/MANIFEST.md` and `docs/BLOOM.md`.

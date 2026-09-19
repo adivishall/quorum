@@ -149,3 +149,71 @@ atomicity and that argument collapses and a much harder one is required.
 
 **Cost.** Not a general-purpose database. Range scans exist internally (compaction needs them)
 but are not exposed.
+
+---
+
+## ADR-009 — The Bloom hash is FNV-1a + a MurmurHash3 finalizer, versioned by the SSTable magic
+
+**Decision.** One 64-bit hash per user key: FNV-1a 64 followed by MurmurHash3's `fmix64`. Its two
+32-bit halves feed the Kirsch–Mitzenmacher construction `g_i = h1 + i*h2 (mod m)` that
+`docs/DESIGN.md` §5 specifies. The serialized filter carries **no version field**; its identity is
+versioned by the SSTable footer magic (`DKVSST01`), so changing the hash is a format change that
+must bump that magic.
+
+**Alternatives.** (a) FNV-1a alone. (b) `hash/maphash`. (c) xxhash or SipHash as a dependency.
+(d) A version byte inside the filter encoding.
+
+**Why not (a).** This construction reads the hash's *high* half as `h2`, and FNV-1a is a
+multiply-xor chain whose high bits barely mix. `h2` would be near-constant across keys and the `k`
+probes would collapse toward a single bit — a filter that technically has no false negatives and
+filters almost nothing. The finalizer costs three shifts and two multiplies and makes the halves
+independent; the measured false-positive rate is 0.8220% against a theoretical 0.8194%.
+
+**Why not (b).** `hash/maphash` is seeded randomly per process. The filter is persisted inside an
+SSTable, so a per-process seed would make a filter written by one process return **false** for keys
+another process knows are present. That is a false negative by construction, and false negatives are
+the one thing a Bloom filter may never produce.
+
+**Why not (c).** It would be the project's first third-party dependency, for a non-cryptographic
+hash whose measured behaviour here already matches theory. A Bloom filter is a performance
+structure, not a security primitive: an adversary who can choose keys can inflate the
+false-positive rate, which costs block reads and cannot cause a wrong answer.
+
+**Why not (d).** `docs/DESIGN.md` §5 specifies the encoding as `k u8 | m u32 | bits`, and the format
+is already versioned one level up. Adding a field the spec does not have, to version something the
+file's magic already versions, is improvising on a specified format.
+
+**Cost.** Changing the hash later invalidates every existing SSTable and requires a magic bump —
+there is no per-filter migration path. That is the same cost every other on-disk format in this
+project carries, and it is the reason format versioning exists.
+
+---
+
+## ADR-010 — One MANIFEST record is one complete version edit
+
+**Decision.** A MANIFEST holds records of a single kind, `VersionEdit`, each carrying a whole atomic
+change to the file set. `docs/DESIGN.md` §6's operation numbers (`AddFile`, `DeleteFile`,
+`SetNextFileNum`, `SetLastSequence`, `SetLogNumber`, `SetApplied`) become **field tags inside** that
+record's payload rather than record kinds of their own.
+
+**Alternatives.** (a) §6 read literally: one record per operation, with a compaction appending a
+"record group" of `AddFile` + `DeleteFile`. (b) Explicit group begin/end marker records.
+
+**Why not (a).** It is not atomic, and the failure is severe. The framing in `docs/DESIGN.md` §2
+has no grouping primitive, so a crash between a compaction's `AddFile` and its `DeleteFile` records
+would leave a manifest in which the output **and all of its inputs** are simultaneously live. That
+is a state no version of the database was ever in, every file in it is individually valid, and
+`Apply` has no way to recognise it as wrong — so the engine would come up cleanly holding every
+superseded version and every dropped tombstone the inputs contained. Deleted keys would resurrect,
+silently, and the MANIFEST would have failed at the one job it exists to do.
+
+**Why not (b).** Markers make the *reader* responsible for noticing an unterminated group, which is
+more machinery and more ways to get it wrong than simply making the unit of atomicity the unit of
+checksumming. The WAL already faced this exact problem and solved it this exact way: a write batch
+is one record, so either the whole batch replays or none of it does (`docs/WAL.md` §2).
+
+**Cost.** A version edit is bounded by `record.MaxRecordSize` (64 MiB), so a single edit cannot name
+an unbounded number of files. At ~60 bytes per `AddFile` that is roughly a million files in one
+edit, which is far beyond anything this engine produces. The deviation from a literal reading of §6
+is also a documentation cost: §6's table now describes tag numbers rather than record kinds, and
+this ADR is the record of why.

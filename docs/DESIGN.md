@@ -200,6 +200,21 @@ is yes. The unit test asserts zero false negatives over a large random corpus, a
 measured false-positive rate is within tolerance of the theoretical rate — a filter that always
 returns "maybe" would pass the first test, so both are required.
 
+> **Phase 4 clarifications.** Implementing the filter settled three points this section left open.
+> None changes the encoding; see ADR-009 and `docs/BLOOM.md`.
+>
+> 1. **The hash is FNV-1a 64 followed by MurmurHash3's `fmix64`.** "xxhash-style" was not a
+>    specification. The finalizer is not optional: this construction reads the hash's high half as
+>    `h2`, and FNV-1a alone barely mixes its high bits, so `h2` would be near-constant and the k
+>    probes would collapse toward one bit. Measured false-positive rate 0.8220% against a
+>    theoretical 0.8194%.
+> 2. **`m` has a 64-bit floor and both `k` and `m` are range-checked on decode.** `m = max(64,
+>    n*bitsPerKey)` stops a one-key file from getting a ten-bit filter, and `k ∈ [1,30]`, `m ≤ 2^31`
+>    are enforced before either is used, because both come off disk.
+> 3. **`filter_length == 0` means "no filter", permanently.** It is the Phase 3 encoding and stays
+>    valid: such a file is consulted in full. A filter block that is non-empty but does not decode
+>    is `ErrCorrupt`, never a downgrade to "no filter".
+
 ---
 
 ## 6. MANIFEST and atomic version changes
@@ -217,6 +232,23 @@ returns "maybe" would pass the first test, so both are required.
 
 `CURRENT` holds the name of the live manifest, written as: write `CURRENT.tmp`, fsync it,
 `rename()` over `CURRENT`, fsync the directory. `rename` is atomic on POSIX.
+
+> **Phase 4 clarification — one record is one edit.** The table above lists the operations as
+> record *kinds*, and the commit protocol below says "append one manifest record group". A group of
+> separate records is **not atomic**: the framing in §2 has no grouping primitive, so a crash
+> between a compaction's `AddFile` and its `DeleteFile` would leave the output and all its inputs
+> simultaneously live — a state no version of the database was ever in, and one that nothing
+> downstream could recognise as wrong.
+>
+> So a manifest holds one record kind, `VersionEdit` (`0x01`), whose payload carries a whole atomic
+> change, and the numbers above are **field tags within that payload**. Its CRC covers the entire
+> edit. This is the same reasoning, and the same fix, as §3's write batch. See ADR-010 and
+> `docs/MANIFEST.md`.
+>
+> Two further points this section left open: integers in an edit payload are **uvarints** and byte
+> strings are uvarint-length-prefixed, matching §3's convention rather than introducing a second
+> one; and a fresh manifest holding a **full snapshot** is installed on every open, with superseded
+> manifests deleted, so recovery replays current state rather than total history.
 
 **Compaction commit protocol** (the part that is easy to get silently wrong):
 
@@ -248,6 +280,19 @@ into the **bottom-most** level, because an older version of the key may still li
 below. Dropping a tombstone early resurrects deleted data. This gets a dedicated test
 (INV-S3: "a deleted key never comes back, at any level, across any number of compactions,
 across restart").
+
+> **Phase 4 clarification — what "bottom-most" means here.** This engine has no leveled hierarchy
+> to look "below", so the rule is expressed in the ordering it actually has. Live files have
+> pairwise-disjoint sequence ranges, so age is a total order on files, and:
+>
+> > a tombstone may be dropped only when the compaction's input set contains the **oldest live data
+> > in the database** — i.e. when no live file outside the input set holds a lower sequence number.
+>
+> Because the ranges are disjoint, the file holding the global minimum is unique, so the test is
+> exact: `inputMin == globalMin`. It is also why "merge **all** of the level" is load-bearing rather
+> than merely simple — a level's contents are a contiguous run of the global sequence ordering, so
+> the output's range straddles no live file that was not an input, which is what keeps §1's "first
+> match wins" read path correct. `docs/COMPACTION.md` §3 and §5.
 
 v1 does not implement leveled compaction, and does not claim its write-amplification profile.
 
