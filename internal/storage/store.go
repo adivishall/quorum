@@ -119,14 +119,22 @@ type Options struct {
 	AdoptLegacySSTables bool
 }
 
-// DefaultOptions returns the limits from docs/DESIGN.md §1.
+// DefaultOptions returns the limits from docs/DESIGN.md §1 and the engine
+// defaults from §4, §5 and §7.
+//
+// Every default is spelled out here rather than only in applyLSMDefaults, so that
+// a caller — or a measurement that wants to print the configuration it ran under —
+// can read the real value instead of a zero that means "fill this in later".
 func DefaultOptions() Options {
 	return Options{
-		MaxKeySize:   DefaultMaxKeySize,
-		MaxValueSize: DefaultMaxValueSize,
-		WAL:          wal.DefaultOptions(),
-		MemTableSize: DefaultMemTableSize,
-		BlockSize:    sstable.DefaultBlockSize,
+		MaxKeySize:          DefaultMaxKeySize,
+		MaxValueSize:        DefaultMaxValueSize,
+		WAL:                 wal.DefaultOptions(),
+		MemTableSize:        DefaultMemTableSize,
+		BlockSize:           sstable.DefaultBlockSize,
+		BitsPerKey:          bloom.DefaultBitsPerKey,
+		L0CompactionTrigger: DefaultL0CompactionTrigger,
+		L1MaxBytes:          DefaultL1MaxBytes,
 	}
 }
 
