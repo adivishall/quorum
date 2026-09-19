@@ -550,10 +550,29 @@ func (s *LSMStore) installManifest(state manifest.State) error {
 		state.LastSequence = s.cur.maxFlushedSeq()
 	}
 
+	// The new manifest's number must be above every manifest ON DISK, not merely
+	// above the one CURRENT named.
+	//
+	// Two situations produce a leftover manifest with a number this open would
+	// otherwise reuse: an Install interrupted before it could point CURRENT at its
+	// output, and a directory whose CURRENT was lost while its manifests remain.
+	// Reusing the number fails on the O_EXCL create — Install refuses to overwrite
+	// a manifest, which is the right instinct — and the store would not open at
+	// all, so the number has to be chosen against the directory.
+	existing, err := manifest.List(s.dir)
+	if err != nil {
+		return err
+	}
 	num := s.recovery.ManifestNum + 1
+	for _, n := range existing {
+		if n >= num {
+			num = n + 1
+		}
+	}
 	if num == 0 {
 		num = 1
 	}
+
 	w, err := manifest.Install(s.dir, num, state)
 	if err != nil {
 		return err
