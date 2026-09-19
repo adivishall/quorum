@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/adivishall/quorum/internal/storage/bloom"
 	"github.com/adivishall/quorum/internal/storage/ikey"
 	"github.com/adivishall/quorum/internal/storage/sstable"
 )
@@ -216,10 +217,20 @@ func TestEmptySSTable(t *testing.T) {
 	if info.Size() != meta.FileSize {
 		t.Fatalf("Metadata.FileSize = %d, on-disk size = %d", meta.FileSize, info.Size())
 	}
-	// Empty filter block + its checksum, empty index block + its checksum,
-	// then the footer. Nothing else is legal.
-	if want := int64(2*sstable.BlockTrailerSize + sstable.FooterSize); info.Size() != want {
-		t.Fatalf("empty table is %d bytes, want exactly %d", info.Size(), want)
+	// A filter over zero keys (a 5-byte header plus the MinBits floor) and its
+	// checksum, an empty index block and its checksum, then the footer. Nothing
+	// else is legal.
+	//
+	// Phase 3 wrote 56 bytes here, because its filter block was empty. The
+	// difference is the filter this phase actually writes, and the assertion
+	// stays exact rather than becoming a range: the empty file is the one case
+	// where every byte of the layout can be accounted for, which makes it the
+	// cheapest place to notice an unintended format change.
+	emptyFilter := int64(bloom.HeaderSize + (bloom.MinBits / 8))
+	if want := emptyFilter + int64(2*sstable.BlockTrailerSize+sstable.FooterSize); info.Size() != want {
+		t.Fatalf("empty table is %d bytes, want exactly %d "+
+			"(%d-byte empty filter + 2 block checksums + %d-byte footer)",
+			info.Size(), want, emptyFilter, sstable.FooterSize)
 	}
 
 	r := openReader(t, path)
@@ -860,3 +871,324 @@ func TestRandomSingleByteDamageIsAlwaysDetected(t *testing.T) {
 // crc32cOf mirrors the package's block checksum so a test can recompute one
 // after deliberately editing a block.
 func crc32cOf(b []byte) uint32 { return crc32.Checksum(b, crc32.MakeTable(crc32.Castagnoli)) }
+
+// ---------------------------------------------------------------- bloom filter
+
+// buildWith writes an SSTable with explicit writer options.
+func buildWith(t *testing.T, entries []entry, opts sstable.WriterOptions) (string, sstable.Metadata) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "000001.sst")
+	meta, err := sstable.WriteFile(path, &src{entries: entries}, opts)
+	if err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	return path, meta
+}
+
+// TestFilterNeverSkipsAPresentKey is INV-S7 at the SSTable level: the property
+// has to hold through the writer, the block checksum, the file, and the reader —
+// not only inside the bloom package.
+func TestFilterNeverSkipsAPresentKey(t *testing.T) {
+	const n = 20000
+	entries := make([]entry, 0, n)
+	for i := 0; i < n; i++ {
+		e := put(fmt.Sprintf("key%08d", i), uint64(i+1), fmt.Sprintf("value%d", i))
+		if i%7 == 0 {
+			e = del(fmt.Sprintf("key%08d", i), uint64(i+1))
+		}
+		entries = append(entries, e)
+	}
+	path, meta := buildWith(t, entries, sstable.WriterOptions{BlockSize: 512})
+	if meta.FilterKeys != n {
+		t.Fatalf("FilterKeys = %d, want %d", meta.FilterKeys, n)
+	}
+
+	r := openReader(t, path)
+	if !r.HasFilter() {
+		t.Fatal("the file carries no filter")
+	}
+	for i := 0; i < n; i++ {
+		k := fmt.Sprintf("key%08d", i)
+		if !r.MayContain([]byte(k)) {
+			t.Fatalf("the filter reported present key %q as definitely absent; "+
+				"the file would be skipped and the key would be invisible", k)
+		}
+		// And the real read still resolves, tombstones included.
+		_, _, found, err := r.Get([]byte(k), ikey.MaxSeq)
+		if err != nil {
+			t.Fatalf("Get(%q): %v", k, err)
+		}
+		if !found {
+			t.Fatalf("Get(%q) did not find the key", k)
+		}
+	}
+	if got := r.FilterSkips(); got != 0 {
+		t.Fatalf("FilterSkips = %d after reading only present keys, want 0", got)
+	}
+}
+
+// TestFilterSkipsAbsentKeysWithoutReadingBlocks is the performance claim stated
+// as a correctness-shaped assertion: a lookup the filter rejects must do no
+// block I/O at all.
+func TestFilterSkipsAbsentKeysWithoutReadingBlocks(t *testing.T) {
+	const n = 5000
+	entries := make([]entry, 0, n)
+	for i := 0; i < n; i++ {
+		entries = append(entries, put(fmt.Sprintf("key%08d", i), uint64(i+1), "v"))
+	}
+	path, _ := buildWith(t, entries, sstable.WriterOptions{BlockSize: 512})
+	r := openReader(t, path)
+
+	const probes = 5000
+	for i := 0; i < probes; i++ {
+		mustAbsent(t, r, fmt.Sprintf("absent%08d", i))
+	}
+
+	skips := r.FilterSkips()
+	reads := r.BlockReads()
+	t.Logf("%d absent lookups: %d skipped by the filter, %d data blocks read (false positives)",
+		probes, skips, reads)
+
+	if skips == 0 {
+		t.Fatal("the filter skipped nothing; it is not being consulted")
+	}
+	// Every probe either was skipped or cost exactly one block read.
+	if skips+reads != probes {
+		t.Fatalf("skips(%d) + blockReads(%d) = %d, want %d", skips, reads, skips+reads, probes)
+	}
+	// At ~1% false positives, the overwhelming majority must be skipped.
+	if float64(skips)/float64(probes) < 0.90 {
+		t.Fatalf("only %.1f%% of absent lookups were skipped; the filter is not effective",
+			100*float64(skips)/float64(probes))
+	}
+}
+
+// TestFalsePositivesAreHarmless: when the filter says maybe and the key is not
+// there, the read must still report absence correctly.
+func TestFalsePositivesAreHarmless(t *testing.T) {
+	const n = 2000
+	entries := make([]entry, 0, n)
+	for i := 0; i < n; i++ {
+		entries = append(entries, put(fmt.Sprintf("key%08d", i), uint64(i+1), "v"))
+	}
+	// A deliberately terrible filter: one bit per key produces a very high
+	// false-positive rate, so many absent lookups reach the data blocks.
+	path, _ := buildWith(t, entries, sstable.WriterOptions{BlockSize: 512, BitsPerKey: 1})
+	r := openReader(t, path)
+
+	var falsePositives int
+	for i := 0; i < 2000; i++ {
+		k := fmt.Sprintf("absent%08d", i)
+		if r.MayContain([]byte(k)) {
+			falsePositives++
+		}
+		// Whatever the filter said, the answer must be "absent".
+		mustAbsent(t, r, k)
+	}
+	if falsePositives == 0 {
+		t.Fatal("a 1-bit-per-key filter produced no false positives; " +
+			"this test is not exercising the false-positive path")
+	}
+	t.Logf("%d false positives out of 2000 at 1 bit/key, all resolved correctly", falsePositives)
+
+	// Present keys still resolve.
+	for i := 0; i < n; i++ {
+		mustGet(t, r, fmt.Sprintf("key%08d", i), "v")
+	}
+}
+
+// TestFilterlessFileIsHandledExplicitly covers a Phase 3 file: filter length
+// zero. Every key must still be found, and nothing may be skipped.
+func TestFilterlessFileIsHandledExplicitly(t *testing.T) {
+	const n = 500
+	entries := make([]entry, 0, n)
+	for i := 0; i < n; i++ {
+		entries = append(entries, put(fmt.Sprintf("key%04d", i), uint64(i+1), "v"))
+	}
+	path, meta := buildWith(t, entries, sstable.WriterOptions{DisableFilter: true})
+	if meta.FilterBytes != int64(sstable.BlockTrailerSize) {
+		t.Fatalf("FilterBytes = %d, want %d (an empty block plus its checksum)",
+			meta.FilterBytes, sstable.BlockTrailerSize)
+	}
+	if meta.FilterKeys != 0 {
+		t.Fatalf("FilterKeys = %d with the filter disabled, want 0", meta.FilterKeys)
+	}
+
+	r := openReader(t, path)
+	if r.HasFilter() {
+		t.Fatal("a file written with DisableFilter reports HasFilter")
+	}
+	// A filterless file must answer "maybe" to everything, present or not.
+	if !r.MayContain([]byte("key0000")) || !r.MayContain([]byte("definitely-absent")) {
+		t.Fatal("a filterless file must never report a key as definitely absent")
+	}
+	for i := 0; i < n; i++ {
+		mustGet(t, r, fmt.Sprintf("key%04d", i), "v")
+	}
+	mustAbsent(t, r, "nope")
+	if got := r.FilterSkips(); got != 0 {
+		t.Fatalf("FilterSkips = %d on a filterless file, want 0", got)
+	}
+	if _, err := r.Verify(); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+}
+
+// TestEmptyFilterlessTableKeepsThePhase3Layout pins the byte layout Phase 3
+// produced, so that "structurally compatible with Phase 3" is a checked claim
+// rather than an assertion in a document.
+func TestEmptyFilterlessTableKeepsThePhase3Layout(t *testing.T) {
+	path, _ := buildWith(t, nil, sstable.WriterOptions{DisableFilter: true})
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(2*sstable.BlockTrailerSize + sstable.FooterSize); info.Size() != want {
+		t.Fatalf("empty filterless table is %d bytes, want exactly %d (the Phase 3 size)",
+			info.Size(), want)
+	}
+	r := openReader(t, path)
+	if r.HasFilter() {
+		t.Fatal("HasFilter on an empty filterless table")
+	}
+	mustAbsent(t, r, "anything")
+}
+
+// TestCorruptFilterIsRefusedNotIgnored is the failure mode that would be easiest
+// to get wrong in a way nobody notices: a damaged filter that is quietly treated
+// as "no filter" would cost performance silently, and one that still decodes
+// with bits cleared would hide keys. Open must refuse it.
+func TestCorruptFilterIsRefusedNotIgnored(t *testing.T) {
+	const n = 400
+	entries := make([]entry, 0, n)
+	for i := 0; i < n; i++ {
+		entries = append(entries, put(fmt.Sprintf("key%04d", i), uint64(i+1), "v"))
+	}
+
+	// Damage each byte of the filter block in turn, including its header and its
+	// checksum, and require every one to be refused.
+	for _, offsetFromStart := range []int{0, 1, 2, 3, 4, 5, 10} {
+		t.Run(fmt.Sprintf("filter byte %d", offsetFromStart), func(t *testing.T) {
+			path, meta := buildWith(t, entries, sstable.WriterOptions{})
+			filterStart := meta.FileSize - sstable.FooterSize - meta.IndexBytes - meta.FilterBytes
+			if int64(offsetFromStart) >= meta.FilterBytes {
+				t.Skipf("filter block is only %d bytes", meta.FilterBytes)
+			}
+			corrupt(t, path, filterStart+int64(offsetFromStart))
+
+			_, err := sstable.Open(path)
+			if err == nil {
+				t.Fatal("damage inside the filter block was accepted; the block checksum " +
+					"is the only thing protecting the filter from turning a present key " +
+					"into 'definitely absent'")
+			}
+			if !errors.Is(err, sstable.ErrCorrupt) {
+				t.Fatalf("Open = %v, want ErrCorrupt", err)
+			}
+		})
+	}
+}
+
+// TestMalformedFilterEncodingIsRefused rewrites the filter's header to something
+// undecodable and fixes the block checksum, so only the filter's own validation
+// can catch it.
+func TestMalformedFilterEncodingIsRefused(t *testing.T) {
+	entries := []entry{put("key0000", 1, "v"), put("key0001", 2, "v")}
+
+	for _, tc := range []struct {
+		name string
+		edit func(filter []byte)
+	}{
+		{"probe count zero", func(f []byte) { f[0] = 0 }},
+		{"probe count absurd", func(f []byte) { f[0] = 200 }},
+		{"bit count zero", func(f []byte) { f[1], f[2], f[3], f[4] = 0, 0, 0, 0 }},
+		{"bit count disagrees with the body", func(f []byte) {
+			binary.LittleEndian.PutUint32(f[1:], 1<<20)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path, meta := buildWith(t, entries, sstable.WriterOptions{})
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			start := int(meta.FileSize - sstable.FooterSize - meta.IndexBytes - meta.FilterBytes)
+			bodyLen := int(meta.FilterBytes) - sstable.BlockTrailerSize
+
+			filter := append([]byte(nil), raw[start:start+bodyLen]...)
+			tc.edit(filter)
+
+			out := append([]byte(nil), raw[:start]...)
+			out = append(out, filter...)
+			var sum [4]byte
+			binary.LittleEndian.PutUint32(sum[:], crc32cOf(filter))
+			out = append(out, sum[:]...)
+			out = append(out, raw[start+bodyLen+sstable.BlockTrailerSize:]...)
+			if err := os.WriteFile(path, out, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = sstable.Open(path)
+			if err == nil {
+				t.Fatal("a malformed filter encoding was accepted")
+			}
+			if !errors.Is(err, sstable.ErrCorrupt) {
+				t.Fatalf("Open = %v, want ErrCorrupt", err)
+			}
+		})
+	}
+}
+
+// TestFilterCoversEveryVersionOfAKey: multiple versions of one user key produce
+// one filter entry, and a lookup for that key must not be skipped.
+func TestFilterCoversEveryVersionOfAKey(t *testing.T) {
+	// Internal-key order: same user key, sequence descending.
+	entries := []entry{
+		put("a", 9, "newest"),
+		del("a", 5),
+		put("a", 1, "oldest"),
+		put("b", 2, "other"),
+	}
+	path, meta := buildWith(t, entries, sstable.WriterOptions{})
+	if meta.FilterKeys != 2 {
+		t.Fatalf("FilterKeys = %d, want 2 (three versions of \"a\" plus \"b\")", meta.FilterKeys)
+	}
+	r := openReader(t, path)
+	for _, k := range []string{"a", "b"} {
+		if !r.MayContain([]byte(k)) {
+			t.Fatalf("key %q is missing from the filter", k)
+		}
+	}
+	mustGet(t, r, "a", "newest")
+	// Bounded reads still work through the filter.
+	if _, kind, found, err := r.Get([]byte("a"), 5); err != nil || !found || kind != ikey.KindTombstone {
+		t.Fatalf("Get(a,5) = (%v,%v,%v), want a tombstone", kind, found, err)
+	}
+}
+
+// TestFilterOverOpaqueByteKeys: the filter must handle the same key space the
+// store does.
+func TestFilterOverOpaqueByteKeys(t *testing.T) {
+	raw := [][]byte{
+		{0x00}, {0x00, 0x01}, {0x01}, []byte(" "), []byte("a\nb"), []byte("a\x00b"),
+		[]byte("ключ"), {0xc3, 0x28}, {0xff}, {0xff, 0xff},
+	}
+	sorted := append([][]byte(nil), raw...)
+	for i := 1; i < len(sorted); i++ {
+		for j := i; j > 0 && bytes.Compare(sorted[j-1], sorted[j]) > 0; j-- {
+			sorted[j-1], sorted[j] = sorted[j], sorted[j-1]
+		}
+	}
+	entries := make([]entry, 0, len(sorted))
+	for i, k := range sorted {
+		entries = append(entries, put(string(k), uint64(i+1), "v"))
+	}
+	path, _ := buildWith(t, entries, sstable.WriterOptions{})
+	r := openReader(t, path)
+	for _, k := range sorted {
+		if !r.MayContain(k) {
+			t.Fatalf("filter reported %x as definitely absent", k)
+		}
+		mustGet(t, r, string(k), "v")
+	}
+}

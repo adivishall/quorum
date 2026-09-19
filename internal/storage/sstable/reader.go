@@ -6,7 +6,9 @@ import (
 	"io"
 	"os"
 	"sort"
+	"sync/atomic"
 
+	"github.com/adivishall/quorum/internal/storage/bloom"
 	"github.com/adivishall/quorum/internal/storage/ikey"
 )
 
@@ -36,6 +38,20 @@ type Reader struct {
 
 	footer Footer
 	index  []indexEntry
+
+	// filter is the decoded Bloom filter, or the zero Filter when the file
+	// carries none (a Phase 3 file, or one written with DisableFilter). The
+	// zero Filter answers "maybe" to everything, so a missing filter degrades
+	// to consulting the file rather than skipping it.
+	filter bloom.Filter
+
+	// Counters. They are atomic because a Reader is shared by concurrent
+	// readers, and they are counters rather than state: nothing about the
+	// answers a Reader gives depends on them. They exist so that the Bloom
+	// measurement in docs/BLOOM.md can report work avoided rather than only
+	// wall-clock time, which is the part of the result that generalises.
+	blockReads  atomic.Uint64
+	filterSkips atomic.Uint64
 }
 
 // Open opens and structurally validates an SSTable.
@@ -87,16 +103,32 @@ func newReader(f *os.File, path string) (*Reader, error) {
 
 	r := &Reader{f: f, name: name, size: size, footer: footer}
 
-	// The filter block is empty in Phase 3 and nothing reads its contents, but
-	// its checksum is verified anyway. The format says every block carries
-	// one; a region of the file that no check covers is a region where damage
-	// goes unnoticed, and "we detect corruption" would then be true only of
-	// the parts we happened to look at.
-	if _, err := r.readBlock(footer.FilterOffset, footer.FilterLength, "filter block"); err != nil {
+	// The filter block's checksum is verified whether or not it holds a filter.
+	// A region of the file that no check covers is a region where damage goes
+	// unnoticed, and it matters doubly here: the filter encoding carries no
+	// checksum of its own, so this block checksum is the only thing that stops
+	// a flipped bit from turning into a filter that answers "definitely absent"
+	// for a key that is present.
+	filterBlock, err := r.readBlock(footer.FilterOffset, footer.FilterLength,
+		MaxMetaBlockSize, "filter block")
+	if err != nil {
 		return nil, err
 	}
+	// A zero-length filter block means "no filter; consult the file directly",
+	// which is what Phase 3 wrote and what DisableFilter still writes. Anything
+	// else must decode, and a filter that does not decode is corruption — never
+	// silently downgraded to "no filter", because that would mean damage
+	// quietly costs performance instead of being reported.
+	if footer.FilterLength > 0 {
+		flt, ferr := bloom.Decode(filterBlock)
+		if ferr != nil {
+			return nil, fmt.Errorf("sstable %s: filter block: %v: %w", name, ferr, ErrCorrupt)
+		}
+		r.filter = flt
+	}
 
-	indexBlock, err := r.readBlock(footer.IndexOffset, footer.IndexLength, "index block")
+	indexBlock, err := r.readBlock(footer.IndexOffset, footer.IndexLength,
+		MaxMetaBlockSize, "index block")
 	if err != nil {
 		return nil, err
 	}
@@ -174,10 +206,15 @@ func (r *Reader) parseIndex(block []byte) error {
 }
 
 // readBlock reads a block and verifies its checksum.
-func (r *Reader) readBlock(offset, length uint64, what string) ([]byte, error) {
-	if length > MaxBlockSize {
+//
+// maxLen is the caller's bound on the declared length: MaxBlockSize for a data
+// block, MaxMetaBlockSize for the filter and index blocks, whose size scales
+// with the file rather than with one entry. The bound is applied before the
+// length is used to size an allocation, because it came off disk.
+func (r *Reader) readBlock(offset, length, maxLen uint64, what string) ([]byte, error) {
+	if length > maxLen {
 		return nil, fmt.Errorf("sstable %s: %s declares %d bytes, over the %d-byte maximum: %w",
-			r.name, what, length, MaxBlockSize, ErrCorrupt)
+			r.name, what, length, maxLen, ErrCorrupt)
 	}
 	end, ok := addChecked(offset, length, BlockTrailerSize)
 	if !ok || end > uint64(r.size) {
@@ -218,6 +255,19 @@ func (r *Reader) readBlock(offset, length uint64, what string) ([]byte, error) {
 //
 // The returned value is freshly allocated and is the caller's to keep.
 func (r *Reader) Get(userKey []byte, seq uint64) (value []byte, kind ikey.Kind, found bool, err error) {
+	// The Bloom filter is consulted before the index, because a negative answer
+	// means the file can be skipped without reading anything at all.
+	//
+	// The asymmetry is the whole point and it is deliberate in the code as well
+	// as the comment: the filter may only ever eliminate a file. It cannot
+	// confirm one, it cannot supply a value, and it cannot turn a damaged file
+	// into an absent key — a filter that fails to decode was already rejected at
+	// Open, and a file with no filter answers "maybe" and is consulted in full.
+	if !r.filter.MayContain(userKey) {
+		r.filterSkips.Add(1)
+		return nil, 0, false, nil
+	}
+
 	target := ikey.Seek(userKey, seq)
 
 	// The candidate block is the first whose last key is >= the seek key.
@@ -231,7 +281,8 @@ func (r *Reader) Get(userKey []byte, seq uint64) (value []byte, kind ikey.Kind, 
 		return nil, 0, false, nil // greater than everything in the file
 	}
 
-	block, err := r.readBlock(r.index[i].Offset, r.index[i].Length,
+	r.blockReads.Add(1)
+	block, err := r.readBlock(r.index[i].Offset, r.index[i].Length, MaxBlockSize,
 		fmt.Sprintf("data block %d", i))
 	if err != nil {
 		return nil, 0, false, err
@@ -353,6 +404,27 @@ func (r *Reader) Verify() (Stats, error) {
 	return st, nil
 }
 
+// HasFilter reports whether this file carries a Bloom filter. A file written by
+// Phase 3, or with WriterOptions.DisableFilter, does not.
+func (r *Reader) HasFilter() bool { return r.filter.Present() }
+
+// Filter returns the decoded filter. The zero Filter means the file has none,
+// and answers "maybe" to every key.
+func (r *Reader) Filter() bloom.Filter { return r.filter }
+
+// MayContain reports whether the file might hold any version of userKey.
+//
+// False means definitely absent. True means nothing on its own. A file with no
+// filter answers true for every key.
+func (r *Reader) MayContain(userKey []byte) bool { return r.filter.MayContain(userKey) }
+
+// BlockReads returns the number of data blocks this Reader has read since Open.
+func (r *Reader) BlockReads() uint64 { return r.blockReads.Load() }
+
+// FilterSkips returns the number of Gets the filter answered without touching
+// the file.
+func (r *Reader) FilterSkips() uint64 { return r.filterSkips.Load() }
+
 // NumEntries returns the entry count the footer declares.
 func (r *Reader) NumEntries() uint64 { return r.footer.NumEntries }
 
@@ -398,7 +470,9 @@ func (it *Iterator) Next() bool {
 			return false
 		}
 		e := it.r.index[it.blk]
-		block, err := it.r.readBlock(e.Offset, e.Length, fmt.Sprintf("data block %d", it.blk))
+		it.r.blockReads.Add(1)
+		block, err := it.r.readBlock(e.Offset, e.Length, MaxBlockSize,
+			fmt.Sprintf("data block %d", it.blk))
 		if err != nil {
 			it.err = err
 			return false

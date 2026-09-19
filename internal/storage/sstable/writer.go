@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/adivishall/quorum/internal/storage/bloom"
 	"github.com/adivishall/quorum/internal/storage/ikey"
 )
 
@@ -28,6 +29,11 @@ type Metadata struct {
 	IndexBytes   int64
 	FilterBytes  int64
 	LargestBlock int
+
+	// FilterKeys is the number of distinct user keys the Bloom filter covers.
+	// It is zero when the filter is disabled, which is how a caller tells "no
+	// keys" from "no filter" apart — NumEntries says whether the file is empty.
+	FilterKeys int
 }
 
 // WriterOptions configures a Writer. The zero value is the documented default.
@@ -36,11 +42,28 @@ type WriterOptions struct {
 	// reaches this size, so it always ends on an entry boundary. Zero selects
 	// DefaultBlockSize.
 	BlockSize int
+
+	// BitsPerKey sizes the Bloom filter (docs/DESIGN.md §5). Zero selects
+	// bloom.DefaultBitsPerKey.
+	BitsPerKey int
+
+	// DisableFilter writes the filter block empty, exactly as Phase 3 did.
+	//
+	// It exists for two reasons and no others: the measurement in
+	// docs/BLOOM.md needs a with-filter/without-filter comparison over the
+	// same data, and the reader's handling of a filterless file has to be
+	// tested against a real one rather than a hand-built fixture. It is a
+	// boolean rather than a sentinel BitsPerKey value so that "no filter" can
+	// never be requested by accident.
+	DisableFilter bool
 }
 
 func (o *WriterOptions) applyDefaults() {
 	if o.BlockSize <= 0 {
 		o.BlockSize = DefaultBlockSize
+	}
+	if o.BitsPerKey <= 0 {
+		o.BitsPerKey = bloom.DefaultBitsPerKey
 	}
 }
 
@@ -61,6 +84,10 @@ type Writer struct {
 	lastKey  []byte
 	blockOff int64 // offset of the block being accumulated
 
+	// filter accumulates the file's distinct USER keys. It is nil when the
+	// filter is disabled.
+	filter *bloom.Builder
+
 	meta Metadata
 	err  error // latched: once the writer has failed it stays failed
 }
@@ -68,7 +95,11 @@ type Writer struct {
 // NewWriter returns a Writer appending an SSTable to w.
 func NewWriter(w io.Writer, opts WriterOptions) *Writer {
 	opts.applyDefaults()
-	return &Writer{w: w, opts: opts}
+	sw := &Writer{w: w, opts: opts}
+	if !opts.DisableFilter {
+		sw.filter = bloom.NewBuilder(opts.BitsPerKey)
+	}
+	return sw
 }
 
 // Add appends one entry. internalKey must sort strictly after the previous one.
@@ -99,6 +130,18 @@ func (w *Writer) Add(internalKey, value []byte) error {
 		w.meta.SmallestSeq = seq
 	} else if seq > w.meta.LargestSeq {
 		w.meta.LargestSeq = seq
+	}
+
+	// The filter covers USER keys (docs/DESIGN.md §5). Entries arrive in
+	// internal-key order, so every version of one user key is contiguous and
+	// the builder's adjacent-duplicate check reduces them to one entry.
+	//
+	// The user key is added for a tombstone exactly as for a value. A lookup for
+	// a deleted key must still reach the file holding its tombstone; a filter
+	// that omitted tombstoned keys would let that file be skipped and an older
+	// value would come back from the dead.
+	if w.filter != nil {
+		w.filter.Add(ikey.UserKey(internalKey))
 	}
 
 	w.block = appendEntry(w.block, internalKey, value)
@@ -177,11 +220,22 @@ func (w *Writer) Finish() (Metadata, error) {
 		return Metadata{}, err
 	}
 
-	// Filter block. Phase 3 writes it empty; see the package comment. It
-	// still carries a checksum so that every block in the file has the same
-	// shape and the reader has one code path.
+	// Filter block. Phase 4 fills the block that Phase 3 reserved and wrote
+	// empty. A disabled filter still writes the block, with length zero, which
+	// is exactly the Phase 3 encoding of "this file carries no filter".
+	//
+	// Either way the block carries a checksum, so no region of the file is left
+	// uncovered by a check. That matters more now than it did in Phase 3: the
+	// filter's own encoding has no checksum, so the block's crc32c is the only
+	// thing standing between a flipped bit and a filter that answers "definitely
+	// absent" for a key that is present.
+	var filterBlock []byte
+	if w.filter != nil {
+		filterBlock = w.filter.Finish()
+		w.meta.FilterKeys = w.filter.Keys()
+	}
 	filterOffset := w.offset
-	if err := w.writeBlock(nil); err != nil {
+	if err := w.writeBlock(filterBlock); err != nil {
 		return Metadata{}, err
 	}
 	w.meta.FilterBytes = w.offset - filterOffset
@@ -195,7 +249,7 @@ func (w *Writer) Finish() (Metadata, error) {
 
 	footer := Footer{
 		FilterOffset: uint64(filterOffset),
-		FilterLength: 0,
+		FilterLength: uint64(len(filterBlock)),
 		IndexOffset:  uint64(indexOffset),
 		IndexLength:  uint64(indexLength),
 		NumEntries:   w.meta.NumEntries,

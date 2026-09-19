@@ -67,12 +67,31 @@ const (
 	// larger than the target becomes a block of its own.
 	DefaultBlockSize = 4 << 10
 
-	// MaxBlockSize bounds a length read from disk before it is used to size
-	// an allocation. A block holds at most one maximum-size key plus one
-	// maximum-size value plus framing, so 2 MiB is generous; the point is
-	// that a corrupted length cannot drive a wild allocation, which is the
+	// MaxBlockSize bounds a DATA block length read from disk before it is used
+	// to size an allocation. A data block holds at most one maximum-size key
+	// plus one maximum-size value plus framing, so 2 MiB is generous; the point
+	// is that a corrupted length cannot drive a wild allocation, which is the
 	// same reasoning as record.MaxRecordSize.
 	MaxBlockSize = 2 << 20
+
+	// MaxMetaBlockSize is the same bound for the two blocks whose size scales
+	// with the file rather than with one entry: the filter block and the index
+	// block.
+	//
+	// Phase 3 bounded all three by MaxBlockSize, which was correct while the
+	// only producer of an SSTable was a memtable flush — a 4 MiB memtable
+	// cannot produce a 2 MiB index. Phase 4's compaction can: the index holds
+	// one entry per data block, so a 1 GiB output file indexes ~262,000 blocks
+	// and needs several MiB, and a filter at 10 bits per key needs ~1.2 MiB per
+	// million keys. Keeping the 2 MiB bound would have made compaction fail on
+	// large files with a corruption error, which is a silent cliff rather than
+	// a limit.
+	//
+	// 256 MiB is chosen to be far above anything this engine produces while
+	// still bounding the allocation a corrupted length can request. The
+	// practical ceiling it implies on a single SSTable is recorded in
+	// docs/LIMITATIONS.md rather than left to be discovered.
+	MaxMetaBlockSize = 256 << 20
 )
 
 // Errors. Callers must branch with errors.Is.
@@ -170,9 +189,10 @@ func DecodeFooter(buf []byte, fileSize int64, name string) (Footer, error) {
 				"(the index block is the last thing before the footer): %w",
 			name, f.IndexOffset, f.IndexLength, indexEnd, footerStart, ErrCorrupt)
 	}
-	if f.IndexLength > MaxBlockSize || f.FilterLength > MaxBlockSize {
-		return Footer{}, fmt.Errorf("sstable %s: block length exceeds the %d-byte maximum: %w",
-			name, MaxBlockSize, ErrCorrupt)
+	if f.IndexLength > MaxMetaBlockSize || f.FilterLength > MaxMetaBlockSize {
+		return Footer{}, fmt.Errorf(
+			"sstable %s: metadata block length (filter %d, index %d) exceeds the %d-byte maximum: %w",
+			name, f.FilterLength, f.IndexLength, uint64(MaxMetaBlockSize), ErrCorrupt)
 	}
 	// An index block of zero length is only legal for a file with no entries;
 	// a data block always produces an index entry.
