@@ -110,11 +110,37 @@ func openLSM(t *testing.T, dir string, opts storage.Options) *storage.LSMStore {
 
 // lsmOpts returns options with a memtable small enough to force flushes at a
 // predictable rate, and a sync mode that survives SIGKILL.
+//
+// Auto-compaction is off. These are the flush, read-path and recovery tests, and
+// several of them assert exactly how many SSTables exist and what their numbers
+// are; a background compactor merging files underneath those assertions would
+// make them nondeterministic without testing anything about compaction. The
+// tests that are about compaction turn it on explicitly with compactOpts, and
+// TestBackgroundCompactionRunsWithoutBeingAsked covers the fact that it happens
+// on its own.
 func lsmOpts(memTableSize int64) storage.Options {
 	o := storage.DefaultOptions()
 	o.MemTableSize = memTableSize
 	o.BlockSize = 256
 	o.WAL.SyncMode = wal.SyncBatch
+	o.DisableAutoCompaction = true
+	return o
+}
+
+// compactOpts returns options with compaction enabled and a low L0 trigger, so a
+// test can produce a compaction from a handful of flushes.
+func compactOpts(memTableSize int64, l0Trigger int) storage.Options {
+	o := lsmOpts(memTableSize)
+	o.DisableAutoCompaction = false
+	o.L0CompactionTrigger = l0Trigger
+	return o
+}
+
+// manualCompactOpts enables compaction but only when a test asks for it, so the
+// file set changes exactly where the test says it does.
+func manualCompactOpts(memTableSize int64, l0Trigger int) storage.Options {
+	o := lsmOpts(memTableSize)
+	o.L0CompactionTrigger = l0Trigger
 	return o
 }
 
@@ -671,11 +697,13 @@ func TestCorruptSSTableRefusesToOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// What Open checks without reading a data block: the footer, the filter
+	// block, the index block, and the index's claims about the data region. Damage
+	// to any of those is refused at startup regardless of options.
 	for _, tc := range []struct {
 		name string
 		off  int
 	}{
-		{"a data block", 30},
 		{"the index block", len(raw) - sstable.FooterSize - 6},
 		{"the footer", len(raw) - 20},
 		{"the magic", len(raw) - 4},
@@ -702,6 +730,75 @@ func TestCorruptSSTableRefusesToOpen(t *testing.T) {
 			}
 		})
 	}
+
+	// A damaged DATA block is the case Phase 4 changed, so both halves of the
+	// change are asserted here rather than one of them being dropped.
+	//
+	// Phase 3 read every block of every SSTable at startup, because the sequence
+	// range a file covered had nowhere on disk to live and recovering it meant
+	// reading the file. The MANIFEST records it now, so startup reads a 48-byte
+	// footer and cross-checks it instead, and damage inside a data block is found
+	// at the read that needs that block.
+	//
+	// The guarantee that survives is the one that matters: the damage is found and
+	// reported as corruption, never as a missing key (INV-L7). What changed is
+	// when. Both are pinned below so that neither can drift silently.
+	t.Run("a data block, with VerifySSTablesOnOpen", func(t *testing.T) {
+		damaged := append([]byte(nil), raw...)
+		damaged[30] ^= 0xff
+		if err := os.WriteFile(path, damaged, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.WriteFile(path, raw, 0o644) })
+
+		verifying := opts
+		verifying.VerifySSTablesOnOpen = true
+		got, err := storage.OpenLSMStore(dir, verifying)
+		if err == nil {
+			_ = got.Close()
+			t.Fatal("damage to a data block was accepted with VerifySSTablesOnOpen set")
+		}
+		if !errors.Is(err, storage.ErrCorrupt) {
+			t.Fatalf("got %v, want ErrCorrupt", err)
+		}
+	})
+
+	t.Run("a data block, by default, is found at the read", func(t *testing.T) {
+		damaged := append([]byte(nil), raw...)
+		damaged[30] ^= 0xff
+		if err := os.WriteFile(path, damaged, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.WriteFile(path, raw, 0o644) })
+
+		// The default opens: the footer, index and filter are intact, and the
+		// MANIFEST's record of the file agrees with its footer.
+		got, err := storage.OpenLSMStore(dir, opts)
+		if err != nil {
+			t.Fatalf("OpenLSMStore: %v (the footer and index are undamaged, so the "+
+				"default configuration is expected to open this file)", err)
+		}
+		defer func() { _ = got.Close() }()
+
+		var sawCorrupt bool
+		for i := 0; i < 40; i++ {
+			_, err := got.Get(context.Background(), []byte(fmt.Sprintf("key%03d", i)))
+			switch {
+			case err == nil:
+				// This key's block was not the damaged one.
+			case errors.Is(err, storage.ErrCorrupt):
+				sawCorrupt = true
+			case errors.Is(err, storage.ErrNotFound):
+				t.Fatalf("Get(key%03d) reported the key absent from a damaged file; "+
+					"corruption must never be presented as 'key not found'", i)
+			default:
+				t.Fatalf("Get(key%03d) = %v, want ErrCorrupt", i, err)
+			}
+		}
+		if !sawCorrupt {
+			t.Fatal("no read reached the damaged block; the test is not exercising what it claims")
+		}
+	})
 }
 
 func TestTruncatedSSTableRefusesToOpen(t *testing.T) {

@@ -12,6 +12,7 @@ package storage
 import (
 	"context"
 
+	"github.com/adivishall/quorum/internal/storage/bloom"
 	"github.com/adivishall/quorum/internal/storage/sstable"
 	"github.com/adivishall/quorum/internal/storage/wal"
 )
@@ -60,6 +61,62 @@ type Options struct {
 	// memtable builds; it cannot change what the memtable contains or the
 	// order it iterates in, only the tower heights.
 	MemTableSeed uint64
+
+	// BitsPerKey sizes each SSTable's Bloom filter (docs/DESIGN.md §5). Zero
+	// selects bloom.DefaultBitsPerKey, which gives ~1% false positives.
+	BitsPerKey int
+
+	// DisableBloomFilter writes every SSTable's filter block empty, which is
+	// exactly what Phase 3 did.
+	//
+	// It exists so that docs/BLOOM.md can measure with and without the filter
+	// over the same data, and so the filterless read path is exercised against
+	// real files. It is not a tuning knob: a store opened with it does strictly
+	// more work per lookup.
+	DisableBloomFilter bool
+
+	// L0CompactionTrigger is the level-0 file count that starts a compaction.
+	// Zero selects DefaultL0CompactionTrigger (4, per docs/DESIGN.md §7).
+	L0CompactionTrigger int
+
+	// L1MaxBytes is level 1's size budget; each deeper level gets ten times the
+	// one above (docs/DESIGN.md §7). Zero selects DefaultL1MaxBytes.
+	L1MaxBytes int64
+
+	// DisableAutoCompaction stops the background compactor from being signalled.
+	//
+	// Compaction still runs when Compact or CompactAll is called. It exists so a
+	// test can control exactly when the file set changes; a store that compacted
+	// underneath an assertion about file counts would be untestable.
+	DisableAutoCompaction bool
+
+	// VerifySSTablesOnOpen reads every block of every referenced SSTable at
+	// startup and checks every checksum, as Phase 3 did unconditionally.
+	//
+	// Phase 3 had to: the sequence range a file covered had nowhere on disk to
+	// live, so recovering it meant reading the file. The MANIFEST records it now,
+	// and startup instead cross-checks each file's footer against the MANIFEST's
+	// record of it — which catches disagreement between the two for the price of
+	// a 48-byte read.
+	//
+	// The cost of the default is stated rather than hidden: damage inside a data
+	// block is found at the read that needs it instead of at startup. It is still
+	// found, and still reported as corruption rather than as a missing key
+	// (INV-L7). Set this when startup cost matters less than finding damage
+	// early. See docs/LIMITATIONS.md.
+	VerifySSTablesOnOpen bool
+
+	// AdoptLegacySSTables permits opening a data directory that holds SSTables
+	// but no CURRENT, by scanning those files and writing a MANIFEST describing
+	// them.
+	//
+	// This is the one-time Phase 3 to Phase 4 upgrade path, and it is opt-in
+	// because nothing on the filesystem distinguishes a Phase 3 database from a
+	// Phase 4 database whose CURRENT was lost. Adopting automatically would mean
+	// that deleting CURRENT silently returns the engine to inferring the file set
+	// from the directory, which is the behaviour the MANIFEST exists to replace
+	// (INV-S6).
+	AdoptLegacySSTables bool
 }
 
 // DefaultOptions returns the limits from docs/DESIGN.md §1.
@@ -86,6 +143,15 @@ func (o *Options) applyLSMDefaults() {
 	if o.BlockSize <= 0 {
 		o.BlockSize = sstable.DefaultBlockSize
 	}
+	if o.BitsPerKey <= 0 {
+		o.BitsPerKey = bloom.DefaultBitsPerKey
+	}
+	if o.L0CompactionTrigger <= 0 {
+		o.L0CompactionTrigger = DefaultL0CompactionTrigger
+	}
+	if o.L1MaxBytes <= 0 {
+		o.L1MaxBytes = DefaultL1MaxBytes
+	}
 }
 
 // validate reports whether the options are usable.
@@ -97,6 +163,9 @@ func (o Options) validate() error {
 		return opErr("open", nil, ErrInvalidOptions)
 	}
 	if o.MemTableSize < 0 || o.BlockSize < 0 {
+		return opErr("open", nil, ErrInvalidOptions)
+	}
+	if o.BitsPerKey < 0 || o.L0CompactionTrigger < 0 || o.L1MaxBytes < 0 {
 		return opErr("open", nil, ErrInvalidOptions)
 	}
 	return nil

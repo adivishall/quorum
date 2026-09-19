@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,13 +12,19 @@ import (
 	"sync"
 
 	"github.com/adivishall/quorum/internal/storage/ikey"
+	"github.com/adivishall/quorum/internal/storage/manifest"
 	"github.com/adivishall/quorum/internal/storage/memtable"
 	"github.com/adivishall/quorum/internal/storage/sstable"
 	"github.com/adivishall/quorum/internal/storage/wal"
 )
 
-// SSTable file naming. Numbers ascend with flush order, so a higher number is
+// SSTable file naming. Numbers ascend with creation order, so a higher number is
 // a newer file. Six digits matches the WAL's segment naming.
+//
+// Since Phase 4 the numbering may contain gaps: a compaction allocates a number
+// before it knows whether it will produce output, and a failed compaction leaves
+// its number unused. That is not a problem the way it was in Phase 3, because the
+// MANIFEST now says exactly which files exist and a gap carries no information.
 const (
 	sstSuffix     = ".sst"
 	sstTempSuffix = ".sst.tmp"
@@ -30,100 +37,101 @@ func sstTempName(n uint64) string { return fmt.Sprintf("%0*d%s", sstDigits, n, s
 
 // LSMStore is Quorum's durable log-structured storage engine.
 //
-// It is the Phase 2 WALStore with its Go map replaced by the real thing:
+//	write:      WAL append  ->  memtable
+//	flush:      memtable    ->  SSTable at level 0, recorded in the MANIFEST
+//	compaction: level N     ->  one SSTable at level N+1, recorded in the MANIFEST
+//	read:       memtable -> immutable memtables -> SSTables, newest first,
+//	            each SSTable's Bloom filter consulted before its blocks
 //
-//	write:  WAL append  ->  memtable
-//	flush:  memtable    ->  SSTable
-//	read:   memtable -> immutable memtables -> SSTables, newest first
+// # What the MANIFEST changed
 //
-// Every client-visible semantic is unchanged. That is not a claim, it is
-// enforced: LSMStore runs the Phase 1 conformance and concurrency suites
-// verbatim, including a configuration with a memtable so small that almost
-// every operation crosses an SSTable boundary.
-//
-// # Write path
-//
-//	validate                    reject bad input before anything is logged
-//	assign the next sequence    under writeMu, so log order == sequence order
-//	append to the WAL           write(2); flushed per the sync mode
-//	publish to the memtable     only after the log write succeeded
-//	flush if the memtable is full
-//
-// Nothing becomes visible in memory before it is in the log. The converse skew
-// — a record in the log that was never acknowledged — is inherent to
-// write-ahead logging and is stated in docs/CONSISTENCY.md C4 rather than
-// papered over.
-//
-// # Reading
-//
-// A read takes a consistent snapshot of the three sources under mu, releases
-// the lock, and searches them newest-first. The first source that holds ANY
-// version of the key decides the answer, including when that version is a
-// tombstone — a tombstone is an answer, not an absence, and falling through it
-// to an older SSTable is exactly how a deleted key comes back from the dead.
+// Phase 3 inferred the live file set by listing the directory. Phase 4 reads it
+// from the MANIFEST, which is the only authority (INV-S6): a file on disk that
+// the MANIFEST does not name is an orphan and is deleted, and a file the MANIFEST
+// names but that is missing is fatal. That distinction is what makes compaction
+// possible at all — after a crash mid-compaction both the inputs and the output
+// are on disk, and only the MANIFEST can say which set is the database.
 //
 // # Locking
 //
-//	closeMu  held for read by every operation for its whole duration; Close
-//	         takes it for write. That is what lets Close close SSTable files
-//	         without racing an in-flight read, and it is why an interrupted
-//	         operation reports ErrClosed rather than a filesystem error.
-//	writeMu  serialises writers across sequence assignment, the log append,
-//	         the memtable publish and the flush. Sequence numbers must be
-//	         assigned in log order or replay reconstructs a state that never
-//	         existed.
-//	mu       guards the three version pointers only. Critical sections are
-//	         pointer swaps, so a reader never waits on disk I/O and a writer
-//	         never waits on a reader's block read.
+//	closeMu    held for read by every operation for its whole duration; Close
+//	           takes it for write. It is a drain barrier, not a data lock.
+//	writeMu    serialises writers across sequence assignment, the log append and
+//	           the memtable publish — and serialises every MANIFEST append,
+//	           whether it comes from a flush or from a compaction's publication.
+//	compactMu  admits one compaction at a time.
+//	mu         guards the current-version pointer and the per-file reference
+//	           counts. Critical sections are pointer swaps; a reader never waits
+//	           on disk I/O and a publication never waits on a reader.
 //
-// Order is always closeMu -> writeMu -> mu, and never the reverse.
+// Order is always closeMu -> compactMu -> writeMu -> mu, and never the reverse.
+//
+// # Reads during compaction
+//
+// A read acquires the current version once and holds it for the operation, so it
+// observes one coherent file set (INV-S5). A compaction merges with no store lock
+// held at all, and synchronises only to append its MANIFEST record and swap the
+// version pointer. The version's reference count is what keeps the merge's input
+// files open while that happens, and what delays unlinking a retired file until
+// no reader can reach it.
 type LSMStore struct {
 	opts Options
 	dir  string
 
-	// closeMu is a drain barrier rather than a data lock. See Locking above.
 	closeMu sync.RWMutex
 	closed  bool
 
 	writeMu sync.Mutex
 	seq     uint64 // last assigned sequence number; writeMu
-	nextNum uint64 // next SSTable file number; writeMu
+	nextNum uint64 // next unused file number; writeMu
 
-	// flushErr latches a failed flush. A flush that fails leaves the data
-	// durable in the WAL and visible in memory, so the write that triggered it
-	// genuinely succeeded and is reported as such. What must not happen is
-	// carrying on: the memtable would grow without bound and the next crash
-	// would replay a log nothing had ever compacted. Every subsequent
-	// mutation fails with this error instead.
+	// flushErr latches a failed flush. The mutation that triggered it genuinely
+	// succeeded — it is in the log and visible in memory — so failing that call
+	// would report a write that happened as one that did not. The next mutation
+	// reports it instead, which also stops the memtable growing without bound.
 	flushErr error
 
-	mu   sync.RWMutex
-	mem  *memtable.MemTable   // mutable; receives writes
-	imm  []*memtable.MemTable // frozen, newest first, being flushed
-	ssts []*sstFile           // ascending file number: oldest first
+	// compactErr latches a failed background compaction. It does not fail reads
+	// or writes: nothing is wrong with the data, only with the file count.
+	compactErr error
+
+	manifest *manifest.Writer // writeMu
+
+	mu  sync.RWMutex
+	cur *version
 
 	applied AppliedIndex
 
 	w        *wal.WAL
 	recovery LSMRecovery
+
+	compactMu      sync.Mutex
+	compactStats   compactionCounters
+	compactWake    chan struct{}
+	compactQuit    chan struct{}
+	compactStopped chan struct{}
+	stopOnce       sync.Once
 }
 
 var _ Store = (*LSMStore)(nil)
 
-// sstFile is one live SSTable and what startup learned about it.
-type sstFile struct {
-	num   uint64
-	r     *sstable.Reader
-	stats sstable.Stats
-}
-
 // LSMRecovery summarises what opening the store found on disk.
 type LSMRecovery struct {
+	// MANIFEST.
+	ManifestNum       uint64
+	ManifestEdits     int
+	ManifestTruncated bool
+	Bootstrapped      bool // no MANIFEST existed; one was created
+	AdoptedLegacy     int  // Phase 3 SSTables adopted into a new MANIFEST
+
 	// SSTables.
 	SSTablesLoaded   int
 	SSTableEntries   uint64
 	SSTableBytes     int64
 	TempFilesRemoved int
+	OrphansRemoved   int
+	ManifestsRemoved int
+	FullyVerified    bool
 	MaxFlushedSeq    uint64
 
 	// WAL replay.
@@ -135,8 +143,8 @@ type LSMRecovery struct {
 	OpsSkipped      int64 // already durable in an SSTable
 	FlushesOnReplay int
 
-	// Sequence is the last sequence number assigned during replay, which is
-	// the total number of mutations the WAL holds.
+	// Sequence is the last sequence number assigned during replay, which is the
+	// total number of mutations the WAL holds.
 	Sequence uint64
 
 	// Truncated reports a repaired torn tail in the WAL.
@@ -151,28 +159,29 @@ type LSMRecovery struct {
 //
 // The startup sequence, and why it is in this order:
 //
-//  1. Delete leftover *.sst.tmp files. A temp file is the signature of a
-//     crash during a flush. Its contents are still in the WAL, so deleting it
-//     loses nothing, and leaving it would mean carrying a file nothing can
-//     classify.
-//  2. Open and fully verify every *.sst: footer, index, every block checksum,
-//     entry ordering and count. Verification is a complete read of each file.
-//     Phase 3 pays that because it has no MANIFEST: the sequence range a file
-//     covers lives in the MANIFEST from Phase 4 (docs/DESIGN.md §6) and there
-//     is nowhere else on disk to put it now. See docs/LSM.md.
-//  3. Check the file set is coherent: no gaps in the numbering, and
-//     non-overlapping, ascending sequence ranges. Both are guaranteed by the
-//     way flushes are produced, so a violation means a file was removed or
-//     substituted, and continuing would silently drop whatever it held.
-//  4. Replay the WAL, assigning sequence numbers from 1 in log order —
-//     identically to how the original writes were numbered. A mutation whose
-//     number is at or below the highest flushed sequence is already in an
-//     SSTable and is skipped; everything after it is applied to the memtable.
+//  1. Read CURRENT and replay the MANIFEST it names. That produces the
+//     authoritative live file set, each file's sequence range, and the next file
+//     number. A torn final record is a crash during that append and is repaired;
+//     anything else is refused.
+//  2. Open every referenced file and cross-check it against what the MANIFEST
+//     claims. A referenced file that is missing is fatal — it is the one state
+//     the publication protocol cannot produce.
+//  3. Check the file set is coherent: sequence ranges disjoint and ascending,
+//     no empty tables. This is what the read path's "first source wins" rests on.
+//  4. Sweep orphans: *.sst.tmp, *.sst the MANIFEST does not name, and superseded
+//     manifests. Safe only because step 1 succeeded, which is why it is here and
+//     not earlier.
+//  5. Install a fresh MANIFEST holding a snapshot, so a manifest never grows
+//     without bound and recovery never replays more than one database's history.
+//  6. Replay the WAL, assigning sequence numbers from 1 in log order. A mutation
+//     at or below the highest flushed sequence is already in a table and is
+//     skipped.
 //
-// Step 4 is the whole Phase 3 recovery argument. It works because sequence
-// assignment is deterministic: the same committed log prefix produces the same
-// numbers, so "seq <= maxFlushedSeq" is exactly "this mutation is already on
-// disk in a table".
+// Step 6 is unchanged from Phase 3 and rests on the same property: sequence
+// assignment is deterministic, so "seq <= maxFlushedSeq" is exactly "this
+// mutation is already durable in a table". Compaction does not disturb it — a
+// compacted file represents the combined effect of every mutation in its range,
+// so skipping that range is still correct.
 func OpenLSMStore(dir string, opts Options) (*LSMStore, error) {
 	// Validate before filling in defaults, or a negative value would be
 	// "corrected" into the default and a caller's mistake would go unreported.
@@ -188,53 +197,185 @@ func OpenLSMStore(dir string, opts Options) (*LSMStore, error) {
 	}
 
 	s := &LSMStore{
-		opts: opts,
-		dir:  dir,
-		mem:  memtable.New(opts.MemTableSeed),
+		opts:           opts,
+		dir:            dir,
+		compactWake:    make(chan struct{}, 1),
+		compactQuit:    make(chan struct{}),
+		compactStopped: make(chan struct{}),
 	}
 
-	removed, err := sweepTempSSTables(dir)
+	state, err := s.recoverManifest()
 	if err != nil {
 		return nil, classify("open", nil, err)
 	}
-	s.recovery.TempFilesRemoved = removed
 
-	if err := s.loadSSTables(); err != nil {
-		s.closeReaders()
+	files, err := s.openFiles(state.Files)
+	if err != nil {
+		for _, f := range files {
+			_ = f.r.Close()
+		}
+		return nil, classify("open", nil, err)
+	}
+	if err := checkCoherentFileSet(files); err != nil {
+		for _, f := range files {
+			_ = f.r.Close()
+		}
+		return nil, classify("open", nil, err)
+	}
+
+	s.nextNum = state.NextFileNum
+	if s.nextNum == 0 {
+		s.nextNum = 1
+	}
+	s.applied = AppliedIndex{Index: state.Applied.Index, Term: state.Applied.Term}
+	s.install(newVersion(memtable.New(opts.MemTableSeed), nil, files))
+
+	s.recovery.SSTablesLoaded = len(files)
+	for _, f := range files {
+		s.recovery.SSTableEntries += f.meta.NumEntries
+		s.recovery.SSTableBytes += f.meta.Size
+	}
+	s.recovery.MaxFlushedSeq = s.cur.maxFlushedSeq()
+
+	if err := s.sweepOrphans(files); err != nil {
+		s.closeAllReaders()
+		return nil, classify("open", nil, err)
+	}
+
+	// A fresh manifest holding a snapshot of the recovered state. Installing it
+	// here, before replay, means a flush triggered during replay records itself
+	// through exactly the same path as one during normal operation.
+	if err := s.installManifest(state); err != nil {
+		s.closeAllReaders()
 		return nil, classify("open", nil, err)
 	}
 
 	if err := s.replayWAL(); err != nil {
-		s.closeReaders()
+		s.closeManifest()
+		s.closeAllReaders()
 		return nil, classify("open", nil, err)
 	}
 
 	w, err := wal.Create(filepath.Join(dir, walDirName), opts.WAL)
 	if err != nil {
-		s.closeReaders()
+		s.closeManifest()
+		s.closeAllReaders()
 		return nil, classify("open", nil, err)
 	}
 	s.w = w
+
+	go s.runCompactor()
+	// A store that opens with a level already over its trigger — because the
+	// previous process died before compacting, or because replay produced many
+	// files — should start catching up without waiting for a write.
+	s.compactionSignal()
+
 	return s, nil
 }
 
-// sweepTempSSTables removes partial flush output left by a crash.
-func sweepTempSSTables(dir string) (int, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return 0, fmt.Errorf("lsm: reading %s: %w", dir, err)
+// recoverManifest reads the MANIFEST, or bootstraps one.
+func (s *LSMStore) recoverManifest() (manifest.State, error) {
+	state, rec, err := manifest.Recover(s.dir)
+	switch {
+	case err == nil:
+		s.recovery.ManifestNum = rec.Num
+		s.recovery.ManifestEdits = rec.EditsApplied
+		s.recovery.ManifestTruncated = rec.Truncated
+		return state, nil
+	case errors.Is(err, manifest.ErrNoManifest):
+		return s.bootstrapState()
+	default:
+		return manifest.State{}, err
 	}
-	var removed int
+}
+
+// bootstrapState decides what a directory with no CURRENT means.
+//
+// An empty directory is simply a database that does not exist yet. A directory
+// that already holds SSTables is a different matter: it is either a Phase 3
+// database, or a Phase 4 database whose CURRENT was lost. Nothing on the
+// filesystem distinguishes those, and treating the second as the first would
+// reduce INV-S6 to a suggestion — delete CURRENT and the engine quietly goes back
+// to guessing the file set from the directory, which is the behaviour the MANIFEST
+// exists to replace.
+//
+// So it refuses, and the Phase 3 upgrade is an explicit opt-in that says "these
+// files are a Phase 3 database, adopt them". That is a deliberate operator
+// decision rather than a silent fallback.
+func (s *LSMStore) bootstrapState() (manifest.State, error) {
+	nums, err := s.listSSTables()
+	if err != nil {
+		return manifest.State{}, err
+	}
+	if len(nums) == 0 {
+		s.recovery.Bootstrapped = true
+		return manifest.State{NextFileNum: 1}, nil
+	}
+	if !s.opts.AdoptLegacySSTables {
+		return manifest.State{}, fmt.Errorf(
+			"lsm: %s holds %d SSTables but no %s; the MANIFEST is the only authority on "+
+				"which files are live, so a missing one cannot be worked around by reading the "+
+				"directory. If this is a Phase 3 data directory, open it once with "+
+				"Options.AdoptLegacySSTables: %w",
+			s.dir, len(nums), manifest.CurrentName, ErrCorrupt)
+	}
+
+	// The Phase 3 mechanism, run once: fully read each file to recover the
+	// sequence range that had nowhere on disk to live before the MANIFEST.
+	state := manifest.State{NextFileNum: 1}
+	for _, n := range nums {
+		r, err := sstable.Open(s.sstPath(n))
+		if err != nil {
+			return manifest.State{}, err
+		}
+		stats, err := r.Verify()
+		if err != nil {
+			_ = r.Close()
+			return manifest.State{}, err
+		}
+		_ = r.Close()
+		if stats.NumEntries == 0 {
+			return manifest.State{}, fmt.Errorf(
+				"lsm: %s holds no entries; a flush never produces an empty table: %w",
+				sstName(n), ErrCorrupt)
+		}
+		state.Files = append(state.Files, manifest.FileMeta{
+			Level:       0,
+			Num:         n,
+			Size:        stats.FileSize,
+			NumEntries:  stats.NumEntries,
+			SmallestKey: stats.SmallestKey,
+			LargestKey:  stats.LargestKey,
+			SmallestSeq: stats.SmallestSeq,
+			LargestSeq:  stats.LargestSeq,
+		})
+		state.NextFileNum = n + 1
+		if stats.LargestSeq > state.LastSequence {
+			state.LastSequence = stats.LargestSeq
+		}
+	}
+	s.recovery.AdoptedLegacy = len(state.Files)
+	s.recovery.Bootstrapped = true
+	return state, nil
+}
+
+// listSSTables returns the SSTable numbers present in the directory, ascending.
+func (s *LSMStore) listSSTables() ([]uint64, error) {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return nil, fmt.Errorf("lsm: reading %s: %w", s.dir, err)
+	}
+	var nums []uint64
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), sstTempSuffix) {
+		if e.IsDir() {
 			continue
 		}
-		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
-			return removed, fmt.Errorf("lsm: removing partial flush output %s: %w", e.Name(), err)
+		if n, ok := parseSSTName(e.Name()); ok {
+			nums = append(nums, n)
 		}
-		removed++
 	}
-	return removed, nil
+	sort.Slice(nums, func(i, j int) bool { return nums[i] < nums[j] })
+	return nums, nil
 }
 
 // parseSSTName parses an SSTable file name. The match is exact — six decimal
@@ -256,80 +397,187 @@ func parseSSTName(name string) (uint64, bool) {
 	return n, err == nil
 }
 
-// loadSSTables opens, verifies and orders every SSTable in the data directory.
-func (s *LSMStore) loadSSTables() error {
-	entries, err := os.ReadDir(s.dir)
-	if err != nil {
-		return fmt.Errorf("lsm: reading %s: %w", s.dir, err)
-	}
-	var nums []uint64
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		if n, ok := parseSSTName(e.Name()); ok {
-			nums = append(nums, n)
-		}
-	}
-	sort.Slice(nums, func(i, j int) bool { return nums[i] < nums[j] })
+// openFiles opens every file the MANIFEST names and cross-checks it.
+//
+// The cross-check is what makes it defensible to skip the full scan Phase 3 did.
+// The MANIFEST records each file's size and entry count, and the file's own footer
+// records them independently, so a disagreement means one of the two is damaged
+// and is caught here for the price of reading a 48-byte footer.
+func (s *LSMStore) openFiles(metas []manifest.FileMeta) ([]*sstFile, error) {
+	sorted := append([]manifest.FileMeta(nil), metas...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Num < sorted[j].Num })
 
-	for i := 1; i < len(nums); i++ {
-		if nums[i] != nums[i-1]+1 {
-			// Nothing in Phase 3 deletes an SSTable. A gap means one was
-			// removed from underneath us, and every key it held whose
-			// sequence number is below the next file's would be skipped
-			// during replay and lost without a trace.
-			return fmt.Errorf(
-				"lsm: SSTable numbering has a gap: %s is followed by %s (%d files missing): %w",
-				sstName(nums[i-1]), sstName(nums[i]), nums[i]-nums[i-1]-1, ErrCorrupt)
-		}
-	}
-
-	for _, n := range nums {
-		path := filepath.Join(s.dir, sstName(n))
+	files := make([]*sstFile, 0, len(sorted))
+	for _, m := range sorted {
+		path := s.sstPath(m.Num)
 		r, err := sstable.Open(path)
 		if err != nil {
-			return err
+			if errors.Is(err, os.ErrNotExist) {
+				return files, fmt.Errorf(
+					"lsm: the MANIFEST references %s, which is not on disk; the publication "+
+						"protocol never removes a referenced file, so this is not a state a "+
+						"crash can produce: %w", sstName(m.Num), ErrCorrupt)
+			}
+			return files, err
 		}
-		stats, err := r.Verify()
-		if err != nil {
+		if got := r.NumEntries(); got != m.NumEntries {
 			_ = r.Close()
-			return err
+			return files, fmt.Errorf(
+				"lsm: %s holds %d entries but the MANIFEST records %d: %w",
+				sstName(m.Num), got, m.NumEntries, ErrCorrupt)
 		}
-		if stats.NumEntries == 0 {
+		if got := r.Size(); got != m.Size {
 			_ = r.Close()
-			return fmt.Errorf("lsm: %s holds no entries; a flush never produces an empty table: %w",
-				sstName(n), ErrCorrupt)
+			return files, fmt.Errorf("lsm: %s is %d bytes but the MANIFEST records %d: %w",
+				sstName(m.Num), got, m.Size, ErrCorrupt)
 		}
-		if last := len(s.ssts); last > 0 {
-			if prev := s.ssts[last-1].stats; prev.LargestSeq >= stats.SmallestSeq {
-				// Flushes are produced in sequence order under one lock, so
-				// file N's sequence numbers are all below file N+1's. An
-				// overlap means the file set is not one this engine produced.
-				return fmt.Errorf(
-					"lsm: %s covers sequences [%d,%d] which overlaps %s's [%d,%d]; "+
-						"flushed files must not overlap: %w",
-					sstName(n), stats.SmallestSeq, stats.LargestSeq,
-					sstName(s.ssts[last-1].num), prev.SmallestSeq, prev.LargestSeq, ErrCorrupt)
+
+		if s.opts.VerifySSTablesOnOpen {
+			stats, verr := r.Verify()
+			if verr != nil {
+				_ = r.Close()
+				return files, verr
+			}
+			if stats.SmallestSeq != m.SmallestSeq || stats.LargestSeq != m.LargestSeq {
+				_ = r.Close()
+				return files, fmt.Errorf(
+					"lsm: %s covers sequences [%d,%d] but the MANIFEST records [%d,%d]: %w",
+					sstName(m.Num), stats.SmallestSeq, stats.LargestSeq,
+					m.SmallestSeq, m.LargestSeq, ErrCorrupt)
 			}
 		}
 
-		s.ssts = append(s.ssts, &sstFile{num: n, r: r, stats: stats})
-		s.recovery.SSTableEntries += stats.NumEntries
-		s.recovery.SSTableBytes += stats.FileSize
-		s.recovery.MaxFlushedSeq = stats.LargestSeq
+		files = append(files, &sstFile{meta: m, r: r, path: path})
 	}
+	s.recovery.FullyVerified = s.opts.VerifySSTablesOnOpen
+	return files, nil
+}
 
-	s.recovery.SSTablesLoaded = len(s.ssts)
-	s.nextNum = 1
-	if len(nums) > 0 {
-		s.nextNum = nums[len(nums)-1] + 1
+// checkCoherentFileSet enforces the property the read path depends on: live files
+// have pairwise-disjoint sequence ranges.
+//
+// "First source holding any version of the key wins" is only correct if every
+// sequence number in a newer file exceeds every sequence number in an older one.
+// Both a flush and a compaction preserve that — a flush's range is above
+// everything, and a compaction merges a whole level, whose range is contiguous in
+// the global ordering — so a violation means the file set is not one this engine
+// produced, and continuing would resolve some keys to the wrong version.
+func checkCoherentFileSet(files []*sstFile) error {
+	ordered := append([]*sstFile(nil), files...)
+	sort.Slice(ordered, func(i, j int) bool {
+		return ordered[i].meta.LargestSeq > ordered[j].meta.LargestSeq
+	})
+	for i, f := range ordered {
+		if f.meta.NumEntries == 0 {
+			return fmt.Errorf("lsm: %s holds no entries; a flush or compaction never "+
+				"produces an empty table: %w", sstName(f.meta.Num), ErrCorrupt)
+		}
+		if f.meta.SmallestSeq > f.meta.LargestSeq {
+			return fmt.Errorf("lsm: %s declares an inverted sequence range [%d,%d]: %w",
+				sstName(f.meta.Num), f.meta.SmallestSeq, f.meta.LargestSeq, ErrCorrupt)
+		}
+		if i == 0 {
+			continue
+		}
+		prev := ordered[i-1]
+		if f.meta.LargestSeq >= prev.meta.SmallestSeq {
+			return fmt.Errorf(
+				"lsm: %s covers sequences [%d,%d] which overlaps %s's [%d,%d]; "+
+					"live files must not overlap: %w",
+				sstName(f.meta.Num), f.meta.SmallestSeq, f.meta.LargestSeq,
+				sstName(prev.meta.Num), prev.meta.SmallestSeq, prev.meta.LargestSeq, ErrCorrupt)
+		}
 	}
 	return nil
 }
 
-// replayWAL rebuilds the memtable from the portion of the log that is not yet
-// in an SSTable.
+// sweepOrphans deletes what the MANIFEST does not name.
+//
+// Every category is explicit, and anything unrecognised is left alone
+// (docs/MANIFEST.md):
+//
+//	*.sst.tmp            a flush or compaction interrupted mid-write. Never read.
+//	*.sst not in the     an output whose MANIFEST record never landed, or an
+//	MANIFEST             input whose deletion never completed. Either way it is
+//	                     not part of the database.
+//	superseded MANIFESTs  replaced by the one CURRENT names.
+//	anything else         ignored. This engine does not own the whole directory.
+//
+// This runs only after the MANIFEST has been recovered successfully. Deleting a
+// file because it is absent from a file set we are not yet sure of would be the
+// one way this could lose data.
+func (s *LSMStore) sweepOrphans(live []*sstFile) error {
+	referenced := make(map[uint64]bool, len(live))
+	for _, f := range live {
+		referenced[f.meta.Num] = true
+	}
+
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return fmt.Errorf("lsm: reading %s: %w", s.dir, err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		switch {
+		case strings.HasSuffix(name, sstTempSuffix):
+			if err := os.Remove(filepath.Join(s.dir, name)); err != nil {
+				return fmt.Errorf("lsm: removing partial output %s: %w", name, err)
+			}
+			s.recovery.TempFilesRemoved++
+		default:
+			n, ok := parseSSTName(name)
+			if !ok || referenced[n] {
+				continue
+			}
+			if err := os.Remove(filepath.Join(s.dir, name)); err != nil {
+				return fmt.Errorf("lsm: removing orphan %s: %w", name, err)
+			}
+			s.recovery.OrphansRemoved++
+		}
+	}
+	return nil
+}
+
+// installManifest writes a fresh manifest holding a snapshot and retires the old
+// ones.
+func (s *LSMStore) installManifest(state manifest.State) error {
+	state.Files = s.cur.metas()
+	state.NextFileNum = s.nextNum
+	if state.LastSequence < s.cur.maxFlushedSeq() {
+		state.LastSequence = s.cur.maxFlushedSeq()
+	}
+
+	num := s.recovery.ManifestNum + 1
+	if num == 0 {
+		num = 1
+	}
+	w, err := manifest.Install(s.dir, num, state)
+	if err != nil {
+		return err
+	}
+	s.manifest = w
+
+	removed, err := manifest.RemoveObsolete(s.dir, num)
+	if err != nil {
+		return err
+	}
+	s.recovery.ManifestsRemoved = removed
+	s.recovery.ManifestNum = num
+	return nil
+}
+
+func (s *LSMStore) closeManifest() {
+	if s.manifest != nil {
+		_ = s.manifest.Close()
+		s.manifest = nil
+	}
+}
+
+// replayWAL rebuilds the memtable from the portion of the log that is not yet in
+// an SSTable.
 func (s *LSMStore) replayWAL() error {
 	maxFlushed := s.recovery.MaxFlushedSeq
 
@@ -345,15 +593,13 @@ func (s *LSMStore) replayWAL() error {
 				if op.Kind == wal.OpDelete {
 					kind = ikey.KindTombstone
 				}
-				s.mem.Add(s.seq, kind, op.Key, op.Value)
+				s.cur.mem.Add(s.seq, kind, op.Key, op.Value)
 				s.recovery.OpsReplayed++
 
 				// Flush during replay for the same reason as during normal
 				// operation: without it, recovering a log larger than memory
-				// would need memory proportional to the whole log, and the
-				// "a dataset larger than RAM fits" claim would hold only
-				// until the first restart.
-				if s.mem.ApproxSize() >= s.opts.MemTableSize {
+				// would need memory proportional to the whole log.
+				if s.cur.mem.ApproxSize() >= s.opts.MemTableSize {
 					if err := s.flushLocked(); err != nil {
 						return err
 					}
@@ -372,10 +618,9 @@ func (s *LSMStore) replayWAL() error {
 	}
 
 	if maxFlushed > s.seq {
-		// An SSTable holds sequence numbers the log never contained. The log
-		// must have been truncated or replaced; replaying it would produce a
-		// state where flushed writes are present but later ones are not, with
-		// no way to tell which.
+		// Tables hold sequence numbers the log never contained, so the log was
+		// truncated or replaced. Replaying it would produce a state where flushed
+		// writes are present but later ones are not, with no way to tell which.
 		return fmt.Errorf(
 			"lsm: SSTables cover sequences up to %d but the WAL holds only %d mutations; "+
 				"the log is shorter than the tables built from it: %w",
@@ -413,10 +658,8 @@ func (s *LSMStore) Put(ctx context.Context, key, value []byte) error {
 
 // Delete implements Store.
 //
-// Delete writes a tombstone. It performs no read, which is why it is
-// idempotent and does not report whether the key existed — the semantic the
-// Store interface committed to in Phase 1 precisely so that this phase would
-// not have to break it.
+// Delete writes a tombstone. It performs no read, which is why it is idempotent
+// and does not report whether the key existed.
 func (s *LSMStore) Delete(ctx context.Context, key []byte) error {
 	if err := ctx.Err(); err != nil {
 		return opErr("delete", key, err)
@@ -434,50 +677,90 @@ func (s *LSMStore) mutate(op string, kind ikey.Kind, key, value []byte) error {
 		return opErr(op, key, ErrClosed)
 	}
 
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	var flushed bool
+	if err := func() error {
+		s.writeMu.Lock()
+		defer s.writeMu.Unlock()
 
-	if s.flushErr != nil {
-		return classify(op, key, s.flushErr)
-	}
-	if s.seq >= ikey.MaxSeq {
-		return opErr(op, key, fmt.Errorf("%w: the %d-bit sequence space is exhausted",
-			ErrIO, 8*ikey.SeqBytes))
-	}
-
-	walKind := wal.OpPut
-	if kind == ikey.KindTombstone {
-		walKind = wal.OpDelete
-	}
-	if err := s.w.AppendBatch(wal.Batch{{Kind: walKind, Key: key, Value: value}}); err != nil {
-		// Nothing is published. The log may hold a partial record, which
-		// recovery repairs as a torn tail; either way the caller is told the
-		// write did not succeed.
-		return classify(op, key, err)
-	}
-
-	s.seq++
-	s.mem.Add(s.seq, kind, key, value)
-
-	if s.mem.ApproxSize() >= s.opts.MemTableSize {
-		if err := s.flushLocked(); err != nil {
-			// The mutation itself succeeded: it is in the log and visible in
-			// memory. Reporting a failure here would say a write did not
-			// happen when it did. The failure latches instead, and the next
-			// mutation is the one that reports it.
-			s.flushErr = err
+		if s.flushErr != nil {
+			return classify(op, key, s.flushErr)
 		}
+		if s.seq >= ikey.MaxSeq {
+			return opErr(op, key, fmt.Errorf("%w: the %d-bit sequence space is exhausted",
+				ErrIO, 8*ikey.SeqBytes))
+		}
+
+		walKind := wal.OpPut
+		if kind == ikey.KindTombstone {
+			walKind = wal.OpDelete
+		}
+		if err := s.w.AppendBatch(wal.Batch{{Kind: walKind, Key: key, Value: value}}); err != nil {
+			// Nothing is published. The log may hold a partial record, which
+			// recovery repairs as a torn tail; either way the caller is told the
+			// write did not succeed.
+			return classify(op, key, err)
+		}
+
+		s.seq++
+		s.mu.RLock()
+		mem := s.cur.mem
+		s.mu.RUnlock()
+		mem.Add(s.seq, kind, key, value)
+
+		if mem.ApproxSize() >= s.opts.MemTableSize {
+			if err := s.flushLocked(); err != nil {
+				// The mutation itself succeeded: it is in the log and visible in
+				// memory. The failure latches and the next mutation reports it.
+				s.flushErr = err
+			} else {
+				flushed = true
+			}
+		}
+		return nil
+	}(); err != nil {
+		return err
+	}
+
+	// Signalled outside writeMu: the compactor takes writeMu to publish, and
+	// signalling under it would be a lock-ordering hazard for no benefit.
+	if flushed {
+		s.compactionSignal()
 	}
 	return nil
+}
+
+// allocFileNum reserves the next file number.
+func (s *LSMStore) allocFileNum() (uint64, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.allocFileNumLocked()
+}
+
+func (s *LSMStore) allocFileNumLocked() (uint64, error) {
+	if s.nextNum > maxSSTNumber {
+		return 0, fmt.Errorf("lsm: SSTable number %d would exceed the %d-digit name format",
+			s.nextNum, sstDigits)
+	}
+	n := s.nextNum
+	s.nextNum++
+	return n, nil
+}
+
+func (s *LSMStore) tmpPath(num uint64) string {
+	return filepath.Join(s.dir, sstTempName(num))
+}
+
+func (s *LSMStore) writerOptions() sstable.WriterOptions {
+	return sstable.WriterOptions{
+		BlockSize:     s.opts.BlockSize,
+		BitsPerKey:    s.opts.BitsPerKey,
+		DisableFilter: s.opts.DisableBloomFilter,
+	}
 }
 
 // ---------------------------------------------------------------- flush
 
 // Flush writes the current memtable to an SSTable, whatever its size.
-//
-// It exists for tests and for an operator who wants the memtable on disk. The
-// engine flushes on its own when the memtable reaches Options.MemTableSize;
-// nothing about correctness depends on this being called.
 func (s *LSMStore) Flush() error {
 	s.closeMu.RLock()
 	defer s.closeMu.RUnlock()
@@ -485,71 +768,74 @@ func (s *LSMStore) Flush() error {
 		return opErr("flush", nil, ErrClosed)
 	}
 
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if s.flushErr != nil {
-		return classify("flush", nil, s.flushErr)
+	if err := func() error {
+		s.writeMu.Lock()
+		defer s.writeMu.Unlock()
+		if s.flushErr != nil {
+			return classify("flush", nil, s.flushErr)
+		}
+		if err := s.flushLocked(); err != nil {
+			s.flushErr = err
+			return classify("flush", nil, err)
+		}
+		return nil
+	}(); err != nil {
+		return err
 	}
-	if err := s.flushLocked(); err != nil {
-		s.flushErr = err
-		return classify("flush", nil, err)
-	}
+	s.compactionSignal()
 	return nil
 }
 
-// flushLocked turns the current memtable into an SSTable. writeMu must be held.
+// flushLocked turns the current memtable into a level-0 SSTable. writeMu must be
+// held.
 //
 // The order is the crash contract, and each step is chosen for what a crash
 // immediately after it leaves behind:
 //
-//	freeze + swap   the memtable stops taking writes and becomes readable as
-//	                an immutable source; a new one takes the writes.
+//	freeze + swap   the memtable stops taking writes and stays readable as an
+//	                immutable source; a fresh one takes the writes.
 //	write to .tmp   a crash here leaves a partial file under a name no reader
-//	                ever consults. Startup deletes it. Nothing is lost,
-//	                because the WAL still holds every mutation in it.
-//	fsync the file  the bytes are on the device before the name exists.
-//	rename          atomic on POSIX: the final name either does not exist or
-//	                names a complete, fsynced file. There is no instant at
-//	                which a reader can see a partial SSTable.
-//	fsync the dir   makes the rename itself durable.
-//	publish         one critical section adds the table and drops the
-//	                immutable memtable, so every mutation is in exactly one
-//	                source at every instant.
+//	                consults and the MANIFEST does not name. Startup deletes it.
+//	fsync the file  the bytes are on the device before any name refers to them.
+//	rename          atomic on POSIX.
+//	fsync the dir   makes the rename durable.
+//	MANIFEST append one record, fsynced. THIS is the instant the file becomes
+//	                part of the database. Before it, the file is an orphan.
+//	publish         one version swap adds the table and drops the immutable
+//	                memtable together.
 //
-// A crash between the rename and the publish is harmless: the file is on disk
-// and complete, and the WAL still holds its contents, so the next startup
-// either uses the file (skipping the replayed prefix) or would have rebuilt
-// the same state from the log.
-//
-// This is synchronous: the writer that triggers it pays for it, and other
-// writers wait. Readers do not — that is what the immutable memtable is for.
-// Making the flush concurrent is a Phase 5 question with a benchmark attached;
-// doing it now would add a scheduler to a phase whose job is to be obviously
-// correct.
+// The difference from Phase 3 is the MANIFEST append. In Phase 3 a complete *.sst
+// was adopted at startup because the directory was the authority; now it is
+// ignored and deleted unless the MANIFEST names it, and the WAL replays its
+// contents instead. Both reconstruct the same logical state — but only one of them
+// also works when the file is a compaction output that was never meant to be live.
 func (s *LSMStore) flushLocked() error {
-	if s.mem.Empty() {
+	s.mu.RLock()
+	cur := s.cur
+	s.mu.RUnlock()
+	if cur == nil {
+		return ErrClosed
+	}
+	if cur.mem.Empty() {
 		return nil
 	}
-	if s.nextNum > maxSSTNumber {
-		return fmt.Errorf("lsm: SSTable number %d would exceed the %d-digit name format",
-			s.nextNum, sstDigits)
-	}
 
-	old := s.mem
+	old := cur.mem
 	old.Freeze()
 	fresh := memtable.New(s.opts.MemTableSeed)
 
-	s.mu.Lock()
-	s.mem = fresh
-	s.imm = append([]*memtable.MemTable{old}, s.imm...)
-	s.mu.Unlock()
+	// Writers continue against the fresh memtable immediately; readers keep
+	// finding the frozen one because it is in imm.
+	s.install(newVersion(fresh, append([]*memtable.MemTable{old}, cur.imm...), cur.files))
 
-	num := s.nextNum
-	tmpPath := filepath.Join(s.dir, sstTempName(num))
-	finalPath := filepath.Join(s.dir, sstName(num))
+	num, err := s.allocFileNumLocked()
+	if err != nil {
+		return err
+	}
+	tmpPath := s.tmpPath(num)
+	finalPath := s.sstPath(num)
 
-	meta, err := sstable.WriteFile(tmpPath, old.NewIterator(),
-		sstable.WriterOptions{BlockSize: s.opts.BlockSize})
+	meta, err := sstable.WriteFile(tmpPath, old.NewIterator(), s.writerOptions())
 	if err != nil {
 		return err
 	}
@@ -566,29 +852,39 @@ func (s *LSMStore) flushLocked() error {
 		return err
 	}
 
-	s.mu.Lock()
-	s.ssts = append(s.ssts, &sstFile{
-		num: num,
-		r:   r,
-		stats: sstable.Stats{
-			NumEntries:  meta.NumEntries,
-			NumBlocks:   meta.NumBlocks,
-			FileSize:    meta.FileSize,
-			SmallestKey: meta.SmallestKey,
-			LargestKey:  meta.LargestKey,
-			SmallestSeq: meta.SmallestSeq,
-			LargestSeq:  meta.LargestSeq,
-		},
-	})
-	s.imm = dropMemtable(s.imm, old)
-	s.mu.Unlock()
+	fm := manifest.FileMeta{
+		Level:       0,
+		Num:         num,
+		Size:        meta.FileSize,
+		NumEntries:  meta.NumEntries,
+		SmallestKey: meta.SmallestKey,
+		LargestKey:  meta.LargestKey,
+		SmallestSeq: meta.SmallestSeq,
+		LargestSeq:  meta.LargestSeq,
+	}
+	var edit manifest.Edit
+	edit.AddFile(fm)
+	edit.SetNextFileNum(s.nextNum)
+	edit.SetLastSequence(s.seq)
+	if err := s.manifest.Append(&edit); err != nil {
+		_ = r.Close()
+		return fmt.Errorf("lsm: recording %s in the manifest: %w", sstName(num), err)
+	}
 
-	s.nextNum++
+	s.mu.RLock()
+	cur2 := s.cur
+	s.mu.RUnlock()
+	if cur2 == nil {
+		_ = r.Close()
+		return ErrClosed
+	}
+	s.install(newVersion(cur2.mem, dropMemtable(cur2.imm, old),
+		append(append([]*sstFile(nil), cur2.files...), &sstFile{meta: fm, r: r, path: finalPath})))
 	return nil
 }
 
 func dropMemtable(list []*memtable.MemTable, m *memtable.MemTable) []*memtable.MemTable {
-	out := list[:0]
+	out := make([]*memtable.MemTable, 0, len(list))
 	for _, e := range list {
 		if e != m {
 			out = append(out, e)
@@ -598,22 +894,6 @@ func dropMemtable(list []*memtable.MemTable, m *memtable.MemTable) []*memtable.M
 }
 
 // ---------------------------------------------------------------- read path
-
-// version is a consistent snapshot of the three places data can live.
-type version struct {
-	mem  *memtable.MemTable
-	imm  []*memtable.MemTable
-	ssts []*sstFile
-}
-
-// snapshot captures the version pointers. Taking all three in one critical
-// section is what guarantees a reader never falls between an immutable
-// memtable being dropped and the SSTable that replaced it being added.
-func (s *LSMStore) snapshot() version {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return version{mem: s.mem, imm: s.imm, ssts: s.ssts}
-}
 
 // Get implements Store.
 func (s *LSMStore) Get(ctx context.Context, key []byte) ([]byte, error) {
@@ -630,7 +910,13 @@ func (s *LSMStore) Get(ctx context.Context, key []byte) ([]byte, error) {
 		return nil, opErr("get", key, ErrClosed)
 	}
 
-	value, kind, found, err := s.lookup(s.snapshot(), key)
+	v := s.acquire()
+	if v == nil {
+		return nil, opErr("get", key, ErrClosed)
+	}
+	defer s.release(v)
+
+	value, kind, found, err := s.lookup(v, key)
 	if err != nil {
 		return nil, classify("get", key, err)
 	}
@@ -644,11 +930,15 @@ func (s *LSMStore) Get(ctx context.Context, key []byte) ([]byte, error) {
 // any version of the key.
 //
 // Stopping at the first source is correct because of two properties that hold
-// together: within one source the internal-key ordering puts the newest
-// version first, and across sources every sequence number in a newer source is
-// greater than every sequence number in an older one. The second is checked at
-// startup (loadSSTables refuses overlapping files) rather than assumed.
-func (s *LSMStore) lookup(v version, key []byte) (value []byte, kind ikey.Kind, found bool, err error) {
+// together: within one source the internal-key ordering puts the newest version
+// first, and across sources every sequence number in a newer source is greater
+// than every sequence number in an older one. The second is checked at startup
+// and maintained by construction — a flush's range is above everything, and a
+// compaction merges a contiguous run of the global sequence ordering.
+//
+// Each SSTable's Bloom filter is consulted inside Reader.Get, before its index
+// and blocks, and may only eliminate the file.
+func (s *LSMStore) lookup(v *version, key []byte) (value []byte, kind ikey.Kind, found bool, err error) {
 	if value, kind, found = v.mem.Get(key, ikey.MaxSeq); found {
 		return value, kind, true, nil
 	}
@@ -657,13 +947,12 @@ func (s *LSMStore) lookup(v version, key []byte) (value []byte, kind ikey.Kind, 
 			return value, kind, true, nil
 		}
 	}
-	for i := len(v.ssts) - 1; i >= 0; i-- {
-		value, kind, found, err := v.ssts[i].r.Get(key, ikey.MaxSeq)
+	for _, f := range v.files {
+		value, kind, found, err := f.r.Get(key, ikey.MaxSeq)
 		if err != nil {
-			// Never degrade a damaged file into "key not found". That would
-			// turn corruption into an ordinary answer and nobody would ever
-			// look.
-			return nil, 0, false, fmt.Errorf("lsm: reading %s: %w", sstName(v.ssts[i].num), err)
+			// Never degrade a damaged file into "key not found". That would turn
+			// corruption into an ordinary answer and nobody would ever look.
+			return nil, 0, false, fmt.Errorf("lsm: reading %s: %w", sstName(f.meta.Num), err)
 		}
 		if found {
 			return value, kind, true, nil
@@ -674,8 +963,13 @@ func (s *LSMStore) lookup(v version, key []byte) (value []byte, kind ikey.Kind, 
 
 // ---------------------------------------------------------------- lifecycle
 
-// SetAppliedIndex durably records applied-index metadata. See AppliedIndex for
-// what it does and does not mean before Phase 9.
+// SetAppliedIndex durably records applied-index metadata.
+//
+// The WAL remains the authority for it, as in Phase 2 and 3. The MANIFEST carries
+// the field too, because docs/DESIGN.md §6 defines it and the snapshot written at
+// each open records the recovered value — but nothing reads it back in preference
+// to the log, and having two authorities for one number would be worse than
+// having the wrong one.
 func (s *LSMStore) SetAppliedIndex(ctx context.Context, a AppliedIndex) error {
 	if err := ctx.Err(); err != nil {
 		return opErr("set-applied-index", nil, err)
@@ -704,8 +998,7 @@ func (s *LSMStore) AppliedIndex() AppliedIndex {
 	return s.applied
 }
 
-// Sync flushes the WAL regardless of the configured sync mode. It does not
-// flush the memtable; see Flush for that.
+// Sync flushes the WAL regardless of the configured sync mode.
 func (s *LSMStore) Sync() error {
 	s.closeMu.RLock()
 	defer s.closeMu.RUnlock()
@@ -717,18 +1010,28 @@ func (s *LSMStore) Sync() error {
 	return classify("sync", nil, s.w.Sync())
 }
 
-// Close flushes the WAL, closes every SSTable and releases the store. It is
-// idempotent.
+// stopCompactor stops the background compactor and waits for it to finish.
+func (s *LSMStore) stopCompactor() {
+	s.stopOnce.Do(func() {
+		close(s.compactQuit)
+		<-s.compactStopped
+	})
+}
+
+// Close stops compaction, flushes the WAL, closes every SSTable and releases the
+// store. It is idempotent.
 //
-// Close does NOT flush the memtable to an SSTable. Everything in it is already
-// in the WAL, so a clean close and a crash recover through exactly the same
-// path — which means the recovery path is exercised by every test that reopens
-// a store, not only by the crash tests.
+// Close does NOT flush the memtable. Everything in it is already in the WAL, so a
+// clean close and a crash recover through exactly the same path — which means the
+// recovery path is exercised by every test that reopens a store.
 //
-// Taking closeMu for write drains in-flight operations first. Without that,
-// closing an SSTable's file underneath a reader would surface as a filesystem
-// error from a Get, and the contract says a Get racing Close returns ErrClosed.
+// The compactor is stopped before closeMu is taken for write, not after. A
+// compaction holds closeMu for read while it runs, so taking the write lock first
+// and then waiting for the compactor would be waiting for a goroutine that is
+// waiting for the lock.
 func (s *LSMStore) Close() error {
+	s.stopCompactor()
+
 	s.closeMu.Lock()
 	defer s.closeMu.Unlock()
 	if s.closed {
@@ -737,21 +1040,9 @@ func (s *LSMStore) Close() error {
 	s.closed = true
 
 	err := s.w.Close()
-	s.closeReaders()
-
-	s.mu.Lock()
-	s.mem = nil
-	s.imm = nil
-	s.ssts = nil
-	s.mu.Unlock()
-
+	s.closeManifest()
+	s.closeAllReaders()
 	return classify("close", nil, err)
-}
-
-func (s *LSMStore) closeReaders() {
-	for _, f := range s.ssts {
-		_ = f.r.Close()
-	}
 }
 
 // ---------------------------------------------------------------- inspection
@@ -766,8 +1057,7 @@ func (s *LSMStore) Recovery() LSMRecovery { return s.recovery }
 func (s *LSMStore) WALStats() wal.Stats { return s.w.Stats() }
 
 // Sequence returns the last assigned sequence number, which is the number of
-// mutations this store has ever accepted (including those replayed from the
-// log at startup).
+// mutations this store has ever accepted.
 func (s *LSMStore) Sequence() uint64 {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -777,57 +1067,138 @@ func (s *LSMStore) Sequence() uint64 {
 // SSTableInfo describes one live SSTable.
 type SSTableInfo struct {
 	Number      uint64
+	Level       int
 	Entries     uint64
 	Blocks      int
 	Bytes       int64
 	SmallestSeq uint64
 	LargestSeq  uint64
+	HasFilter   bool
+	FilterBytes int
+	BlockReads  uint64
+	FilterSkips uint64
 }
 
 // SSTables returns the live tables, oldest first.
 func (s *LSMStore) SSTables() []SSTableInfo {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]SSTableInfo, 0, len(s.ssts))
-	for _, f := range s.ssts {
+	v := s.acquire()
+	if v == nil {
+		return nil
+	}
+	defer s.release(v)
+
+	out := make([]SSTableInfo, 0, len(v.files))
+	for i := len(v.files) - 1; i >= 0; i-- { // v.files is newest-first
+		f := v.files[i]
 		out = append(out, SSTableInfo{
-			Number:      f.num,
-			Entries:     f.stats.NumEntries,
-			Blocks:      f.stats.NumBlocks,
-			Bytes:       f.stats.FileSize,
-			SmallestSeq: f.stats.SmallestSeq,
-			LargestSeq:  f.stats.LargestSeq,
+			Number:      f.meta.Num,
+			Level:       f.meta.Level,
+			Entries:     f.meta.NumEntries,
+			Blocks:      f.r.NumBlocks(),
+			Bytes:       f.meta.Size,
+			SmallestSeq: f.meta.SmallestSeq,
+			LargestSeq:  f.meta.LargestSeq,
+			HasFilter:   f.r.HasFilter(),
+			FilterBytes: int(f.r.Filter().NumBits() / 8),
+			BlockReads:  f.r.BlockReads(),
+			FilterSkips: f.r.FilterSkips(),
 		})
 	}
 	return out
 }
 
+// ReadCounters aggregates the live readers' work counters, for the Bloom
+// measurement in docs/BLOOM.md. They count since each file was opened, so they
+// reset when a compaction replaces a file.
+type ReadCounters struct {
+	BlockReads  uint64
+	FilterSkips uint64
+	Files       int
+	WithFilter  int
+}
+
+// ReadCounters returns the aggregated counters.
+func (s *LSMStore) ReadCounters() ReadCounters {
+	v := s.acquire()
+	if v == nil {
+		return ReadCounters{}
+	}
+	defer s.release(v)
+
+	var rc ReadCounters
+	rc.Files = len(v.files)
+	for _, f := range v.files {
+		rc.BlockReads += f.r.BlockReads()
+		rc.FilterSkips += f.r.FilterSkips()
+		if f.r.HasFilter() {
+			rc.WithFilter++
+		}
+	}
+	return rc
+}
+
+// LevelSummary reports the file count and total bytes per level.
+func (s *LSMStore) LevelSummary() map[int]struct {
+	Files int
+	Bytes int64
+} {
+	v := s.acquire()
+	if v == nil {
+		return nil
+	}
+	defer s.release(v)
+
+	out := map[int]struct {
+		Files int
+		Bytes int64
+	}{}
+	for _, f := range v.files {
+		e := out[f.meta.Level]
+		e.Files++
+		e.Bytes += f.meta.Size
+		out[f.meta.Level] = e
+	}
+	return out
+}
+
+// ManifestNumber returns the live manifest's number.
+func (s *LSMStore) ManifestNumber() uint64 {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.manifest == nil {
+		return 0
+	}
+	return s.manifest.Num()
+}
+
 // MemTableSize returns the current memtable's approximate byte size.
 func (s *LSMStore) MemTableSize() int64 {
 	s.mu.RLock()
-	mem := s.mem
+	v := s.cur
 	s.mu.RUnlock()
-	if mem == nil {
+	if v == nil || v.mem == nil {
 		return 0
 	}
-	return mem.ApproxSize()
+	return v.mem.ApproxSize()
 }
 
 // Snapshot returns every live key and its value.
 //
-// It merges the memtable, any immutable memtables and every SSTable, keeping
-// the version with the highest sequence number per user key and dropping
-// tombstoned keys. It reads every byte of every SSTable, so it is a
-// diagnostic and a test affordance, not part of the Store interface and not
-// something to call on a hot path. There are deliberately no range scans in
-// the client API (ADR-008); this is not one.
+// It merges the memtable, any immutable memtables and every SSTable, keeping the
+// version with the highest sequence number per user key and dropping tombstoned
+// keys. It reads every byte of every SSTable, so it is a diagnostic and a test
+// affordance, not part of the Store interface.
 func (s *LSMStore) Snapshot() (map[string][]byte, error) {
 	s.closeMu.RLock()
 	defer s.closeMu.RUnlock()
 	if s.closed {
 		return nil, opErr("snapshot", nil, ErrClosed)
 	}
-	v := s.snapshot()
+	v := s.acquire()
+	if v == nil {
+		return nil, opErr("snapshot", nil, ErrClosed)
+	}
+	defer s.release(v)
 
 	type versioned struct {
 		seq   uint64
@@ -850,13 +1221,14 @@ func (s *LSMStore) Snapshot() (map[string][]byte, error) {
 			offer(it.Key(), it.Value())
 		}
 	}
-	for _, f := range v.ssts {
+	for _, f := range v.files {
 		it := f.r.NewIterator()
 		for it.Next() {
 			offer(it.Key(), it.Value())
 		}
 		if err := it.Err(); err != nil {
-			return nil, classify("snapshot", nil, fmt.Errorf("lsm: reading %s: %w", sstName(f.num), err))
+			return nil, classify("snapshot", nil,
+				fmt.Errorf("lsm: reading %s: %w", sstName(f.meta.Num), err))
 		}
 	}
 
@@ -869,13 +1241,8 @@ func (s *LSMStore) Snapshot() (map[string][]byte, error) {
 	return out, nil
 }
 
-// Len reports the number of live keys.
-//
-// Like MemStore.Len it exists for tests and metrics and is not part of the
-// Store interface. Unlike MemStore.Len it has to merge every source to answer,
-// so it is O(everything). It returns -1 if the merge failed, which is a value
-// no caller can mistake for a count — reporting 0 for an unreadable store
-// would be exactly the silent degradation this engine refuses elsewhere.
+// Len reports the number of live keys. It returns -1 if the merge failed, which
+// is a value no caller can mistake for a count.
 func (s *LSMStore) Len() int {
 	m, err := s.Snapshot()
 	if err != nil {
