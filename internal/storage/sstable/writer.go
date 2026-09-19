@@ -280,6 +280,22 @@ type Source interface {
 	Value() []byte
 }
 
+// FailableSource is a Source whose iteration can fail partway through.
+//
+// A memtable iterator cannot fail, so Phase 3 did not need this. A compaction's
+// merge iterator reads SSTables and therefore can, and the distinction is
+// load-bearing: Next returning false means "no more entries", and a source that
+// stopped because a block failed its checksum would otherwise be
+// indistinguishable from one that finished. WriteFile would write a short,
+// well-formed, silently incomplete file — the exact shape of data loss this
+// engine is built to refuse.
+//
+// WriteFile checks for this interface and fails if Err is non-nil.
+type FailableSource interface {
+	Source
+	Err() error
+}
+
 // WriteFile creates path, writes every entry from src into it, and fsyncs it.
 //
 // It does NOT rename or publish the file, and it does not fsync the directory.
@@ -306,6 +322,14 @@ func WriteFile(path string, src Source, opts WriterOptions) (Metadata, error) {
 	for src.Next() {
 		if err := w.Add(src.Key(), src.Value()); err != nil {
 			return cleanup(err)
+		}
+	}
+	// A source that stopped because of an error has not finished; writing a
+	// footer over a truncated entry stream would produce a file that is
+	// structurally perfect and missing data.
+	if fs, ok := src.(FailableSource); ok {
+		if err := fs.Err(); err != nil {
+			return cleanup(fmt.Errorf("sstable: writing %s: the entry source failed: %w", path, err))
 		}
 	}
 	meta, err := w.Finish()
