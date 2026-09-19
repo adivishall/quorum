@@ -29,6 +29,8 @@ const (
 	envCount  = "DKV_CRASH_COUNT"  // how many keys to write
 	envEngine = "DKV_CRASH_ENGINE" // "wal" (Phase 2) or "lsm" (Phase 3)
 	envMemTbl = "DKV_CRASH_MEMTBL" // lsm: memtable flush threshold in bytes
+	envL0     = "DKV_CRASH_L0"     // lsm: L0 compaction trigger
+	envNoAuto = "DKV_CRASH_NOAUTO" // lsm: "1" disables the background compactor
 
 	readyLine   = "READY"
 	childTimout = 60 * time.Second
@@ -77,6 +79,18 @@ func childOptions() storage.Options {
 		}
 		opts.MemTableSize = n
 	}
+	if v := os.Getenv(envL0); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "child: bad L0 trigger: %v\n", err)
+			os.Exit(2)
+		}
+		opts.L0CompactionTrigger = n
+	}
+	// The compaction crash test drives compaction explicitly, so that the SIGKILL
+	// lands inside a compaction the test started rather than inside whichever one
+	// the background compactor happened to be running.
+	opts.DisableAutoCompaction = os.Getenv(envNoAuto) == "1"
 	return opts
 }
 

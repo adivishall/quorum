@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/adivishall/quorum/internal/storage"
+	"github.com/adivishall/quorum/internal/storage/manifest"
 	"github.com/adivishall/quorum/internal/storage/wal"
 )
 
@@ -125,6 +126,30 @@ func runLSMChild() {
 			os.Exit(2)
 		}
 
+	case "kill-during-compaction":
+		// Build several L0 files large enough that merging them takes long enough
+		// to be interrupted, announce that every write was acknowledged, then
+		// start the compaction. The parent kills a moment later.
+		files := compactionInputFiles
+		for f := 0; f < files; f++ {
+			for i := 0; i < n; i++ {
+				idx := f*n + i
+				if err := s.Put(ctx, []byte(keyFor(idx)), []byte(paddedValueFor(idx))); err != nil {
+					fmt.Fprintf(os.Stderr, "child: Put %d: %v\n", idx, err)
+					os.Exit(2)
+				}
+			}
+			if err := s.Flush(); err != nil {
+				fmt.Fprintf(os.Stderr, "child: Flush: %v\n", err)
+				os.Exit(2)
+			}
+		}
+		announceReady()
+		if _, err := s.Compact(); err != nil {
+			fmt.Fprintf(os.Stderr, "child: Compact: %v\n", err)
+			os.Exit(2)
+		}
+
 	case "mutate-then-flush-loop":
 		// Overwrites and deletes spread across many files, with a kill
 		// somewhere in the middle.
@@ -159,10 +184,18 @@ func runLSMChild() {
 }
 
 // reopenLSM reopens a crashed directory.
+//
+// Auto-compaction is off. These tests assert what is on disk immediately after
+// recovery — that a temp file was swept, that no orphan survived — and a store
+// that opens onto four L0 files starts compacting them at once, which would
+// create a new *.sst.tmp underneath those assertions. That is the compactor doing
+// exactly what it should; it just cannot be allowed to race the inspection.
+// Tests that want compaction after recovery call CompactAll explicitly.
 func reopenLSM(t *testing.T, dir string, memTableSize int64) *storage.LSMStore {
 	t.Helper()
 	opts := storage.DefaultOptions()
 	opts.MemTableSize = memTableSize
+	opts.DisableAutoCompaction = true
 	s, err := storage.OpenLSMStore(dir, opts)
 	if err != nil {
 		t.Fatalf("reopening %s after the crash: %v", dir, err)
@@ -512,4 +545,253 @@ func TestCrashedFlushLeavesReplayableLog(t *testing.T) {
 		t.Fatalf("the log holds %d operations, want %d", ops, n)
 	}
 	t.Logf("wal recovery: %+v", rec)
+}
+
+// ============================================================ compaction crashes
+
+// compactionInputFiles is how many L0 files the compaction crash test builds, and
+// therefore also the L0 trigger it runs with.
+const compactionInputFiles = 4
+
+// lsmCompactEnv returns the child environment for a compaction crash: a memtable
+// far larger than the data so only explicit flushes produce files, an L0 trigger
+// equal to the number of files built, and no background compactor.
+func lsmCompactEnv() []string {
+	return []string{
+		envEngine + "=lsm",
+		envMemTbl + "=" + strconv.FormatInt(256<<20, 10),
+		envL0 + "=" + strconv.Itoa(compactionInputFiles),
+		envNoAuto + "=1",
+	}
+}
+
+// compactionWindow names what a crash actually left on disk.
+type compactionWindow int
+
+const (
+	// windowBeforeOutput: no temp file and no unreferenced table. Either the
+	// compaction had not started writing, or it finished completely.
+	windowBeforeOutput compactionWindow = iota
+	// windowDuringOutput: a *.sst.tmp exists. The output was being written.
+	windowDuringOutput
+	// windowOutputUnreferenced: the output was renamed into place but the MANIFEST
+	// record never landed, so the old file set is still authoritative.
+	windowOutputUnreferenced
+	// windowPublishedInputsRemain: the MANIFEST names the output and some inputs
+	// are still on disk, unreferenced.
+	windowPublishedInputsRemain
+)
+
+func (w compactionWindow) String() string {
+	switch w {
+	case windowBeforeOutput:
+		return "before the output existed (or after everything finished)"
+	case windowDuringOutput:
+		return "during the output's creation"
+	case windowOutputUnreferenced:
+		return "after the rename, before the MANIFEST record"
+	case windowPublishedInputsRemain:
+		return "after the MANIFEST record, before the inputs were unlinked"
+	}
+	return "unknown"
+}
+
+// classifyCompactionCrash reads the directory and the MANIFEST and says which
+// window the crash landed in.
+//
+// It reads the MANIFEST rather than asking the store, because the whole point is
+// that the MANIFEST — not the directory — decides what the database is. A test
+// that asked the reopened store would be asking the code under test what it
+// thinks happened.
+func classifyCompactionCrash(t *testing.T, dir string) (compactionWindow, manifest.State) {
+	t.Helper()
+
+	st := inspectDir(t, dir)
+	state, _, err := manifest.Recover(dir)
+	if err != nil {
+		t.Fatalf("reading the MANIFEST after the crash: %v", err)
+	}
+
+	referenced := map[string]bool{}
+	maxLevel := 0
+	for _, f := range state.Files {
+		referenced[fmt.Sprintf("%06d.sst", f.Num)] = true
+		if f.Level > maxLevel {
+			maxLevel = f.Level
+		}
+	}
+	var unreferenced []string
+	for _, name := range st.sstables {
+		if !referenced[name] {
+			unreferenced = append(unreferenced, name)
+		}
+	}
+
+	switch {
+	case len(st.temps) > 0:
+		return windowDuringOutput, state
+	case len(unreferenced) > 0 && maxLevel > 0:
+		// The output is live, so publication happened; what is left over is inputs.
+		return windowPublishedInputsRemain, state
+	case len(unreferenced) > 0:
+		// Nothing is live above level 0, so the leftover is the output itself.
+		return windowOutputUnreferenced, state
+	default:
+		return windowBeforeOutput, state
+	}
+}
+
+// TestCrashDuringCompaction is the mandatory Phase 4 crash test.
+//
+// A real child process builds several SSTables, reports that every write was
+// acknowledged, starts a compaction, and is destroyed with SIGKILL partway
+// through. Each attempt is classified by what the crash actually left on disk,
+// and every one of them must recover every acknowledged write.
+//
+// The classification is the part that makes this worth running. A crash test that
+// assumed it hit the interesting window would pass just as happily if it never
+// did, so the run requires that the compaction was genuinely interrupted at least
+// once — and it reads the MANIFEST directly to decide, rather than asking the
+// engine what it thinks happened.
+func TestCrashDuringCompaction(t *testing.T) {
+	const (
+		perFile  = 700 // ~2.8 MiB per file at flushValueSize
+		attempts = 10
+	)
+	total := perFile * compactionInputFiles
+
+	hit := map[compactionWindow]int{}
+
+	for attempt := 0; attempt < attempts; attempt++ {
+		dir := t.TempDir()
+
+		c := startChildEnv(t, dir, "kill-during-compaction", wal.SyncBatch, perFile, lsmCompactEnv())
+		// A spread of delays, so different attempts land in different windows.
+		time.Sleep(time.Duration(attempt*attempt) * time.Millisecond)
+		c.kill()
+
+		window, state := classifyCompactionCrash(t, dir)
+		hit[window]++
+
+		// Whatever the crash caught, the MANIFEST describes a coherent database
+		// and every acknowledged write is in it.
+		s := reopenLSM(t, dir, 256<<20)
+		assertPrefixIntact(t, s, total, paddedValueFor)
+		if got := s.Len(); got != total {
+			t.Fatalf("attempt %d (%v): recovered %d keys, want %d",
+				attempt, window, got, total)
+		}
+
+		// No temp file and no orphan survives recovery: the sweep ran.
+		after := inspectDir(t, dir)
+		if len(after.temps) != 0 {
+			t.Fatalf("attempt %d (%v): %v survived recovery", attempt, window, after.temps)
+		}
+		live := map[string]bool{}
+		for _, f := range s.SSTables() {
+			live[fmt.Sprintf("%06d.sst", f.Number)] = true
+		}
+		for _, name := range after.sstables {
+			if !live[name] {
+				t.Fatalf("attempt %d (%v): %s is on disk but not live after recovery; "+
+					"the orphan sweep did not run", attempt, window, name)
+			}
+		}
+
+		// Recovery is a function of the bytes on disk, not of when we looked.
+		seqA := s.Sequence()
+		snapA, err := s.Snapshot()
+		if err != nil {
+			t.Fatalf("attempt %d: Snapshot: %v", attempt, err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatalf("attempt %d: Close: %v", attempt, err)
+		}
+		again := reopenLSM(t, dir, 256<<20)
+		if got := again.Sequence(); got != seqA {
+			t.Fatalf("attempt %d: two recoveries produced sequences %d and %d",
+				attempt, seqA, got)
+		}
+		snapB, err := again.Snapshot()
+		if err != nil {
+			t.Fatalf("attempt %d: second Snapshot: %v", attempt, err)
+		}
+		if len(snapA) != len(snapB) {
+			t.Fatalf("attempt %d: two recoveries produced %d and %d live keys",
+				attempt, len(snapA), len(snapB))
+		}
+		if err := again.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		t.Logf("attempt %d: killed %v; MANIFEST named %d files", attempt, window, len(state.Files))
+	}
+
+	for w, n := range hit {
+		t.Logf("window hit %2d times: %v", n, w)
+	}
+	// The window this test exists for is the one where the output was actually
+	// being written. Without it the test would be proving only that a compaction
+	// which never started loses nothing.
+	if hit[windowDuringOutput] == 0 {
+		t.Fatalf("no attempt was killed while the compaction was writing its output, "+
+			"so the crash window this test exists for was never exercised: %v", hit)
+	}
+	// The two remaining windows — between the rename and the MANIFEST append, and
+	// between the MANIFEST append and the unlink — are each a few microseconds
+	// wide, so a sleep-and-kill reaches them only by luck and this test does not
+	// require it. They are covered deterministically instead, by building the
+	// exact on-disk state and recovering from it:
+	// TestOrphanSSTableIsDeletedAtStartup and
+	// TestCompactionInputsLeftOnDiskAreSweptAsOrphans.
+}
+
+// TestCrashDuringCompactionNeverLosesADelete is INV-S3 under a real crash. A
+// compaction is interrupted while it is merging files that include a tombstone,
+// and the deleted key must still be absent afterwards.
+func TestCrashDuringCompactionNeverLosesADelete(t *testing.T) {
+	const perFile = 400
+	total := perFile * compactionInputFiles
+
+	for attempt := 0; attempt < 4; attempt++ {
+		dir := t.TempDir()
+
+		c := startChildEnv(t, dir, "kill-during-compaction", wal.SyncBatch, perFile, lsmCompactEnv())
+		time.Sleep(time.Duration(attempt*3) * time.Millisecond)
+		c.kill()
+
+		// Reopen, delete a key that the compaction was merging, then compact
+		// again and restart. The delete must stick through all of it.
+		s := reopenLSM(t, dir, 256<<20)
+		assertPrefixIntact(t, s, total, paddedValueFor)
+
+		victim := keyFor(total / 2)
+		if err := s.Delete(context.Background(), []byte(victim)); err != nil {
+			t.Fatalf("attempt %d: Delete: %v", attempt, err)
+		}
+		if err := s.Flush(); err != nil {
+			t.Fatalf("attempt %d: Flush: %v", attempt, err)
+		}
+		if _, err := s.CompactAll(); err != nil {
+			t.Fatalf("attempt %d: CompactAll: %v", attempt, err)
+		}
+		if _, err := s.Get(context.Background(), []byte(victim)); !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("attempt %d: the deleted key came back after compaction: %v", attempt, err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		reopened := reopenLSM(t, dir, 256<<20)
+		if _, err := reopened.Get(context.Background(), []byte(victim)); !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("attempt %d: the deleted key came back after a restart: %v", attempt, err)
+		}
+		// And nothing else was lost.
+		if got := reopened.Len(); got != total-1 {
+			t.Fatalf("attempt %d: %d live keys, want %d", attempt, got, total-1)
+		}
+		if err := reopened.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
 }

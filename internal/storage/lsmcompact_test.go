@@ -1387,3 +1387,146 @@ func TestMixedFilterAndFilterlessFilesResolveCorrectly(t *testing.T) {
 	assertValue(t, s2, "shared", "new-value")
 	assertAbsent(t, s2, "old000")
 }
+
+// TestCompactionInputsLeftOnDiskAreSweptAsOrphans builds the crash window that a
+// real SIGKILL cannot reliably reach: the MANIFEST record landed, so the output is
+// live, but the process died before unlinking the inputs.
+//
+// That window is a few microseconds wide in the publication protocol, so
+// TestCrashDuringCompaction does not require hitting it. It is built here
+// directly instead: run a real compaction, then put the input files back on disk
+// under their original names, which is byte-for-byte the state such a crash
+// leaves.
+//
+// The recovered database must be the compacted one, and the restored inputs must
+// be swept — not adopted, and not merged back in. An engine that inferred its file
+// set from the directory would resurrect every superseded version they hold.
+func TestCompactionInputsLeftOnDiskAreSweptAsOrphans(t *testing.T) {
+	dir := t.TempDir()
+	opts := manualCompactOpts(storage.DefaultMemTableSize, 2)
+
+	s := openLSM(t, dir, opts)
+
+	// Two files, the second overwriting the first's key, so an input coming back
+	// from the dead would be visible as a stale value.
+	mustPut(t, s, "k", "stale")
+	mustPut(t, s, "only-in-input", "present")
+	mustFlush(t, s)
+	mustPut(t, s, "k", "current")
+	mustFlush(t, s)
+
+	// Keep the inputs' bytes before the compaction deletes them.
+	inputs := map[string][]byte{}
+	for _, name := range sstFiles(t, dir) {
+		raw, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		inputs[name] = raw
+	}
+	if len(inputs) != 2 {
+		t.Fatalf("expected 2 input files, got %d", len(inputs))
+	}
+
+	if !mustCompact(t, s) {
+		t.Fatal("compaction did not run")
+	}
+	output := s.SSTables()
+	if len(output) != 1 {
+		t.Fatalf("expected one output file, got %+v", output)
+	}
+	assertValue(t, s, "k", "current")
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now the crash state: the output is live in the MANIFEST, and the inputs are
+	// back on disk because nothing got round to unlinking them.
+	for name, raw := range inputs {
+		if err := os.WriteFile(filepath.Join(dir, name), raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(sstFiles(t, dir)); got != 3 {
+		t.Fatalf("%d files on disk, want 3 (the output plus two restored inputs)", got)
+	}
+
+	reopened := openLSM(t, dir, opts)
+	defer func() { _ = reopened.Close() }()
+
+	// The MANIFEST decided: one live file, the compaction output.
+	live := reopened.SSTables()
+	if len(live) != 1 || live[0].Number != output[0].Number {
+		t.Fatalf("live files = %+v, want only the compaction output %d", live, output[0].Number)
+	}
+	if got := reopened.Recovery().OrphansRemoved; got != 2 {
+		t.Fatalf("OrphansRemoved = %d, want 2", got)
+	}
+	if got := len(sstFiles(t, dir)); got != 1 {
+		t.Fatalf("%d files on disk after recovery, want 1", got)
+	}
+
+	// And the stale value the inputs held did not come back.
+	assertValue(t, reopened, "k", "current")
+	assertValue(t, reopened, "only-in-input", "present")
+}
+
+// TestCompactionOutputWithoutAManifestRecordIsIgnored is the other narrow window:
+// the output was renamed into place but the MANIFEST append never happened, so the
+// old file set is still the database.
+//
+// The output is a complete, valid, fsynced SSTable. It is ignored anyway, because
+// the MANIFEST does not name it — which is the whole distinction between Phase 3's
+// directory scan and Phase 4's authority.
+func TestCompactionOutputWithoutAManifestRecordIsIgnored(t *testing.T) {
+	dir := t.TempDir()
+	opts := manualCompactOpts(storage.DefaultMemTableSize, 2)
+
+	// Build a real compaction output in a scratch directory, so the file is
+	// genuinely one this engine produced rather than a hand-made fixture.
+	scratch := t.TempDir()
+	src := openLSM(t, scratch, opts)
+	mustPut(t, src, "k", "from the orphaned output")
+	mustPut(t, src, "ghost", "should never be visible")
+	mustFlush(t, src)
+	mustPut(t, src, "pad", "v")
+	mustFlush(t, src)
+	if !mustCompact(t, src) {
+		t.Fatal("the scratch compaction did not run")
+	}
+	outNum := src.SSTables()[0].Number
+	outBytes, err := os.ReadFile(filepath.Join(scratch, fmt.Sprintf("%06d.sst", outNum)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The real database, with its own data.
+	s := openLSM(t, dir, opts)
+	mustPut(t, s, "k", "the real value")
+	mustFlush(t, s)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Drop the complete output in under a plausible name, with no MANIFEST record.
+	orphan := filepath.Join(dir, "000500.sst")
+	if err := os.WriteFile(orphan, outBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := openLSM(t, dir, opts)
+	defer func() { _ = reopened.Close() }()
+
+	if _, err := os.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("an unreferenced compaction output survived startup")
+	}
+	if got := reopened.Recovery().OrphansRemoved; got != 1 {
+		t.Fatalf("OrphansRemoved = %d, want 1", got)
+	}
+	// The database is what the MANIFEST said, not what was on disk.
+	assertValue(t, reopened, "k", "the real value")
+	assertAbsent(t, reopened, "ghost")
+}
