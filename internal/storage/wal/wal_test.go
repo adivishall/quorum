@@ -731,3 +731,65 @@ func TestRecordKindsAreDistinct(t *testing.T) {
 			wal.KindWriteBatch, wal.KindAppliedIndex)
 	}
 }
+
+// TestSyncCounterReflectsBatchAndAlways proves the fsync counter that the WAL
+// sync-mode benchmark relies on: off never syncs, always syncs per append, and
+// batch with a small SyncBytes threshold syncs several times across a workload
+// that crosses that threshold repeatedly.
+func TestSyncCounterReflectsBatchAndAlways(t *testing.T) {
+	value := bytes.Repeat([]byte("v"), 100)
+	appendN := func(w *wal.WAL, n int) {
+		t.Helper()
+		for i := 0; i < n; i++ {
+			op := wal.Op{Kind: wal.OpPut, Key: []byte("k"), Value: value}
+			if err := w.AppendBatch(wal.Batch{op}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	t.Run("off never syncs", func(t *testing.T) {
+		o := wal.DefaultOptions()
+		o.SyncMode = wal.SyncOff
+		w, err := wal.Create(t.TempDir(), o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = w.Close() }()
+		appendN(w, 500)
+		if got := w.Stats().Syncs; got != 0 {
+			t.Fatalf("off performed %d syncs, want 0", got)
+		}
+	})
+
+	t.Run("always syncs every append", func(t *testing.T) {
+		o := wal.DefaultOptions()
+		o.SyncMode = wal.SyncAlways
+		w, err := wal.Create(t.TempDir(), o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = w.Close() }()
+		appendN(w, 300)
+		if got := w.Stats().Syncs; got != 300 {
+			t.Fatalf("always performed %d syncs over 300 appends, want 300", got)
+		}
+	})
+
+	t.Run("batch syncs when SyncBytes is crossed", func(t *testing.T) {
+		o := wal.DefaultOptions()
+		o.SyncMode = wal.SyncBatch
+		o.SyncBytes = 8 << 10      // small threshold
+		o.SyncInterval = time.Hour // isolate byte-triggered flushes from the timer
+		w, err := wal.Create(t.TempDir(), o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = w.Close() }()
+		// 500 records of ~100B+framing well exceed several 8 KiB windows.
+		appendN(w, 500)
+		if got := w.Stats().Syncs; got < 3 {
+			t.Fatalf("batch performed only %d syncs, expected several byte-triggered flushes", got)
+		}
+	})
+}

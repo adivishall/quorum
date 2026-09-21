@@ -154,6 +154,7 @@ type WAL struct {
 	seg      uint64 // active segment number
 	segBytes int64  // bytes written to the active segment
 	unsynced int64  // bytes written since the last flush
+	syncs    int64  // count of fsyncs performed (for measurement; guarded by mu)
 	closed   bool
 
 	// syncErr latches a failed flush. A background flush that fails means the
@@ -325,6 +326,7 @@ func (w *WAL) syncLocked() error {
 		return w.syncErr
 	}
 	w.unsynced = 0
+	w.syncs++ // count fsyncs so a benchmark can prove a batch flush happened
 	return nil
 }
 
@@ -408,6 +410,7 @@ type Stats struct {
 	ActiveSegment   uint64
 	ActiveBytes     int64
 	UnsyncedBytes   int64
+	Syncs           int64 // fsyncs performed since the WAL was opened
 	SyncMode        SyncMode
 	FullSyncEnabled bool
 }
@@ -421,6 +424,7 @@ func (w *WAL) Stats() Stats {
 		ActiveSegment:   w.seg,
 		ActiveBytes:     w.segBytes,
 		UnsyncedBytes:   w.unsynced,
+		Syncs:           w.syncs,
 		SyncMode:        w.opts.SyncMode,
 		FullSyncEnabled: w.fullSyncOK,
 	}
