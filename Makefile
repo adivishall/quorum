@@ -6,7 +6,7 @@ GO      ?= go
 PKGS    := ./...
 BIN     := bin
 
-.PHONY: all build test race vet fmt fmtcheck checkignore integration bench tidy clean check
+.PHONY: all build test race vet fmt fmtcheck checkignore integration bench benchsuite dkvbench tidy clean check
 
 all: check
 
@@ -26,9 +26,27 @@ race:
 integration:
 	$(GO) test -race -count=1 -v ./tests/integration/
 
-## bench — indicative measurements; Phase 5 is where benchmarking is done properly
+## bench — the Go micro-benchmarks (testing.B). Quick order-of-magnitude checks.
 bench:
-	$(GO) test -run='^$$' -bench=. -benchtime=2000x ./internal/storage/...
+	$(GO) test -run='^$$' -bench=. -benchmem -benchtime=2000x ./internal/storage/...
+
+## dkvbench — build the Phase 5 workload orchestrator
+dkvbench:
+	$(GO) build -o "$(BIN)/dkvbench" ./cmd/dkvbench
+
+## benchsuite — run the full Phase 5 benchmark suite and write JSON results.
+## Reproduces the numbers in docs/BENCHMARKS.md; see that document for the
+## methodology. Override DATASET/VALUE/RUNS/SEED/BENCHDIR/BENCHOUT as needed.
+DATASET  ?= 100000
+VALUE    ?= 100
+RUNS     ?= 5
+SEED     ?= 1
+BENCHDIR ?= $(shell mktemp -d)/dkvbench
+BENCHOUT ?= bench/results/latest.json
+benchsuite: dkvbench
+	@mkdir -p bench/results
+	"$(BIN)/dkvbench" -suite all -dataset $(DATASET) -value $(VALUE) \
+		-runs $(RUNS) -seed $(SEED) -dir "$(BENCHDIR)" -out "$(BENCHOUT)"
 
 ## vet — static analysis
 vet:
