@@ -88,6 +88,8 @@ type Aggregate struct {
 	OpsPerSecMed float64 `json:"ops_per_sec_median"`
 	OpsPerSecMin float64 `json:"ops_per_sec_min"`
 	OpsPerSecMax float64 `json:"ops_per_sec_max"`
+	P50USMed     float64 `json:"latency_us_p50_median"`
+	P95USMed     float64 `json:"latency_us_p95_median"`
 	P99USMed     float64 `json:"latency_us_p99_median"`
 	SpreadPct    float64 `json:"ops_per_sec_spread_pct"`
 }
@@ -101,14 +103,20 @@ func (s RunSet) Summary() Aggregate {
 		return a
 	}
 	ops := make([]float64, len(s.Runs))
+	p50 := make([]float64, len(s.Runs))
+	p95 := make([]float64, len(s.Runs))
 	p99 := make([]float64, len(s.Runs))
 	for i, r := range s.Runs {
 		ops[i] = r.OpsPerSec
+		p50[i] = r.Latency.P50US
+		p95[i] = r.Latency.P95US
 		p99[i] = r.Latency.P99US
 	}
 	a.OpsPerSecMed = median(ops)
 	a.OpsPerSecMin = min(ops)
 	a.OpsPerSecMax = max(ops)
+	a.P50USMed = median(p50)
+	a.P95USMed = median(p95)
 	a.P99USMed = median(p99)
 	if a.OpsPerSecMed > 0 {
 		a.SpreadPct = (a.OpsPerSecMax - a.OpsPerSecMin) / a.OpsPerSecMed * 100

@@ -1,8 +1,8 @@
 # binaries
 /bin/
 /dist/
-dkvd
-dkvbench
+/dkvd
+/dkvbench
 
 # test / runtime data
 *.test

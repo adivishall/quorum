@@ -61,23 +61,24 @@ func SnapshotStorage(s *storage.LSMStore, dir string) StorageMetrics {
 	}
 }
 
-// walBytesOnDisk sums the sizes of the WAL segment files (%06d.log) in dir. It
-// returns 0 if the directory cannot be read; a benchmark reports the number it
-// measured and does not fail on an unreadable directory.
+// walBytesOnDisk sums the sizes of the WAL segment files (%06d.log) under dir.
+// The engine keeps them in a "wal" subdirectory, so the search is recursive and
+// finds them wherever they live; the only .log files the engine writes are WAL
+// segments. Because the WAL is never truncated in this phase, this sum is the
+// cumulative bytes the WAL wrote — a physical measurement, not an estimate. It
+// returns 0 if the tree cannot be read; a benchmark reports what it measured
+// rather than failing on an unreadable directory.
 func walBytesOnDisk(dir string) int64 {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return 0
-	}
 	var total int64
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".log") {
-			continue
+	_ = filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".log") {
+			return nil
 		}
-		if info, err := e.Info(); err == nil {
+		if info, err := d.Info(); err == nil {
 			total += info.Size()
 		}
-	}
+		return nil
+	})
 	return total
 }
 
