@@ -27,7 +27,14 @@ func (h *harness) reopen(dir string, sp storeSpec) (time.Duration, storage.LSMRe
 }
 
 // suiteScaling measures how build time, read latency, restart time and on-disk
-// size move with the dataset size across two orders of magnitude.
+// size move with the dataset size across two orders of magnitude. Build
+// throughput is a wall-clock timing, so it is measured h.runs times per size
+// (fresh DB, identical deterministic workload each run) and reported as a median
+// with min/max/spread, like the other timing suites. The read latency, on-disk
+// size and reopen time are structural properties of the built dataset and are
+// sampled once from the representative (last) build, which is identical across
+// runs because the sequential build is deterministic; §3.2 and §3.10 carry the
+// repeated-timing get and reopen numbers.
 func (h *harness) suiteScaling() error {
 	h.section("DATASET size scaling (§3.5)")
 	sizes := []int{10_000, 100_000, 1_000_000}
@@ -35,55 +42,84 @@ func (h *harness) suiteScaling() error {
 	sp.sync = wal.SyncOff // isolate engine cost from device flush across sizes
 	sp.memtable = 4 << 20
 
-	fmt.Fprintf(h.out, "  %-10s %12s %12s %12s %12s %10s\n", "dataset", "build ops/s", "get p99 us", "reopen ms", "on-disk MB", "sstables")
+	fmt.Fprintf(h.out, "  %-10s %14s %8s %12s %12s %12s %10s\n", "dataset", "build ops/s med", "spread", "get p99 us", "reopen ms", "on-disk MB", "sstables")
 	for _, n := range sizes {
 		ks := bench.NewKeyspace("key", n)
-		dir, err := h.dataDir(fmt.Sprintf("scale-%d", n))
-		if err != nil {
-			return err
-		}
-		s, err := storage.OpenLSMStore(dir, sp.options())
-		if err != nil {
-			return err
-		}
-		build, err := bench.PutSequential(ctx, s, ks, h.valueSize, 0, n)
-		if err != nil {
-			_ = s.Close()
-			return err
-		}
-		if err := s.Flush(); err != nil {
-			_ = s.Close()
-			return err
-		}
-		if _, err := s.CompactAll(); err != nil {
-			_ = s.Close()
-			return err
-		}
-		get, err := bench.GetRandom(ctx, s, ks, n, n, h.concurrency, h.seed, false)
-		if err != nil {
-			_ = s.Close()
-			return err
-		}
-		diskBytes := bench.DirBytes(dir)
-		sstables := len(s.SSTables())
-		sm := bench.SnapshotStorage(s, dir)
-		_ = s.Close()
-
-		reopenD, _, _, err := h.reopen(dir, sp)
-		if err != nil {
-			return err
-		}
-
 		cfg := sp.config(n, ks.KeyBytes(), h.valueSize, h.concurrency, "scaling", "", h.onTmpfs)
-		br := build.Result(fmt.Sprintf("scaling build n=%d", n))
-		h.record(br, cfg, h.seed, 0, sm, "sequential build, fresh DB")
-		gr := get.Result(fmt.Sprintf("scaling get n=%d", n))
-		h.record(gr, cfg, h.seed, 0, sm, "compacted, warm")
-		rr := bench.NewResult(fmt.Sprintf("scaling reopen n=%d", n), 0, 0, reopenD)
-		h.record(rr, cfg, h.seed, 0, sm, "restart time, WAL fully replayed")
 
-		fmt.Fprintf(h.out, "  %-10d %12.0f %12.1f %12.1f %12.2f %10d\n",
-			n, br.OpsPerSec, gr.Latency.P99US, float64(reopenD.Microseconds())/1000.0,
+		var set bench.RunSet
+		set.Benchmark = fmt.Sprintf("scaling build n=%d", n)
+
+		// Structural samples, filled from the representative (last) build.
+		var (
+			gr        bench.Result
+			reopenD   time.Duration
+			diskBytes int64
+			sstables  int
+			sm        bench.StorageMetrics
+		)
+
+		for i := 0; i < h.runs; i++ {
+			seed := h.seed + int64(i)
+			dir, err := h.dataDir(fmt.Sprintf("scale-%d-r%d", n, i))
+			if err != nil {
+				return err
+			}
+			s, err := storage.OpenLSMStore(dir, sp.options())
+			if err != nil {
+				return err
+			}
+			// Only the build loop is timed; the fresh DB open above is setup.
+			build, err := bench.PutSequential(ctx, s, ks, h.valueSize, 0, n)
+			if err != nil {
+				_ = s.Close()
+				return err
+			}
+			br := build.Result(set.Benchmark)
+			br = h.record(br, cfg, seed, i, bench.SnapshotStorage(s, dir), "sequential build, fresh DB")
+			set.Add(br)
+
+			if i < h.runs-1 {
+				_ = s.Close()
+				continue
+			}
+			// Representative build: flush + compact, then take the structural
+			// read-latency / on-disk / reopen samples. These steps run after the
+			// build was already timed and recorded, so they never enter the
+			// build interval.
+			if err := s.Flush(); err != nil {
+				_ = s.Close()
+				return err
+			}
+			if _, err := s.CompactAll(); err != nil {
+				_ = s.Close()
+				return err
+			}
+			get, err := bench.GetRandom(ctx, s, ks, n, n, h.concurrency, h.seed, false)
+			if err != nil {
+				_ = s.Close()
+				return err
+			}
+			gr = get.Result(fmt.Sprintf("scaling get n=%d", n))
+			diskBytes = bench.DirBytes(dir)
+			sstables = len(s.SSTables())
+			sm = bench.SnapshotStorage(s, dir)
+			_ = s.Close()
+
+			reopenD, _, _, err = h.reopen(dir, sp)
+			if err != nil {
+				return err
+			}
+		}
+
+		a := set.Summary()
+		h.record(gr, cfg, h.seed, 0, sm, "compacted, warm; structural sample from representative build")
+		rr := bench.NewResult(fmt.Sprintf("scaling reopen n=%d", n), 0, 0, reopenD)
+		h.record(rr, cfg, h.seed, 0, sm, "restart time, WAL fully replayed; structural sample from representative build")
+
+		h.aggRow(set.Benchmark, a)
+		fmt.Fprintf(h.out, "  %-10d %14.0f %7.0f%% %12.1f %12.1f %12.2f %10d\n",
+			n, a.OpsPerSecMed, a.SpreadPct, gr.Latency.P99US, float64(reopenD.Microseconds())/1000.0,
 			float64(diskBytes)/(1<<20), sstables)
 	}
 	return nil
