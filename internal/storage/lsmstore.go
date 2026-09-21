@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/adivishall/quorum/internal/storage/ikey"
 	"github.com/adivishall/quorum/internal/storage/manifest"
@@ -107,6 +108,7 @@ type LSMStore struct {
 
 	compactMu      sync.Mutex
 	compactStats   compactionCounters
+	flushStats     flushCounters
 	compactWake    chan struct{}
 	compactQuit    chan struct{}
 	compactStopped chan struct{}
@@ -899,6 +901,15 @@ func (s *LSMStore) flushLocked() error {
 	}
 	s.install(newVersion(cur2.mem, dropMemtable(cur2.imm, old),
 		append(append([]*sstFile(nil), cur2.files...), &sstFile{meta: fm, r: r, path: finalPath})))
+
+	// Record the flush's output. This is the flush half of the bytes the engine
+	// writes to disk; compaction's half is in CompactionStats. Together they are
+	// what a write-amplification measurement divides by the logical bytes the
+	// client stored (docs/BENCHMARKS.md §3.8). Recorded only on the success path,
+	// so a crashed flush's partial .tmp is never counted.
+	s.flushStats.flushes.Add(1)
+	s.flushStats.bytes.Add(meta.FileSize)
+	s.flushStats.entries.Add(int64(meta.NumEntries))
 	return nil
 }
 
@@ -1124,6 +1135,33 @@ func (s *LSMStore) SSTables() []SSTableInfo {
 		})
 	}
 	return out
+}
+
+// flushCounters is the atomic form of FlushStats held by the store.
+type flushCounters struct {
+	flushes atomic.Int64
+	bytes   atomic.Int64
+	entries atomic.Int64
+}
+
+// FlushStats records what flushing has written since the store was opened: the
+// memtable-to-L0-SSTable half of the engine's physical writes. Compaction's half
+// is in CompactionStats. Together they let a write-amplification measurement
+// (docs/BENCHMARKS.md §3.8) account for every SSTable byte the engine produced,
+// not only the ones still live. Counted only on the flush success path.
+type FlushStats struct {
+	Flushes int64
+	Bytes   int64
+	Entries int64
+}
+
+// FlushStats returns the flush counters.
+func (s *LSMStore) FlushStats() FlushStats {
+	return FlushStats{
+		Flushes: s.flushStats.flushes.Load(),
+		Bytes:   s.flushStats.bytes.Load(),
+		Entries: s.flushStats.entries.Load(),
+	}
 }
 
 // ReadCounters aggregates the live readers' work counters, for the Bloom

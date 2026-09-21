@@ -1350,3 +1350,74 @@ func TestConcurrentReadsAcrossFlushPublication(t *testing.T) {
 	}
 	t.Logf("%d readers ran across %d SSTable publications", readers, len(s.SSTables()))
 }
+
+// TestFlushStatsAccountForEveryFlushedTable checks the flush counters that the
+// write-amplification measurement relies on. With compaction disabled, every
+// byte a flush writes is still live, so the counter must equal the sum of the
+// live tables' sizes, and the flush count must equal the number of flushes.
+func TestFlushStatsAccountForEveryFlushedTable(t *testing.T) {
+	dir := t.TempDir()
+	s := openLSM(t, dir, lsmOpts(1<<20))
+
+	const flushes = 5
+	for i := 0; i < flushes; i++ {
+		flushWith(t, s, fmt.Sprintf("key%03d", i), fmt.Sprintf("value-%03d", i))
+	}
+
+	fs := s.FlushStats()
+	if fs.Flushes != flushes {
+		t.Fatalf("Flushes = %d, want %d", fs.Flushes, flushes)
+	}
+
+	var liveBytes int64
+	var liveEntries uint64
+	for _, tbl := range s.SSTables() {
+		liveBytes += tbl.Bytes
+		liveEntries += tbl.Entries
+	}
+	if fs.Bytes != liveBytes {
+		t.Fatalf("flushed bytes = %d, live SSTable bytes = %d; with no compaction they must match", fs.Bytes, liveBytes)
+	}
+	if fs.Entries != int64(liveEntries) {
+		t.Fatalf("flushed entries = %d, live entries = %d", fs.Entries, liveEntries)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestFlushStatsCountFlushOutputSeparatelyFromCompaction checks that a
+// compaction does not disturb the flush counter: it counts what flushing wrote,
+// not what is currently on disk. After compaction the live bytes are smaller
+// than the flushed bytes, and the flushed total must be unchanged.
+func TestFlushStatsCountFlushOutputSeparatelyFromCompaction(t *testing.T) {
+	dir := t.TempDir()
+	s := openLSM(t, dir, compactOpts(1<<20, 3))
+
+	// Overwrite the same keys across several flushes so a compaction has real
+	// versions to drop and the compacted output is smaller than the inputs.
+	for gen := 0; gen < 4; gen++ {
+		for k := 0; k < 3; k++ {
+			mustPut(t, s, fmt.Sprintf("key%02d", k), fmt.Sprintf("gen%02d", gen))
+		}
+		mustFlush(t, s)
+	}
+	mustCompactAll(t, s)
+
+	fs := s.FlushStats()
+	cs := s.CompactionStats()
+	if cs.Runs == 0 {
+		t.Fatal("expected at least one compaction to have run")
+	}
+	if fs.Flushes < 4 {
+		t.Fatalf("Flushes = %d, want >= 4", fs.Flushes)
+	}
+	// Flushed bytes count what flushing produced, which is strictly more than
+	// what compaction left live once versions are dropped.
+	if cs.OutputBytes >= fs.Bytes {
+		t.Fatalf("compaction output %d not smaller than flush output %d; the versions should have been dropped", cs.OutputBytes, fs.Bytes)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
