@@ -20,6 +20,7 @@ type Config struct {
 	Workload        string `json:"workload"`
 	WorkloadRatio   string `json:"workload_ratio,omitempty"`
 	SyncMode        string `json:"sync_mode"`
+	WALSyncBytes    int64  `json:"wal_sync_bytes,omitempty"`
 	MemTableBytes   int64  `json:"memtable_bytes"`
 	BlockBytes      int    `json:"block_bytes"`
 	BloomBitsPerKey int    `json:"bloom_bits_per_key"`

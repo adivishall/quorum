@@ -15,6 +15,7 @@ type StorageMetrics struct {
 	SSTables          int    `json:"sstables"`
 	LiveBytes         int64  `json:"live_sstable_bytes"`
 	WALBytes          int64  `json:"wal_bytes_on_disk"`
+	WALSyncs          int64  `json:"wal_syncs"`
 	FlushCount        int64  `json:"flush_count"`
 	FlushBytes        int64  `json:"flush_bytes"`
 	FlushEntries      int64  `json:"flush_entries"`
@@ -47,6 +48,7 @@ func SnapshotStorage(s *storage.LSMStore, dir string) StorageMetrics {
 		SSTables:          len(s.SSTables()),
 		LiveBytes:         live,
 		WALBytes:          walBytesOnDisk(dir),
+		WALSyncs:          s.WALStats().Syncs,
 		FlushCount:        fs.Flushes,
 		FlushBytes:        fs.Bytes,
 		FlushEntries:      fs.Entries,

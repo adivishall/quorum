@@ -8,9 +8,10 @@ import (
 // Latencies collects per-operation durations and computes percentiles exactly.
 //
 // It stores every sample rather than bucketing into a histogram. That is a
-// deliberate, *bounded* trade, not a silent one: memory is exactly 8 bytes per
-// recorded operation (one int64), so a run of N operations costs 8N bytes and
-// ApproxBytes reports it. The benchmark suite's operation counts are bounded by
+// deliberate, *bounded* trade, not a silent one: the sample payload is 8 bytes
+// per recorded operation (one int64), so a run of N operations holds 8N bytes of
+// samples (plus slice-growth and per-worker overhead), and ApproxBytes reports
+// that payload. The benchmark suite's operation counts are bounded by
 // design — the largest is one read per key over a 1,000,000-key dataset, i.e.
 // 1,000,000 samples ≈ 8 MB, split across workers — so the whole set of samples
 // plus one sort is affordable, and in return the percentiles are exact with no
@@ -47,10 +48,14 @@ func (l *Latencies) Merge(other *Latencies) {
 // Len is the number of samples.
 func (l *Latencies) Len() int { return len(l.ns) }
 
-// ApproxBytes is the memory the samples occupy: 8 bytes each. It makes the
-// collector's memory a measurable quantity a benchmark can report or bound,
-// rather than a claim in a comment (requirement: no silent unbounded latency
-// collector). It counts the backing array's length, not its capacity.
+// ApproxBytes is the sample payload the collector holds: 8 bytes per recorded
+// operation (one int64), counted over the backing array's length. It is the
+// dominant, measurable term — not a claim of total Go memory. The real footprint
+// is somewhat larger: slice capacity is over-allocated as the array grows, each
+// worker holds its own Latencies, and Stats sorts in place. Those are constant
+// or small-multiple overheads on top of this payload; ApproxBytes exists to make
+// the payload a reported number rather than a comment (requirement: no silent
+// unbounded latency collector), not to claim the process uses exactly 8N bytes.
 func (l *Latencies) ApproxBytes() int64 { return int64(len(l.ns)) * 8 }
 
 // LatencyStats is the summary of a set of samples, in microseconds.

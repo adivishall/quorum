@@ -227,6 +227,7 @@ func Mixed(ctx context.Context, s storage.Store, ks Keyspace, mix Mix, valueSize
 		workers = 1
 	}
 	perWorker := make([]*Latencies, workers)
+	bytesMoved := make([]int64, workers)
 	errs := make([]error, workers)
 	var wg sync.WaitGroup
 	start := time.Now()
@@ -242,9 +243,11 @@ func Mixed(ctx context.Context, s storage.Store, ks Keyspace, mix Mix, valueSize
 			lat := NewLatencies(count)
 			val := make([]byte, valueSize)
 			var key []byte
+			var moved int64
 			for j := 0; j < count; j++ {
 				idx := r.Intn(live)
 				key = ks.AppendKey(key[:0], idx)
+				kb := int64(len(key))
 				switch mix.Pick(r) {
 				case OpWrite:
 					FillValue(val, idx)
@@ -253,6 +256,8 @@ func Mixed(ctx context.Context, s storage.Store, ks Keyspace, mix Mix, valueSize
 						errs[w] = fmt.Errorf("mixed put %d: %w", idx, err)
 					}
 					lat.Record(time.Since(t0))
+					// A write moves the key and the value.
+					moved += kb + int64(valueSize)
 				case OpDelete:
 					t0 := time.Now()
 					err := s.Delete(ctx, key)
@@ -260,19 +265,26 @@ func Mixed(ctx context.Context, s storage.Store, ks Keyspace, mix Mix, valueSize
 					if err != nil {
 						errs[w] = fmt.Errorf("mixed delete %d: %w", idx, err)
 					}
+					// A delete moves only the key (a tombstone has no value).
+					moved += kb
 				default: // OpRead
 					t0 := time.Now()
-					_, err := s.Get(ctx, key)
+					v, err := s.Get(ctx, key)
 					lat.Record(time.Since(t0))
 					if err != nil && !errors.Is(err, storage.ErrNotFound) {
 						errs[w] = fmt.Errorf("mixed get %d: %w", idx, err)
 					}
+					// A read moves the key in and whatever value came back
+					// (zero on a miss). Per-operation accounting, not a flat
+					// key+value for every op — GET, PUT and DELETE differ.
+					moved += kb + int64(len(v))
 				}
 				if errs[w] != nil {
 					break
 				}
 			}
 			perWorker[w] = lat
+			bytesMoved[w] = moved
 		}(w)
 	}
 	wg.Wait()
@@ -283,8 +295,10 @@ func Mixed(ctx context.Context, s storage.Store, ks Keyspace, mix Mix, valueSize
 		}
 	}
 	merged := NewLatencies(n)
-	for _, l := range perWorker {
-		merged.Merge(l)
+	var totalBytes int64
+	for w := 0; w < workers; w++ {
+		merged.Merge(perWorker[w])
+		totalBytes += bytesMoved[w]
 	}
-	return PhaseResult{Ops: int64(n), Bytes: int64(n) * int64(ks.KeyBytes()+valueSize), Elapsed: elapsed, Lat: merged}, nil
+	return PhaseResult{Ops: int64(n), Bytes: totalBytes, Elapsed: elapsed, Lat: merged}, nil
 }
