@@ -217,3 +217,51 @@ an unbounded number of files. At ~60 bytes per `AddFile` that is roughly a milli
 edit, which is far beyond anything this engine produces. The deviation from a literal reading of §6
 is also a documentation cost: §6's table now describes tag numbers rather than record kinds, and
 this ADR is the record of why.
+
+## ADR-011 — Benchmark methodology: exact percentiles, storage-level write amplification, one flush counter
+
+**Decision.** Phase 5's harness (`internal/bench`, `cmd/dkvbench`) makes four choices worth
+recording, and adds exactly one instrumentation hook to the engine.
+
+1. **Latencies are stored, not bucketed.** Every operation's duration is kept and the samples are
+   sorted once at the end; percentiles use the **nearest-rank** method (the p-th percentile is the
+   sample at 1-based rank `ceil(p/100 × n)`). At the operation counts these benchmarks run (millions
+   at most), that is a few MB and one sort per benchmark.
+
+2. **Write amplification is a storage-engine metric with an explicit formula.** WA = physical bytes
+   the engine wrote / logical bytes the client stored, where physical = WAL segment bytes + flushed
+   SSTable bytes + cumulative compaction-output bytes (`docs/BENCHMARKS.md` §3.8). It is stated to be
+   *not* a filesystem-level physical-write count.
+
+3. **One flush counter was added to the engine.** `FlushStats` (flushes, bytes, entries) is the one
+   quantity Phase 5 needed that the engine did not already expose: compaction already counted its
+   input and output bytes, but the flush half of the engine's writes was uncounted, and write
+   amplification needs both. It is recorded only on the flush success path.
+
+4. **Every measured benchmark repeats and reports variance;** no run modifies the engine's semantics.
+
+**Alternatives.** (a) An HdrHistogram-style bucketed latency recorder. (b) A vaguer single
+"write amplification" number, or a filesystem-level `iostat`-style physical count. (c) Reconstructing
+flush bytes after the fact from live SSTable sizes instead of a counter. (d) A general metrics
+framework.
+
+**Why not (a).** Bucketing introduces bucket-boundary error that then has to be reasoned about and
+documented; storing samples removes it entirely, and the memory cost is affordable here. If a future
+phase benchmarks billions of operations, a histogram becomes the right trade — that is a later
+decision, not this one.
+
+**Why not (b).** A bare "write amplification: 3.3×" invites the reader to assume a
+filesystem-level measurement the project cannot make (it has no OS-level write accounting). Naming
+the three components and the formula makes the number checkable and its scope honest.
+
+**Why not (c).** Compaction consumes flushed files, so live SSTable sizes undercount what flushing
+actually wrote. A cumulative counter is the only way to attribute physical bytes correctly, and it
+is four lines.
+
+**Why not (d).** Observability is Phase 16. A metrics framework now would be scope creep; the flush
+counter is purpose-built for the one measurement that needed it and nothing more.
+
+**Cost.** One `atomic` triple on the engine's struct and three `Add` calls on the flush success
+path — no behaviour change, and the counters are tested (`TestFlushStatsAccountForEveryFlushedTable`,
+`TestFlushStatsCountFlushOutputSeparatelyFromCompaction`). The methodology choices are a documentation
+cost: `docs/BENCHMARKS.md` §D exists so a reader can see exactly how each number was produced.

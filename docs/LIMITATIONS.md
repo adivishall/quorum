@@ -3,10 +3,10 @@
 The things this system does not do, cannot do, or has not proven. Kept current: an item may be
 removed only when a test exists showing it is no longer true.
 
-**Status: Phase 4.** A single-node key-value store with a durable write-ahead log and an
+**Status: Phase 5.** A single-node key-value store with a durable write-ahead log and an
 LSM storage engine — memtable, immutable SSTables with Bloom filters, flush, size-tiered
-compaction, crash-safe MANIFEST-based file publication, restart recovery — exists. Nothing
-distributed does.
+compaction, crash-safe MANIFEST-based file publication, restart recovery — exists and is now
+benchmarked (`docs/BENCHMARKS.md`). Nothing distributed does.
 
 ### True right now, and temporary
 
@@ -16,16 +16,16 @@ distributed does.
 | **The WAL grows without bound.** Nothing reclaims segments. | a later phase |
 | **Power-loss durability is claimed for `sync` mode but untested, and untested for every other mode.** The crash tests destroy a real process with SIGKILL, which only proves data reached the kernel. This now covers the MANIFEST too. | not testable here — see `docs/WAL.md` §9 |
 | **Damage inside an SSTable data block is found at the read that needs it, not at startup.** Phase 3 read every block of every file at open, because a file's sequence range had nowhere else to live; the MANIFEST records it, so startup cross-checks footers instead. The damage is still found and still reported as corruption rather than as a missing key. `Options.VerifySSTablesOnOpen` restores the Phase 3 behaviour. | deliberate trade — `docs/MANIFEST.md` §6 |
-| **Compaction has no rate limit and no I/O budget**, so it competes freely with foreground reads and writes. | Phase 5, if measured to matter |
+| **Compaction has no rate limit and no I/O budget**, so it competes freely with foreground reads and writes. | measured (`docs/BENCHMARKS.md` §3.7): unbounded; it did not spike foreground p99 above ~7 µs on this SSD in one run, which is reported, not promised. A later phase if it matters |
 | **One compaction at a time**, and a compaction's output is a single file however large, so one SSTable's size grows with the dataset. `sstable.MaxMetaBlockSize` (256 MiB of filter or index) is the practical ceiling on a single file. | deferred — `docs/COMPACTION.md` §10 |
 | **Tombstone dropping is conservative**: it uses the input set's position in the global sequence ordering rather than per-key range checks, so some tombstones outlive their usefulness and cost space. | deferred — the correct-but-conservative rule is the one that is easy to prove |
 | A MANIFEST grows within one session (one record per flush and per compaction) and is only compacted by reopening, which installs a fresh one holding a snapshot. | deferred — a within-session rotation threshold would be the fix |
 | A Phase 3 data directory (SSTables with no `CURRENT`) needs an explicit `Options.AdoptLegacySSTables` to open. | deliberate — `docs/MANIFEST.md` §8 |
 | `bitsPerKey` is global rather than per level, and filters are rebuilt from scratch on every compaction. | deferred; a measurement would have to justify per-level tuning |
-| The flush is synchronous: the writer that triggers it pays for it and other writers wait. Readers do not. Compaction, unlike the flush, does run in the background. | Phase 5, if measured to matter |
+| The flush is synchronous: the writer that triggers it pays for it and other writers wait. Readers do not. Compaction, unlike the flush, does run in the background. | measured (`docs/BENCHMARKS.md` §3.1): visible as the 16 KiB-value tail (p99 ~6 ms) and as why concurrent writers do not scale. A later phase if it matters |
 | Segments missing from the *start* of the WAL sequence are undetectable (gaps in the middle are refused). SSTables ahead of the log **are** detected. | a later phase (MANIFEST log number) |
 | A length field corrupted within the 64 MiB range can cause a torn-tail/corruption misclassification in the newest segment | inherent to this framing; `docs/WAL.md` §8 |
-| `sync` mode serialises writers behind the device flush (~3.9 ms/append measured on an M4) | Phase 5, if group commit is measured to be worth it |
+| `sync` mode serialises writers behind the device flush (~3.4 ms/append, ~291 appends/s, measured on an M4 — `docs/BENCHMARKS.md` §3.6) | a later phase, if group commit is measured to be worth it |
 | No networking, no cluster, no replication, no consensus | Phases 7–9 |
 | `dkv put` cannot carry a maximum-size (1 MiB) value, because `ARG_MAX` is 1 MiB on macOS and the kernel rejects the exec. `dkv shell` can. This is an OS limit, not a dkv limit. | not applicable — use `dkv shell`, or the HTTP API from Phase 15 |
 | The CLI is still in-memory-only: it does not yet open a data directory, so `dkv` remains ephemeral even though the storage layer is not | Phase 15 (CLI wiring) |
@@ -62,22 +62,30 @@ distributed does.
 | Dedup table is bounded | A retry arriving after its session is evicted degrades to at-least-once. The bound will be stated with a number once implemented. |
 | Single-machine Docker demo is not a durability demo | All containers share one disk. It demonstrates topology, routing, election, and recovery — not independent hardware failure. |
 
-## Scale limits (to be measured, not guessed)
+## Scale limits (measured, not guessed)
 
-These will be filled in with real numbers from Phases 5 and 19. Until then they are blank
-rather than estimated:
+Phase 5 measured single-node storage performance on one machine (Apple M4, APFS SSD,
+`docs/BENCHMARKS.md`). These are **measurements, not ceilings**: they are what the engine did
+on that machine under those workloads, not a proven maximum. Read the methodology before
+quoting any of them.
 
-- Maximum practical shard count per node: *unmeasured*
-- Write throughput ceiling: *unmeasured*
-- Read throughput ceiling: *unmeasured*
-- Leader election time: *unmeasured*
+- Single-writer PUT throughput: ~386 k ops/s at 100-byte values, ~69 k at 1 KiB, ~3 k at
+  16 KiB (`docs/BENCHMARKS.md` §3.1). Concurrent writers do **not** raise this — the write path
+  is single-threaded by design.
+- Point-read throughput: ~548 k hit / ~3.3 M miss ops/s single-threaded on a compacted
+  dataset; ~908 k reads/s across 4 goroutines before it saturates (§3.2, §3.12).
+- Write amplification: ~3.3× for a moderate-overwrite 100-byte workload (§3.8).
+- Restart cost scales with total WAL length, not live data (§3.10) — the WAL-truncation
+  limitation above, made concrete.
 - Maximum value size: 1 MiB (enforced limit, `docs/DESIGN.md` §1)
 - Maximum key size: 4 KiB (enforced limit)
 
-Phases 3 and 4 collected development measurements while building the engine (`docs/LSM.md` §10,
-`docs/BLOOM.md` §5, `docs/COMPACTION.md` §8, `docs/MANIFEST.md` §9). They are deliberately not
-repeated here and are not scale limits: nothing about the environment was controlled or recorded,
-and Phase 5 is where a number earns the right to be quoted.
+Distributed scale limits (shard count per node, leader election time) remain *unmeasured*
+until Phase 19; they are left blank rather than estimated.
+
+The scattered development measurements Phases 3 and 4 collected while building the engine
+(`docs/LSM.md` §10, `docs/BLOOM.md` §5, `docs/COMPACTION.md` §8, `docs/MANIFEST.md` §9) predate
+`docs/BENCHMARKS.md` and are superseded by it as the place a storage number is quoted from.
 
 ## Not production-ready
 

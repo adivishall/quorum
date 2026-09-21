@@ -6,7 +6,7 @@ Quorum is currently implementing its durable storage engine. No Raft library, no
 database, no consensus service — the storage engine and the consensus implementation are
 the project, and they are being built in that order.
 
-> **Status: Phase 4 of 25 — single-node durable LSM-backed key-value store.**
+> **Status: Phase 5 of 25 — single-node durable LSM-backed key-value store, now benchmarked.**
 >
 > **Implemented:** a write-ahead log, an ordered memtable, immutable on-disk SSTables, Bloom
 > filters, size-tiered compaction, crash-safe MANIFEST-based file publication, and restart
@@ -136,8 +136,8 @@ The row that teaches the most is the first one. `sync=off` loses nothing on SIGK
 **Process death is not power loss**, and no test here proves power-loss durability for any
 mode. `docs/WAL.md` §9 spells out what was and was not established.
 
-Cost of each mode, measured on an Apple M4 (100-byte values, indicative only — Phase 5 does
-benchmarking properly):
+Cost of each mode, an early development measurement on an Apple M4 (100-byte values, indicative
+only — `docs/BENCHMARKS.md` §3.6 has the Phase 5 numbers with methodology and variance):
 
 | Mode | ns/append | approx. appends/s |
 |---|---|---|
@@ -171,7 +171,7 @@ What is **not** claimed:
 | | |
 |---|---|
 | Power-loss durability | Untested in every mode, for the WAL and now the MANIFEST alike. The crash tests destroy a process, which proves the bytes reached the kernel, not the platter. |
-| Performance | The numbers below and in `docs/BLOOM.md`, `docs/COMPACTION.md` and `docs/MANIFEST.md` are development measurements on one laptop. Phase 5 owns benchmarking; nothing here may be quoted as a result. |
+| Performance | Reproducible measurements now live in `docs/BENCHMARKS.md` (harness: `internal/bench`, `cmd/dkvbench`). They are a single-machine reference point, not a guarantee or a ceiling. The scattered development numbers below and in `docs/BLOOM.md`, `docs/COMPACTION.md` and `docs/MANIFEST.md` predate that document and are indicative only. |
 | WAL truncation | The log is still never truncated, so startup replays every mutation ever written even though compaction absorbed most of them. The MANIFEST records `SetLogNumber` and does not act on it. |
 | Startup corruption detection | Startup no longer reads every data block, so damage inside one is found at the read that needs it rather than at open. It is still found, and still reported as corruption rather than as a missing key. `VerifySSTablesOnOpen` restores the old behaviour. |
 
