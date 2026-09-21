@@ -100,8 +100,13 @@ values, 12-byte keys, seed 1, 5 repetitions per measured benchmark.
   recorder; recorders merge at the end and the combined samples are sorted once.
   Percentiles use the **nearest-rank** method: the p-th percentile is the sample
   at 1-based rank `ceil(p/100 × n)`. No interpolation, no bucketing — exact
-  percentiles at the cost of 8 bytes per sample, which is affordable at these
-  operation counts.
+  percentiles at the cost of 8 bytes per sample. This is a *bounded, measured*
+  cost, not a silent one: memory is exactly `8 × operations` bytes
+  (`Latencies.ApproxBytes`, unit-tested), the suite's largest single collector is
+  the 1 M-key read pass at ~8 MB, and the harness prints the peak per-benchmark
+  sample count and its megabytes at the end of every run. A caller timing
+  billions of operations should switch to a bounded reservoir or a histogram
+  (approximate percentiles); nothing in this phase runs at that scale.
 - **Repetition and variance.** Each measured benchmark runs 5 times with
   per-run seeds; the tables report the **median** ops/s with **min**, **max** and
   **spread** = `(max−min)/median`. A single run is never reported alone.
@@ -110,10 +115,15 @@ values, 12-byte keys, seed 1, 5 repetitions per measured benchmark.
   seed, so a run is reproducible. Keys are fixed-width and sort in index order.
 - **Correctness gating.** Each workload phase verifies it did what it claims: a
   sampled fraction of live reads are checked against the index their value
-  encodes, missing reads must return `ErrNotFound`, deleted keys must read back
-  absent, and the compaction suite asserts a compaction actually ran. A silently
-  empty or short-circuited database fails these checks instead of posting a fast
-  number. The checks are unit-tested in `internal/bench`.
+  encodes, missing reads must return `ErrNotFound`, and deleted keys must read
+  back absent. The **compaction and write-amplification suites hard-fail at
+  runtime** if compaction did not actually run — the foreground suite requires
+  `CompactionStats.Runs > 0`, the isolated suite additionally requires the file
+  set to have shrunk, and write-amp requires a compaction so its compaction term
+  is real, not a silent zero. A silently empty, short-circuited, or
+  never-compacted database fails these checks instead of posting a number. The
+  checks are unit-tested in `internal/bench` (including
+  `TestCompactionActuallyRunsUnderLoad`).
 - **Outliers.** None are removed. The max latency is reported; the tail includes
   GC pauses, flush stalls and scheduler effects, because a client sees those too.
 - **Not pinned.** Processes were not CPU-pinned; benchmarks ran sequentially

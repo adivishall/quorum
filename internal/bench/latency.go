@@ -8,11 +8,21 @@ import (
 // Latencies collects per-operation durations and computes percentiles exactly.
 //
 // It stores every sample rather than bucketing into a histogram. That is a
-// deliberate trade: exact percentiles at the cost of 8 bytes per operation.
-// Benchmarks here run a controlled, bounded number of operations (millions at
-// most), so a few tens of megabytes and one sort is acceptable, and it removes
-// histogram bucket-boundary error as a thing to reason about. Each worker fills
-// its own Latencies with no lock; Merge combines them at the end.
+// deliberate, *bounded* trade, not a silent one: memory is exactly 8 bytes per
+// recorded operation (one int64), so a run of N operations costs 8N bytes and
+// ApproxBytes reports it. The benchmark suite's operation counts are bounded by
+// design — the largest is one read per key over a 1,000,000-key dataset, i.e.
+// 1,000,000 samples ≈ 8 MB, split across workers — so the whole set of samples
+// plus one sort is affordable, and in return the percentiles are exact with no
+// histogram bucket-boundary error to reason about.
+//
+// The cost scales linearly with the operation count, so a caller that wants to
+// time billions of operations should not use this directly; at that scale a
+// bounded reservoir or a log-linear histogram (approximate percentiles) is the
+// right structure. Nothing in this phase runs at that scale, and the bound is
+// documented and asserted (TestApproxBytesIsEightPerSample) rather than assumed.
+// Each worker fills its own Latencies with no lock; Merge combines them at the
+// end.
 type Latencies struct {
 	ns []int64
 }
@@ -36,6 +46,12 @@ func (l *Latencies) Merge(other *Latencies) {
 
 // Len is the number of samples.
 func (l *Latencies) Len() int { return len(l.ns) }
+
+// ApproxBytes is the memory the samples occupy: 8 bytes each. It makes the
+// collector's memory a measurable quantity a benchmark can report or bound,
+// rather than a claim in a comment (requirement: no silent unbounded latency
+// collector). It counts the backing array's length, not its capacity.
+func (l *Latencies) ApproxBytes() int64 { return int64(len(l.ns)) * 8 }
 
 // LatencyStats is the summary of a set of samples, in microseconds.
 type LatencyStats struct {

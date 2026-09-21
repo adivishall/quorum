@@ -187,3 +187,23 @@ func TestRunSetSummaryMedianAndSpread(t *testing.T) {
 		t.Fatalf("SpreadPct = %v, want 100", a.SpreadPct)
 	}
 }
+
+func TestApproxBytesIsEightPerSample(t *testing.T) {
+	l := NewLatencies(0)
+	if l.ApproxBytes() != 0 {
+		t.Fatalf("empty ApproxBytes = %d, want 0", l.ApproxBytes())
+	}
+	for i := 0; i < 1000; i++ {
+		l.Record(time.Microsecond)
+	}
+	if got := l.ApproxBytes(); got != 8000 {
+		t.Fatalf("ApproxBytes for 1000 samples = %d, want 8000", got)
+	}
+	// Merging adds the other's samples, and the accounting tracks it.
+	other := NewLatencies(10)
+	other.Record(time.Microsecond)
+	l.Merge(other)
+	if got := l.ApproxBytes(); got != 8008 {
+		t.Fatalf("ApproxBytes after merge = %d, want 8008", got)
+	}
+}

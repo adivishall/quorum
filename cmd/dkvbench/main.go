@@ -39,6 +39,7 @@ type harness struct {
 	onTmpfs     bool
 	verbose     bool
 	results     []bench.Result
+	peakLatN    int // largest per-benchmark latency-sample count seen
 	out         io.Writer
 }
 
@@ -84,6 +85,10 @@ func main() {
 		fatal(err)
 	}
 	fmt.Fprintf(h.out, "\nran %d result(s) in %s\n", len(h.results), time.Since(start).Round(time.Millisecond))
+	// Measured, not assumed: the largest single latency collector this run used.
+	// Memory is 8 bytes per sample; a run stays practical as long as this is small.
+	fmt.Fprintf(h.out, "peak latency samples in one benchmark: %d (%.1f MiB at 8 B/sample)\n",
+		h.peakLatN, float64(h.peakLatN*8)/(1<<20))
 
 	if *out != "" {
 		if err := h.writeResults(*out); err != nil {
@@ -148,6 +153,9 @@ func (h *harness) record(r bench.Result, cfg bench.Config, seed int64, runIdx in
 	r.RunIndex = runIdx
 	r.Storage = sm
 	r.Note = note
+	if r.Latency.Count > h.peakLatN {
+		h.peakLatN = r.Latency.Count
+	}
 	h.results = append(h.results, r)
 	if h.verbose {
 		fmt.Fprintf(h.out, "  run %d: %s  %.0f ops/s  p50=%.1f p99=%.1fus\n",

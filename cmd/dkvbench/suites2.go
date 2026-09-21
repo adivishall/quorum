@@ -153,7 +153,16 @@ func (h *harness) suiteCompaction() error {
 			}
 			return bench.PhaseResult{Ops: int64(gens * keys), Bytes: int64(gens*keys) * int64(ks.KeyBytes()+h.valueSize), Elapsed: time.Since(start), Lat: lat}, nil
 		})
-		return pr.Result(label), sm, err
+		if err != nil {
+			return bench.Result{}, bench.StorageMetrics{}, err
+		}
+		// Prove the benchmark measured what it claims: a foreground-write
+		// benchmark labelled "bg compaction" is meaningless if no compaction
+		// ran. Fail loudly rather than post a number for the wrong workload.
+		if sm.CompactionRuns == 0 {
+			return bench.Result{}, bench.StorageMetrics{}, fmt.Errorf("compaction benchmark: no background compaction ran (sstables=%d) — precondition not met", sm.SSTables)
+		}
+		return pr.Result(label), sm, nil
 	}); err != nil {
 		return err
 	}
@@ -193,6 +202,14 @@ func (h *harness) suiteCompaction() error {
 	cs := s.CompactionStats()
 	sm := bench.SnapshotStorage(s, dir)
 	bytesAfter := bench.DirBytes(dir)
+
+	// Prove compaction actually happened before reporting its numbers: at least
+	// one run, and the file set genuinely shrank. Without this, a build that
+	// silently produced too few files to compact would report a "compaction"
+	// result that measured nothing.
+	if cs.Runs == 0 || filesBefore <= len(s.SSTables()) {
+		return fmt.Errorf("isolated compaction did not occur: runs=%d, files %d->%d", cs.Runs, filesBefore, len(s.SSTables()))
+	}
 
 	compThroughput := 0.0
 	if dur.Seconds() > 0 {
@@ -252,6 +269,13 @@ func (h *harness) suiteWriteAmp() error {
 		return err
 	}
 	sm := bench.SnapshotStorage(s, dir)
+
+	// The write-amplification workload overwrites keys across generations
+	// specifically so compaction rewrites data; if it did not run, the
+	// compaction term of the amplification would be a silent zero. Prove it ran.
+	if s.CompactionStats().Runs == 0 {
+		return fmt.Errorf("write-amp: no compaction ran, so the compaction term would be unmeasured")
+	}
 
 	walB := sm.WALBytes
 	flushB := sm.FlushBytes
