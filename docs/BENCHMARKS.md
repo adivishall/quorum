@@ -147,6 +147,14 @@ Single suites: `-suite put|get|delete|mixed|scaling|wal|compaction|writeamp|`
 `-runs -seed -dir -out -tmpfs -verbose`. The exact numbers below will differ run
 to run and machine to machine; the shape should not.
 
+The tables were read from a seed-1 run (`bench/phase5-baseline.json`); an
+independent seed-2 run on the same machine reproduced every **deterministic**
+quantity exactly — write amplification 3.27×, compaction 72→1 files / 0.63×
+on-disk, the Bloom block-read counts (≈70 k with the filter vs ≈1.26 M without),
+and the on-disk sizes — with the timing quantities inside their reported spread.
+That is the intended reproducibility: the byte- and count-based results are
+exact, the wall-clock results are stable in shape and bounded in variance.
+
 ---
 
 ## 3.1 PUT throughput
