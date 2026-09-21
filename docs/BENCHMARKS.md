@@ -10,7 +10,7 @@ look better, hand-edited, or cherry-picked from a lucky run. Where a number is
 noisy or a comparison is not apples-to-apples, that is stated next to the number
 rather than hidden. The committed snapshot the tables were read from is
 [`bench/phase5-baseline.json`](../bench/phase5-baseline.json) (seed 1, commit
-`8a7cdca`).
+`06e5560`).
 
 The engine measured is the one described in [DESIGN.md](DESIGN.md),
 [LSM.md](LSM.md), [BLOOM.md](BLOOM.md), [COMPACTION.md](COMPACTION.md) and
@@ -51,7 +51,7 @@ The recorded run was made on:
 | OS | macOS 26.5.2 (build 25F84), Darwin 25.5.0 |
 | Arch | arm64 |
 | Go | go1.27.1 |
-| Commit | `8a7cdca` (clean tree) |
+| Commit | `06e5560` (clean tree) |
 | Data location | local APFS, **not** tmpfs — real filesystem, real `fsync` |
 | Date | 2026-09-21 |
 
@@ -120,14 +120,19 @@ values, 12-byte keys, seed 1, 5 repetitions per measured timing benchmark.
 - **Repeated-timing vs single-shot measurements — which is which.** The two are
   not treated the same, and the document does not pretend they are:
   - *Repeated timing, median + variance* — put, get, delete, mixed, WAL,
-    concurrency, and the startup and MANIFEST **reopen** times: run 5× (reopens
-    per size), reported as **median** ops/s (or ms) with **min**, **max** and
-    **spread** = `(max−min)/median`. Every run is recorded in the JSON.
+    concurrency, the **dataset-scaling build** throughput, and the startup and
+    MANIFEST **reopen** times: run 5× (reopens per size), reported as **median**
+    ops/s (or ms) with **min**, **max** and **spread** = `(max−min)/median`. Every
+    run is recorded in the JSON. Build throughput is a wall-clock timing like any
+    other, so §3.5 measures it 5× per size (fresh DB, identical deterministic
+    workload each run) rather than once.
   - *Single-shot structural / counter measurements* — write amplification, the
     Bloom block-read and filter-skip counts, the isolated `CompactAll` byte
-    movement, and the dataset-scaling build/on-disk figures: these are exact
-    byte- and count-based quantities that do not vary run to run, so they are
-    measured once and reported as-is, not dressed up with a fake distribution.
+    movement, and the dataset-scaling **on-disk sizes** (and the read-latency and
+    reopen figures sampled alongside them in §3.5): these are exact byte- and
+    count-based quantities, or structural properties of a deterministic build, so
+    they are measured once and reported as-is, not dressed up with a fake
+    distribution.
   The startup suite specifically reports the **median** reopen, not the minimum,
   and preserves every reopen in the JSON.
 - **Randomness.** All random choices (read key selection, mix operation
@@ -182,22 +187,22 @@ compaction on). Sequential is a single writer with ascending keys.
 
 | Workload | Value | n | Ops/s (median) | Spread | p99 (µs) |
 |---|---|---|---|---|---|
-| put sequential | 100 B | 100 000 | 383 791 | 9% | 3.4 |
-| put sequential | 1 KiB | 100 000 | 70 039 | 4% | 11.6 |
-| put sequential | 16 KiB | 16 360 | 5 350 | 46% | 4 440 |
-| put concurrent | 100 B, 1 worker | 100 000 | 310 811 | 13% | 3.6 |
-| put concurrent | 100 B, 2 workers | 100 000 | 259 561 | 2% | 49.2 |
-| put concurrent | 100 B, 4 workers | 100 000 | 252 645 | 10% | 125.9 |
-| put concurrent | 100 B, 8 workers | 100 000 | 254 472 | 2% | 283.4 |
+| put sequential | 100 B | 100 000 | 380 380 | 7% | 3.4 |
+| put sequential | 1 KiB | 100 000 | 65 990 | 3% | 11.8 |
+| put sequential | 16 KiB | 16 360 | 3 088 | 69% | 6 289 |
+| put concurrent | 100 B, 1 worker | 100 000 | 302 217 | 10% | 3.8 |
+| put concurrent | 100 B, 2 workers | 100 000 | 261 345 | 6% | 48.7 |
+| put concurrent | 100 B, 4 workers | 100 000 | 259 588 | 11% | 127.9 |
+| put concurrent | 100 B, 8 workers | 100 000 | 252 510 | 2% | 280.7 |
 
 Observations, supported by the data:
 
-- Throughput falls sharply as value size grows — 384 k ops/s at 100 B, 70 k at
-  1 KiB, 5.4 k at 16 KiB. At 100 B this is ~41 MB/s of key+value; at 16 KiB the
-  workload is byte-bound, and the 16 KiB p99 (4.4 ms) and 46% spread come from
+- Throughput falls sharply as value size grows — 380 k ops/s at 100 B, 66 k at
+  1 KiB, 3.1 k at 16 KiB. At 100 B this is ~41 MB/s of key+value; at 16 KiB the
+  workload is byte-bound, and the 16 KiB p99 (6.3 ms) and 69% spread come from
   flushes: a 16 KiB run fills the 4 MiB memtable every ~250 writes.
 - **Adding writer goroutines does not increase write throughput; it lowers it**
-  (311 k → 254 k) and inflates tail latency (3.6 µs → 283 µs). This is expected
+  (302 k → 253 k) and inflates tail latency (3.8 µs → 281 µs). This is expected
   and correct: a single writer path serialises on the WAL append and memtable
   insert under one mutex, so extra writers only add contention. This is a
   documented property of the engine, not a regression — see § Analysis.
@@ -210,12 +215,12 @@ Warm, fully compacted dataset (built with a 1 MiB memtable, sync off, then
 
 | Workload | Ops/s (median) | Spread | p50 (µs) | p99 (µs) |
 |---|---|---|---|---|
-| get hit (key present) | 560 132 | 1% | 1.4 | 5.2 |
-| get miss (key absent) | 3 390 060 | 1% | 0.2 | 0.3 |
+| get hit (key present) | 567 107 | 3% | 1.4 | 5.1 |
+| get miss (key absent) | 3 451 494 | 2% | 0.2 | 0.3 |
 
 - Hits cost 1.4 µs at the median; misses are ~6× faster (0.2 µs median) because
   the Bloom filter answers "absent" without touching a data block — the read path
-  returns before any block read. The miss path at 3.4 M ops/s is essentially the
+  returns before any block read. The miss path at 3.5 M ops/s is essentially the
   Bloom filter plus the index bound check.
 - This is the *compacted* read path (one file). The multi-file read path, where
   the Bloom filter earns its keep, is §3.9.
@@ -227,10 +232,10 @@ Fresh database each run: build 100 000 keys, delete 50 000 distinct keys
 
 | Workload | Ops/s (median) | Spread | p99 (µs) |
 |---|---|---|---|
-| delete 50 000 of 100 000 | 335 297 | 4% | 3.2 |
+| delete 50 000 of 100 000 | 328 060 | 11% | 3.2 |
 
 A delete is a tombstone write: it takes the same write path as a PUT of an empty
-value, and the throughput (335 k ops/s) is in line with 100 B sequential PUT.
+value, and the throughput (328 k ops/s) is in line with 100 B sequential PUT.
 Deletes do not read, so they are not slowed by the dataset already present.
 
 ## 3.4 MIXED workload
@@ -244,9 +249,9 @@ key). Latency covers all operation kinds.
 
 | Mix | R/W/D | Ops/s (median) | Spread | p99 (µs) |
 |---|---|---|---|---|
-| read-heavy | 90/9/1 | 384 806 | 5% | 8.0 |
-| balanced | 50/45/5 | 240 603 | 6% | 5.8 |
-| write-heavy | 20/75/5 | 195 683 | 19% | 4.9 |
+| read-heavy | 90/9/1 | 384 733 | 2% | 7.9 |
+| balanced | 50/45/5 | 239 923 | 24% | 5.8 |
+| write-heavy | 20/75/5 | 190 427 | 35% | 4.8 |
 
 Throughput tracks the write fraction: more writes means more memtable inserts,
 flushes and background compaction, so the write-heavy mix is ~2× slower than
@@ -255,27 +260,33 @@ the point of running all three is that no single ratio is representative.
 
 ## 3.5 Dataset-size scaling
 
-Fresh database per size, 100 B values, sync off, built then fully compacted;
-reopen measured separately. On-disk is MiB (2²⁰ bytes).
+Fresh database per size **and per run**, 100 B values, sync off. Build
+throughput is a wall-clock timing, so it is the **median of 5 runs** (min/max/
+spread in the JSON, like every other timing suite); the get-p99, reopen and
+on-disk figures are structural samples taken from the representative (last)
+build, which is byte-identical across runs because the sequential build is
+deterministic — §3.2 and §3.10 carry the repeated-timing get and reopen numbers.
+On-disk is MiB (2²⁰ bytes).
 
-| Dataset | Build ops/s | Get p99 (µs) | Reopen (ms) | On-disk (MiB) | SSTables |
-|---|---|---|---|---|---|
-| 10 000 | 683 474 | 2.3 | 15.2 | 2.38 | 1 |
-| 100 000 | 459 723 | 4.2 | 24.7 | 23.76 | 2 |
-| 1 000 000 | 391 886 | 3.4 | 85.2 | 237.62 | 7 |
+| Dataset | Build ops/s (median) | Spread | Get p99 (µs) | Reopen (ms) | On-disk (MiB) | SSTables |
+|---|---|---|---|---|---|---|
+| 10 000 | 686 479 | 3% | 2.2 | 18.0 | 2.38 | 1 |
+| 100 000 | 465 214 | 6% | 5.1 | 25.3 | 23.76 | 2 |
+| 1 000 000 | 372 056 | 14% | 3.5 | 94.4 | 237.62 | 7 |
 
 - On-disk size scales linearly with the dataset (2.38 → 23.76 → 237.6 MiB, ~10×
   per 10×). At 1 M keys the footprint is **≈249 bytes/key** (124.2 MB of SSTable
   + 125.0 MB of WAL, decimal). Note the WAL is roughly **half** of that and is as
   large as the live SSTable data — because it is never truncated in this phase
   (§3.10), the on-disk cost is inflated by a full copy of every mutation's log.
-- Read latency stays flat (p99 2–4 µs) across two orders of magnitude, because
+- Read latency stays flat (p99 2–5 µs) across two orders of magnitude, because
   the dataset is compacted and a point read touches a bounded number of blocks
   regardless of size.
 - Reopen time grows with the dataset (see §3.10): the WAL is scanned in full on
   every open in this phase.
-- Build throughput dips from 10 k to 100 k (more flushes/compactions kick in)
-  then is roughly flat to 1 M.
+- Build throughput falls as the dataset grows (686 k → 465 k → 372 k median) as
+  more flushes and compaction kick in; the 1 M run has the widest spread (14%),
+  from compaction timing over the longer run. Every build run is in the JSON.
 
 ## 3.6 WAL sync modes
 
@@ -289,9 +300,9 @@ each mode did.
 
 | Mode | Ops/s (median) | Spread | p99 (µs) | fsyncs / 2 000 appends | Durability |
 |---|---|---|---|---|---|
-| off | 544 391 | 28% | 4.5 | **0** | survives process kill; nothing forced to disk |
-| batch | 26 644 | 12% | 62.0 | **15** | survives process kill; a bounded window reaches the device |
-| sync | 247 | 1% | 5 228 | **2 000** | fsync per append |
+| off | 539 029 | 14% | 4.2 | **0** | survives process kill; nothing forced to disk |
+| batch | 25 879 | 18% | 57.9 | **15** | survives process kill; a bounded window reaches the device |
+| sync | 239 | 11% | 6 540 | **2 000** | fsync per append |
 
 This is a **durability/performance trade, not a ranking**, and the fsync counts
 are the proof each arm did its job. `off` never fsyncs (the counter is 0); its
@@ -300,13 +311,13 @@ project's documented WAL semantics — but nothing is forced to the device, so a
 power loss or OS crash could lose them. `batch` fsynced 15 times as the 16 KiB
 threshold was crossed, costing ~20× the throughput of `off` but bounding how much
 un-flushed data a device-level failure could lose. `sync` fsynced on every append
-(2 000 times), at ~4 ms/append (the p99 of ~5 ms is one device flush), ~108×
+(2 000 times), at ~4 ms/append (the p99 of ~6.5 ms is one device flush), ~108×
 slower than `batch`. **All three survive process death**; they differ in flushing
 to the device, and power-loss durability is untested for any of them
 ([WAL.md](WAL.md) §9). The right mode depends on what a caller can afford to lose
 to a *power* failure, not on this table.
 
-(The `off` spread is wide because the run is short — 2 000 ops — so a single
+(The spreads are wide — 11–18% — because the run is short, 2 000 ops, so a single
 scheduling blip moves the median; the relative ordering across modes is stable.)
 
 ## 3.7 Compaction impact
@@ -319,23 +330,23 @@ that asserts the file set shrank.
 
 | Measurement | Value |
 |---|---|
-| Foreground write throughput | 71 046 ops/s (spread 8%, p99 7.6 µs) |
-| Isolated compaction | 72 files → 1 file in **55 ms** |
+| Foreground write throughput | 62 595 ops/s (spread 10%, p99 9.5 µs) |
+| Isolated compaction | 72 files → 1 file in **56 ms** |
 | Bytes read / written | 12 418 976 → 3 103 616 (in → out) |
-| Compaction input throughput | 213.7 MiB/s |
+| Compaction input throughput | 211.2 MiB/s |
 | Superseded versions dropped | 75 000 |
 | On-disk before → after | 23.77 MiB → 14.89 MiB (**0.63×**) |
 
 - Compaction reclaimed 37% of on-disk space here by dropping 75 000 superseded
   versions (3 old versions of each of 25 000 keys) and merging 72 files into one.
-- The foreground number (71 046 ops/s) is **not** comparable to the 384 k ops/s
+- The foreground number (62 595 ops/s) is **not** comparable to the 380 k ops/s
   of §3.1: this configuration uses a 16× smaller memtable (256 KiB vs 4 MiB), so
   it flushes 16× more often and compacts continuously. It measures throughput
   *under a deliberately compaction-heavy setup*, not "the cost of compaction" as
   a clean subtraction. The honest statement is that a small memtable with
-  constant compaction sustains ~71 k 100 B writes/s here.
+  constant compaction sustains ~63 k 100 B writes/s here.
 - Compaction is not rate-limited and competes freely with foreground work; that
-  it did not spike the foreground p99 above 7.6 µs in this run is reported, not
+  it did not spike the foreground p99 above 9.5 µs in this run is reported, not
   promised (§ Limitations).
 
 ## 3.8 Write amplification
@@ -381,14 +392,14 @@ matters. 60 000 keys, 60 000 reads, counters read directly from the engine.
 
 | Config | SSTables | Block reads | Filter skips | p99 (µs/read) |
 |---|---|---|---|---|
-| bloom on, hit | 41 | 70 096 | 1 192 140 | 8.2 |
+| bloom on, hit | 41 | 70 096 | 1 192 140 | 8.7 |
 | bloom on, miss | 41 | 0 | 2 439 562 | 1.5 |
-| bloom off, hit | 41 | 1 261 497 | 0 | 133.5 |
+| bloom off, hit | 41 | 1 261 497 | 0 | 130.0 |
 | bloom off, miss | 41 | 0 | 0 | 1.5 |
 
 - **Hits:** with the filter, 70 096 block reads; without it, 1 261 497 — the
   filter avoided **94.4%** of data-block reads, and per-read p99 dropped from
-  133 µs to 8.2 µs (~16×). Without the filter a read opens a block in essentially
+  130 µs to 8.7 µs (~15×). Without the filter a read opens a block in essentially
   every file (1.26 M ≈ 60 000 reads × ~21 files that pass the range check);
   with it, only the file that actually holds the key plus the false-positive
   handful.
@@ -409,16 +420,16 @@ recovery report says where the time went.
 
 | Dataset | Reopen med (ms) | min | max | spread | WAL records | Ops replayed | SSTables |
 |---|---|---|---|---|---|---|---|
-| 10 000 | 15.0 | 11.9 | 15.9 | 27% | 10 000 | 4 131 | 1 |
-| 100 000 | 23.9 | 21.8 | 24.9 | 13% | 100 000 | 227 | 5 |
-| 300 000 | 38.1 | 36.8 | 38.9 | 6% | 300 000 | 681 | 15 |
+| 10 000 | 16.0 | 15.0 | 17.7 | 17% | 10 000 | 4 131 | 1 |
+| 100 000 | 24.8 | 23.8 | 24.9 | 4% | 100 000 | 227 | 5 |
+| 300 000 | 38.5 | 37.3 | 40.1 | 7% | 300 000 | 681 | 15 |
 
 - Reopen scans and CRC-checks **every** WAL record (`WAL records` column = the
   whole log), because nothing truncates the WAL in this phase. Most records are
   already durable in an SSTable and are *skipped* (not re-applied) — the
   `Ops replayed` column is small — but the scan is still paid. Reopen time
-  therefore grows with total mutations ever written, not with live data: 15.0 →
-  23.9 → 38.1 ms as the log goes 10 k → 100 k → 300 k records, and 85.2 ms at 1 M
+  therefore grows with total mutations ever written, not with live data: 16.0 →
+  24.8 → 38.5 ms as the log goes 10 k → 100 k → 300 k records, and 94.4 ms at 1 M
   (§3.5).
 - Only the tail past the highest flushed sequence is actually re-applied, which
   is why a larger dataset can replay *fewer* ops — more of it was flushed before
@@ -438,20 +449,21 @@ block read and checksummed); both are medians of 5 reopens.
 
 | SSTables | Keys/file | Reopen med (ms) | Reopen + full verify (ms) |
 |---|---|---|---|
-| 8 | 8 000 | 21.1 | 27.9 |
-| 32 | 2 000 | 23.9 | 29.9 |
-| 128 | 500 | 25.7 | 30.9 |
+| 8 | 8 000 | 20.8 | 28.0 |
+| 32 | 2 000 | 23.8 | 29.1 |
+| 128 | 500 | 28.4 | 32.2 |
 
-- With total data fixed, default reopen still grows with file count (21.1 → 25.7
+- With total data fixed, default reopen still grows with file count (20.8 → 28.4
   ms from 8 to 128 files): each additional file costs a MANIFEST entry, an open,
-  and a 48-byte footer cross-check. The growth is modest — ~4.6 ms across a 16×
+  and a 48-byte footer cross-check. The growth is modest — ~7.6 ms across a 16×
   increase in file count — because the constant full-WAL scan dominates the
   absolute time.
-- Full verification adds a **roughly constant** ~5–7 ms on top (6.8 ms at 8
-  files, 5.2 ms at 128) — as expected, since with total data fixed it reads
-  about the same total bytes regardless of how many files they are split into.
-  It is the cost of finding data-block damage at startup rather than at first
-  read — the trade [MANIFEST.md](MANIFEST.md) §6 and
+- Full verification adds ~4–7 ms on top (7.2 ms at 8 files, 3.7 ms at 128).
+  With total data fixed it reads about the same total bytes regardless of how
+  many files they are split into, so this cost is roughly flat; the run-to-run
+  scatter (the 128-file default reopen has a 42% spread) is larger than any
+  trend across the rows. It is the cost of finding data-block damage at startup
+  rather than at first read — the trade [MANIFEST.md](MANIFEST.md) §6 and
   [LIMITATIONS.md](LIMITATIONS.md) describe.
 
 ## 3.12 Concurrency scaling
@@ -462,17 +474,17 @@ concurrency question is reads.)
 
 | Workers | Ops/s (median) | p50 (µs) | p95 (µs) | p99 (µs) |
 |---|---|---|---|---|
-| 1 | 555 178 | 1.4 | 2.2 | 5.5 |
-| 2 | 774 640 | 1.8 | 3.1 | 28.8 |
-| 4 | 889 422 | 2.0 | 7.3 | 69.2 |
-| 8 | 905 583 | 3.4 | 11.0 | 148.8 |
+| 1 | 564 931 | 1.4 | 2.2 | 5.0 |
+| 2 | 805 768 | 1.8 | 3.0 | 27.7 |
+| 4 | 917 458 | 2.1 | 5.7 | 68.9 |
+| 8 | 881 846 | 3.5 | 12.2 | 151.2 |
 
-- Read throughput rises from 1 → 4 workers (555 k → 889 k, ~1.6×) then flattens
-  at 8 (906 k). This is **sub-linear** scaling: readers share the immutable
-  version under a read lock and contend on the OS page cache and memory
-  bandwidth, and the M4's read path saturates well before 8 goroutines. It is not
-  claimed to be linear, because it is not.
-- Tail latency inflates steadily with concurrency (p99 5.5 → 149 µs) as readers
+- Read throughput rises from 1 → 4 workers (565 k → 917 k, ~1.6×) then flattens —
+  in fact dips slightly — at 8 (882 k). This is **sub-linear** scaling: readers
+  share the immutable version under a read lock and contend on the OS page cache
+  and memory bandwidth, and the M4's read path saturates well before 8
+  goroutines. It is not claimed to be linear, because it is not.
+- Tail latency inflates steadily with concurrency (p99 5.0 → 151 µs) as readers
   queue; the median stays low.
 
 ---
@@ -489,7 +501,7 @@ What the measurements show about *this* engine on *this* machine:
    are ~1.4 µs and flat across dataset size (§3.2, §3.5); more readers help up to
    ~4× then saturate (§3.12).
 3. **The Bloom filter is the read path's most consequential component under a
-   realistic multi-file layout** — 94% fewer block reads and a 16× tail-latency
+   realistic multi-file layout** — 94% fewer block reads and a 15× tail-latency
    improvement on hits across 41 overlapping files (§3.9).
 4. **Restart cost is a WAL-scan cost.** It scales with total mutations, not live
    data, because the WAL is never truncated in this phase (§3.10). The same
@@ -529,8 +541,9 @@ line honestly:
 - Every absolute ops/s and µs figure. They are this M4, this APFS SSD, this OS,
   with the page cache warm and the machine not otherwise quiesced. Another
   machine will differ, possibly by a lot.
-- The 16 KiB PUT spread of 46% (§3.1) and the write-heavy mix spread of 19%
-  (§3.4) are flush-timing noise on short runs, not stable measurements.
+- The 16 KiB PUT spread of 69% (§3.1) and the write-heavy / balanced mix spreads
+  of 35% / 24% (§3.4) are flush-timing noise on short runs, not stable
+  measurements.
 - That compaction did not spike foreground p99 (§3.7) is one run's behaviour on a
   fast SSD; with a slower device or larger dataset it could.
 - Absolute reopen times (§3.10–3.11) depend on read bandwidth and the page cache.
