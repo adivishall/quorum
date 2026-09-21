@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/adivishall/quorum/internal/bench"
@@ -93,24 +94,65 @@ func (h *harness) suiteScaling() error {
 func (h *harness) suiteWAL() error {
 	h.section("WAL sync modes (§3.6)")
 	const walOps = 2000
+	// The default SyncBytes is 1 MiB; a 2,000 x 100 B workload writes only
+	// ~240 KB, so with the default threshold the batch arm would never perform a
+	// byte-triggered fsync inside the timed interval and would not actually
+	// measure batching. Reduce the threshold to 16 KiB for this suite (a
+	// documented benchmark configuration, not a production semantics change): the
+	// workload then crosses it repeatedly, and the WAL's fsync counter proves it.
+	const walSyncBytes = 16 << 10
 	ks := bench.NewKeyspace("key", walOps)
 	for _, mode := range []wal.SyncMode{wal.SyncOff, wal.SyncBatch, wal.SyncAlways} {
 		sp := defaultSpec()
 		sp.sync = mode
-		sp.memtable = 64 << 20 // no flush during the run
+		sp.syncBytes = walSyncBytes
+		sp.memtable = 64 << 20 // no memtable flush during the run
 		cfg := sp.config(walOps, ks.KeyBytes(), 100, 1, "wal-"+mode.String(), "", h.onTmpfs)
 		label := fmt.Sprintf("wal %-6s  n=%d", mode.String(), walOps)
-		if _, err := h.runRepeated(label, cfg, "no flush during the run; measures append+sync", func(runIdx int, seed int64) (bench.Result, bench.StorageMetrics, error) {
+		var lastSyncs int64
+		if _, err := h.runRepeated(label, cfg, fmt.Sprintf("no memtable flush; SyncBytes=%dKiB; measures append+sync", walSyncBytes>>10), func(runIdx int, seed int64) (bench.Result, bench.StorageMetrics, error) {
 			pr, sm, err := h.freshRun("wal-"+mode.String(), sp, runIdx, func(s *storage.LSMStore) (bench.PhaseResult, error) {
 				return bench.PutSequential(ctx, s, ks, 100, 0, walOps)
 			})
-			return pr.Result(label), sm, err
+			if err != nil {
+				return bench.Result{}, bench.StorageMetrics{}, err
+			}
+			// Prove each mode did what its name says, using the fsync counter.
+			if verr := verifyWALSyncs(mode, sm.WALSyncs, walOps); verr != nil {
+				return bench.Result{}, bench.StorageMetrics{}, verr
+			}
+			lastSyncs = sm.WALSyncs
+			return pr.Result(label), sm, nil
 		}); err != nil {
 			return err
 		}
+		fmt.Fprintf(h.out, "      %-6s performed %d fsync(s) over %d appends within the timed run\n", mode.String(), lastSyncs, walOps)
 	}
-	fmt.Fprintf(h.out, "  note: these are the same workload under different durability settings,\n")
-	fmt.Fprintf(h.out, "        not a ranking. sync survives power loss (device permitting); off does not.\n")
+	fmt.Fprintf(h.out, "  note: the same workload under different durability policies, not a ranking.\n")
+	fmt.Fprintf(h.out, "        All three survive process death (a completed write(2) is in the kernel);\n")
+	fmt.Fprintf(h.out, "        they differ in flushing to the device, and power-loss durability is untested.\n")
+	return nil
+}
+
+// verifyWALSyncs checks the fsync counter matches the sync mode's contract, so a
+// benchmark cannot report a "batch" number for a run that never batched. off
+// must never fsync; always must fsync once per append; batch (with the reduced
+// SyncBytes above) must fsync several times as the threshold is crossed.
+func verifyWALSyncs(mode wal.SyncMode, syncs int64, ops int) error {
+	switch mode {
+	case wal.SyncOff:
+		if syncs != 0 {
+			return fmt.Errorf("wal off performed %d fsyncs, want 0", syncs)
+		}
+	case wal.SyncAlways:
+		if syncs != int64(ops) {
+			return fmt.Errorf("wal sync performed %d fsyncs over %d appends, want %d", syncs, ops, ops)
+		}
+	case wal.SyncBatch:
+		if syncs < 3 {
+			return fmt.Errorf("wal batch performed only %d fsyncs — the batch threshold was not crossed within the timed run", syncs)
+		}
+	}
 	return nil
 }
 
@@ -378,7 +420,8 @@ func (h *harness) suiteStartup() error {
 	sp.sync = wal.SyncOff
 	sp.memtable = 1 << 20
 
-	fmt.Fprintf(h.out, "  %-10s %12s %12s %12s %12s %10s\n", "dataset", "reopen ms", "records", "ops replayed", "ops skipped", "sstables")
+	fmt.Fprintf(h.out, "  %-10s %11s %9s %9s %8s %12s %12s %10s\n",
+		"dataset", "reopen med", "min", "max", "spread", "records", "ops replayed", "sstables")
 	for _, n := range sizes {
 		ks := bench.NewKeyspace("key", n)
 		dir, err := h.dataDir(fmt.Sprintf("startup-%d", n))
@@ -395,7 +438,11 @@ func (h *harness) suiteStartup() error {
 		}
 		_ = s.Close()
 
-		var best time.Duration
+		cfg := sp.config(n, ks.KeyBytes(), h.valueSize, 1, "startup", "", h.onTmpfs)
+		// Repeat the reopen and preserve the distribution: record every reopen as
+		// its own result (RunIndex) rather than silently keeping the minimum, and
+		// report the median as representative with min/max/spread beside it.
+		durs := make([]time.Duration, 0, h.runs)
 		var rec storage.LSMRecovery
 		var sm bench.StorageMetrics
 		for i := 0; i < h.runs; i++ {
@@ -403,33 +450,62 @@ func (h *harness) suiteStartup() error {
 			if err != nil {
 				return err
 			}
-			if i == 0 || d < best {
-				best, rec, sm = d, r, m
-			}
+			durs = append(durs, d)
+			rec, sm = r, m // identical across reopens (same directory)
+			rr := bench.NewResult(fmt.Sprintf("startup n=%d", n), rec.RecordsApplied, 0, d)
+			note := fmt.Sprintf("segments=%d sstables=%d records=%d replayed=%d skipped=%d",
+				rec.SegmentsScanned, rec.SSTablesLoaded, rec.RecordsApplied, rec.OpsReplayed, rec.OpsSkipped)
+			h.record(rr, cfg, h.seed, i, sm, note)
 		}
-		cfg := sp.config(n, ks.KeyBytes(), h.valueSize, 1, "startup", "", h.onTmpfs)
-		rr := bench.NewResult(fmt.Sprintf("startup n=%d", n), rec.RecordsApplied, 0, best)
-		note := fmt.Sprintf("segments=%d sstables=%d records=%d replayed=%d skipped=%d",
-			rec.SegmentsScanned, rec.SSTablesLoaded, rec.RecordsApplied, rec.OpsReplayed, rec.OpsSkipped)
-		h.single(rr.Benchmark, cfg, note, rr, sm)
-		fmt.Fprintf(h.out, "  %-10d %12.1f %12d %12d %12d %10d\n",
-			n, float64(best.Microseconds())/1000.0, rec.RecordsApplied, rec.OpsReplayed, rec.OpsSkipped, sm.SSTables)
+		med, mn, mx, spread := durStatsMS(durs)
+		fmt.Fprintf(h.out, "  %-10d %10.1f %8.1f %8.1f %6.0f%% %12d %12d %10d\n",
+			n, med, mn, mx, spread, rec.RecordsApplied, rec.OpsReplayed, sm.SSTables)
 	}
-	fmt.Fprintf(h.out, "  note: reopen replays the whole WAL (no truncation in this phase); replay dominates.\n")
+	fmt.Fprintf(h.out, "  note: reopen scans the whole WAL (no truncation in this phase); most records are\n")
+	fmt.Fprintf(h.out, "        already durable in an SSTable and skipped, but the scan cost is paid.\n")
 	return nil
+}
+
+// durStatsMS returns the median, min, max (all in milliseconds) and the spread
+// percent (max-min)/median of a set of durations.
+func durStatsMS(ds []time.Duration) (med, mn, mx, spreadPct float64) {
+	if len(ds) == 0 {
+		return 0, 0, 0, 0
+	}
+	xs := make([]float64, len(ds))
+	for i, d := range ds {
+		xs[i] = float64(d.Microseconds()) / 1000.0
+	}
+	sort.Float64s(xs)
+	mn, mx = xs[0], xs[len(xs)-1]
+	m := len(xs)
+	if m%2 == 1 {
+		med = xs[m/2]
+	} else {
+		med = (xs[m/2-1] + xs[m/2]) / 2
+	}
+	if med > 0 {
+		spreadPct = (mx - mn) / med * 100
+	}
+	return med, mn, mx, spreadPct
 }
 
 // suiteManifest measures how restart scales with the number of SSTables, and the
 // cost of the optional full block verification, holding the key count fixed.
 func (h *harness) suiteManifest() error {
 	h.section("MANIFEST / SSTable metadata scaling (§3.11)")
+	// Hold the total logical data (and therefore WAL length) approximately
+	// constant and vary only the number of SSTables it is split across, so the
+	// experiment isolates per-file metadata cost instead of confounding it with a
+	// larger dataset. totalKeys is chosen to divide every file count evenly.
+	const totalKeys = 64_000
 	counts := []int{8, 32, 128}
-	const perFile = 500
 
-	fmt.Fprintf(h.out, "  %-10s %14s %18s\n", "sstables", "reopen ms", "reopen+verify ms")
+	fmt.Fprintf(h.out, "  total keys held constant at %d; only the SSTable count varies\n", totalKeys)
+	fmt.Fprintf(h.out, "  %-10s %10s %14s %10s\n", "sstables", "keys/file", "reopen med ms", "+verify ms")
 	for _, files := range counts {
-		total := files * perFile
-		ks := bench.NewKeyspace("key", total)
+		perFile := totalKeys / files
+		ks := bench.NewKeyspace("key", totalKeys)
 		sp := defaultSpec()
 		sp.sync = wal.SyncOff
 		sp.autoCompact = false
@@ -462,19 +538,24 @@ func (h *harness) suiteManifest() error {
 		got := len(s.SSTables())
 		_ = s.Close()
 
-		var plain, verify time.Duration
+		cfg := sp.config(totalKeys, ks.KeyBytes(), h.valueSize, 1, "manifest-scaling", "", h.onTmpfs)
+
+		// Default reopen (footer cross-check), repeated; record every run.
+		plain := make([]time.Duration, 0, h.runs)
 		for i := 0; i < h.runs; i++ {
-			d, _, _, err := h.reopen(dir, sp)
+			d, _, sm, err := h.reopen(dir, sp)
 			if err != nil {
 				return err
 			}
-			if i == 0 || d < plain {
-				plain = d
-			}
+			plain = append(plain, d)
+			rr := bench.NewResult(fmt.Sprintf("manifest reopen files=%d", got), 0, 0, d)
+			h.record(rr, cfg, h.seed, i, sm, fmt.Sprintf("%d sstables, %d keys/file, default reopen", got, perFile))
 		}
-		spv := sp
-		spvOpts := spv.options()
+
+		// Full block verification, repeated.
+		spvOpts := sp.options()
 		spvOpts.VerifySSTablesOnOpen = true
+		verify := make([]time.Duration, 0, h.runs)
 		for i := 0; i < h.runs; i++ {
 			t0 := time.Now()
 			vs, err := storage.OpenLSMStore(dir, spvOpts)
@@ -483,17 +564,17 @@ func (h *harness) suiteManifest() error {
 			}
 			d := time.Since(t0)
 			_ = vs.Close()
-			if i == 0 || d < verify {
-				verify = d
-			}
+			verify = append(verify, d)
+			rr := bench.NewResult(fmt.Sprintf("manifest reopen+verify files=%d", got), 0, 0, d)
+			h.record(rr, cfg, h.seed, i, bench.StorageMetrics{SSTables: got}, fmt.Sprintf("%d sstables, %d keys/file, full block verification", got, perFile))
 		}
 
-		cfg := sp.config(total, ks.KeyBytes(), h.valueSize, 1, "manifest-scaling", "", h.onTmpfs)
-		rr := bench.NewResult(fmt.Sprintf("manifest reopen files=%d", got), 0, 0, plain)
-		h.record(rr, cfg, h.seed, 0, bench.StorageMetrics{SSTables: got}, fmt.Sprintf("%d sstables; reopen=%s verify=%s", got, plain, verify))
-		fmt.Fprintf(h.out, "  %-10d %14.1f %18.1f\n", got, ms(plain), ms(verify))
+		plainMed, _, _, _ := durStatsMS(plain)
+		verifyMed, _, _, _ := durStatsMS(verify)
+		fmt.Fprintf(h.out, "  %-10d %10d %14.1f %10.1f\n", got, perFile, plainMed, verifyMed)
 	}
-	fmt.Fprintf(h.out, "  note: default reopen cross-checks each file's footer; +verify reads every block.\n")
+	fmt.Fprintf(h.out, "  note: total data is fixed, so the change across rows isolates file-count cost.\n")
+	fmt.Fprintf(h.out, "        default reopen cross-checks each file's footer; +verify reads every block.\n")
 	return nil
 }
 

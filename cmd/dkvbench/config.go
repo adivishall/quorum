@@ -16,6 +16,7 @@ import (
 // configuration printed beside it.
 type storeSpec struct {
 	sync        wal.SyncMode
+	syncBytes   int64
 	memtable    int64
 	blockSize   int
 	bloom       bool
@@ -47,6 +48,9 @@ func defaultSpec() storeSpec {
 func (sp storeSpec) options() storage.Options {
 	o := storage.DefaultOptions()
 	o.WAL.SyncMode = sp.sync
+	if sp.syncBytes > 0 {
+		o.WAL.SyncBytes = sp.syncBytes
+	}
 	o.MemTableSize = sp.memtable
 	if sp.blockSize > 0 {
 		o.BlockSize = sp.blockSize
@@ -77,6 +81,7 @@ func (sp storeSpec) config(dataset, keyBytes, valueBytes, concurrency int, workl
 		Workload:        workload,
 		WorkloadRatio:   ratio,
 		SyncMode:        sp.sync.String(),
+		WALSyncBytes:    sp.syncBytes,
 		MemTableBytes:   o.MemTableSize,
 		BlockBytes:      o.BlockSize,
 		BloomBitsPerKey: o.BitsPerKey,

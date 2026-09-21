@@ -203,27 +203,24 @@ func (h *harness) suiteMixed() error {
 		ops := 2 * n
 		ks := bench.NewKeyspace("key", n)
 
-		s, dir, err := h.openStore("mixed-"+mix.Name, sp)
-		if err != nil {
-			return err
-		}
-		if err := h.populate(s, ks, h.valueSize, n); err != nil {
-			_ = s.Close()
-			return err
-		}
 		cfg := sp.config(n, ks.KeyBytes(), h.valueSize, h.concurrency, "mixed-"+mix.Name, mix.Ratio(), h.onTmpfs)
 		label := fmt.Sprintf("mixed %-11s (R/W/D %s) conc=%d", mix.Name, mix.Ratio(), h.concurrency)
-		if _, err := h.runRepeated(label, cfg, "warm reused DB", func(runIdx int, seed int64) (bench.Result, bench.StorageMetrics, error) {
-			pr, err := bench.Mixed(ctx, s, ks, mix, h.valueSize, n, ops, h.concurrency, seed)
-			if err != nil {
-				return bench.Result{}, bench.StorageMetrics{}, err
-			}
-			return pr.Result(label), bench.SnapshotStorage(s, dir), nil
+		// Each run rebuilds the same baseline dataset before the timed mixed
+		// workload, because the mix mutates the store (writes and deletes). A
+		// reused store would drift — run 2 would see whatever run 1 left — so the
+		// five runs would not be comparable. Population is deterministic and
+		// outside the timed interval.
+		if _, err := h.runRepeated(label, cfg, "identical freshly-populated baseline each run", func(runIdx int, seed int64) (bench.Result, bench.StorageMetrics, error) {
+			pr, sm, err := h.freshRun("mixed-"+mix.Name, sp, runIdx, func(s *storage.LSMStore) (bench.PhaseResult, error) {
+				if err := h.populate(s, ks, h.valueSize, n); err != nil {
+					return bench.PhaseResult{}, err
+				}
+				return bench.Mixed(ctx, s, ks, mix, h.valueSize, n, ops, h.concurrency, seed)
+			})
+			return pr.Result(label), sm, err
 		}); err != nil {
-			_ = s.Close()
 			return err
 		}
-		_ = s.Close()
 	}
 	return nil
 }

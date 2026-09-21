@@ -86,8 +86,9 @@ func main() {
 	}
 	fmt.Fprintf(h.out, "\nran %d result(s) in %s\n", len(h.results), time.Since(start).Round(time.Millisecond))
 	// Measured, not assumed: the largest single latency collector this run used.
-	// Memory is 8 bytes per sample; a run stays practical as long as this is small.
-	fmt.Fprintf(h.out, "peak latency samples in one benchmark: %d (%.1f MiB at 8 B/sample)\n",
+	// 8 B/sample is the payload; real footprint is somewhat larger (slice growth,
+	// per-worker slices). A run stays practical as long as this stays small.
+	fmt.Fprintf(h.out, "peak latency samples in one benchmark: %d (%.1f MiB payload at 8 B/sample)\n",
 		h.peakLatN, float64(h.peakLatN*8)/(1<<20))
 
 	if *out != "" {
