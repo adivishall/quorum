@@ -363,22 +363,36 @@ leases are out.
 
 ## 9. Wire protocol (internal, node↔node)
 
-Framed over TCP. One connection carries multiplexed request/response pairs.
+Framed over TCP. One long-lived connection per peer pair carries messages in both directions
+(`docs/TRANSPORT.md`, ADR-013/014). **Implemented in Phase 7** (`internal/transport`).
+
+Every message is one record in the §2 framing — checksummed, little-endian — with the 1-byte
+`kind` serving as the message type:
 
 ```
-offset size  field
-0      4     length   (bytes following this field)
-4      2     msgType
-6      2     flags    (bit 0: isResponse, bit 1: isError)
-8      8     requestID
-16     N     payload
+offset  size  field
+0       4     crc32c(length ‖ kind ‖ payload)
+4       4     length   (payload byte count)
+8       1     kind     (message type)
+9       N     payload  (hand-written message codec)
 ```
 
-Handshake on connect: `"DKV1"` magic + 4-byte protocol version + node ID, so a misdirected
-connection fails immediately instead of being interpreted as a frame.
+> **Phase 7 reconciliation (ADR-013).** Phase 0 sketched a different, checksumless header here
+> (`length·msgType·flags·requestID`). It was retired in favour of the §2 record framing, which
+> `docs/FAILURE_MODEL.md` §2 already assumes ("our own framing; a frame that fails to parse
+> closes the connection"). The message type is the `kind` byte; request/response correlation
+> (`requestID`) and "is a response" live in the message payload / distinct response kinds, not
+> in the frame header. Unlike the WAL, the transport reader never repairs a torn frame — a
+> truncated socket frame is a failed connection, not a recoverable log tail.
 
-Message types: `RequestVote`, `AppendEntries`, `InstallSnapshot`, `Forward` (client request
-proxied to a leader), `Probe` (liveness), each with a matching response type.
+Handshake on connect: `"DKV1"` magic + 4-byte protocol version + length-prefixed node ID, so a
+misdirected or wrong-version connection fails immediately instead of being interpreted as a
+frame. Exact grammar, sizes, and timeouts: `docs/TRANSPORT.md` §3.
+
+Message types: `Probe` and `ProbeResponse` (liveness) are implemented in Phase 7.
+`RequestVote`, `AppendEntries`, `InstallSnapshot`, `Forward` (client request proxied to a
+leader) and their responses are **reserved kind identifiers** for Phases 9/13/14; Phase 7
+defines no codec or semantics for them.
 
 Payloads use a hand-written binary codec (explicit `Marshal`/`Unmarshal`, varints, no
 reflection). Not gob, not JSON, not protobuf. Reasons, in order of weight:

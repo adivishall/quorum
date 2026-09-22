@@ -64,6 +64,13 @@ Node-to-node traffic (Raft RPCs, request forwarding) uses our own framed TCP pro
 The two are separated so that fault injection on the internal network cannot be confused
 with client-side failures.
 
+As of Phase 7 the internal transport is **implemented** (`internal/transport`, `cmd/dkvd`,
+`docs/TRANSPORT.md`): real node processes, a checksummed framed-TCP protocol, a version
+handshake, one bidirectional connection per peer pair, and `Probe`/`ProbeResponse` liveness.
+It carries bytes tagged with a message kind; it does **not** yet run Raft, replicate, forward
+client requests, or host the storage engine — those are Phases 8+. The Raft RPC kinds are
+reserved identifiers only (ADR-013).
+
 ---
 
 ## 3. Components and ownership boundaries
