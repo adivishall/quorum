@@ -46,8 +46,12 @@ offset  size  field
 ```
 
 Frames are written with `record.Encode`, so the transport and the on-disk logs share one
-checksum implementation. Reading is the transport's **own strict reader** — it does not reuse
-the WAL's torn-tail policy (ADR-013):
+checksum implementation. The write path writes the **whole** frame even when the underlying
+writer accepts fewer bytes than requested per call (an `io.Writer`, `net.Conn` included, may do
+a short write): it loops until the frame is fully written under the connection's writer lock,
+propagates the first write error, and refuses to spin on a writer that makes no progress
+(returning `io.ErrShortWrite`). A partial frame is never left on the wire. Reading is the
+transport's **own strict reader** — it does not reuse the WAL's torn-tail policy (ADR-013):
 
 | Reader situation | Result |
 |---|---|
@@ -234,7 +238,7 @@ those phases can be added on top of it without changing this layer.
 | INV-T2 | Malformed transport input is rejected as a protocol error and the connection is closed — never repaired, resynchronised, or interpreted as valid data (a socket is not a WAL). | `TestTruncatedFrameIsError`, `TestBadChecksumIsError`, `TestUnknownKindIsError`, `TestBadMagicIsRejected`, `TestVersionMismatchIsRejected`, `FuzzFrameDecode`, `FuzzHandshakeDecode`, `FuzzProbeDecode` |
 | INV-T3 | A successful handshake precedes any application message; a connection that fails the handshake exchanges no frames. | `TestNoMessagesBeforeHandshake`, `TestHandshakeTimeoutClosesConnection`, `TestSelfConnectionRejected`, `TestUnknownPeerRejected` |
 | INV-T4 | Each received message is attributed to the peer identity established by the handshake on its connection, never to a value carried in the payload. | `TestReceivedEnvelopeCarriesConnectionPeerID`, `TestPayloadCannotSpoofSender` |
-| INV-T5 | Frames on a single connection are delivered in send order. | `TestPerConnectionOrderPreserved`, `TestConcurrentSendersDoNotInterleave` |
+| INV-T5 | Frames on a single connection are delivered in send order, and a frame is written in full (even across short writes) so its bytes never interleave or truncate. | `TestPerConnectionOrderPreserved`, `TestConcurrentSendersDoNotInterleave`, `TestFrameSurvivesPartialWrites`, `TestWriteErrorAfterPartialWriteIsReturned`, `TestZeroProgressWriterDoesNotLoopForever` |
 | INV-T6 | Node shutdown terminates all transport resources: accept loop, dial loops, reader and writer paths, and connections; repeated shutdown is safe; no goroutine leak. | `TestCloseIsIdempotent`, `TestNoGoroutineLeakAfterClose`, `TestSendAfterCloseFails`, and the three-process `TestThreeNodeClusterProbesAndShutsDownCleanly` |
 
 INV-C4 (Phase 6) remains **PLANNED**: routing is not yet integrated into request serving, which
