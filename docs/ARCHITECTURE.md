@@ -93,6 +93,13 @@ bootstrap and never changed at runtime in v1.
 key ──sha256──▶ 64-bit token ──▶ hash ring ──▶ shard id ──▶ replica group {n1,n2,n3}
 ```
 
+As of Phase 6 the routing half of this pipeline is **implemented** in `internal/routing` and
+specified in `docs/ROUTING.md`: `key → shard` is a consistent-hash ring over the fixed shard
+set, and `shard → replica group` is a second consistent-hash ring over the node set, producing
+**declarative** ownership metadata. The `replica group → Raft group` step (actually replicating
+and serving) is Phase 8+ and does not exist yet. ADR-012 records why routing is two rings
+rather than one, and why the redistribution guarantee (INV-C3) lives in the node ring.
+
 Each shard is an **independent Raft group** with its own log, its own leader, and its own
 storage directory. A 3-node cluster with 16 shards runs 16 Raft groups; every node is a
 member of every shard's group when RF == cluster size, and of a subset otherwise.

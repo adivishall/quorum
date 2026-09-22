@@ -437,3 +437,25 @@ Each of these is a real technique we are *choosing* not to implement yet, not on
 
 They belong in `docs/BENCHMARKS.md` as "measured, then decided", not in the code as
 speculation.
+
+## 12. Sharding and routing (Phase 6)
+
+Routing lives in `internal/routing` and is specified in full in `docs/ROUTING.md`; only the
+formats it pins are repeated here, to keep this file the single index of on-the-wire and
+on-ring encodings.
+
+- **Token.** `token(b) = binary.BigEndian.Uint64(sha256(b)[:8])` — SHA-256 of the opaque input
+  bytes, first 8 bytes, big-endian (matching §1's big-endian sequence trailer). Keys are hashed
+  unmodified: no normalisation, casing, or trimming.
+- **Ring positions** are derived with the same rule over namespaced labels, with a fixed-width
+  big-endian `i` last (so the label is injective in its inputs):
+  `shardVnodeToken(s,i)=token("DKVSHARD\x00"‖be32(s)‖be32(i))`,
+  `nodeVnodeToken(id,i)=token("DKVNODE\x00"‖id‖be32(i))`,
+  `anchorToken(s)=token("DKVANCHOR\x00"‖be32(s))`.
+- **Ownership** is the clockwise successor: the position with the smallest token `≥` the query,
+  wrapping to the smallest position; a position `P` owns the half-open arc `(predecessor, P]`.
+  Ties at equal tokens break by `(token, ownerID, vnodeIndex)`, so collisions are deterministic
+  rather than errors.
+- Two rings: `key → shard` (fixed `ShardCount`, default 16) and `shard → replica group` (over
+  the node set, declarative metadata only). ADR-012 is the rationale; `docs/ROUTING.md` §9 is
+  the explicit list of what this phase does not build.
