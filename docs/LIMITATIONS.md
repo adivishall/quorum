@@ -3,10 +3,14 @@
 The things this system does not do, cannot do, or has not proven. Kept current: an item may be
 removed only when a test exists showing it is no longer true.
 
-**Status: Phase 5.** A single-node key-value store with a durable write-ahead log and an
+**Status: Phase 6.** A single-node key-value store with a durable write-ahead log and an
 LSM storage engine — memtable, immutable SSTables with Bloom filters, flush, size-tiered
-compaction, crash-safe MANIFEST-based file publication, restart recovery — exists and is now
-benchmarked (`docs/BENCHMARKS.md`). Nothing distributed does.
+compaction, crash-safe MANIFEST-based file publication, restart recovery — exists and is
+benchmarked (`docs/BENCHMARKS.md`). Phase 6 adds a **pure, deterministic routing library**
+(`internal/routing`, `docs/ROUTING.md`): `key → shard` over a consistent-hash ring, and
+`shard → replica group` as declarative metadata, with a ring visualization (`cmd/dkvring`).
+That library computes *who would own* a key; it does not replicate, elect, communicate, or
+serve anything. Nothing else distributed exists — no networking, no cluster, no consensus.
 
 ### True right now, and temporary
 
@@ -27,6 +31,7 @@ benchmarked (`docs/BENCHMARKS.md`). Nothing distributed does.
 | A length field corrupted within the 64 MiB range can cause a torn-tail/corruption misclassification in the newest segment | inherent to this framing; `docs/WAL.md` §8 |
 | `sync` mode serialises writers behind the device flush (~3.4 ms/append, ~291 appends/s, measured on an M4 — `docs/BENCHMARKS.md` §3.6) | a later phase, if group commit is measured to be worth it |
 | No networking, no cluster, no replication, no consensus | Phases 7–9 |
+| **Routing is a library, not a running system.** `internal/routing` computes which shard owns a key and which nodes *would* form each shard's replica group, but no node hosts a shard, no data is placed or moved, and a "membership change" is a new `Config` compared against the old one, never a live cluster mutation (ADR-005, ADR-012). The replica group is declarative metadata; replication, leader election, forwarding, and availability do not exist. | Phases 7–9; `docs/ROUTING.md` §9 |
 | `dkv put` cannot carry a maximum-size (1 MiB) value, because `ARG_MAX` is 1 MiB on macOS and the kernel rejects the exec. `dkv shell` can. This is an OS limit, not a dkv limit. | not applicable — use `dkv shell`, or the HTTP API from Phase 15 |
 | The CLI is still in-memory-only: it does not yet open a data directory, so `dkv` remains ephemeral even though the storage layer is not | Phase 15 (CLI wiring) |
 | The interactive shell cannot express keys containing whitespace, because it splits on whitespace. The one-shot form and the Go API can. | Phase 15 (HTTP API) |

@@ -22,7 +22,7 @@ Legend: ☐ not started · ◐ in progress · ☑ complete and verified
 | 3 | MemTable + SSTable | skip list, SST writer/reader, flush, multi-level read path | Reads correct across memtable + N SSTables; restart-safe | ☑ INV-L1..L9; INV-S5 partial (flush only) |
 | 4 | Bloom + compaction | bloom filters, size-tiered compaction, MANIFEST | INV-S3, S5, S6, S7 verified; crash-during-compaction test passes | ☑ INV-S3, S5, S6, S7; INV-B1–B2, C1–C7, M1–M5 |
 | 5 | Storage benchmarks | `internal/bench`, `cmd/dkvbench`, `bench/`, `docs/BENCHMARKS.md` | Reproducible numbers with recorded hardware/config; no fabricated figures | ☑ harness + measurements; see `docs/BENCHMARKS.md` |
-| 6 | Sharding | consistent hash ring, shard metadata, routing | INV-C1, C2, C3 verified; ring visualization | ☐ |
+| 6 | Sharding | consistent hash ring, shard metadata, routing | INV-C1, C2, C3 verified; ring visualization | ☑ INV-C1, C2, C3 (routing); `internal/routing`, `cmd/dkvring`, `docs/ROUTING.md` |
 | 7 | Node process + networking | `cmd/dkvd`, `internal/transport`, framing, heartbeats | Real 3-process cluster; nodes communicate over TCP; clean shutdown | ☐ |
 | 8 | Replication model | replica groups, replicated-log interface | Interfaces Raft will drive exist and are exercised; **no consistency claim yet** | ☐ |
 | 9 | Raft | deterministic core + node driver + persistence | INV-R1..R10 verified in deterministic simulation; paper figures reproduced as tests | ☐ |

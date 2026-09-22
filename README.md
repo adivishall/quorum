@@ -6,15 +6,18 @@ Quorum is currently implementing its durable storage engine. No Raft library, no
 database, no consensus service — the storage engine and the consensus implementation are
 the project, and they are being built in that order.
 
-> **Status: Phase 5 of 25 — single-node durable LSM-backed key-value store, now benchmarked.**
+> **Status: Phase 6 of 25 — durable single-node LSM engine, plus a deterministic routing library.**
 >
 > **Implemented:** a write-ahead log, an ordered memtable, immutable on-disk SSTables, Bloom
 > filters, size-tiered compaction, crash-safe MANIFEST-based file publication, and restart
 > recovery across all of it. Acknowledged writes survive the process being killed, including a
-> kill during a flush and a kill during a compaction.
+> kill during a flush and a kill during a compaction. Phase 6 adds a pure consistent-hash
+> routing library (`internal/routing`): `key → shard` and `shard → replica group` as
+> declarative metadata, with a deterministic ring visualization (`cmd/dkvring`).
 >
-> **Not implemented:** sharding, replication, Raft, a distributed cluster, linearizable reads,
-> networking, an HTTP API, a dashboard. Those are Phases 6 and later. See
+> **Not implemented:** replication, Raft, a distributed cluster, linearizable reads,
+> networking, request forwarding, an HTTP API, a dashboard. Routing computes *who would own* a
+> key; it does not replicate, elect, or serve anything. Those are Phases 7 and later. See
 > [docs/ROADMAP.md](docs/ROADMAP.md) for exactly what is done and what is not.
 >
 > The binary is still called `dkv`; that is the command name, not the project name.
@@ -42,8 +45,13 @@ Get ───────────────▶│  MemTable ▸ immutable 
                     │  MANIFEST decides which files are the database      │
                     └────────────────────────────────────────────────────┘
 
+                    ┌─────────── implemented, Phase 6 (library) ─────────┐
+key ───────────────▶│  sha256 ▸ token ▸ shard ring ▸ ShardID             │
+                    │  shard ▸ anchor ▸ node ring ▸ replica group (meta) │
+                    └────────────────────────────────────────────────────┘
+
                     ┌──────────────── not implemented ───────────────────┐
-                    │  sharding · replication · Raft · networking        │ Phases 6+
+                    │  replication · Raft · networking · forwarding      │ Phases 7+
                     │  HTTP API · dashboard                              │ Phases 15+
                     └────────────────────────────────────────────────────┘
 ```
@@ -69,6 +77,14 @@ original writes received.
 The details, including what every crash window leaves on disk: [docs/LSM.md](docs/LSM.md),
 [docs/BLOOM.md](docs/BLOOM.md), [docs/COMPACTION.md](docs/COMPACTION.md),
 [docs/MANIFEST.md](docs/MANIFEST.md).
+
+Alongside the engine, Phase 6 adds a pure routing library: a key is hashed (SHA-256, first 8
+bytes, big-endian) to a 64-bit token, a consistent-hash ring of the fixed shard set maps that
+token to a shard, and a second ring of the node set assigns each shard an ordered replica
+group — declarative metadata only, because replication and consensus are later phases. A
+one-node membership change moves ≈ 1/N of the key space instead of reshuffling it. `dkvring`
+renders the ring (`-format svg|text`) deterministically. The algorithm, golden vectors, and
+the explicit list of what it does *not* do: [docs/ROUTING.md](docs/ROUTING.md).
 
 ## The one thing this project refuses to do
 
@@ -230,6 +246,7 @@ it is being answered out of memory.
 | [BLOOM.md](docs/BLOOM.md) | Filter format, the hash and why it is that one, what may and may not be eliminated, measured false-positive rate and work avoided |
 | [COMPACTION.md](docs/COMPACTION.md) | Size-tiered policy, the streaming k-way merge, version and tombstone elimination, every publication crash window, concurrency |
 | [MANIFEST.md](docs/MANIFEST.md) | Why a directory scan cannot work, the edit format, the publication protocol, orphan and corruption policy, startup |
+| [ROUTING.md](docs/ROUTING.md) | The token rule, the two consistent-hash rings, ownership/wrap/collision rules, redistribution numbers, the visualization, and what Phase 6 is not |
 
 ## Development
 
