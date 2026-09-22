@@ -60,6 +60,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	// A non-positive interval would panic time.NewTicker in probeLoop, so it is
+	// rejected here as invalid configuration rather than reaching the ticker.
+	if *probeIvl <= 0 {
+		fmt.Fprintf(stderr, "dkvd: -probe-interval must be positive, got %s\n", *probeIvl)
+		return 2
+	}
+
 	lg := &logger{w: stdout}
 	tr, err := transport.NewTCPTransport(transport.Config{
 		NodeID:     transport.NodeID(*id),

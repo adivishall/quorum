@@ -46,6 +46,50 @@ func TestRunRejectsBadConfig(t *testing.T) {
 	}
 }
 
+// TestRunRejectsNonPositiveProbeInterval proves a zero or negative
+// -probe-interval is rejected as configuration (exit 2) with a stderr message,
+// and — crucially — never reaches time.NewTicker (a panic would fail the test
+// rather than return 2). run() returns synchronously here, so no goroutine or
+// ticker is started.
+func TestRunRejectsNonPositiveProbeInterval(t *testing.T) {
+	for _, ivl := range []string{"0", "0s", "-5s", "-1ns"} {
+		var out, errb bytes.Buffer
+		code := run(context.Background(),
+			[]string{"-id", "a", "-listen", "127.0.0.1:0", "-probe-interval", ivl},
+			&out, &errb)
+		if code != 2 {
+			t.Fatalf("-probe-interval %q: exit code = %d, want 2", ivl, code)
+		}
+		if !strings.Contains(errb.String(), "probe-interval") {
+			t.Fatalf("-probe-interval %q: stderr = %q, want it to mention probe-interval", ivl, errb.String())
+		}
+		if out.String() != "" {
+			t.Fatalf("-probe-interval %q: node emitted output %q before rejecting the config", ivl, out.String())
+		}
+	}
+}
+
+// TestRunAcceptsValidProbeInterval proves an explicit positive interval still
+// lets the node start and shut down cleanly with exit 0.
+func TestRunAcceptsValidProbeInterval(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	out := &syncBuffer{}
+	done := make(chan int, 1)
+	go func() {
+		done <- run(ctx, []string{"-id", "solo", "-listen", "127.0.0.1:0", "-probe-interval", "50ms"}, out, io.Discard)
+	}()
+	waitFor(t, out, "event=ready", 3*time.Second)
+	cancel()
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0", code)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("node did not exit after cancellation")
+	}
+}
+
 // syncBuffer is a concurrency-safe buffer for reading a node's event stream
 // while it runs.
 type syncBuffer struct {
