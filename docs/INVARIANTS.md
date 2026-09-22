@@ -225,11 +225,17 @@ labelled as such.
 
 ## Routing / cluster
 
+The `C` numbers here are the **routing** series and are distinct from the Phase-4
+**compaction** `INV-C1..C7` above; both series predate this note and are not renumbered
+(the compaction ones are cited across `docs/COMPACTION.md` and the storage tests). Context
+disambiguates: these are enforced by `internal/routing`, specified in `docs/ROUTING.md`, and
+introduced by ADR-012.
+
 | ID | Invariant | Checked by | Status |
 |---|---|---|---|
-| INV-C1 | Key routing is a pure function of (key, membership configuration). Same inputs → same shard, on every node, forever. | Phase 6 determinism + golden-file test | PLANNED |
-| INV-C2 | Every shard has exactly one replica group, and every key maps to exactly one shard. No key is unowned; no key is doubly owned. | Phase 6 exhaustive ring coverage test | PLANNED |
-| INV-C3 | A membership change of one node moves only the keys it must (≈ 1/N of the space), not a reshuffle. | Phase 6 redistribution test | PLANNED |
+| INV-C1 | Key routing is a pure function of (key, membership configuration). Same inputs → same shard, on every node, forever. | `internal/routing`: `TestGoldenTokenVectors`, `TestGoldenKeyToShard`, `TestGoldenReplicaGroups` (values from an independent Python reference, not self-checked), `TestRouteIsDeterministicAcrossManyCalls`, `TestEquivalentConfigsRouteIdentically`, `TestNodeOrderDoesNotAffectRouting`, `TestConfigRoundTripThroughSerializationRoutesIdentically`, `FuzzRouteIsDeterministicAndValid` | VERIFIED |
+| INV-C2 | Every shard has exactly one replica group, and every key maps to exactly one shard. No key is unowned; no key is doubly owned. | `internal/routing`: `TestEveryTokenIntervalHasExactlyOneOwner` (arc lengths sum to 2⁶⁴ — no gap, no overlap — plus per-arc boundary/interior ownership), `TestRingIsSorted`, `TestSuccessorBoundaryAndWrap`, `TestTokenCollisionIsDeterministic`, `TestRouteAlwaysReturnsAValidShard`, `TestEveryShardIsRepresentedExactlyOnce`, `TestEveryShardHasOneReplicaGroup` | VERIFIED |
+| INV-C3 | A membership change of one node moves only the keys it must (≈ 1/N of the space), not a reshuffle. | `internal/routing`: `TestKeyToShardIsStableAcrossNodeMembershipChange` (0 key→shard changes), `TestOwnerMovesOnlyWhereItsShardPrimaryMoved` (movement fully attributed to shard reassignment), `TestConsistentHashingBeatsModuloOnRedistribution`, `TestRedistributionGoldenCounts` (fixed 141/141/68 ring vs 383/383/425 modulo shards of 512) | VERIFIED |
 | INV-C4 | A client request for key k is never served by a node that does not host k's shard, except as an explicit forward or redirect. | Phase 7 routing tests | PLANNED |
 
 ## Client semantics
