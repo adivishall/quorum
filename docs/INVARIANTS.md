@@ -236,7 +236,22 @@ introduced by ADR-012.
 | INV-C1 | Key routing is a pure function of (key, membership configuration). Same inputs → same shard, on every node, forever. | `internal/routing`: `TestGoldenTokenVectors`, `TestGoldenKeyToShard`, `TestGoldenReplicaGroups` (values from an independent Python reference, not self-checked), `TestRouteIsDeterministicAcrossManyCalls`, `TestEquivalentConfigsRouteIdentically`, `TestNodeOrderDoesNotAffectRouting`, `TestConfigRoundTripThroughSerializationRoutesIdentically`, `FuzzRouteIsDeterministicAndValid` | VERIFIED |
 | INV-C2 | Every shard has exactly one replica group, and every key maps to exactly one shard. No key is unowned; no key is doubly owned. | `internal/routing`: `TestEveryTokenIntervalHasExactlyOneOwner` (arc lengths sum to 2⁶⁴ — no gap, no overlap — plus per-arc boundary/interior ownership), `TestRingIsSorted`, `TestSuccessorBoundaryAndWrap`, `TestTokenCollisionIsDeterministic`, `TestRouteAlwaysReturnsAValidShard`, `TestEveryShardIsRepresentedExactlyOnce`, `TestEveryShardHasOneReplicaGroup` | VERIFIED |
 | INV-C3 | A membership change of one node moves only the keys it must (≈ 1/N of the space), not a reshuffle. | `internal/routing`: `TestKeyToShardIsStableAcrossNodeMembershipChange` (0 key→shard changes), `TestOwnerMovesOnlyWhereItsShardPrimaryMoved` (movement fully attributed to shard reassignment), `TestConsistentHashingBeatsModuloOnRedistribution`, `TestRedistributionGoldenCounts` (fixed 141/141/68 ring vs 383/383/425 modulo shards of 512) | VERIFIED |
-| INV-C4 | A client request for key k is never served by a node that does not host k's shard, except as an explicit forward or redirect. | Phase 7 routing tests | PLANNED |
+| INV-C4 | A client request for key k is never served by a node that does not host k's shard, except as an explicit forward or redirect. | Phase 8+ (request serving) — Phase 7 has no server to violate it | PLANNED |
+
+## Transport / node process (Phase 7)
+
+Enforced by `internal/transport`, `cmd/dkvd`, and `tests/integration/cluster_test.go`;
+specified in `docs/TRANSPORT.md` and introduced by ADR-013/ADR-014. The `T` series is the
+transport/node namespace, distinct from every series above.
+
+| ID | Invariant | Checked by | Status |
+|---|---|---|---|
+| INV-T1 | Frame parsing is bounded and explicit: a declared length over `MaxFrameSize` (16 MiB) is rejected before any allocation, and a frame is read with `io.ReadFull` discipline regardless of TCP fragmentation. | `internal/transport`: `TestFrameTooLargeIsRejectedBeforeAlloc`, `TestFrameReassembledFromFragments`, `TestConcatenatedFramesDecodeIndividually`, `FuzzFrameDecode` | VERIFIED |
+| INV-T2 | Malformed transport input is rejected as a protocol error that closes the connection — never repaired, resynchronised, or interpreted as valid data (a socket is not a WAL). Nothing panics on hostile input. | `internal/transport`: `TestTruncatedFrameIsError`, `TestBadChecksumIsError`, `TestUnknownKindIsError`, `TestHandshakeBadMagicRejected`, `TestHandshakeVersionMismatchRejected`, `TestProbeMalformedRejected`, `FuzzFrameDecode`, `FuzzHandshakeDecode`, `FuzzProbeDecode` | VERIFIED |
+| INV-T3 | A successful handshake precedes any application message; a connection that fails the handshake (bad magic, wrong version, self id, unknown peer, timeout) exchanges no frames and is closed. | `internal/transport`: `TestSelfConnectionRejected`, `TestUnknownPeerRejected`, `TestHandshakeTimeoutClosesConnection`, `TestBadMagicClosesConnection`, `TestHandshakeTruncatedRejected` | VERIFIED |
+| INV-T4 | Each received message is attributed to the peer identity established by the handshake on its connection, never to a value carried in the payload. | `internal/transport`: `TestTCPHandshakeAndProbe`, `TestPayloadCannotSpoofSender` | VERIFIED |
+| INV-T5 | Frames on a single connection are delivered in send order, and concurrent senders never interleave a frame's bytes. | `internal/transport`: `TestPerConnectionOrderPreserved`, `TestConcurrentSendersDoNotInterleave` | VERIFIED |
+| INV-T6 | Node shutdown terminates all transport resources — accept loop, dial loops, reader/writer paths, connections — with no goroutine leak; repeated shutdown is safe; and three real processes exit cleanly. | `internal/transport`: `TestCloseIsIdempotent`, `TestNoGoroutineLeakAfterClose`, `TestSendAfterCloseFails`; `tests/integration`: `TestThreeNodeClusterProbesAndShutsDownCleanly` | VERIFIED |
 
 ## Client semantics
 

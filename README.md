@@ -6,18 +6,21 @@ Quorum is currently implementing its durable storage engine. No Raft library, no
 database, no consensus service — the storage engine and the consensus implementation are
 the project, and they are being built in that order.
 
-> **Status: Phase 6 of 25 — durable single-node LSM engine, plus a deterministic routing library.**
+> **Status: Phase 7 of 25 — durable single-node LSM engine, a routing library, and real node processes on a TCP transport.**
 >
 > **Implemented:** a write-ahead log, an ordered memtable, immutable on-disk SSTables, Bloom
 > filters, size-tiered compaction, crash-safe MANIFEST-based file publication, and restart
 > recovery across all of it. Acknowledged writes survive the process being killed, including a
-> kill during a flush and a kill during a compaction. Phase 6 adds a pure consistent-hash
-> routing library (`internal/routing`): `key → shard` and `shard → replica group` as
-> declarative metadata, with a deterministic ring visualization (`cmd/dkvring`).
+> kill during a flush and a kill during a compaction. A pure consistent-hash routing library
+> (`internal/routing`): `key → shard` and `shard → replica group` metadata, with a ring
+> visualization (`cmd/dkvring`). Phase 7 adds real node processes (`cmd/dkvd`) and an internal
+> TCP transport (`internal/transport`): checksummed framing, a version handshake, one
+> bidirectional connection per peer pair, and `Probe`/`ProbeResponse` liveness — proven by three
+> real processes exchanging probes over TCP and shutting down cleanly.
 >
-> **Not implemented:** replication, Raft, a distributed cluster, linearizable reads,
-> networking, request forwarding, an HTTP API, a dashboard. Routing computes *who would own* a
-> key; it does not replicate, elect, or serve anything. Those are Phases 7 and later. See
+> **Not implemented:** replication, Raft, leader election, a consensus-backed cluster,
+> linearizable reads, request forwarding, an HTTP API, a dashboard. The transport carries bytes;
+> it runs no consensus and serves no clients. Those are Phases 8 and later. See
 > [docs/ROADMAP.md](docs/ROADMAP.md) for exactly what is done and what is not.
 >
 > The binary is still called `dkv`; that is the command name, not the project name.
@@ -50,8 +53,13 @@ key ───────────────▶│  sha256 ▸ token ▸ sh
                     │  shard ▸ anchor ▸ node ring ▸ replica group (meta) │
                     └────────────────────────────────────────────────────┘
 
+                    ┌─────────── implemented, Phase 7 (processes) ───────┐
+dkvd node ─TCP────▶ │  framed TCP · handshake · one conn per peer pair   │
+                    │  Probe / ProbeResponse liveness · clean shutdown   │
+                    └────────────────────────────────────────────────────┘
+
                     ┌──────────────── not implemented ───────────────────┐
-                    │  replication · Raft · networking · forwarding      │ Phases 7+
+                    │  replication · Raft · request forwarding           │ Phases 8+
                     │  HTTP API · dashboard                              │ Phases 15+
                     └────────────────────────────────────────────────────┘
 ```
@@ -85,6 +93,19 @@ group — declarative metadata only, because replication and consensus are later
 one-node membership change moves ≈ 1/N of the key space instead of reshuffling it. `dkvring`
 renders the ring (`-format svg|text`) deterministically. The algorithm, golden vectors, and
 the explicit list of what it does *not* do: [docs/ROUTING.md](docs/ROUTING.md).
+
+Phase 7 makes nodes real. `cmd/dkvd` is one OS process per node; `internal/transport` is the
+internal node-to-node link: messages framed with the same checksummed record format the logs
+use, a `"DKV1"` version handshake, one long-lived bidirectional TCP connection per peer pair
+(the lower node id dials), automatic reconnect, concurrent-safe sends, and per-connection frame
+ordering. Unlike the WAL, a torn network frame is a failed connection, not a repairable tail.
+Phase 7 sends only `Probe`/`ProbeResponse`; the Raft message kinds are reserved identifiers.
+It runs no consensus and serves no clients. The wire format, handshake, sizes, timeouts,
+ordering guarantees, and the explicit boundary: [docs/TRANSPORT.md](docs/TRANSPORT.md).
+
+```bash
+dkvd -id node-1 -listen 127.0.0.1:7001 -peers node-2=127.0.0.1:7002,node-3=127.0.0.1:7003
+```
 
 ## The one thing this project refuses to do
 
@@ -247,6 +268,7 @@ it is being answered out of memory.
 | [COMPACTION.md](docs/COMPACTION.md) | Size-tiered policy, the streaming k-way merge, version and tombstone elimination, every publication crash window, concurrency |
 | [MANIFEST.md](docs/MANIFEST.md) | Why a directory scan cannot work, the edit format, the publication protocol, orphan and corruption policy, startup |
 | [ROUTING.md](docs/ROUTING.md) | The token rule, the two consistent-hash rings, ownership/wrap/collision rules, redistribution numbers, the visualization, and what Phase 6 is not |
+| [TRANSPORT.md](docs/TRANSPORT.md) | Framing, handshake, message kinds, sizes, codec, connection model, timeouts, shutdown, ordering semantics, failure behavior, and what Phase 7 is not |
 
 ## Development
 
