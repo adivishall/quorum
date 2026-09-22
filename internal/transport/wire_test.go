@@ -7,9 +7,98 @@ import (
 	"hash/crc32"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/adivishall/quorum/internal/record"
 )
+
+// chunkWriter is a deliberately hostile io.Writer for the partial-write tests. It
+// accepts at most perWrite bytes per call (forcing a single frame to take several
+// Write calls), can fail after a threshold, and can make zero progress with a nil
+// error to prove writeFull does not spin forever.
+type chunkWriter struct {
+	buf      bytes.Buffer
+	perWrite int   // max bytes accepted per Write (0 = unlimited)
+	failAt   int   // if failErr != nil, return it once written >= failAt
+	failErr  error // error to return after failAt bytes
+	zero     bool  // if true, every Write returns (0, nil)
+	written  int
+	calls    int
+}
+
+func (w *chunkWriter) Write(p []byte) (int, error) {
+	w.calls++
+	if w.zero {
+		return 0, nil
+	}
+	n := len(p)
+	if w.perWrite > 0 && n > w.perWrite {
+		n = w.perWrite
+	}
+	w.buf.Write(p[:n])
+	w.written += n
+	if w.failErr != nil && w.written >= w.failAt {
+		return n, w.failErr
+	}
+	return n, nil
+}
+
+// TestFrameSurvivesPartialWrites proves writeFrame writes a whole frame even when
+// the writer accepts only a few bytes per call, and that the reassembled bytes
+// decode back to the exact message (strengthens INV-T5 / stream correctness).
+func TestFrameSurvivesPartialWrites(t *testing.T) {
+	payload := []byte("a frame long enough to require many Write calls to complete")
+	for _, per := range []int{1, 3, 7} {
+		cw := &chunkWriter{perWrite: per}
+		if _, err := writeFrame(cw, nil, MsgProbe, payload); err != nil {
+			t.Fatalf("perWrite=%d: writeFrame: %v", per, err)
+		}
+		// The whole frame must have been written across multiple calls.
+		full := frameBytes(t, MsgProbe, payload)
+		if cw.written != len(full) {
+			t.Fatalf("perWrite=%d: wrote %d bytes, want the full %d", per, cw.written, len(full))
+		}
+		if cw.calls < 2 {
+			t.Fatalf("perWrite=%d: only %d Write call(s) — the writer did not force a short write", per, cw.calls)
+		}
+		kind, got, err := readOneFrame(t, &cw.buf)
+		if err != nil || kind != MsgProbe || !bytes.Equal(got, payload) {
+			t.Fatalf("perWrite=%d: decode kind=%v payload=%q err=%v", per, kind, got, err)
+		}
+	}
+}
+
+// TestWriteErrorAfterPartialWriteIsReturned proves a write error that occurs
+// after some bytes have already been written is propagated, not swallowed.
+func TestWriteErrorAfterPartialWriteIsReturned(t *testing.T) {
+	boom := errors.New("write failed mid-frame")
+	cw := &chunkWriter{perWrite: 4, failAt: 4, failErr: boom}
+	if _, err := writeFrame(cw, nil, MsgProbe, []byte("this payload needs several writes")); !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the mid-frame write error", err)
+	}
+	if cw.written < 4 {
+		t.Fatalf("expected a partial write before the error, wrote %d", cw.written)
+	}
+}
+
+// TestZeroProgressWriterDoesNotLoopForever proves a writer that reports (0, nil)
+// forever cannot hang writeFrame: it returns io.ErrShortWrite. The goroutine +
+// deadline is what catches a regression that reintroduces an infinite loop.
+func TestZeroProgressWriterDoesNotLoopForever(t *testing.T) {
+	done := make(chan error, 1)
+	go func() {
+		_, err := writeFrame(&chunkWriter{zero: true}, nil, MsgProbe, []byte("x"))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("err = %v, want io.ErrShortWrite", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("writeFrame looped forever on a zero-progress writer")
+	}
+}
 
 // frameBytes builds a valid on-the-wire frame for a payload.
 func frameBytes(t *testing.T, kind MsgKind, payload []byte) []byte {

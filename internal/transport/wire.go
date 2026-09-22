@@ -80,15 +80,39 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 // per-frame allocation; the returned slice is buf grown as needed. The caller
 // holds the connection's writer lock, so w receives one frame's bytes without
 // interleaving from another goroutine.
+//
+// The whole frame is written even if w consumes fewer bytes than requested per
+// call (an io.Writer, including net.Conn, may do a short write). A partial frame
+// on the wire is a corrupt frame to the peer, so writeFull loops until the frame
+// is fully written, propagating any error and refusing to spin on a writer that
+// makes no progress.
 func writeFrame(w io.Writer, buf []byte, kind MsgKind, payload []byte) ([]byte, error) {
 	enc, err := record.Encode(buf[:0], record.Kind(kind), payload)
 	if err != nil {
 		return enc, err // payload exceeds record.MaxRecordSize
 	}
-	if _, err := w.Write(enc); err != nil {
-		return enc, err
+	return enc, writeFull(w, enc)
+}
+
+// writeFull writes all of p to w, tolerating short writes. It returns the first
+// write error, and treats a zero-progress write with a nil error (a misbehaving
+// writer) as io.ErrShortWrite rather than looping forever.
+func writeFull(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		if n < 0 || n > len(p) {
+			return io.ErrShortWrite // an impossible count from a broken writer
+		}
+		p = p[n:]
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			// No bytes written and no error reported: stop instead of spinning.
+			return io.ErrShortWrite
+		}
 	}
-	return enc, nil
+	return nil
 }
 
 // readFrame reads exactly one frame from r with io.ReadFull discipline, so it is
