@@ -43,9 +43,24 @@ type Config struct {
 	TickInterval   time.Duration
 	ElectionTicks  int
 	HeartbeatTicks int
-	Sync           bool       // fsync the raft log on every Save (default true path)
-	Rand           *rand.Rand // optional; defaults to a seed derived from ID
-	Logf           func(string, ...any)
+
+	// DisableSync turns OFF the fsync of the durable Raft log on every Save. It is
+	// UNSAFE and exists only for tests and benchmarks where durability is not under
+	// test. The zero value (false) is the durable, production path: every Save
+	// fsyncs before the driver sends the dependent reply, which is what the
+	// persistence contract (INV-R6) requires. Production code leaves this false.
+	DisableSync bool
+
+	Rand *rand.Rand // optional; defaults to a seed derived from ID
+	Logf func(string, ...any)
+}
+
+// raftlogOptions returns the durable-log options this config implies. The default
+// (zero-value) config is durable (Sync: true); only an explicit DisableSync turns
+// fsync off. Start uses this exact function, so a test that pins its result pins
+// the real durability default.
+func (c Config) raftlogOptions() raftlog.Options {
+	return raftlog.Options{Sync: !c.DisableSync}
 }
 
 // NodeID re-exported for callers.
@@ -93,7 +108,7 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		cfg.Rand = rand.New(rand.NewSource(seedFromID(cfg.ID)))
 	}
 
-	lg, rec, err := raftlog.Open(cfg.LogPath, raftlog.Options{Sync: cfg.Sync})
+	lg, rec, err := raftlog.Open(cfg.LogPath, cfg.raftlogOptions())
 	if err != nil {
 		return nil, err
 	}

@@ -241,7 +241,7 @@ func runRaft(ctx context.Context, id string, peers map[transport.NodeID]string, 
 	n, err := raftnode.Start(ctx, raftnode.Config{
 		ID: raftnode.NodeID(id), Peers: group, Transport: tr,
 		LogPath:      filepath.Join(dataDir, "raft-"+id+".log"),
-		TickInterval: tick, Sync: true, Logf: lg.logf,
+		TickInterval: tick, Logf: lg.logf, // durable by default (DisableSync left false)
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "dkvd: %v\n", err)

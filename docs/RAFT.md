@@ -173,6 +173,14 @@ the last `HardState` wins. Every append that a reply depends on is `f.Sync()`'d 
 reply is sent — the `Ready` contract makes this structural: the driver persists all of a `Ready`'s
 `HardState` and `Entries` before sending any of its `Messages`.
 
+**Durability is the default, not an opt-in.** `raftnode.Config` is durable at its zero value: the
+driver fsyncs every `Save` unless `DisableSync` is explicitly set, and `DisableSync` exists only for
+tests/benchmarks where durability is not under test (production leaves it false). The default is
+pinned by a test (`TestDefaultConfigIsDurable`) that asserts the effective log options, so the
+unsafe zero-value behaviour cannot be reintroduced silently. `f.Sync()` here is a kernel-level
+fsync: it makes an acknowledged write survive **process kill**, not proven against power loss (the
+same honest bound the WAL carries, `docs/FAILURE_MODEL.md`).
+
 **Crash policy** (distinct from the WAL's; ADR-016): a torn final record truncates to the last good
 offset (crash mid-append; the dependent reply was never sent). A checksum mismatch with bytes
 following, a zero-filled header with data after it, an unknown kind, a malformed payload, or an

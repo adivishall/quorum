@@ -32,6 +32,22 @@ func (s *recSM) snapshot() []string {
 	return append([]string(nil), s.applied...)
 }
 
+// TestDefaultConfigIsDurable pins the durability default: a zero-value Config (no
+// DisableSync set) fsyncs the Raft log, and only an explicit DisableSync turns it
+// off. Start uses raftlogOptions() verbatim, so this fails if anyone reintroduces
+// the old unsafe zero-value behaviour where durability was off by default.
+func TestDefaultConfigIsDurable(t *testing.T) {
+	if got := (Config{}).raftlogOptions(); !got.Sync {
+		t.Fatalf("default Config is not durable: raftlogOptions().Sync = %v, want true", got.Sync)
+	}
+	if got := (Config{ID: "n0", LogPath: "x"}).raftlogOptions(); !got.Sync {
+		t.Fatalf("a populated Config without DisableSync is not durable: Sync = %v, want true", got.Sync)
+	}
+	if got := (Config{DisableSync: true}).raftlogOptions(); got.Sync {
+		t.Fatalf("DisableSync did not turn off fsync: Sync = %v, want false", got.Sync)
+	}
+}
+
 func freeAddr(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -82,7 +98,7 @@ func startCluster(t *testing.T, ctx context.Context, n int) *harness {
 		node, err := Start(ctx, Config{
 			ID: id, Peers: ids, Transport: tr,
 			LogPath:      filepath.Join(h.dir, string(id)+".log"),
-			StateMachine: sm, TickInterval: 15 * time.Millisecond, Sync: false,
+			StateMachine: sm, TickInterval: 15 * time.Millisecond, DisableSync: true,
 		})
 		if err != nil {
 			t.Fatalf("node %s: %v", id, err)
@@ -212,7 +228,7 @@ func TestGracefulRecovery(t *testing.T) {
 		}
 		node, err := Start(ctx, Config{
 			ID: id, Peers: []NodeID{id}, Transport: tr,
-			LogPath: logPath, TickInterval: 15 * time.Millisecond, Sync: true,
+			LogPath: logPath, TickInterval: 15 * time.Millisecond, // durable by default
 		})
 		if err != nil {
 			t.Fatalf("start: %v", err)
