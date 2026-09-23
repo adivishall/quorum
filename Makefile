@@ -6,7 +6,7 @@ GO      ?= go
 PKGS    := ./...
 BIN     := bin
 
-.PHONY: all build test race vet fmt fmtcheck checkignore integration mutation bench benchsuite dkvbench tidy clean check
+.PHONY: all build test race vet fmt fmtcheck checkignore integration mutation faults fuzz bench benchsuite dkvbench tidy clean check
 
 all: check
 
@@ -26,12 +26,25 @@ race:
 integration:
 	$(GO) test -race -count=1 -v ./tests/integration/
 
-## mutation — Phase 9 Raft mutation testing. Applies deliberate rule-violating
-## edits to the source, runs the tests that must catch each, and requires every
-## mutant to be killed (edits are reverted via git). Needs a clean working tree
-## for the files it mutates. See docs/RAFT.md.
+## mutation — mutation testing (Phase 9 Raft rules, Phase 10 failure handling and
+## fault-model fidelity). Applies deliberate rule-violating edits to the source,
+## runs the tests that must catch each, and requires every mutant to be killed
+## (edits are reverted via git). Needs a clean working tree for the files it
+## mutates. See docs/RAFT.md §12a and docs/FAULTS.md.
 mutation:
 	./scripts/mutation.sh
+
+## faults — Phase 10 deterministic fault schedules at a large seed budget (plain
+## `go test` runs a small seed set). Every run is replayable: a failure prints the
+## exact command and a minimized script. See docs/FAULTS.md.
+FAULT_SEEDS ?= 200
+faults:
+	$(GO) test -count=1 -run 'TestRandomizedFaultSchedules|TestSameSeedSameTrace|TestTraceIsPlatformIndependent' ./internal/raftsim -raftsim.seeds=$(FAULT_SEEDS)
+
+## fuzz — run every fuzz target in the repository for FUZZTIME each (default 10s).
+FUZZTIME ?= 10s
+fuzz:
+	FUZZTIME="$(FUZZTIME)" ./scripts/fuzz.sh
 
 ## bench — the Go micro-benchmarks (testing.B). Quick order-of-magnitude checks.
 bench:
