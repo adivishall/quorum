@@ -1,6 +1,7 @@
 # DESIGN — formats, protocols, state machines
 
-Status: **Phase 0 — specification only.**
+Status: **Phase 0 specification, with each later phase's implementation notes inline (latest:
+Phase 10).**
 Formats defined here are v1 and are versioned on disk so they can change without silent
 misinterpretation of old data.
 
@@ -320,6 +321,13 @@ Consensus Algorithm"), sections 5.1–5.4 plus §7 snapshots.
 > honoured (one record stream; last HardState wins; `commitIndex` is a recoverable optimization).
 > §8.5's ReadIndex read path is **not** implemented in Phase 9 (no client read serving yet), and
 > snapshots (§7) are Phase 14.
+>
+> **Phase 10 update (ADR-017, docs/FAULTS.md).** The persist-then-send ordering of §8.1 is one
+> function, `raftnode.DrainReady`, and the startup path of §10 is `raftnode.Recover`; the
+> deterministic fault simulator calls both. A durable-log write or fsync failure is fail-stop: the
+> log latches the error and refuses further writes, the driver sends none of the dependent
+> messages and stops, and `dkvd` exits 1 (INV-F1). The raft log does all file I/O through a small
+> `vfs.FS` seam, which is where persistence faults are injected.
 
 ### 8.1 Persistent state (fsynced before any RPC reply that depends on it)
 
@@ -439,8 +447,8 @@ inspectable with `curl` during a demo.
 2.  Sweep orphan SSTables (on disk but not in the manifest) — delete.
 3.  Replay engine WAL segments >= logNumber into a fresh memtable.
         Torn tail → truncate (§2). Mid-log corruption → abort.
-4.  Open the raft log; replay Entry and HardState records.
-        → currentTerm, votedFor, entries[]
+4.  Open the raft log; replay Entry and HardState records; truncate a torn tail; fsync.
+        → currentTerm, votedFor, entries[]   (durable before the node acts on them — Phase 10)
 5.  Reconcile: engine.appliedIndex must be <= raft.lastIndex.
         If engine.appliedIndex > raft.lastIndex → ErrInconsistent, refuse to start.
         (This means the state machine is ahead of its own log: impossible unless the

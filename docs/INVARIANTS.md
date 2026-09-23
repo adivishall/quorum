@@ -217,29 +217,64 @@ which runs the continuously-checkable invariants after every step) and, for dura
 **process-kill** tests. These are Raft **safety** properties; they are not, on their own, the
 end-to-end Quorum consistency model (`docs/CONSISTENCY.md`), which Phase 12 verifies.
 
+**Phase 10 (`docs/FAULTS.md`)** re-verified every one of them **under injected faults**: the
+`internal/raftsim` simulator checks R1–R10 continuously — after every event, or at the exact send,
+commit, apply or restart the property is about — across scripted fault scenarios and seeded
+random schedules of drop, duplication, delay, reordering, partitions, process crashes, a modeled
+power loss, restarts, pauses and persistence failures; the driver and real-process fault tests
+add what the simulator cannot show. The "Checked by" column lists both.
+
 | ID | Invariant | Checked by | Status |
 |---|---|---|---|
-| INV-R1 | **Election Safety.** At most one leader can be elected in a given term. | `internal/raft`: `assertAtMostOneLeaderPerTerm` (continuous, every step of every sim test), `TestThreeNodeElection`, `TestVoteGrantedOncePerTerm`, `TestVoteDeniedToStaleLog`, `TestSplitVoteResolves` | VERIFIED (simulation) |
-| INV-R2 | **Leader Append-Only.** A leader never overwrites or deletes entries in its own log; it only appends. | `internal/raft`: `TestLeaderAppendOnly` (records each index across proposals and fails on any rewrite) | VERIFIED (simulation) |
-| INV-R3 | **Log Matching.** If two logs contain an entry with the same index and term, the logs are identical in all entries up through that index. | `internal/raft`: `assertLogMatching` (continuous, every step, all node pairs), `TestReplicationAndCommitAndApply`, `TestSuffixReplacement`, `TestConflictBackupByTerm` | VERIFIED (simulation) |
-| INV-R4 | **Leader Completeness.** If an entry is committed in term T, it is present in the log of every leader of every term > T. | `internal/raft`: `TestLeaderCompleteness` (commit, then forced leadership changes), `TestFigure8` (the committed old-term entry survives and blocks a competing candidate) | VERIFIED (simulation) |
-| INV-R5 | **State Machine Safety.** If a node has applied an entry at index i, no node ever applies a different entry at index i. | `internal/raft`: cross-node apply-history comparison in `applyCommitted` (continuous), `TestReplicationAndCommitAndApply`; `internal/raftnode`: `TestClusterElectsAndReplicates` (real TCP, applied order asserted) | VERIFIED (simulation + real cluster) |
-| INV-R6 | `currentTerm` and `votedFor` are durable before any vote is granted or any dependent AppendEntries reply is sent. | Structural via the `Ready` contract (persist HardState/Entries before Messages), asserted by `internal/raft`: `TestHardStateAccompaniesVoteGrant`, `TestHardStateAccompaniesTermBump`; durability across process death by `internal/raftlog` round-trip tests and `tests/integration`: `TestRaftLogSurvivesSIGKILL` | VERIFIED (process kill) |
-| INV-R7 | A node never applies an entry with index > `commitIndex`. | `internal/raft`: apply-path guard in `applyCommitted` (continuous), `FuzzRaftEvents` (applied ≤ commit ≤ lastIndex after every step); enforced structurally by the Phase 8 log (INV-P8) | VERIFIED |
-| INV-R8 | `commitIndex` is monotonically non-decreasing on every node, across restarts. | Within a session: Phase 8 log (INV-P5). Across restart: `internal/raftnode`: `TestGracefulRecovery`; `tests/integration`: `TestRaftLogSurvivesSIGKILL` (recovered node reaches a strictly higher commit, never lower); `internal/raftlog` clamps a persisted commit to the recovered log | VERIFIED (process kill) |
-| INV-R9 | A leader only advances `commitIndex` past entries from its own term. | `internal/raft`: the `maybeCommit` current-term check + the mandatory election no-op; `TestFigure8` (a prior-term entry on a majority is committed only via a current-term entry — removing the no-op fails the test) | VERIFIED (simulation) |
-| INV-R10 | A stale message (lower term) never mutates state beyond sending a rejection carrying the current term. | `internal/raft`: `TestStaleMessageIsInert`, `TestStaleAppendResponseIgnored`, `TestHigherTermForcesStepDown` | VERIFIED (simulation) |
+| INV-R1 | **Election Safety.** At most one leader can be elected in a given term. | `internal/raft`: `assertAtMostOneLeaderPerTerm` (continuous, every step of every sim test), `TestThreeNodeElection`, `TestVoteGrantedOncePerTerm`, `TestVoteDeniedToStaleLog`, `TestSplitVoteResolves`. Phase 10 — `internal/raftsim`: continuous under every fault schedule, by role observation and by AppendEntries sender, plus `TestDuplicatedVoteDoesNotCountTwice`; `internal/raftnode`: a Status monitor in every real-TCP fault test; `tests/integration`: no two `dkvd` processes ever announce one term (sampled every 20 ms, so it can miss a violation, never invent one) | VERIFIED (simulation, incl. under faults) |
+| INV-R2 | **Leader Append-Only.** A leader never overwrites or deletes entries in its own log; it only appends. | `internal/raft`: `TestLeaderAppendOnly` (records each index across proposals and fails on any rewrite). Phase 10 — `internal/raftsim`: continuous for every leader under every fault schedule | VERIFIED (simulation, incl. under faults) |
+| INV-R3 | **Log Matching.** If two logs contain an entry with the same index and term, the logs are identical in all entries up through that index. | `internal/raft`: `assertLogMatching` (continuous, every step, all node pairs), `TestReplicationAndCommitAndApply`, `TestSuffixReplacement`, `TestConflictBackupByTerm`. Phase 10 — `internal/raftsim`: continuous across all live pairs under every fault schedule; `internal/raftnode` and `tests/integration`: the durable logs on disk compared after partition, crash and flapping runs | VERIFIED (simulation, incl. under faults; durable logs of real processes) |
+| INV-R4 | **Leader Completeness.** If an entry is committed in term T, it is present in the log of every leader of every term > T. | `internal/raft`: `TestLeaderCompleteness` (commit, then forced leadership changes), `TestFigure8` (the committed old-term entry survives and blocks a competing candidate). Phase 10 — `internal/raftsim`: continuous (every leader against the global committed record) under every fault schedule, `TestLeaderCrashAndReelection`, `TestAckedEntrySurvivesPowerLoss`, `TestNoAckOfUnsyncedEntriesAfterFailedFsync`; `tests/integration`: every prefix committed before a SIGKILL/partition is at the head of every log afterwards | VERIFIED (simulation, incl. under faults; process kill) |
+| INV-R5 | **State Machine Safety.** If a node has applied an entry at index i, no node ever applies a different entry at index i. | `internal/raft`: cross-node apply-history comparison in `applyCommitted` (continuous), `TestReplicationAndCommitAndApply`; `internal/raftnode`: `TestClusterElectsAndReplicates` (real TCP, applied order asserted). Phase 10 — `internal/raftsim`: continuous at every commit and every apply under every fault schedule; `internal/raftnode`: `TestDuplicatedAndReorderedTrafficAppliesOnce` (real TCP) | VERIFIED (simulation, incl. under faults; real cluster) |
+| INV-R6 | `currentTerm` and `votedFor` are durable before any vote is granted or any dependent AppendEntries reply is sent. | Structural via the `Ready` contract (persist HardState/Entries before Messages), asserted by `internal/raft`: `TestHardStateAccompaniesVoteGrant`, `TestHardStateAccompaniesTermBump`; on the real driver path by `internal/raftnode`: `TestPersistBeforeReplyOnDriverPath`; across process death by `tests/integration`: `TestRaftLogSurvivesSIGKILL`, `TestHardStateSurvivesSIGKILL`. Phase 10 — the **fsync** form: `internal/raftlog`: `TestSaveIsDurableWhenItReturns`, `TestOpenMakesRecoveredStateDurable`; `internal/raftnode`: `TestReplyOnlyAfterFsync`; `internal/raftsim`: at every send, no un-fsynced byte and durable term/vote/log equal to in-memory, and no node grants one term's vote to two candidates across any number of crashes and modeled power losses | VERIFIED (process kill; fsync ordering against a modeled power loss — not real power loss) |
+| INV-R7 | A node never applies an entry with index > `commitIndex`. | `internal/raft`: apply-path guard in `applyCommitted` (continuous), `FuzzRaftEvents` (applied ≤ commit ≤ lastIndex after every step); enforced structurally by the Phase 8 log (INV-P8). Phase 10 — `internal/raftsim`: at every apply under every fault schedule | VERIFIED |
+| INV-R8 | `commitIndex` is monotonically non-decreasing on every node, across restarts. | Within a session: Phase 8 log (INV-P5). Across restart: `internal/raftnode`: `TestGracefulRecovery`; `tests/integration`: `TestRaftLogSurvivesSIGKILL` (recovered node reaches a strictly higher commit, never lower), `TestCurrentTermMonotonicAcrossRestart` (the term, too, only climbs); `internal/raftlog` clamps a persisted commit to the recovered log. Phase 10 — `internal/raftsim`: within a run after every event, and at every restart the recovered commit is never below what the node had applied | VERIFIED (process kill; simulated crashes) |
+| INV-R9 | A leader only advances `commitIndex` past entries from its own term. | `internal/raft`: the `maybeCommit` current-term check + the mandatory election no-op; `TestCommitRuleRequiresCurrentTerm` (the rule pinned directly on `maybeCommit`), `TestFigure8` (removing the no-op fails it). Phase 10 — `internal/raftsim`: continuous — whenever a leader's commit advances, the entry there has the leader's term | VERIFIED (simulation, incl. under faults) |
+| INV-R10 | A stale message (lower term) never mutates state beyond sending a rejection carrying the current term. | `internal/raft`: `TestStaleMessageIsInert`, `TestStaleAppendResponseIgnored`, `TestHigherTermForcesStepDown`. Phase 10 — `internal/raftsim`: at every delivery of a lower-term message (role, term, vote, log and commit unchanged), `TestDelayedOldTermAppendIsInert` | VERIFIED (simulation, incl. under faults) |
 
 ### Note on INV-R9 and the no-op
 
 With the **mandatory** election no-op (`TestNoOpAppendedOnElection`), a new leader's first
 quorum acknowledgement already covers a current-term entry, so the `maybeCommit` term check never
-has to *reject* a reachable commit — the no-op is the primary mechanism and the explicit
-`term == currentTerm` check is defense-in-depth that matches the paper. `TestFigure8` has teeth
-against removing the no-op (the term-4 leader then cannot commit the term-2 entry, failing the
-`commit >= 3` assertion), and the continuous R3/R5 checks would fire if a committed entry were
-ever overwritten. Power-loss durability is untested throughout (SIGKILL only), as everywhere in
+has to *reject* a commit reachable through the message flow — the no-op is the primary mechanism
+and the explicit `term == currentTerm` check is defense-in-depth that matches the paper. Because
+that state is unreachable end to end, the rule is pinned directly on `maybeCommit` by
+`TestCommitRuleRequiresCurrentTerm`, which is what kills a mutation that drops the check
+(`docs/RAFT.md` §12a). `TestFigure8` has teeth against removing the no-op (the term-4 leader then
+cannot commit the term-2 entry, failing the `commit >= 3` assertion), and the continuous R3/R5
+checks would fire if a committed entry were ever overwritten. Power-loss durability is untested throughout (SIGKILL only), as everywhere in
 this project (`docs/FAILURE_MODEL.md`).
+
+## Fault injection (Phase 10)
+
+Enforced by `internal/raftlog`, `internal/raftnode` and `cmd/dkvd`; exercised by `internal/fault`,
+`internal/raftsim`, and `tests/integration/raft_fault_test.go`; specified in `docs/FAULTS.md` and
+introduced by ADR-017. The `F` series is the fault-behaviour namespace, distinct from every series
+above. Each is a property of the system under injected failure, not of the test harness.
+
+| ID | Invariant | Checked by | Status |
+|---|---|---|---|
+| INV-F1 | A durable-log write or fsync failure is **fail-stop**: none of the failing Ready's messages is sent, the node processes no further event, the log accepts no further write, `dkvd` exits 1, and the log remains openable (a torn record is truncated on reopen). | `internal/raftlog`: `TestFailedWriteLatchesAndLogStaysRecoverable`, `TestFailedSyncLatches`; `internal/raftnode`: `TestPersistFailureIsFailStop` (disk full, torn write, fsync failure — the op log shows no write or fsync after the failure); `cmd/dkvd`: `TestRaftModeExitsNonZeroWhenTheLogFails`; `internal/raftsim`: `TestVoteNotSentWhenItCannotBePersisted`, `TestTornWriteIsTruncatedOnRestart`, `TestDiskFullOnLeaderStopsItAndClusterMovesOn`, the `disk` profile | VERIFIED (injected software I/O errors) |
+| INV-F2 | A restarted node resumes from exactly its durable state: its recovered term, vote, log and commit equal what it last successfully persisted, extended by at most a prefix of the records of a save that was interrupted — after a process crash and after a modeled power loss — and that recovered state is made durable before the node acts on it. | `internal/raftsim`: at every restart, against an independent record of every Save (continuous), `TestFollowerCrashAndCatchUp`, `TestNoAckOfUnsyncedEntriesAfterFailedFsync`, the `crashes`/`disk`/`mixed` profiles; `internal/raftlog`: `TestOpenMakesRecoveredStateDurable`; `tests/integration`: committed prefixes survive real SIGKILL/restart | VERIFIED (simulation; process kill) |
+| INV-F3 | **Liveness after faults stop**: once every node is up, every partition healed and the schedule fair, one leader is elected, commits an entry of its own term, and every node's log, commit and applied index converge to it within 400 rounds. | `internal/raftsim`: `check-converged` ends every seeded run and fuzz input; `TestRepeatedCrashRestart`, `TestPartitionedNodeRestartsWhileIsolated` | VERIFIED (simulation only) |
+| INV-F4 | Faults never fabricate or duplicate a command: every applied command was accepted by a leader and occupies exactly one log index, under any mix of drop, duplicate, reorder, delay and crash. | `internal/raftsim`: at every apply (continuous); `internal/raftnode`: `TestDuplicatedAndReorderedTrafficAppliesOnce` (real TCP) | VERIFIED |
+| INV-F5 | The driver never blocks its Raft actor on the network: a peer whose sends block delays only its own messages; heartbeats and replication to the other peers continue and no election is triggered. | `internal/raftnode`: `TestWedgedPeerDoesNotStallTheLeader` (real TCP; fails with a synchronous send) | VERIFIED (driver) |
+
+### Note on the F series and what it does not cover
+
+INV-F1 is proven against **injected software I/O errors** at the `vfs` boundary, underneath the
+unchanged `raftlog` code; it says nothing about how a real device fails. INV-F2's power-loss half
+is proven against `fault.MemFS`, a model that assumes an fsync that returned success is honest and
+that lost data is a prefix — never holes or reordered sectors — so real power-loss durability stays
+untested, exactly as for INV-S1 and INV-M1. INV-F3 is a liveness property proven only in the
+simulator, and only after faults stop (FLP: no claim is possible while they continue). The storage
+WAL's own durability latch, INV-W10, is a different layer and stays PLANNED: no node hosts the
+engine yet.
 
 ## Routing / cluster
 
@@ -275,7 +310,7 @@ transport/node namespace, distinct from every series above.
 
 Enforced by `internal/replication`; specified in `docs/REPLICATION.md` and introduced by
 ADR-015. The `P` series is the replication-model namespace, distinct from every series above
-(in particular from the `R` Raft series, which stays PLANNED). These are **local** properties
+(in particular from the `R` Raft series). These are **local** properties
 of a replicated-log model and a replica-group abstraction; none of them is a distributed or
 consistency guarantee — Phase 8 adds no such claim anywhere.
 

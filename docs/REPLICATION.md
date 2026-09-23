@@ -289,5 +289,5 @@ model and a replica-group abstraction. It does **not** provide:
 - snapshots, log truncation from the front, or dynamic membership;
 - persistence of the log (the Phase 8 log is in-memory).
 
-**No distributed consistency guarantee is added by Phase 8**, anywhere in the repository. The
-next phase, **Phase 9 — Raft**, is **not started**.
+**No distributed consistency guarantee is added by Phase 8**, anywhere in the repository. Phase 9
+(Raft, `docs/RAFT.md`) has since been built on top of this model, which it drives unchanged.

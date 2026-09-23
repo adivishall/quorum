@@ -15,9 +15,10 @@ import (
 // streaming (Phase 14) will chunk rather than raise this.
 const MaxFrameSize = 16 << 20 // 16 MiB
 
-// MsgKind is the 1-byte frame kind, which is the message type. The reserved
-// kinds are identifiers only: Phase 7 defines no codec or semantics for them
-// (docs/TRANSPORT.md §5).
+// MsgKind is the 1-byte frame kind, which is the message type. This package
+// defines the codec only for the probe kinds; the Raft kinds' payloads are
+// encoded by internal/raft and are opaque here, and the snapshot/forward kinds
+// are reserved identifiers (docs/TRANSPORT.md §5).
 type MsgKind uint8
 
 const (
@@ -25,11 +26,13 @@ const (
 	MsgProbe         MsgKind = 1
 	MsgProbeResponse MsgKind = 2
 
+	// Raft kinds, carried since Phase 9 (codec in internal/raft; opaque here).
+	MsgRequestVote           MsgKind = 16
+	MsgRequestVoteResponse   MsgKind = 17
+	MsgAppendEntries         MsgKind = 18
+	MsgAppendEntriesResponse MsgKind = 19
+
 	// Reserved for later phases — identifiers only, no codec, no semantics.
-	MsgRequestVote             MsgKind = 16
-	MsgRequestVoteResponse     MsgKind = 17
-	MsgAppendEntries           MsgKind = 18
-	MsgAppendEntriesResponse   MsgKind = 19
 	MsgInstallSnapshot         MsgKind = 20
 	MsgInstallSnapshotResponse MsgKind = 21
 	MsgForward                 MsgKind = 32

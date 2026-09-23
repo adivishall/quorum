@@ -29,11 +29,13 @@
 // fixed-interval retry. Concurrent sends on one connection are serialised so
 // their bytes never interleave, and per-connection frame order is preserved.
 //
-// # Phase 7 scope
+// # Scope
 //
-// Probe/ProbeResponse (liveness) are implemented. RequestVote, AppendEntries,
-// InstallSnapshot, Forward and their responses are reserved kind identifiers
-// only — no codec, no semantics. The transport implements no replication, Raft,
-// election, forwarding, or consistency; docs/TRANSPORT.md §11 is the explicit
-// boundary.
+// Probe/ProbeResponse (liveness) are implemented here (Phase 7). Since Phase 9
+// the RequestVote and AppendEntries kinds (and their responses) carry Raft
+// traffic for internal/raftnode; their codec lives in internal/raft, and this
+// package moves those payloads as opaque bytes. InstallSnapshot and Forward
+// remain reserved identifiers with no codec. The transport itself implements no
+// replication, Raft, election, forwarding, or consistency; docs/TRANSPORT.md §11
+// is the explicit boundary.
 package transport

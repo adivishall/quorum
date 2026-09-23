@@ -7,7 +7,7 @@ Algorithm", against the repository-specific contract in `docs/DESIGN.md` §8.
 
 > **Scope boundary, stated once.** Phase 9 proves Raft's **safety properties in deterministic
 > simulation** and makes Raft state **durable across process kill**. It does **not** add
-> end-to-end linearizability, the full network fault matrix (Phase 10), a client/HTTP API or
+> end-to-end linearizability, the full network fault matrix (Phase 10, `docs/FAULTS.md`), a client/HTTP API or
 > request forwarding (Phases 13/15), linearizable-read serving / ReadIndex (later), snapshots
 > (Phase 14), or dynamic membership (never, in v1 — ADR-005). Raft working is not the finished
 > Quorum consistency model.
@@ -187,10 +187,23 @@ following, a zero-filled header with data after it, an unknown kind, a malformed
 impossible index progression is **fatal** — the log refuses to open rather than silently skip a
 record.
 
+**Failure policy (Phase 10, INV-F1; `docs/FAULTS.md` §10).** A failed or short write, or a failed
+fsync, poisons the log: every later `Save` returns the original error (`raftlog.ErrFailed`) and
+writes nothing, because appending behind a partial record would turn a recoverable torn tail into
+mid-log corruption, and after a failed fsync a later successful one vouches for nothing. The
+driver fail-stops: none of the failing Ready's messages is sent, the actor never drives the core
+again, `Node.Err`/`Node.Done` report it, and `dkvd` exits 1. All file access goes through the
+`vfs` seam (`raftlog.Options.FS`, `raftnode.Config.FS`; nil is the real OS), which is where Phase
+10 injects persistence faults underneath this unchanged code.
+
 ## 11. Recovery (`docs/DESIGN.md` §10, steps 4–5)
 
 On restart the driver reads the durable log → `currentTerm`, `votedFor`, entries, and the persisted
-`commitIndex` (clamped). It builds a `MemoryLog` from the entries, sets `commitIndex`, and
+`commitIndex` (clamped) — and, since Phase 10, `raftlog.Open` **fsyncs the file before returning**,
+so whatever it recovered is durable before the node acts on it. (A Save whose fsync failed can
+leave records in the page cache; without this, a restarted node could acknowledge entries a power
+loss would still erase — the Phase 10 simulator found exactly that, `docs/FAULTS.md` §13.) The
+startup path is one function, `raftnode.Recover`, which the deterministic simulator uses too. It builds a `MemoryLog` from the entries, sets `commitIndex`, and
 constructs the core in Follower state at the recovered term. Recovery verifies indexes are still
 contiguous, terms non-decreasing, and `currentTerm` does not move backward; incoherent state is
 refused, not repaired. Snapshot recovery is **not** Phase 9.
@@ -226,7 +239,11 @@ The continuously-checkable invariants (R1/R3/R5/R7) run after every delivery, so
 that induced a safety violation is caught immediately. This is enough deterministic control to
 prove the algorithm and is deliberately **not** the Phase 10 fault-injection framework — it is
 hand-scheduled correctness testing, not a reusable systematic failure-matrix generator. No test
-result depends on wall-clock timing or on `time.Sleep`.
+result depends on wall-clock timing or on `time.Sleep`. The fault framework is
+`internal/raftsim` (`docs/FAULTS.md`): it drives the same core, the real durable log on a
+crash-modeling disk, and the driver's own persist-then-send and recovery functions under seeded,
+replayable schedules of drops, duplicates, delays, partitions, crashes, power losses, pauses and
+persistence failures.
 
 ## 12a. Mutation testing
 
@@ -257,6 +274,9 @@ and asserts the guard rejects it. This keeps the §5.4.2 rule tested as defense-
 the no-op is its load-bearing partner (whose removal `TestFigure8`/`TestNoOpAppendedOnElection`
 catch).
 
+Phase 10 adds 14 mutants for its failure-handling rules and for the fault harness's own fidelity
+(`docs/FAULTS.md` §12); `make mutation` runs all 22.
+
 ## 13. Multi-Raft and membership
 
 One shard = one independent Raft group (ADR-001). The core operates on a single group; the driver
@@ -274,7 +294,8 @@ stays declarative (ADR-012).
 stale lower-term messages are inert (R10). See `docs/INVARIANTS.md` for the exact tests behind each.
 
 **Not proven / not present in Phase 9:** behavior under the full network fault matrix
-(drop/delay/dup/partition at scale — Phase 10/11); end-to-end linearizability (Phase 12); client
+(drop/delay/dup/partition at scale — since established by Phase 10, `docs/FAULTS.md`, with the
+qualifiers stated there); end-to-end linearizability (Phase 12); client
 retry / dedup / exactly-once application (Phase 13); linearizable-read serving / ReadIndex; an HTTP
 API or request forwarding (Phases 13/15); snapshots and log compaction (Phase 14); dynamic
 membership (v1 never). Power-loss durability is not tested (SIGKILL only), as everywhere in this

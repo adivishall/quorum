@@ -289,8 +289,8 @@ that Phase 8 has a correct assignment to build on.
 | ID | Statement | Tests |
 |---|---|---|
 | INV-C1 | Key routing is a pure function of `(key, configuration)`; same inputs → same shard, on every node, forever. | `TestRouteIsDeterministicAcrossManyCalls`, `TestEquivalentConfigsRouteIdentically`, `TestNodeOrderDoesNotAffectRouting`, `TestConfigRoundTripThroughSerializationRoutesIdentically`, `TestGoldenKeyToShard`, `TestGoldenReplicaGroups`, `FuzzRouteIsDeterministicAndValid` |
-| INV-C2 | Every key maps to exactly one shard, and every shard has exactly one replica group; no arc is unowned or doubly owned. | `TestEveryTokenIntervalHasExactlyOneOwner`, `TestRingCoversTheWholeSpaceIncludingWrap`, `TestEveryShardIsRepresentedExactlyOnce`, `TestEveryShardHasOneReplicaGroup`, `TestRouteAlwaysReturnsAValidShard` |
-| INV-C3 | A one-node membership change moves only ≈ 1/N of keys, not a reshuffle. | `TestKeyToShardIsStableAcrossNodeMembershipChange`, `TestAddingNodeMovesOnlyAffectedShards`, `TestRemovingNodeMovesOnlyAffectedShards`, `TestConsistentHashingBeatsModuloOnRedistribution`, `TestRedistributionGoldenCounts` |
+| INV-C2 | Every key maps to exactly one shard, and every shard has exactly one replica group; no arc is unowned or doubly owned. | `TestEveryTokenIntervalHasExactlyOneOwner`, `TestRingIsSorted`, `TestSuccessorBoundaryAndWrap`, `TestTokenCollisionIsDeterministic`, `TestEveryShardIsRepresentedExactlyOnce`, `TestEveryShardHasOneReplicaGroup`, `TestRouteAlwaysReturnsAValidShard` |
+| INV-C3 | A one-node membership change moves only ≈ 1/N of keys, not a reshuffle. | `TestKeyToShardIsStableAcrossNodeMembershipChange`, `TestOwnerMovesOnlyWhereItsShardPrimaryMoved`, `TestConsistentHashingBeatsModuloOnRedistribution`, `TestRedistributionGoldenCounts` |
 
 INV-C4 ("a request is never served by a node that does not host the key's shard") is a Phase 7
 property and remains PLANNED — Phase 6 has no server to violate it.

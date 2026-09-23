@@ -1,5 +1,10 @@
 // Package integration holds tests that need more than one process.
 //
+// Since Phase 10 it also holds the real-process fault tests (raft_fault_test.go):
+// dkvd processes are SIGKILLed, frozen with SIGSTOP, restarted on their data
+// directories, and partitioned by test-owned TCP proxies (tcpproxy_test.go), and
+// the durable logs are checked from outside afterwards (docs/FAULTS.md §9).
+//
 // The crash tests here launch a real child process, let it perform writes that
 // are acknowledged, then kill it with SIGKILL and reopen its data directory.
 // Nothing is simulated: the child is a separate OS process and it is destroyed

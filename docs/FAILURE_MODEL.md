@@ -1,6 +1,7 @@
 # FAILURE MODEL
 
-Status: **Phase 0 — specification.**
+Status: **specification (Phase 0); the fault-injection matrix in §7 is implemented and verified
+in Phase 10** (`docs/FAULTS.md`, ADR-017), with the scope and qualifiers stated there.
 
 A distributed system is only meaningful relative to the failures it claims to survive. This
 document states the assumptions. Anything not assumed here is something we do **not** tolerate,
@@ -92,7 +93,13 @@ it is not a defect we can engineer away, and any system claiming otherwise is wr
   snapshot. That is the documented operational procedure, not an automatic one in v1.
 - **Full disk** and **I/O error** are surfaced as errors that fail the write and, for a Raft
   log write, stop the node rather than acknowledging something that is not durable. A node
-  that cannot persist must not vote and must not acknowledge AppendEntries.
+  that cannot persist must not vote and must not acknowledge AppendEntries. *Implemented and
+  verified in Phase 10 (INV-F1):* a failed write or fsync latches the durable log, the driver
+  sends none of the dependent messages and stops, and `dkvd` exits 1; a restart truncates any
+  torn record and makes the recovered state durable (fsync) before acting on it. This rests on
+  the fsync assumption above: after a failed fsync a kernel may drop the affected pages
+  ("fsyncgate"), in which case records a restarted process read back from the page cache can
+  still be lost — fail-stop is the only defence taken.
 
 ---
 
@@ -126,27 +133,33 @@ suspicion, not truth, and will be labeled that way.
 
 ## 7. The fault-injection matrix (Phase 10)
 
-Every row must be reproducible from a seed and runnable in CI:
+Implemented in Phase 10; `docs/FAULTS.md` has the mechanisms and every test. Rows run in CI in
+three tiers: the **simulator** (`internal/raftsim`) is reproducible from a seed or a script; the
+**real driver** (`internal/raftnode`) and **real process** (`tests/integration`) tiers run real
+goroutines, timers and TCP, so they are not seed-replayable — they assert properties that hold
+under any timing.
 
-| Fault | Mechanism | Primary property under test |
-|---|---|---|
-| Node crash (SIGKILL) | process kill | committed data survives; election happens |
-| Node restart | process restart | recovery, catch-up, no divergence |
-| Leader crash mid-write | kill during proposal storm | no lost acknowledged write, no phantom write |
-| Symmetric partition | transport drop-list | minority unavailable; majority progresses; no split brain |
-| Asymmetric partition | one-way drop-list | no livelock; stale leader steps down |
-| Message drop (p%) | transport hook | retry/backoff correctness |
-| Message delay | transport hook | stale message handling |
-| Message duplication | transport hook | idempotence of RPC handlers |
-| Message reorder | transport hook | no assumption of ordering beyond TCP per-connection |
-| Slow node | artificial latency | leader does not block on slowest follower |
-| Disk full | injected `ENOSPC` | node fails loudly, does not ack |
-| Corrupt WAL tail | byte mutation | truncate-and-continue |
-| Corrupt WAL middle | byte mutation | refuse to start, clear error |
-| Crash during compaction | kill between protocol steps | orphan sweep; no reader sees a partial file set |
-| Crash during flush | kill mid-flush | WAL replay reconstructs the memtable |
-
----
+| Fault | Mechanism | Primary property under test | Evidence | Status |
+|---|---|---|---|---|
+| Node crash (SIGKILL) | real process kill; simulated process crash | committed data survives; election happens | `TestRealLeaderCrashAndReelection`, `TestRealFollowerCrashAndCatchUp`, `TestRealRepeatedCrashRestart`; `TestLeaderCrashAndReelection`, `crashes` profile | VERIFIED |
+| Node restart | real process restart on the same data dir; simulated restart via `raftnode.Recover` | recovery, catch-up, no divergence | INV-F2 at every simulated restart; `TestRealFollowerCrashAndCatchUp`, `TestRealRestartWhileIsolated` | VERIFIED |
+| Leader crash mid-write | crashes while proposals are in flight (chaos profiles) | no lost acknowledged write, no phantom write | no committed entry lost (INV-R4) and no fabricated command (INV-F4) under every schedule; an *acknowledged* write needs client acks (Phases 12/13) | PARTIAL |
+| Symmetric partition | simulator links; `fault.Network`; TCP proxy cut | minority unavailable; majority progresses; no split brain | `TestLeaderIsolatedFromMajority`, `TestIsolatedLeaderCannotCommitAndRejoins`, `TestRealIsolatedLeaderRejoinsAfterPartition`, `partitions` profile | VERIFIED |
+| Asymmetric partition | one-way simulator link; one-way `fault.Network` link | no livelock; stale leader steps down | `partitions`/`mixed` profiles (one-way blocks) with convergence after healing (INV-F3). TCP is bidirectional, so a real one-way cut is not produced | VERIFIED (simulation) |
+| Message drop (p%) | simulator `drop`; `fault.Network` Drop | retry/backoff correctness | `TestMessageLoss`, `messages` profile | VERIFIED |
+| Message delay | simulator `delay`; `fault.Network` Hold/Release | stale message handling | `TestDelayedOldTermAppendIsInert`, INV-R10 at every stale delivery, `messages` profile | VERIFIED |
+| Message duplication | simulator `dup`; `fault.Network` Duplicate | idempotence of RPC handlers | `TestDuplicatedVoteDoesNotCountTwice`, `TestDuplicatedReplicationTraffic`, `TestDuplicatedAndReorderedTrafficAppliesOnce`, INV-F4 | VERIFIED |
+| Message reorder | random delivery order; reversed release | no assumption of ordering beyond TCP per-connection | `TestStaleSuccessDoesNotRegressReplication`, `messages` profile | VERIFIED |
+| Slow node | wedged sends (`fault.Network` Block); pause; SIGSTOP | leader does not block on slowest follower | `TestWedgedPeerDoesNotStallTheLeader` (INV-F5), `TestPausedLeaderStepsDownOnResume`, `TestRealFrozenLeaderStepsDown` | VERIFIED |
+| Disk full | injected `ENOSPC` (`fault.InjectFS`) | node fails loudly, does not ack | `TestPersistFailureIsFailStop`, `TestDiskFullOnLeaderStopsItAndClusterMovesOn`, `TestRaftModeExitsNonZeroWhenTheLogFails` (INV-F1) | VERIFIED (injected) |
+| Failed fsync | injected `EIO` on fsync | nothing dependent is sent; restart makes recovered state durable | `TestPersistFailureIsFailStop`, `TestVoteNotSentWhenItCannotBePersisted`, `TestNoAckOfUnsyncedEntriesAfterFailedFsync` | VERIFIED (injected) |
+| Torn write | injected short write; torn tail after a modeled power loss | truncate on reopen; nothing built on it | `TestFailedWriteLatchesAndLogStaysRecoverable`, `TestTornWriteIsTruncatedOnRestart`, `disk`/`crashes` profiles | VERIFIED |
+| Power loss | `fault.MemFS` model: only fsynced bytes (+ a torn prefix) survive | nothing acknowledged is lost | fsync form of INV-R6 at every send; `TestAckedEntrySurvivesPowerLoss` | VERIFIED **in the model only**; real power loss untested |
+| Connection loss / flapping | TCP proxy cut/heal, repeatedly | reconnect; convergence; no crash | `TestRealConnectionFlapping` | VERIFIED |
+| Corrupt WAL tail | byte mutation | truncate-and-continue | storage WAL: `TestBadChecksumInFinalRecordIsRepaired`; Raft log: `TestTornTailIsTruncated` | VERIFIED (unit) |
+| Corrupt WAL middle | byte mutation | refuse to start, clear error | storage WAL: `TestBadChecksumInMiddleRecordIsRefused`; Raft log: `TestMidCorruptionIsFatal` | VERIFIED (unit) |
+| Crash during compaction | kill between protocol steps | orphan sweep; no reader sees a partial file set | `TestCrashDuringCompaction` (Phase 4, standalone engine) | VERIFIED standalone; hosted-engine windows are Phase 11 |
+| Crash during flush | kill mid-flush | WAL replay reconstructs the memtable | `TestCrashDuringFlush` (Phase 3, standalone engine) | VERIFIED standalone; Phase 11 |
 
 ## 8. What we do not tolerate
 

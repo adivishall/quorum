@@ -1,10 +1,14 @@
 # ARCHITECTURE
 
 Status: **specification.** Every claim here is a *design intent* for the finished system,
-not a description of what exists. As of Phase 3 the storage layer — WAL, memtable, SSTables,
-recovery — is real (`docs/WAL.md`, `docs/LSM.md`); everything about sharding, replication,
-consensus and networking is still design. `docs/LIMITATIONS.md` and the per-phase reports
-record what is actually true of the code at any point in time.
+not a description of what exists. As of Phase 10 these parts are real: the storage engine (WAL,
+memtable, SSTables, Bloom filters, compaction, MANIFEST — Phases 1–5), routing as a library
+(Phase 6), node processes and the TCP transport (Phase 7), the local replicated-log model (Phase
+8), a single Raft group with a durable log and node driver (Phase 9), and fault injection (Phase
+10). The client API, request serving and forwarding, one Raft group per hosted shard, the
+engine-as-state-machine wiring, snapshots and the dashboard are still design.
+`docs/LIMITATIONS.md` and the per-phase reports record what is actually true of the code at any
+point in time.
 
 ---
 
@@ -67,9 +71,11 @@ with client-side failures.
 As of Phase 7 the internal transport is **implemented** (`internal/transport`, `cmd/dkvd`,
 `docs/TRANSPORT.md`): real node processes, a checksummed framed-TCP protocol, a version
 handshake, one bidirectional connection per peer pair, and `Probe`/`ProbeResponse` liveness.
-It carries bytes tagged with a message kind; it does **not** yet run Raft, replicate, forward
-client requests, or host the storage engine — those are Phases 8+. The Raft RPC kinds are
-reserved identifiers only (ADR-013).
+It carries bytes tagged with a message kind and knows nothing of what they mean. Since Phase 9
+it carries Raft traffic (`RequestVote`/`AppendEntries`, codec in `internal/raft`, ADR-016); it
+still forwards no client requests and hosts no storage engine. Phase 10 injects network faults
+*around* it — a `transport.Transport` decorator in-process, TCP proxies between real processes —
+without changing it (ADR-017).
 
 ---
 
@@ -79,11 +85,15 @@ reserved identifiers only (ADR-013).
 |---|---|---|
 | `internal/storage` | on-disk format, WAL, memtable, SSTables, compaction, local reads/writes | Raft, shards, the network |
 | `internal/raft` | terms, elections, log replication, commit index | disk I/O, sockets, wall-clock time, the KV format |
-| `internal/transport` | framing, dialing, timeouts, retries, fault hooks | the meaning of any message |
+| `internal/transport` | framing, dialing, timeouts, retries | the meaning of any message |
 | `internal/routing` | hash ring, key→shard, shard→replica set | storage layout, Raft internals |
 | `internal/cluster` | node lifecycle, shard hosting, wiring raft↔storage↔transport | wire encoding details |
 | `internal/api` | HTTP surface, validation, error mapping | consensus, storage |
-| `internal/fault` | drop/delay/duplicate/partition injection | everything else (it is a decorator) |
+| `internal/raftlog` | the durable Raft log: record framing, crash policy, recovery, the failure latch | the Raft algorithm, sockets |
+| `internal/raftnode` | the driver: actor loop, ticks, persist-then-send ordering, per-peer outboxes, apply | the algorithm's rules (it drives the core) |
+| `internal/vfs` | the filesystem seam the durable log does I/O through | everything else |
+| `internal/fault` | drop/delay/duplicate/partition injection (a transport decorator), a crash-consistent disk model, I/O fault injection | Raft (it is a set of decorators and models) |
+| `internal/raftsim` | the deterministic fault-injection simulator (tests only) | wall-clock time, goroutines, real I/O |
 | `internal/metrics` | counters, histograms | business logic |
 
 The rule that matters most: **`internal/raft` performs no I/O and reads no clock.**
@@ -121,8 +131,15 @@ drives the Phase 8 log, a durable log + HardState makes its state crash-safe, an
 runs a real group over the transport (electing a leader, replicating, committing). This is the
 consensus core for one group; the multi-Raft node that instantiates one group per shard and serves
 clients is a later phase. Raft's safety properties are verified in deterministic simulation and by
-a real 3-process smoke test; end-to-end linearizability, the fault matrix, and request serving are
-Phases 10–13 and are **not** claimed yet.
+a real 3-process smoke test; end-to-end linearizability and request serving are Phases 12–13 and
+are **not** claimed yet.
+
+As of Phase 10 (`docs/FAULTS.md`, ADR-017) that group's behaviour under failure is tested at
+three levels: a deterministic simulator (`internal/raftsim`) drives the real core, the real durable
+log on a crash-modeling disk, and the driver's own persist-then-send and recovery functions
+through seeded, replayable fault schedules with every safety invariant checked after every event;
+the real driver runs under injected disk and network faults; and real processes are killed,
+frozen and partitioned. `internal/raft` itself gained no fault code — the core stays pure.
 
 Each shard is an **independent Raft group** with its own log, its own leader, and its own
 storage directory. A 3-node cluster with 16 shards runs 16 Raft groups; every node is a

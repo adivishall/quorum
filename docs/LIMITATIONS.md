@@ -3,7 +3,7 @@
 The things this system does not do, cannot do, or has not proven. Kept current: an item may be
 removed only when a test exists showing it is no longer true.
 
-**Status: Phase 9.** A single-node key-value store with a durable write-ahead log and an
+**Status: Phase 10.** A single-node key-value store with a durable write-ahead log and an
 LSM storage engine — memtable, immutable SSTables with Bloom filters, flush, size-tiered
 compaction, crash-safe MANIFEST-based file publication, restart recovery — exists and is
 benchmarked (`docs/BENCHMARKS.md`). Phase 6 added a **pure, deterministic routing library**
@@ -23,9 +23,14 @@ may commit, or persists. Phase 9 adds **Raft** (`internal/raft`, `internal/raftl
 RequestVote, AppendEntries with a term-based conflict hint, the §5.4.2 commit rule, the mandatory
 election no-op), a durable Raft log + HardState, and a node driver that runs a real group over the
 transport — verified in deterministic simulation (INV-R1..R10) and by a real 3-process election
-and a SIGKILL log-recovery test. But Raft functioning is **not** the finished Quorum consistency
-model: there is no end-to-end linearizability verification, no network fault matrix, no client/HTTP
-API, no request forwarding or dedup, no linearizable-read serving, no snapshots, and no dynamic
+and a SIGKILL log-recovery test. Phase 10 adds **fault injection** (`internal/fault`,
+`internal/raftsim`, `docs/FAULTS.md`, ADR-017): a deterministic, seed-replayable simulator that
+drives the real core, durable log and driver ordering through drops, duplicates, delays,
+reordering, partitions, process crashes, a modeled power loss, restarts, pauses and persistence
+failures with every invariant checked continuously; plus real-driver and real-process fault tests
+(SIGKILL, SIGSTOP, TCP-level partitions). But Raft functioning under faults is **not** the finished
+Quorum consistency model: there is no end-to-end linearizability verification, no client/HTTP API,
+no request forwarding or dedup, no linearizable-read serving, no snapshots, and no dynamic
 membership. **No distributed consistency guarantee is claimed as verified end-to-end.**
 
 ### True right now, and temporary
@@ -48,10 +53,15 @@ membership. **No distributed consistency guarantee is claimed as verified end-to
 | `sync` mode serialises writers behind the device flush (~3.4 ms/append, ~291 appends/s, measured on an M4 — `docs/BENCHMARKS.md` §3.6) | a later phase, if group commit is measured to be worth it |
 | **The transport is a generic byte carrier** (ADR-013): `internal/transport` frames and moves bytes tagged with a kind and knows nothing of terms, log indexes, or leaders. As of Phase 9 it carries real **Raft** traffic — `dkvd -raft` runs elections, replication, and commit over it (`internal/raftnode`, `docs/RAFT.md`) — and the `RequestVote`/`AppendEntries` kinds are active. Still not carried over it: request forwarding, shard/client serving, and storage bytes; the `InstallSnapshot`/`Forward` kinds remain reserved with no codec. A `dkvd` node still hosts no LSM engine. | Phases 13–14 (`docs/TRANSPORT.md` §11) |
 | **The transport is unauthenticated plaintext TCP.** No TLS, no authentication; the handshake node id is a protocol label, not a cryptographic identity. Bounded frame/handshake/id sizes and malformed-input rejection are enforced regardless. | out of scope for v1 (`docs/TRANSPORT.md` §10) |
-| **Raft is verified in simulation and by a smoke test, not under the full fault matrix.** `internal/raft` proves the safety invariants (INV-R1..R10) in a deterministic single-goroutine network, and `internal/raftnode` runs a real group over TCP with a 3-process election and a SIGKILL log-recovery test. What is *not* yet done: systematic drop/delay/duplicate/reorder/partition fault injection (Phase 10), real multi-process crash recovery across every failure window (Phase 11), and end-to-end linearizability checking (Phase 12). | Phases 10–12 |
+| **Raft is verified under injected faults, within stated bounds.** Phase 10 checks INV-R1..R10 and INV-F1..F5 across seeded fault schedules in a deterministic simulator, on the real driver, and across real processes (`docs/FAULTS.md`). Not yet done: a systematic crash-window harness for a node that hosts the storage engine (Phase 11) and end-to-end linearizability checking of client histories (Phase 12). The simulator is replayable from a seed; the real-driver and real-process fault tests are not (real timing), and assert only properties that hold under any timing. | Phases 11–12 |
 | **The durable Raft log grows without bound.** `internal/raftlog` is append-only; a suffix replacement appends rather than rewrites, and nothing compacts or truncates it. Snapshotting (which would cap it) is Phase 14. | Phase 14 (snapshots) |
 | **A node hosts one Raft group and no state machine of consequence.** `internal/raftnode` drives a single group with a minimal (often nil / recording) state machine; it is not wired to the LSM engine, hosts no shards, and the multi-Raft (one group per shard) node is a later phase. `appliedIndex` is volatile and re-applied from the recovered log on restart. | Phases 11+ (per-shard node, engine wiring) |
-| No end-to-end cross-node consistency verification, no failover testing, no request forwarding, no client serving, no HTTP API, no linearizable-read serving (ReadIndex), no dashboard | Phases 10–13, 15–17 |
+| No end-to-end cross-node consistency verification, no request forwarding, no client serving, no HTTP API, no linearizable-read serving (ReadIndex), no dashboard. (Leader/follower failover is tested under faults since Phase 10, but only at the Raft level — no client observes it.) | Phases 12–13, 15–17 |
+| **Real power loss is untested; Phase 10's power loss is a software model.** `fault.MemFS` assumes a successful fsync is honest and that lost un-synced data is a prefix (never holes, reordered sectors, or bit rot). It proves the code issues its writes and fsyncs in the right order, not what a device does. Kernel fsync-error semantics ("fsyncgate": pages dropped after a write-back error) are not modelled; fail-stop is the only defence. | not testable here — `docs/FAULTS.md` §14 |
+| **Real processes are partitioned by resetting connections, not by silently dropping packets**, and one-way partitions exist only in the simulator and the in-process decorator (TCP is bidirectional). A real disk error is never injected into a real process; the fail-stop path is proven in-process on the real driver and on `dkvd`'s raft-mode code. | a later phase, if kernel-level fault tooling is justified |
+| **A node whose durable log fails stops and stays stopped** (fail-stop, INV-F1): no write is retried; `dkvd` exits 1 and an operator restarts it, which truncates any torn record and fsyncs the recovered state. | deliberate — ADR-017 |
+| **No PreVote or CheckQuorum.** A node that inflated its term while partitioned forces one extra election when it rejoins (it cannot win with a stale log), and a leader cut off from its followers keeps believing it leads until it hears a higher term — it can never commit meanwhile. Liveness is claimed only after faults stop (INV-F3). | a later phase, if measured to matter |
+| **A peer whose writes stay blocked loses messages beyond its outbox** (`raftnode.OutboxSize` = 256). The actor never blocks (INV-F5); Raft retransmits once the peer drains. | deliberate |
 | **Routing is a library, not a running system.** `internal/routing` computes which shard owns a key and which nodes *would* form each shard's replica group, but no node hosts a shard, no data is placed or moved, and a "membership change" is a new `Config` compared against the old one, never a live cluster mutation (ADR-005, ADR-012). The replica group is declarative metadata; replication, leader election, forwarding, and availability do not exist. | Phases 7–9; `docs/ROUTING.md` §9 |
 | `dkv put` cannot carry a maximum-size (1 MiB) value, because `ARG_MAX` is 1 MiB on macOS and the kernel rejects the exec. `dkv shell` can. This is an OS limit, not a dkv limit. | not applicable — use `dkv shell`, or the HTTP API from Phase 15 |
 | The CLI is still in-memory-only: it does not yet open a data directory, so `dkv` remains ephemeral even though the storage layer is not | Phase 15 (CLI wiring) |

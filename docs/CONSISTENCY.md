@@ -1,6 +1,7 @@
 # CONSISTENCY MODEL
 
-Status: **Phase 9 — the consensus core is verified in simulation; the end-to-end model is not.**
+Status: **Phase 10 — the consensus core is verified in simulation and under injected faults; the
+end-to-end model is not.**
 The claims in §2 remain design targets, not yet properties of the running system. This file is
 updated after Phase 12 to say which claims are backed by passing tests and which are not.
 
@@ -8,13 +9,16 @@ updated after Phase 12 to say which claims are backed by passing tests and which
 leader completeness, state-machine safety, the §5.4.2 commit rule, and durable term/vote before a
 dependent reply — hold in a deterministic simulation, and durable Raft state survives process kill
 (`docs/RAFT.md`, `docs/INVARIANTS.md` INV-R1..R10). These are the mechanisms §4 relies on
-(single vote per term, current-term commit + no-op, fsync before reply).
+(single vote per term, current-term commit + no-op, fsync before reply). **Phase 10**
+(`docs/FAULTS.md`) re-verified them under injected drops, duplicates, delays, reordering,
+partitions, crashes, a modeled power loss, restarts and persistence failures — continuously, in a
+seed-replayable simulator — and on the real driver and real processes.
 
-**Not yet verified.** Real failure behaviour under the complete network fault matrix
-(drop/delay/duplicate/reorder/partition — Phases 10/11); end-to-end single-key linearizability
+**Not yet verified.** End-to-end single-key linearizability
 against a real cluster under faults (Phase 12); client retry / dedup semantics (C4 stage two,
 Phase 13); the distributed API and `stale`/`linearizable` read serving including ReadIndex (§8.5,
-Phases 13/15); and crash recovery across every failure window (Phase 11). The claims C1–C5 below
+Phases 13/15); crash recovery across every failure window of a node that hosts the storage
+engine (Phase 11); and real power-loss durability (untestable here). The claims C1–C5 below
 are therefore **still design targets**: Raft working is a necessary part of them, not the whole
 proof.
 

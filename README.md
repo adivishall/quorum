@@ -6,7 +6,7 @@ Quorum is currently implementing its durable storage engine. No Raft library, no
 database, no consensus service — the storage engine and the consensus implementation are
 the project, and they are being built in that order.
 
-> **Status: Phase 9 of 25 — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, and a working Raft consensus core.**
+> **Status: Phase 10 of 25 — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, a working Raft consensus core, and deterministic fault injection.**
 >
 > **Implemented:** a write-ahead log, an ordered memtable, immutable on-disk SSTables, Bloom
 > filters, size-tiered compaction, crash-safe MANIFEST-based file publication, and restart
@@ -26,13 +26,19 @@ the project, and they are being built in that order.
 > the mandatory election no-op), a durable Raft log + HardState, and a node driver that runs a real
 > group over TCP. Its safety properties (INV-R1..R10) are verified in a deterministic simulation,
 > and durable state survives a real SIGKILL — proven by a 3-process election and a crash-recovery
-> test.
+> test. Phase 10 adds **fault injection** (`internal/fault`, `internal/raftsim`): a deterministic,
+> seed-replayable simulator that drives the real Raft core, durable log and driver ordering through
+> dropped, duplicated, delayed and reordered messages, partitions, process crashes, a modeled power
+> loss, restarts, pauses and disk failures, checking every safety invariant after every event —
+> plus real-driver and real-process fault tests (SIGKILL, SIGSTOP, TCP-level partitions). It found
+> and fixed three real bugs, including one that let a restarted node acknowledge entries a power
+> loss could still erase.
 >
-> **Not implemented:** end-to-end linearizability verification, the network fault matrix
-> (drop/delay/partition), failover testing, request forwarding, client/HTTP API, linearizable-read
-> serving (ReadIndex), dedup / exactly-once client semantics, snapshots, dynamic membership, a
-> dashboard. **Raft working is the consensus core, not the finished distributed database — no
-> end-to-end distributed consistency guarantee is claimed.** Those are Phases 10 and later. See
+> **Not implemented:** end-to-end linearizability verification, request forwarding, client/HTTP
+> API, linearizable-read serving (ReadIndex), dedup / exactly-once client semantics, snapshots,
+> dynamic membership, a dashboard. **Raft working under faults is the consensus core, not the
+> finished distributed database — no end-to-end distributed consistency guarantee is claimed.**
+> Those are Phases 11 and later. See
 > [docs/ROADMAP.md](docs/ROADMAP.md) for exactly what is done and what is not.
 >
 > The binary is still called `dkv`; that is the command name, not the project name.
@@ -82,8 +88,14 @@ durable log ───────▶│  no-op on election · conflict hint · H
                     │  deterministic core + node driver over real TCP    │
                     └────────────────────────────────────────────────────┘
 
+                    ┌───────── implemented, Phase 10 (fault injection) ──┐
+seed / script ─────▶│  deterministic simulator · drop/dup/delay/reorder  │
+                    │  partitions · crash · power-loss model · disk I/O  │
+                    │  real driver + real processes: kill/stop/partition │
+                    └────────────────────────────────────────────────────┘
+
                     ┌──────────────── not implemented ───────────────────┐
-                    │  fault matrix · linearizability · forwarding       │ Phases 10+
+                    │  crash harness · linearizability · forwarding      │ Phases 11+
                     │  HTTP API · dashboard · snapshots                  │ Phases 14+
                     └────────────────────────────────────────────────────┘
 ```
@@ -123,8 +135,8 @@ internal node-to-node link: messages framed with the same checksummed record for
 use, a `"DKV1"` version handshake, one long-lived bidirectional TCP connection per peer pair
 (the lower node id dials), automatic reconnect, concurrent-safe sends, and per-connection frame
 ordering. Unlike the WAL, a torn network frame is a failed connection, not a repairable tail.
-Phase 7 sends only `Probe`/`ProbeResponse`; the Raft message kinds are reserved identifiers.
-It runs no consensus and serves no clients. The wire format, handshake, sizes, timeouts,
+Phase 7 sends only `Probe`/`ProbeResponse` (Phase 9 later activated the Raft message kinds).
+It serves no clients. The wire format, handshake, sizes, timeouts,
 ordering guarantees, and the explicit boundary: [docs/TRANSPORT.md](docs/TRANSPORT.md).
 
 ```bash
@@ -151,6 +163,18 @@ cluster runs in one goroutine, replayable from a seed, so the paper's figures (i
 are deterministic tests and the safety invariants are checked after every step. What Phase 9 proves
 and — as carefully — what it does not: [docs/RAFT.md](docs/RAFT.md). Run a real 3-node group with
 `dkvd -raft`.
+
+Phase 10 injects **faults** at the system's real boundaries, never inside the Raft core. The durable
+log does its file I/O through a small filesystem seam (`internal/vfs`), under which
+`internal/fault` puts a crash-consistent disk model — a process crash keeps every written byte, a
+modeled power loss keeps only fsynced ones — and armed write/fsync failures; a transport decorator
+drops, duplicates, holds and blocks messages. `internal/raftsim` composes these with the real core,
+the real durable log, and the driver's own persist-then-send and recovery functions into a
+single-goroutine cluster whose every run is a pure function of a seed or a script: traced, hashed,
+replayable, and shrinkable to a minimal failing schedule. Real processes are killed, frozen and
+partitioned through TCP proxies. Persistence failure is fail-stop (`dkvd` exits 1). The fault
+model, what each tier proves, the bugs it found, and what stays untested (real power loss above
+all): [docs/FAULTS.md](docs/FAULTS.md).
 
 ## The one thing this project refuses to do
 
@@ -316,6 +340,7 @@ it is being answered out of memory.
 | [TRANSPORT.md](docs/TRANSPORT.md) | Framing, handshake, message kinds, sizes, codec, connection model, timeouts, shutdown, ordering semantics, failure behavior, and what Phase 7 is not |
 | [REPLICATION.md](docs/REPLICATION.md) | The replica-group model, the local replicated-log interface and its index/term/copy semantics, conflicting-suffix rules, commit/apply bookkeeping, the state-machine seam, the INV-P invariants, and what Phase 8 explicitly does not guarantee |
 | [RAFT.md](docs/RAFT.md) | The deterministic core, persistent state and election timing, RequestVote/AppendEntries, the conflict hint, the commit rule and no-op, the apply path, persistence ordering and recovery, the simulated network, the INV-R invariants, and what Phase 9 does and does not prove |
+| [FAULTS.md](docs/FAULTS.md) | The fault model and its three tiers, the deterministic simulator, crash/power-loss/persistence-failure semantics, seeds/replay/minimization, the INV-F invariants, the bugs Phase 10 found, and what remains untested |
 
 ## Development
 
@@ -326,7 +351,10 @@ make check        # gofmt + gitignore guard + go vet + go test -race — the pha
 make build
 make test
 make race
-make integration  # real-process SIGKILL crash recovery tests
+make integration  # real-process tests: SIGKILL recovery, Raft over TCP, kill/stop/partition faults
+make faults       # the deterministic fault schedules at a large seed budget (FAULT_SEEDS=200)
+make mutation     # mutation testing: every rule-violating edit must be caught
+make fuzz         # every fuzz target in the repository (FUZZTIME=10s each)
 make bench        # indicative WAL measurements
 ```
 

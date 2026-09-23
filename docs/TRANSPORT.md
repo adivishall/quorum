@@ -232,9 +232,16 @@ elections, `RequestVote`/`AppendEntries`, and commit over it (`internal/raftnode
 proven by a real 3-process election and a SIGKILL recovery test. The transport itself is unchanged
 and still does not know what a term or a log index means; it only moves the bytes.
 
+**Fault injection (Phase 10).** The transport is unchanged. Message-level faults are injected
+*around* it: `fault.Network` decorates any `Transport` with partitions and drop/duplicate/hold/
+block rules for in-process tests, and the real-process tests partition `dkvd` processes with
+test-owned TCP proxies on the node-to-node links (`docs/FAULTS.md`). Since Phase 10 the Raft driver
+sends from one goroutine per peer (bounded outboxes), so a peer whose writes block delays only its
+own messages (INV-F5); per-connection frame order is unaffected.
+
 **Still not built (on top of the transport):** request forwarding, shard/client serving, an HTTP
-API, a dashboard, dynamic membership, snapshots, systematic fault injection, and end-to-end
-cross-node consistency verification. The `InstallSnapshot`/`Forward` kinds remain reserved. `Probe`
+API, a dashboard, dynamic membership, snapshots, and end-to-end cross-node consistency
+verification. The `InstallSnapshot`/`Forward` kinds remain reserved. `Probe`
 is a liveness probe, not a Raft heartbeat.
 
 ## 12. Invariants
@@ -242,11 +249,12 @@ is a liveness probe, not a Raft heartbeat.
 | ID | Statement | Tests |
 |---|---|---|
 | INV-T1 | Frame parsing is bounded and explicit: a declared length over `MaxFrameSize` is rejected before allocation, and a frame is read with `io.ReadFull`-discipline regardless of TCP fragmentation. | `TestFrameTooLargeIsRejectedBeforeAlloc`, `TestFrameReassembledFromFragments`, `TestConcatenatedFramesDecodeIndividually`, `FuzzFrameDecode` |
-| INV-T2 | Malformed transport input is rejected as a protocol error and the connection is closed — never repaired, resynchronised, or interpreted as valid data (a socket is not a WAL). | `TestTruncatedFrameIsError`, `TestBadChecksumIsError`, `TestUnknownKindIsError`, `TestBadMagicIsRejected`, `TestVersionMismatchIsRejected`, `FuzzFrameDecode`, `FuzzHandshakeDecode`, `FuzzProbeDecode` |
-| INV-T3 | A successful handshake precedes any application message; a connection that fails the handshake exchanges no frames. | `TestNoMessagesBeforeHandshake`, `TestHandshakeTimeoutClosesConnection`, `TestSelfConnectionRejected`, `TestUnknownPeerRejected` |
-| INV-T4 | Each received message is attributed to the peer identity established by the handshake on its connection, never to a value carried in the payload. | `TestReceivedEnvelopeCarriesConnectionPeerID`, `TestPayloadCannotSpoofSender` |
+| INV-T2 | Malformed transport input is rejected as a protocol error and the connection is closed — never repaired, resynchronised, or interpreted as valid data (a socket is not a WAL). | `TestTruncatedFrameIsError`, `TestBadChecksumIsError`, `TestUnknownKindIsError`, `TestHandshakeBadMagicRejected`, `TestHandshakeVersionMismatchRejected`, `TestProbeMalformedRejected`, `FuzzFrameDecode`, `FuzzHandshakeDecode`, `FuzzProbeDecode` |
+| INV-T3 | A successful handshake precedes any application message; a connection that fails the handshake exchanges no frames. | `TestSelfConnectionRejected`, `TestUnknownPeerRejected`, `TestHandshakeTimeoutClosesConnection`, `TestBadMagicClosesConnection`, `TestHandshakeTruncatedRejected` |
+| INV-T4 | Each received message is attributed to the peer identity established by the handshake on its connection, never to a value carried in the payload. | `TestTCPHandshakeAndProbe`, `TestPayloadCannotSpoofSender` |
 | INV-T5 | Frames on a single connection are delivered in send order, and a frame is written in full (even across short writes) so its bytes never interleave or truncate. | `TestPerConnectionOrderPreserved`, `TestConcurrentSendersDoNotInterleave`, `TestFrameSurvivesPartialWrites`, `TestWriteErrorAfterPartialWriteIsReturned`, `TestZeroProgressWriterDoesNotLoopForever` |
 | INV-T6 | Node shutdown terminates all transport resources: accept loop, dial loops, reader and writer paths, and connections; repeated shutdown is safe; no goroutine leak. | `TestCloseIsIdempotent`, `TestNoGoroutineLeakAfterClose`, `TestSendAfterCloseFails`, and the three-process `TestThreeNodeClusterProbesAndShutsDownCleanly` |
 
-INV-C4 (Phase 6) remains **PLANNED**: routing is not yet integrated into request serving, which
-is Phase 8+. Phase 7 adds no Raft invariant (INV-R1..R10 stay PLANNED).
+INV-C4 (Phase 6) remains **PLANNED**: routing is not yet integrated into request serving. Phase 7
+added no Raft invariant; INV-R1..R10 were established in Phase 9 (`docs/RAFT.md`) and re-verified
+under injected faults in Phase 10 (`docs/FAULTS.md`).
