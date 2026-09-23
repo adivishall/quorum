@@ -71,6 +71,14 @@ type harness struct {
 // startCluster builds an n-node cluster over real TCP transports.
 func startCluster(t *testing.T, ctx context.Context, n int) *harness {
 	t.Helper()
+	return startClusterWith(t, ctx, n, func(tr transport.Transport) transport.Transport { return tr })
+}
+
+// startClusterWith is startCluster with each node's transport passed through wrap
+// before the node uses it (e.g. a fault.Network decorator). The harness still owns
+// and closes the underlying TCP transports.
+func startClusterWith(t *testing.T, ctx context.Context, n int, wrap func(transport.Transport) transport.Transport) *harness {
+	t.Helper()
 	var ids []NodeID
 	addrs := map[NodeID]string{}
 	for i := 0; i < n; i++ {
@@ -96,7 +104,7 @@ func startCluster(t *testing.T, ctx context.Context, n int) *harness {
 		sm := &recSM{}
 		h.sms[id] = sm
 		node, err := Start(ctx, Config{
-			ID: id, Peers: ids, Transport: tr,
+			ID: id, Peers: ids, Transport: wrap(tr),
 			LogPath:      filepath.Join(h.dir, string(id)+".log"),
 			StateMachine: sm, TickInterval: 15 * time.Millisecond, DisableSync: true,
 		})
