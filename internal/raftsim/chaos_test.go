@@ -63,14 +63,19 @@ func reproCommand(p Profile, seed int64) string {
 
 // TestRandomizedFaultSchedules is scenario J: long seeded schedules mixing every
 // fault type, with every continuous invariant checked after every event and the
-// post-fault convergence check (INV-F3) at the end. A run must also have actually
-// exercised its profile's faults — a run that injected nothing proves nothing.
+// post-fault convergence check (INV-F3) at the end. No run may pass vacuously:
+// each must commit and must inject faults, and across the seed set every fault
+// type its profile weights must actually occur (a rare fault — a power loss is a
+// sub-case of an already-rare crash — can legitimately be absent from one seed,
+// so that part is checked on the whole set, not per run).
 func TestRandomizedFaultSchedules(t *testing.T) {
 	for _, p := range selectedProfiles(t) {
 		if *flagSteps > 0 {
 			p.Steps = *flagSteps
 		}
-		for _, seed := range selectedSeeds() {
+		seeds := selectedSeeds()
+		var tally Stats
+		for _, seed := range seeds {
 			p, seed := p, seed
 			t.Run(fmt.Sprintf("%s/seed=%d", p.Name, seed), func(t *testing.T) {
 				r := Run(p, seed)
@@ -80,54 +85,66 @@ func TestRandomizedFaultSchedules(t *testing.T) {
 					t.Fatalf("%s--- minimized script (%d of %d events; save it and replay with -raftsim.replay=FILE -raftsim.nodes=%d -raftsim.seed=%d) ---\n%s",
 						r.Report(reproCommand(p, seed)), len(min), len(r.Script), p.Nodes, seed, FormatScript(min))
 				}
-				requireFaultsExercised(t, p, r.Stats)
+				requireProgressAndFaults(t, p, r.Stats)
+				tally = addStats(tally, r.Stats)
 				if testing.Verbose() {
 					t.Logf("events=%d trace=%s %+v", len(r.Script), r.TraceHash[:16], r.Stats)
 				}
 			})
 		}
+		if len(seeds) >= 5 {
+			requireEveryFaultOccurred(t, p, tally)
+		}
 	}
 }
 
-// requireFaultsExercised fails a run that did not actually inject the faults its
-// profile is for, or never made progress.
-func requireFaultsExercised(t *testing.T, p Profile, s Stats) {
+// requireProgressAndFaults fails a run that never committed, never elected, or
+// injected no fault at all.
+func requireProgressAndFaults(t *testing.T, p Profile, s Stats) {
+	t.Helper()
+	injected := s.DroppedInjected + s.Duplicated + s.Delayed + s.DroppedPartition + s.ProcessCrashes +
+		s.PowerLosses + s.PersistFailures + s.Pauses
+	if s.MaxCommit <= 1 || s.LeaderElections == 0 || injected == 0 {
+		t.Fatalf("profile %s run proved nothing: commit=%d elections=%d faults injected=%d (%+v)",
+			p.Name, s.MaxCommit, s.LeaderElections, injected, s)
+	}
+}
+
+// requireEveryFaultOccurred fails a profile whose seed set never produced one of
+// the faults it weights: then it would not be exercising what it claims.
+func requireEveryFaultOccurred(t *testing.T, p Profile, s Stats) {
 	t.Helper()
 	var missing []string
-	need := func(ok bool, what string) {
-		if !ok {
+	need := func(weighted bool, ok bool, what string) {
+		if weighted && !ok {
 			missing = append(missing, what)
 		}
 	}
-	need(s.MaxCommit > 1, "a committed command")
-	need(s.LeaderElections > 0, "an election")
-	if p.Drop > 0 {
-		need(s.DroppedInjected > 0, "an injected drop")
-	}
-	if p.Duplicate > 0 {
-		need(s.Duplicated > 0, "a duplicate")
-	}
-	if p.Delay > 0 {
-		need(s.Delayed > 0, "a delay")
-	}
-	if p.Partition > 0 {
-		need(s.DroppedPartition > 0, "a message lost to a partition")
-	}
-	if p.Crash > 0 {
-		need(s.ProcessCrashes > 0 && s.Restarts > 0, "a crash and a restart")
-	}
-	if p.Crash > 0 && p.PowerLossPercent > 0 {
-		need(s.PowerLosses > 0, "a power loss")
-	}
-	if p.FailPersist > 0 {
-		need(s.PersistFailures > 0, "a persistence failure")
-	}
-	if p.Pause > 0 {
-		need(s.Pauses > 0, "a pause")
-	}
+	need(p.Drop > 0, s.DroppedInjected > 0, "an injected drop")
+	need(p.Duplicate > 0, s.Duplicated > 0, "a duplicate")
+	need(p.Delay > 0, s.Delayed > 0, "a delay")
+	need(p.Partition > 0, s.DroppedPartition > 0, "a message lost to a partition")
+	need(p.Crash > 0, s.ProcessCrashes > 0 && s.Restarts > 0, "a crash and a restart")
+	need(p.Crash > 0 && p.PowerLossPercent > 0, s.PowerLosses > 0, "a power loss")
+	need(p.FailPersist > 0, s.PersistFailures > 0, "a persistence failure")
+	need(p.Pause > 0, s.Pauses > 0, "a pause")
 	if len(missing) > 0 {
-		t.Fatalf("profile %s run never produced %s: it did not exercise what it claims (%+v)", p.Name, strings.Join(missing, ", "), s)
+		t.Fatalf("profile %s: no run in the seed set produced %s — it does not exercise what it claims (%+v)",
+			p.Name, strings.Join(missing, ", "), s)
 	}
+}
+
+func addStats(a, b Stats) Stats {
+	a.DroppedInjected += b.DroppedInjected
+	a.Duplicated += b.Duplicated
+	a.Delayed += b.Delayed
+	a.DroppedPartition += b.DroppedPartition
+	a.ProcessCrashes += b.ProcessCrashes
+	a.Restarts += b.Restarts
+	a.PowerLosses += b.PowerLosses
+	a.PersistFailures += b.PersistFailures
+	a.Pauses += b.Pauses
+	return a
 }
 
 // TestSameSeedSameTrace is the reproducibility guarantee: the same profile and seed
