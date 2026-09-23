@@ -1,9 +1,22 @@
 # CONSISTENCY MODEL
 
-Status: **Phase 0 — this is the model we intend to implement and to *verify*.**
-Until the verification listed in §6 actually runs and passes, the claims in §2 are design
-targets, not properties of the code. This file will be updated after Phase 12 to say which
-claims are backed by passing tests and which are not.
+Status: **Phase 9 — the consensus core is verified in simulation; the end-to-end model is not.**
+The claims in §2 remain design targets, not yet properties of the running system. This file is
+updated after Phase 12 to say which claims are backed by passing tests and which are not.
+
+**Currently verified (Phase 9).** Raft's *safety* properties — election safety, log matching,
+leader completeness, state-machine safety, the §5.4.2 commit rule, and durable term/vote before a
+dependent reply — hold in a deterministic simulation, and durable Raft state survives process kill
+(`docs/RAFT.md`, `docs/INVARIANTS.md` INV-R1..R10). These are the mechanisms §4 relies on
+(single vote per term, current-term commit + no-op, fsync before reply).
+
+**Not yet verified.** Real failure behaviour under the complete network fault matrix
+(drop/delay/duplicate/reorder/partition — Phases 10/11); end-to-end single-key linearizability
+against a real cluster under faults (Phase 12); client retry / dedup semantics (C4 stage two,
+Phase 13); the distributed API and `stale`/`linearizable` read serving including ReadIndex (§8.5,
+Phases 13/15); and crash recovery across every failure window (Phase 11). The claims C1–C5 below
+are therefore **still design targets**: Raft working is a necessary part of them, not the whole
+proof.
 
 ---
 

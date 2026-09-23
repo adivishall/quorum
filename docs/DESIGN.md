@@ -312,6 +312,14 @@ Consensus Algorithm"), sections 5.1–5.4 plus §7 snapshots.
 > in §2 framing holding `Entry` and `HardState` records) and the state transitions in §8.2–§8.5
 > are Phase 9, which drives the Phase 8 primitive; the message codecs are the transport's reserved
 > kinds (ADR-013), still inactive.
+>
+> **Phase 9 update (ADR-016, docs/RAFT.md).** §8.2–§8.4 and the §5.4.2 commit rule are now
+> **implemented**: a pure deterministic core (`internal/raft`) drives that Phase 8 log, backed by a
+> durable log + HardState (`internal/raftlog`) and a node driver (`internal/raftnode`) that
+> activates the RequestVote/AppendEntries transport kinds. §8.1's persistent-state design is
+> honoured (one record stream; last HardState wins; `commitIndex` is a recoverable optimization).
+> §8.5's ReadIndex read path is **not** implemented in Phase 9 (no client read serving yet), and
+> snapshots (§7) are Phase 14.
 
 ### 8.1 Persistent state (fsynced before any RPC reply that depends on it)
 

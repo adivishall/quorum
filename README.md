@@ -6,7 +6,7 @@ Quorum is currently implementing its durable storage engine. No Raft library, no
 database, no consensus service — the storage engine and the consensus implementation are
 the project, and they are being built in that order.
 
-> **Status: Phase 8 of 25 — durable single-node LSM engine, a routing library, real node processes on a TCP transport, and a local replicated-log model.**
+> **Status: Phase 9 of 25 — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, and a working Raft consensus core.**
 >
 > **Implemented:** a write-ahead log, an ordered memtable, immutable on-disk SSTables, Bloom
 > filters, size-tiered compaction, crash-safe MANIFEST-based file publication, and restart
@@ -18,15 +18,21 @@ the project, and they are being built in that order.
 > bidirectional connection per peer pair, and `Probe`/`ProbeResponse` liveness — proven by three
 > real processes exchanging probes over TCP and shutting down cleanly. Phase 8 adds a **local
 > replicated-log model** (`internal/replication`): an immutable `ReplicaGroup` consumed from the
-> routing metadata, and a small `Log` interface (with an in-memory `MemoryLog`) that Phase 9's
-> Raft will drive — 1-based contiguous indexes, deterministic conflicting-suffix replacement that
-> cannot overwrite a committed entry, and monotonic commit/apply bookkeeping.
+> routing metadata, and a small `Log` interface (with an in-memory `MemoryLog`) that Raft drives —
+> 1-based contiguous indexes, deterministic conflicting-suffix replacement that cannot overwrite a
+> committed entry, and monotonic commit/apply bookkeeping. Phase 9 adds **Raft**
+> (`internal/raft`, `internal/raftlog`, `internal/raftnode`): a pure deterministic consensus core
+> (elections, RequestVote, AppendEntries with a term-based conflict hint, the §5.4.2 commit rule,
+> the mandatory election no-op), a durable Raft log + HardState, and a node driver that runs a real
+> group over TCP. Its safety properties (INV-R1..R10) are verified in a deterministic simulation,
+> and durable state survives a real SIGKILL — proven by a 3-process election and a crash-recovery
+> test.
 >
-> **Not implemented:** distributed replication, Raft, leader election, a consensus-backed cluster,
-> cross-node consistency, linearizable reads, failover, request forwarding, an HTTP API, a
-> dashboard. The replication model is **local and in-memory** — it records that an index *is*
-> committed but does not decide, replicate, or elect — and the transport carries bytes and serves
-> no clients. **No distributed consistency guarantee exists.** Those are Phases 9 and later. See
+> **Not implemented:** end-to-end linearizability verification, the network fault matrix
+> (drop/delay/partition), failover testing, request forwarding, client/HTTP API, linearizable-read
+> serving (ReadIndex), dedup / exactly-once client semantics, snapshots, dynamic membership, a
+> dashboard. **Raft working is the consensus core, not the finished distributed database — no
+> end-to-end distributed consistency guarantee is claimed.** Those are Phases 10 and later. See
 > [docs/ROADMAP.md](docs/ROADMAP.md) for exactly what is done and what is not.
 >
 > The binary is still called `dkv`; that is the command name, not the project name.
@@ -70,9 +76,15 @@ local Log ─────────▶│  1-based entries · suffix replace �
                     │  in-memory MemoryLog — no consensus, no network    │
                     └────────────────────────────────────────────────────┘
 
+                    ┌─────────── implemented, Phase 9 (consensus) ───────┐
+raft group ────────▶│  elections · RequestVote · AppendEntries · commit  │
+durable log ───────▶│  no-op on election · conflict hint · HardState      │
+                    │  deterministic core + node driver over real TCP    │
+                    └────────────────────────────────────────────────────┘
+
                     ┌──────────────── not implemented ───────────────────┐
-                    │  Raft · distributed replication · forwarding       │ Phases 9+
-                    │  HTTP API · dashboard                              │ Phases 15+
+                    │  fault matrix · linearizability · forwarding       │ Phases 10+
+                    │  HTTP API · dashboard · snapshots                  │ Phases 14+
                     └────────────────────────────────────────────────────┘
 ```
 
@@ -127,6 +139,18 @@ an in-memory `MemoryLog` that exercises every edge case. It is deliberately *loc
 that an index *is* committed but does not decide, replicate across nodes, or elect. What it models,
 what it explicitly does not guarantee, and the invariants (INV-P1..P9):
 [docs/REPLICATION.md](docs/REPLICATION.md).
+
+Phase 9 implements **Raft**. `internal/raft` is a pure, deterministic consensus core — no sockets,
+no clock, no goroutines, no global randomness — that drives the Phase 8 log: it runs elections
+(randomized timeouts from an injected source), RequestVote and AppendEntries with a term-based
+conflict hint, the §5.4.2 commit rule and the mandatory election no-op that makes it safe, and the
+apply path. `internal/raftlog` makes its log and HardState durable in the shared record framing
+(a torn tail truncates; any other damage refuses to open). `internal/raftnode` is the driver that
+persists before it replies, sends over the transport, ticks, and applies. A whole simulated
+cluster runs in one goroutine, replayable from a seed, so the paper's figures (including Figure 8)
+are deterministic tests and the safety invariants are checked after every step. What Phase 9 proves
+and — as carefully — what it does not: [docs/RAFT.md](docs/RAFT.md). Run a real 3-node group with
+`dkvd -raft`.
 
 ## The one thing this project refuses to do
 
@@ -291,6 +315,7 @@ it is being answered out of memory.
 | [ROUTING.md](docs/ROUTING.md) | The token rule, the two consistent-hash rings, ownership/wrap/collision rules, redistribution numbers, the visualization, and what Phase 6 is not |
 | [TRANSPORT.md](docs/TRANSPORT.md) | Framing, handshake, message kinds, sizes, codec, connection model, timeouts, shutdown, ordering semantics, failure behavior, and what Phase 7 is not |
 | [REPLICATION.md](docs/REPLICATION.md) | The replica-group model, the local replicated-log interface and its index/term/copy semantics, conflicting-suffix rules, commit/apply bookkeeping, the state-machine seam, the INV-P invariants, and what Phase 8 explicitly does not guarantee |
+| [RAFT.md](docs/RAFT.md) | The deterministic core, persistent state and election timing, RequestVote/AppendEntries, the conflict hint, the commit rule and no-op, the apply path, persistence ordering and recovery, the simulated network, the INV-R invariants, and what Phase 9 does and does not prove |
 
 ## Development
 

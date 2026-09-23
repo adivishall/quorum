@@ -115,6 +115,15 @@ only. The `replica group → Raft group` step — actually replicating across no
 entry commits, electing a leader, and serving requests — is Phase 9+ and does not exist yet;
 Phase 8 adds no distributed or consistency guarantee.
 
+As of Phase 9, `internal/raft`, `internal/raftlog`, and `internal/raftnode` (`docs/RAFT.md`,
+ADR-016) implement **Raft**: the pure deterministic core (§5a below is now real, not aspirational)
+drives the Phase 8 log, a durable log + HardState makes its state crash-safe, and a node driver
+runs a real group over the transport (electing a leader, replicating, committing). This is the
+consensus core for one group; the multi-Raft node that instantiates one group per shard and serves
+clients is a later phase. Raft's safety properties are verified in deterministic simulation and by
+a real 3-process smoke test; end-to-end linearizability, the fault matrix, and request serving are
+Phases 10–13 and are **not** claimed yet.
+
 Each shard is an **independent Raft group** with its own log, its own leader, and its own
 storage directory. A 3-node cluster with 16 shards runs 16 Raft groups; every node is a
 member of every shard's group when RF == cluster size, and of a subset otherwise.

@@ -3,7 +3,7 @@
 The things this system does not do, cannot do, or has not proven. Kept current: an item may be
 removed only when a test exists showing it is no longer true.
 
-**Status: Phase 8.** A single-node key-value store with a durable write-ahead log and an
+**Status: Phase 9.** A single-node key-value store with a durable write-ahead log and an
 LSM storage engine — memtable, immutable SSTables with Bloom filters, flush, size-tiered
 compaction, crash-safe MANIFEST-based file publication, restart recovery — exists and is
 benchmarked (`docs/BENCHMARKS.md`). Phase 6 added a **pure, deterministic routing library**
@@ -18,9 +18,15 @@ immutable `ReplicaGroup` consumed from the routing metadata, and a small `Log` i
 in-memory `MemoryLog`) that Phase 9's Raft will drive — 1-based contiguous indexes, deterministic
 suffix replacement that cannot overwrite a committed entry, and monotonic commit/apply
 bookkeeping. It is **local** and in-memory; nothing replicates across nodes, decides when an entry
-may commit, or persists. The transport still carries bytes; it runs no Raft, replicates nothing,
-serves no clients, and hosts no storage. Nothing that requires consensus exists — no distributed
-replication, no election, no request serving. **No distributed consistency guarantee exists.**
+may commit, or persists. Phase 9 adds **Raft** (`internal/raft`, `internal/raftlog`,
+`internal/raftnode`, `docs/RAFT.md`, ADR-016): a pure deterministic consensus core (elections,
+RequestVote, AppendEntries with a term-based conflict hint, the §5.4.2 commit rule, the mandatory
+election no-op), a durable Raft log + HardState, and a node driver that runs a real group over the
+transport — verified in deterministic simulation (INV-R1..R10) and by a real 3-process election
+and a SIGKILL log-recovery test. But Raft functioning is **not** the finished Quorum consistency
+model: there is no end-to-end linearizability verification, no network fault matrix, no client/HTTP
+API, no request forwarding or dedup, no linearizable-read serving, no snapshots, and no dynamic
+membership. **No distributed consistency guarantee is claimed as verified end-to-end.**
 
 ### True right now, and temporary
 
@@ -42,8 +48,10 @@ replication, no election, no request serving. **No distributed consistency guara
 | `sync` mode serialises writers behind the device flush (~3.4 ms/append, ~291 appends/s, measured on an M4 — `docs/BENCHMARKS.md` §3.6) | a later phase, if group commit is measured to be worth it |
 | **The transport carries bytes, nothing more.** `internal/transport` and `cmd/dkvd` give real processes a checksummed framed-TCP link with a handshake, reconnect, and `Probe`/`ProbeResponse`. There is no replication, no Raft, no leader election, no request forwarding, no shard serving, and no storage over the wire. The Raft/`Forward` message kinds are reserved identifiers with no codec or semantics. A node process hosts no LSM engine. | Phases 8–9, 13 (`docs/TRANSPORT.md` §11) |
 | **The transport is unauthenticated plaintext TCP.** No TLS, no authentication; the handshake node id is a protocol label, not a cryptographic identity. Bounded frame/handshake/id sizes and malformed-input rejection are enforced regardless. | out of scope for v1 (`docs/TRANSPORT.md` §10) |
-| **The replication model is local and in-memory.** `internal/replication` defines a `ReplicaGroup` and a `Log`/`MemoryLog` that Phase 9's Raft will drive. It replicates nothing across nodes, decides nothing about *when* an entry may be committed (`Commit` only *records* that it is), elects nothing, and does not persist — the log lives in memory and is lost on restart. The state-machine seam (`StateMachine.Apply`) is defined but not wired to the LSM engine, and no driver pumps committed entries into it. It carries no distributed or consistency guarantee. | Phase 9 (Raft), 14 (persistence/snapshots); `docs/REPLICATION.md` §11 |
-| No distributed replication, no consensus, no cross-node consistency, no leader election, no failover, no request forwarding, no client serving, no HTTP API, no dashboard | Phases 9, 13, 15–17 |
+| **Raft is verified in simulation and by a smoke test, not under the full fault matrix.** `internal/raft` proves the safety invariants (INV-R1..R10) in a deterministic single-goroutine network, and `internal/raftnode` runs a real group over TCP with a 3-process election and a SIGKILL log-recovery test. What is *not* yet done: systematic drop/delay/duplicate/reorder/partition fault injection (Phase 10), real multi-process crash recovery across every failure window (Phase 11), and end-to-end linearizability checking (Phase 12). | Phases 10–12 |
+| **The durable Raft log grows without bound.** `internal/raftlog` is append-only; a suffix replacement appends rather than rewrites, and nothing compacts or truncates it. Snapshotting (which would cap it) is Phase 14. | Phase 14 (snapshots) |
+| **A node hosts one Raft group and no state machine of consequence.** `internal/raftnode` drives a single group with a minimal (often nil / recording) state machine; it is not wired to the LSM engine, hosts no shards, and the multi-Raft (one group per shard) node is a later phase. `appliedIndex` is volatile and re-applied from the recovered log on restart. | Phases 11+ (per-shard node, engine wiring) |
+| No end-to-end cross-node consistency verification, no failover testing, no request forwarding, no client serving, no HTTP API, no linearizable-read serving (ReadIndex), no dashboard | Phases 10–13, 15–17 |
 | **Routing is a library, not a running system.** `internal/routing` computes which shard owns a key and which nodes *would* form each shard's replica group, but no node hosts a shard, no data is placed or moved, and a "membership change" is a new `Config` compared against the old one, never a live cluster mutation (ADR-005, ADR-012). The replica group is declarative metadata; replication, leader election, forwarding, and availability do not exist. | Phases 7–9; `docs/ROUTING.md` §9 |
 | `dkv put` cannot carry a maximum-size (1 MiB) value, because `ARG_MAX` is 1 MiB on macOS and the kernel rejects the exec. `dkv shell` can. This is an OS limit, not a dkv limit. | not applicable — use `dkv shell`, or the HTTP API from Phase 15 |
 | The CLI is still in-memory-only: it does not yet open a data directory, so `dkv` remains ephemeral even though the storage layer is not | Phase 15 (CLI wiring) |

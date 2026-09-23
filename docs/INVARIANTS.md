@@ -208,20 +208,38 @@ deterministically instead, by constructing the exact on-disk state
 `TestCompactionInputsLeftOnDiskAreSweptAsOrphans`). That is weaker evidence than a real crash and is
 labelled as such.
 
-## Raft
+## Raft (Phase 9)
+
+Enforced by `internal/raft` (the pure deterministic core), `internal/raftlog` (durable log),
+and `internal/raftnode` (driver); specified in `docs/RAFT.md` and introduced by ADR-016. The `R`
+series is proven in **deterministic simulation** (`internal/raft`'s single-goroutine network,
+which runs the continuously-checkable invariants after every step) and, for durability, by
+**process-kill** tests. These are Raft **safety** properties; they are not, on their own, the
+end-to-end Quorum consistency model (`docs/CONSISTENCY.md`), which Phase 12 verifies.
 
 | ID | Invariant | Checked by | Status |
 |---|---|---|---|
-| INV-R1 | **Election Safety.** At most one leader can be elected in a given term. | Phase 9 deterministic simulation; asserted continuously by the test harness after every step | PLANNED |
-| INV-R2 | **Leader Append-Only.** A leader never overwrites or deletes entries in its own log; it only appends. | Phase 9 invariant checker | PLANNED |
-| INV-R3 | **Log Matching.** If two logs contain an entry with the same index and term, the logs are identical in all entries up through that index. | Phase 9 invariant checker, run across all nodes after every step | PLANNED |
-| INV-R4 | **Leader Completeness.** If an entry is committed in term T, it is present in the log of every leader of every term > T. | Phase 9 simulation with election churn | PLANNED |
-| INV-R5 | **State Machine Safety.** If a node has applied an entry at index i, no node ever applies a different entry at index i. | Phase 9/12 cross-node apply-log comparison | PLANNED |
-| INV-R6 | `currentTerm` and `votedFor` are durable before any vote is granted or any AppendEntries is acknowledged. | Phase 11 crash-during-vote test | PLANNED |
-| INV-R7 | A node never applies an entry with index > `commitIndex`. | Phase 9 assertion in the apply path (enabled in tests) | PLANNED |
-| INV-R8 | `commitIndex` is monotonically non-decreasing on every node, across restarts. | Phase 11 restart tests | PLANNED |
-| INV-R9 | A leader only advances `commitIndex` past entries from its own term. | Phase 9 figure-8 regression test | PLANNED |
-| INV-R10 | A stale message (lower term) never mutates state beyond sending a rejection carrying the current term. | Phase 9 stale/duplicate/delayed-message tests | PLANNED |
+| INV-R1 | **Election Safety.** At most one leader can be elected in a given term. | `internal/raft`: `assertAtMostOneLeaderPerTerm` (continuous, every step of every sim test), `TestThreeNodeElection`, `TestVoteGrantedOncePerTerm`, `TestVoteDeniedToStaleLog`, `TestSplitVoteResolves` | VERIFIED (simulation) |
+| INV-R2 | **Leader Append-Only.** A leader never overwrites or deletes entries in its own log; it only appends. | `internal/raft`: `TestLeaderAppendOnly` (records each index across proposals and fails on any rewrite) | VERIFIED (simulation) |
+| INV-R3 | **Log Matching.** If two logs contain an entry with the same index and term, the logs are identical in all entries up through that index. | `internal/raft`: `assertLogMatching` (continuous, every step, all node pairs), `TestReplicationAndCommitAndApply`, `TestSuffixReplacement`, `TestConflictBackupByTerm` | VERIFIED (simulation) |
+| INV-R4 | **Leader Completeness.** If an entry is committed in term T, it is present in the log of every leader of every term > T. | `internal/raft`: `TestLeaderCompleteness` (commit, then forced leadership changes), `TestFigure8` (the committed old-term entry survives and blocks a competing candidate) | VERIFIED (simulation) |
+| INV-R5 | **State Machine Safety.** If a node has applied an entry at index i, no node ever applies a different entry at index i. | `internal/raft`: cross-node apply-history comparison in `applyCommitted` (continuous), `TestReplicationAndCommitAndApply`; `internal/raftnode`: `TestClusterElectsAndReplicates` (real TCP, applied order asserted) | VERIFIED (simulation + real cluster) |
+| INV-R6 | `currentTerm` and `votedFor` are durable before any vote is granted or any dependent AppendEntries reply is sent. | Structural via the `Ready` contract (persist HardState/Entries before Messages), asserted by `internal/raft`: `TestHardStateAccompaniesVoteGrant`, `TestHardStateAccompaniesTermBump`; durability across process death by `internal/raftlog` round-trip tests and `tests/integration`: `TestRaftLogSurvivesSIGKILL` | VERIFIED (process kill) |
+| INV-R7 | A node never applies an entry with index > `commitIndex`. | `internal/raft`: apply-path guard in `applyCommitted` (continuous), `FuzzRaftEvents` (applied ≤ commit ≤ lastIndex after every step); enforced structurally by the Phase 8 log (INV-P8) | VERIFIED |
+| INV-R8 | `commitIndex` is monotonically non-decreasing on every node, across restarts. | Within a session: Phase 8 log (INV-P5). Across restart: `internal/raftnode`: `TestGracefulRecovery`; `tests/integration`: `TestRaftLogSurvivesSIGKILL` (recovered node reaches a strictly higher commit, never lower); `internal/raftlog` clamps a persisted commit to the recovered log | VERIFIED (process kill) |
+| INV-R9 | A leader only advances `commitIndex` past entries from its own term. | `internal/raft`: the `maybeCommit` current-term check + the mandatory election no-op; `TestFigure8` (a prior-term entry on a majority is committed only via a current-term entry — removing the no-op fails the test) | VERIFIED (simulation) |
+| INV-R10 | A stale message (lower term) never mutates state beyond sending a rejection carrying the current term. | `internal/raft`: `TestStaleMessageIsInert`, `TestStaleAppendResponseIgnored`, `TestHigherTermForcesStepDown` | VERIFIED (simulation) |
+
+### Note on INV-R9 and the no-op
+
+With the **mandatory** election no-op (`TestNoOpAppendedOnElection`), a new leader's first
+quorum acknowledgement already covers a current-term entry, so the `maybeCommit` term check never
+has to *reject* a reachable commit — the no-op is the primary mechanism and the explicit
+`term == currentTerm` check is defense-in-depth that matches the paper. `TestFigure8` has teeth
+against removing the no-op (the term-4 leader then cannot commit the term-2 entry, failing the
+`commit >= 3` assertion), and the continuous R3/R5 checks would fire if a committed entry were
+ever overwritten. Power-loss durability is untested throughout (SIGKILL only), as everywhere in
+this project (`docs/FAILURE_MODEL.md`).
 
 ## Routing / cluster
 

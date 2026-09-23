@@ -25,7 +25,7 @@ Legend: ☐ not started · ◐ in progress · ☑ complete and verified
 | 6 | Sharding | consistent hash ring, shard metadata, routing | INV-C1, C2, C3 verified; ring visualization | ☑ INV-C1, C2, C3 (routing); `internal/routing`, `cmd/dkvring`, `docs/ROUTING.md` |
 | 7 | Node process + networking | `cmd/dkvd`, `internal/transport`, framing, heartbeats | Real 3-process cluster; nodes communicate over TCP; clean shutdown | ☑ INV-T1..T6; `internal/transport`, `cmd/dkvd`, `docs/TRANSPORT.md`; real 3-process TCP test |
 | 8 | Replication model | replica groups, replicated-log interface | Interfaces Raft will drive exist and are exercised; **no consistency claim yet** | ☑ INV-P1..P9; `internal/replication`, `docs/REPLICATION.md`, ADR-015 |
-| 9 | Raft | deterministic core + node driver + persistence | INV-R1..R10 verified in deterministic simulation; paper figures reproduced as tests | ☐ |
+| 9 | Raft | deterministic core + node driver + persistence | INV-R1..R10 verified in deterministic simulation; paper figures reproduced as tests | ☑ INV-R1..R10; `internal/raft`, `internal/raftlog`, `internal/raftnode`, `docs/RAFT.md`, ADR-016; real 3-process election + SIGKILL recovery |
 | 10 | Fault injection | `internal/fault`, drop/delay/dup/partition/crash | Full matrix in `docs/FAILURE_MODEL.md` §7 runs from a seed in CI | ☐ |
 | 11 | Crash recovery | real-process kill/restart harness | Leader crash, follower crash, crash during compaction/WAL/flush all recover | ☐ |
 | 12 | Consistency testing | linearizability checker, reference-model diff | Real histories from a real cluster under faults check out (INV-X1, X3) | ☐ |
