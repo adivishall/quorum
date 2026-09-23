@@ -210,10 +210,23 @@ involved, the documented `engine.appliedIndex ≤ raft.lastIndex` invariant is p
 The core is fully deterministic: given the same initial state, seed, and event sequence it produces
 the same state **and the same messages in the same order**. Message ordering never depends on map
 iteration (peers are iterated in a sorted, fixed order). The test-only simulated network runs N
-cores in one goroutine with an explicit message queue, and lets a test deliver, delay, drop,
-reorder, and duplicate individual messages and inspect the full history — enough deterministic
-control to prove the algorithm, and deliberately **not** the Phase 10 fault-injection framework.
-No test result depends on wall-clock timing or on `time.Sleep`.
+cores in one goroutine with an explicit message queue. It gives a test direct control over message
+scheduling, and each mode is actually exercised (`schedule_test.go`):
+
+- **FIFO delivery** — `deliverOne`/`deliverAll`.
+- **Duplicate delivery** — `TestDuplicateDelivery` delivers every message twice; the per-node
+  apply-once check confirms no entry is applied twice.
+- **Reordered delivery** — `TestReorderedDelivery` drains the queue and delivers it in reverse.
+- **Delayed delivery** — `TestDelayedDelivery` holds one follower's message back while the cluster
+  makes progress, then releases the now-stale message.
+- **Dropped delivery** — `TestDroppedDelivery` partitions a follower (messages dropped), then heals
+  and relies on retransmission to catch it up.
+
+The continuously-checkable invariants (R1/R3/R5/R7) run after every delivery, so a bad schedule
+that induced a safety violation is caught immediately. This is enough deterministic control to
+prove the algorithm and is deliberately **not** the Phase 10 fault-injection framework — it is
+hand-scheduled correctness testing, not a reusable systematic failure-matrix generator. No test
+result depends on wall-clock timing or on `time.Sleep`.
 
 ## 13. Multi-Raft and membership
 

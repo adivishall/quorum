@@ -11,10 +11,17 @@ import (
 
 // network is the deterministic Raft simulation harness (docs/RAFT.md §12). It runs
 // N cores in one goroutine with an explicit message queue the test controls: no
-// sockets, no clock, no goroutines. It lets a test deliver, drop, reorder, and
-// duplicate individual messages and inspect the full history, and it runs the
-// continuously-checkable invariants (R1/R3/R5/R7) after every step. It is
-// deliberately NOT the Phase 10 fault-injection framework.
+// sockets, no clock, no goroutines, replayable from a seed.
+//
+// It gives tests explicit control over message scheduling, exercised by
+// schedule_test.go: FIFO delivery (deliverOne/deliverAll), single-message delivery
+// (deliver), draining the queue for reordering/duplication (takeQueue), enqueuing
+// without delivering (proposeNoDeliver), and directional partition/drop
+// (isolate/heal). Duplicate, reorder, delayed, and dropped delivery are all tested.
+// The continuously-checkable invariants (R1 election safety, R3 log matching, R5
+// state-machine safety, R7 no-apply-beyond-commit) run after every step. This is
+// deliberately NOT the Phase 10 fault-injection framework: it is hand-scheduled
+// correctness testing, not a reusable systematic failure-matrix generator.
 type network struct {
 	t     *testing.T
 	ids   []NodeID
@@ -164,17 +171,13 @@ func (nw *network) tickAll() {
 	}
 }
 
-// deliverOne pops and delivers the oldest queued message, then drains the
-// recipient. It returns false if the queue was empty.
-func (nw *network) deliverOne() bool {
-	if len(nw.queue) == 0 {
-		return false
-	}
-	m := nw.queue[0]
-	nw.queue = nw.queue[1:]
+// deliver hands one specific message to its recipient and drains it. A message on
+// a partitioned link is dropped. This is the single primitive the scheduling
+// controls (FIFO, reorder, duplicate, delay) are all built from.
+func (nw *network) deliver(m Message) {
 	if !nw.reachable(m.From, m.To) {
 		nw.dropped++ // partitioned link: the message is lost
-		return true
+		return
 	}
 	if m.Type == MsgAppendRequest {
 		nw.appendsTo[m.To]++
@@ -183,7 +186,36 @@ func (nw *network) deliverOne() bool {
 		nw.t.Fatalf("Step(%s <- %s %s): %v", m.To, m.From, m.Type, err)
 	}
 	nw.drain(m.To)
+}
+
+// deliverOne pops and delivers the oldest queued message (FIFO). It returns false
+// if the queue was empty.
+func (nw *network) deliverOne() bool {
+	if len(nw.queue) == 0 {
+		return false
+	}
+	m := nw.queue[0]
+	nw.queue = nw.queue[1:]
+	nw.deliver(m)
 	return true
+}
+
+// takeQueue removes and returns all currently-queued messages, so a test can
+// reorder, duplicate, or delay them explicitly before delivering.
+func (nw *network) takeQueue() []Message {
+	q := nw.queue
+	nw.queue = nil
+	return q
+}
+
+// proposeNoDeliver appends a proposal on the leader and enqueues its outbound
+// messages WITHOUT delivering them, so the test controls their scheduling.
+func (nw *network) proposeNoDeliver(id NodeID, data string) {
+	nw.t.Helper()
+	if err := nw.nodes[id].Propose([]byte(data)); err != nil {
+		nw.t.Fatalf("Propose on %s: %v", id, err)
+	}
+	nw.drain(id)
 }
 
 // deliverAll delivers messages until the network is quiescent (no messages, no
