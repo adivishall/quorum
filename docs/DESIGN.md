@@ -303,6 +303,16 @@ v1 does not implement leveled compaction, and does not claim its write-amplifica
 We implement Raft from the paper (Ongaro & Ousterhout, "In Search of an Understandable
 Consensus Algorithm"), sections 5.1–5.4 plus §7 snapshots.
 
+> **Phase 8 note (ADR-015).** The **local log primitive** this section's Raft will drive is
+> implemented in Phase 8 as `internal/replication` (`docs/REPLICATION.md`): a `Log` interface and
+> an in-memory `MemoryLog` with 1-based contiguous indexes, non-decreasing terms, deterministic
+> conflicting-suffix replacement that cannot overwrite a committed entry, and monotonic
+> commit/apply watermarks. Phase 8 is **local only** — it records that an index *is* committed but
+> does not decide, replicate, or elect. The persistent raft log described in §8.1 (a record stream
+> in §2 framing holding `Entry` and `HardState` records) and the state transitions in §8.2–§8.5
+> are Phase 9, which drives the Phase 8 primitive; the message codecs are the transport's reserved
+> kinds (ADR-013), still inactive.
+
 ### 8.1 Persistent state (fsynced before any RPC reply that depends on it)
 
 `currentTerm`, `votedFor`, and the log. `commitIndex` is persisted as an optimization only —

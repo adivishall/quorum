@@ -253,6 +253,26 @@ transport/node namespace, distinct from every series above.
 | INV-T5 | Frames on a single connection are delivered in send order, concurrent senders never interleave a frame's bytes, and a frame is written in full even across short writes (no partial frame on the wire). | `internal/transport`: `TestPerConnectionOrderPreserved`, `TestConcurrentSendersDoNotInterleave`, `TestFrameSurvivesPartialWrites`, `TestWriteErrorAfterPartialWriteIsReturned`, `TestZeroProgressWriterDoesNotLoopForever` | VERIFIED |
 | INV-T6 | Node shutdown terminates all transport resources — accept loop, dial loops, reader/writer paths, connections — with no goroutine leak; repeated shutdown is safe; and three real processes exit cleanly. | `internal/transport`: `TestCloseIsIdempotent`, `TestNoGoroutineLeakAfterClose`, `TestSendAfterCloseFails`; `tests/integration`: `TestThreeNodeClusterProbesAndShutsDownCleanly` | VERIFIED |
 
+## Replication model (Phase 8)
+
+Enforced by `internal/replication`; specified in `docs/REPLICATION.md` and introduced by
+ADR-015. The `P` series is the replication-model namespace, distinct from every series above
+(in particular from the `R` Raft series, which stays PLANNED). These are **local** properties
+of a replicated-log model and a replica-group abstraction; none of them is a distributed or
+consistency guarantee — Phase 8 adds no such claim anywhere.
+
+| ID | Invariant | Checked by | Status |
+|---|---|---|---|
+| INV-P1 | A `ReplicaGroup` is valid or it does not exist: an empty group, an empty or duplicate replica id, and an RF that is < 1 or not equal to the replica count are refused (never repaired); replica order is preserved (head = primary), and identity/equality are deterministic and order-sensitive. Groups are consumed from routing metadata rather than recomputed. | `TestReplicaGroupValidConstruction`, `TestReplicaGroupRejectsInvalid`, `TestReplicaGroupIsImmutable`, `TestReplicaGroupEqualityIsDeterministic`, `TestReplicaGroupsFromRouter`, `FuzzReplicaGroup` | VERIFIED |
+| INV-P2 | Log indexes are contiguous and 1-based with no gaps or duplicates (0 is the empty sentinel), and terms are non-decreasing along the log; an append that would break either is refused. | `TestSequentialAppendAndRangeReads`, `TestAppendRejectsGapDuplicateAndTermRegression`, `TestAgainstReferenceModel` (invariants asserted after every step), `FuzzLogOperations` | VERIFIED |
+| INV-P3 | Suffix replacement is deterministic and hole-free: it retains a prefix, drops the existing suffix, appends the batch, cannot start past the end (no gap), and cannot replace a committed entry. | `TestSuffixReplacementVariants`, `TestSuffixReplacementRejections`, `TestCannotReplaceCommittedEntry`, `TestAgainstReferenceModel`, `FuzzLogOperations` | VERIFIED |
+| INV-P4 | Entries are copy-safe in both directions: stored bytes are never aliased to caller memory, and returned bytes never expose internal storage. | `TestAppendCopiesInput`, `TestReadsReturnCopies`, `TestEmptyAndNilDataArePreserved`, `TestGroupIsolation`, `FuzzLogOperations` (aliasing check) | VERIFIED |
+| INV-P5 | `commitIndex` is monotonic — a backward commit is rejected and leaves it unchanged. | `TestCommitInitialAndMonotonic`, `TestAgainstReferenceModel` | VERIFIED |
+| INV-P6 | `commitIndex` never exceeds the last local log index, including after a suffix replacement. | `TestCommitInitialAndMonotonic`, `TestCannotReplaceCommittedEntry`, `TestAgainstReferenceModel` (asserted after every step), `FuzzLogOperations` | VERIFIED |
+| INV-P7 | `appliedIndex` is monotonic — a backward apply is rejected and leaves it unchanged. | `TestApplyInitialAndMonotonic`, `TestAgainstReferenceModel` | VERIFIED |
+| INV-P8 | `appliedIndex` never exceeds `commitIndex`: applying an uncommitted index is rejected. | `TestApplyInitialAndMonotonic`, `TestCommittedRangeEnumeration`, `TestAgainstReferenceModel` (asserted after every step), `FuzzLogOperations` | VERIFIED |
+| INV-P9 | No entry is applied twice through the interface: application is a watermark, so a re-issued apply applies nothing and a state machine driven from `Unapplied` sees each index exactly once. | `TestNoDoubleApplication`, `TestCommittedRangeEnumeration` | VERIFIED |
+
 ## Client semantics
 
 | ID | Invariant | Checked by | Status |

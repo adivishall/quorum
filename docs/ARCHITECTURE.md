@@ -103,9 +103,17 @@ key ──sha256──▶ 64-bit token ──▶ hash ring ──▶ shard id �
 As of Phase 6 the routing half of this pipeline is **implemented** in `internal/routing` and
 specified in `docs/ROUTING.md`: `key → shard` is a consistent-hash ring over the fixed shard
 set, and `shard → replica group` is a second consistent-hash ring over the node set, producing
-**declarative** ownership metadata. The `replica group → Raft group` step (actually replicating
-and serving) is Phase 8+ and does not exist yet. ADR-012 records why routing is two rings
-rather than one, and why the redistribution guarantee (INV-C3) lives in the node ring.
+**declarative** ownership metadata. ADR-012 records why routing is two rings rather than one, and
+why the redistribution guarantee (INV-C3) lives in the node ring.
+
+As of Phase 8, `internal/replication` (`docs/REPLICATION.md`, ADR-015) turns that declarative
+`shard → replica group` metadata into a validated, immutable `ReplicaGroup`, and defines the
+**local replicated-log model** — a `Log` interface with an in-memory `MemoryLog` — that Phase 9's
+Raft will drive: contiguous 1-based indexes, deterministic suffix replacement that cannot
+overwrite a committed entry, and monotonic commit/apply bookkeeping. This is a **local** primitive
+only. The `replica group → Raft group` step — actually replicating across nodes, deciding when an
+entry commits, electing a leader, and serving requests — is Phase 9+ and does not exist yet;
+Phase 8 adds no distributed or consistency guarantee.
 
 Each shard is an **independent Raft group** with its own log, its own leader, and its own
 storage directory. A 3-node cluster with 16 shards runs 16 Raft groups; every node is a

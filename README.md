@@ -6,21 +6,27 @@ Quorum is currently implementing its durable storage engine. No Raft library, no
 database, no consensus service — the storage engine and the consensus implementation are
 the project, and they are being built in that order.
 
-> **Status: Phase 7 of 25 — durable single-node LSM engine, a routing library, and real node processes on a TCP transport.**
+> **Status: Phase 8 of 25 — durable single-node LSM engine, a routing library, real node processes on a TCP transport, and a local replicated-log model.**
 >
 > **Implemented:** a write-ahead log, an ordered memtable, immutable on-disk SSTables, Bloom
 > filters, size-tiered compaction, crash-safe MANIFEST-based file publication, and restart
 > recovery across all of it. Acknowledged writes survive the process being killed, including a
 > kill during a flush and a kill during a compaction. A pure consistent-hash routing library
 > (`internal/routing`): `key → shard` and `shard → replica group` metadata, with a ring
-> visualization (`cmd/dkvring`). Phase 7 adds real node processes (`cmd/dkvd`) and an internal
+> visualization (`cmd/dkvring`). Phase 7 added real node processes (`cmd/dkvd`) and an internal
 > TCP transport (`internal/transport`): checksummed framing, a version handshake, one
 > bidirectional connection per peer pair, and `Probe`/`ProbeResponse` liveness — proven by three
-> real processes exchanging probes over TCP and shutting down cleanly.
+> real processes exchanging probes over TCP and shutting down cleanly. Phase 8 adds a **local
+> replicated-log model** (`internal/replication`): an immutable `ReplicaGroup` consumed from the
+> routing metadata, and a small `Log` interface (with an in-memory `MemoryLog`) that Phase 9's
+> Raft will drive — 1-based contiguous indexes, deterministic conflicting-suffix replacement that
+> cannot overwrite a committed entry, and monotonic commit/apply bookkeeping.
 >
-> **Not implemented:** replication, Raft, leader election, a consensus-backed cluster,
-> linearizable reads, request forwarding, an HTTP API, a dashboard. The transport carries bytes;
-> it runs no consensus and serves no clients. Those are Phases 8 and later. See
+> **Not implemented:** distributed replication, Raft, leader election, a consensus-backed cluster,
+> cross-node consistency, linearizable reads, failover, request forwarding, an HTTP API, a
+> dashboard. The replication model is **local and in-memory** — it records that an index *is*
+> committed but does not decide, replicate, or elect — and the transport carries bytes and serves
+> no clients. **No distributed consistency guarantee exists.** Those are Phases 9 and later. See
 > [docs/ROADMAP.md](docs/ROADMAP.md) for exactly what is done and what is not.
 >
 > The binary is still called `dkv`; that is the command name, not the project name.
@@ -58,8 +64,14 @@ dkvd node ─TCP────▶ │  framed TCP · handshake · one conn per pee
                     │  Probe / ProbeResponse liveness · clean shutdown   │
                     └────────────────────────────────────────────────────┘
 
+                    ┌─────── implemented, Phase 8 (local model) ─────────┐
+replica group ─────▶│  ReplicaGroup (from routing metadata)              │
+local Log ─────────▶│  1-based entries · suffix replace · commit/apply   │
+                    │  in-memory MemoryLog — no consensus, no network    │
+                    └────────────────────────────────────────────────────┘
+
                     ┌──────────────── not implemented ───────────────────┐
-                    │  replication · Raft · request forwarding           │ Phases 8+
+                    │  Raft · distributed replication · forwarding       │ Phases 9+
                     │  HTTP API · dashboard                              │ Phases 15+
                     └────────────────────────────────────────────────────┘
 ```
@@ -106,6 +118,15 @@ ordering guarantees, and the explicit boundary: [docs/TRANSPORT.md](docs/TRANSPO
 ```bash
 dkvd -id node-1 -listen 127.0.0.1:7001 -peers node-2=127.0.0.1:7002,node-3=127.0.0.1:7003
 ```
+
+Phase 8 defines the **local replicated-log model** Raft will drive. `internal/replication` turns
+the routing layer's `shard → replica group` metadata into an immutable, validated `ReplicaGroup`,
+and defines a small `Log` interface — 1-based contiguous entries, deterministic conflicting-suffix
+replacement that cannot overwrite a committed entry, and monotonic commit/apply watermarks — with
+an in-memory `MemoryLog` that exercises every edge case. It is deliberately *local*: it records
+that an index *is* committed but does not decide, replicate across nodes, or elect. What it models,
+what it explicitly does not guarantee, and the invariants (INV-P1..P9):
+[docs/REPLICATION.md](docs/REPLICATION.md).
 
 ## The one thing this project refuses to do
 
@@ -269,6 +290,7 @@ it is being answered out of memory.
 | [MANIFEST.md](docs/MANIFEST.md) | Why a directory scan cannot work, the edit format, the publication protocol, orphan and corruption policy, startup |
 | [ROUTING.md](docs/ROUTING.md) | The token rule, the two consistent-hash rings, ownership/wrap/collision rules, redistribution numbers, the visualization, and what Phase 6 is not |
 | [TRANSPORT.md](docs/TRANSPORT.md) | Framing, handshake, message kinds, sizes, codec, connection model, timeouts, shutdown, ordering semantics, failure behavior, and what Phase 7 is not |
+| [REPLICATION.md](docs/REPLICATION.md) | The replica-group model, the local replicated-log interface and its index/term/copy semantics, conflicting-suffix rules, commit/apply bookkeeping, the state-machine seam, the INV-P invariants, and what Phase 8 explicitly does not guarantee |
 
 ## Development
 
