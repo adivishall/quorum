@@ -228,6 +228,35 @@ prove the algorithm and is deliberately **not** the Phase 10 fault-injection fra
 hand-scheduled correctness testing, not a reusable systematic failure-matrix generator. No test
 result depends on wall-clock timing or on `time.Sleep`.
 
+## 12a. Mutation testing
+
+The correctness suite is checked for teeth by a mutation runner (`scripts/mutation.sh`, `make
+mutation`). For each mutant it applies a real source edit that violates one Raft rule, runs the
+test(s) that should catch it, and requires them to **fail** (the mutant is "killed"); every edit is
+reverted with `git checkout`, so the tree is unchanged afterward. A mutant that survives fails the
+runner. It is not a source-string inspection — it exercises altered behaviour. The eight mutants
+and their killers:
+
+| Mutation | Killed by |
+|---|---|
+| remove the current-term commit restriction | `TestCommitRuleRequiresCurrentTerm` |
+| remove the mandatory election no-op | `TestNoOpAppendedOnElection` |
+| grant a second vote to a different candidate in a term | `TestVoteGrantedOncePerTerm`, `TestVoteAgainstReferenceModel` |
+| overwrite a committed suffix | `TestCannotReplaceCommittedEntry` (Phase 8 log) |
+| disable term-based conflict backtracking (naive per-index) | `TestConflictBackupByTerm` |
+| let a stale lower-term message mutate state | `TestStaleAppendResponseIgnored`, `TestStaleMessageIsInert` |
+| fail to step down on a higher term | `TestHigherTermForcesStepDown`, `TestLeaderCompleteness` |
+| send a dependent reply without persisting HardState first | `TestPersistBeforeReplyOnDriverPath` |
+
+A note on the current-term commit rule: because the **mandatory no-op** puts a current-term entry
+at the leader's tail, and `matchIndex` only advances by acked prefixes, the dangerous state (a
+quorum holding a *prior*-term entry but not a current-term one) is unreachable through the normal
+message flow — so removing the guard breaks no end-to-end test. The rule is therefore pinned
+directly on `maybeCommit` by `TestCommitRuleRequiresCurrentTerm`, which constructs that exact state
+and asserts the guard rejects it. This keeps the §5.4.2 rule tested as defense-in-depth even though
+the no-op is its load-bearing partner (whose removal `TestFigure8`/`TestNoOpAppendedOnElection`
+catch).
+
 ## 13. Multi-Raft and membership
 
 One shard = one independent Raft group (ADR-001). The core operates on a single group; the driver

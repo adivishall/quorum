@@ -63,6 +63,48 @@ func TestStaleAppendResponseIgnored(t *testing.T) {
 	}
 }
 
+// TestCommitRuleRequiresCurrentTerm pins the §5.4.2 commit rule directly on
+// maybeCommit (INV-R9). It constructs a leader whose log holds a prior-term entry
+// below a current-term no-op, and hand-sets matchIndex so a quorum has replicated
+// only the prior-term entry. The rule must NOT commit that prior-term entry by
+// counting replicas; it commits only once the quorum reaches the current-term
+// entry. This is the reachable-through-the-function test of the rule that the
+// mandatory no-op otherwise keeps unreachable through the message flow — so it is
+// what actually kills a mutation that drops the `term == currentTerm` guard.
+func TestCommitRuleRequiresCurrentTerm(t *testing.T) {
+	lg := replication.NewMemoryLog()
+	// index 1 (term 1) and index 2 (term 2) are prior-term entries.
+	if err := lg.Append(Entry{Index: 1, Term: 1}, Entry{Index: 2, Term: 2}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{ID: "a", Peers: ids(3), Rand: rand.New(rand.NewSource(1)), Log: lg, Term: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Put it in leader state in term 4 and append the mandatory current-term no-op
+	// at index 3 (as becomeLeader would).
+	r.role = Leader
+	r.leaderID = "a"
+	r.nextIndex = map[NodeID]uint64{"b": 3, "c": 3}
+	r.appendEntry(nil) // index 3, term 4
+
+	// A quorum (a,b,c → need 2) has replicated only up through the prior-term
+	// index 2, NOT the current-term index 3.
+	r.matchIndex = map[NodeID]uint64{"b": 2, "c": 2}
+	r.maybeCommit()
+	if r.CommitIndex() != 0 {
+		t.Fatalf("committed prior-term index %d by replica count; §5.4.2 forbids it (INV-R9)", r.CommitIndex())
+	}
+
+	// Once the quorum reaches the current-term entry at index 3, commit advances —
+	// and carries the prior-term prefix with it.
+	r.matchIndex = map[NodeID]uint64{"b": 3, "c": 3}
+	r.maybeCommit()
+	if r.CommitIndex() != 3 {
+		t.Fatalf("commit = %d, want 3 once a current-term entry is on a quorum", r.CommitIndex())
+	}
+}
+
 // TestRecoveredTermCannotRegress proves construction refuses a currentTerm below a
 // term already in the log (a corrupt/rolled-back HardState), rather than silently
 // accepting it (recovery coherence, docs/RAFT.md §11).

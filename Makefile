@@ -6,7 +6,7 @@ GO      ?= go
 PKGS    := ./...
 BIN     := bin
 
-.PHONY: all build test race vet fmt fmtcheck checkignore integration bench benchsuite dkvbench tidy clean check
+.PHONY: all build test race vet fmt fmtcheck checkignore integration mutation bench benchsuite dkvbench tidy clean check
 
 all: check
 
@@ -25,6 +25,13 @@ race:
 ## integration — multi-process tests, including real SIGKILL crash recovery
 integration:
 	$(GO) test -race -count=1 -v ./tests/integration/
+
+## mutation — Phase 9 Raft mutation testing. Applies deliberate rule-violating
+## edits to the source, runs the tests that must catch each, and requires every
+## mutant to be killed (edits are reverted via git). Needs a clean working tree
+## for the files it mutates. See docs/RAFT.md.
+mutation:
+	./scripts/mutation.sh
 
 ## bench — the Go micro-benchmarks (testing.B). Quick order-of-magnitude checks.
 bench:
