@@ -6,15 +6,18 @@
 // probes its peers to prove bidirectional connectivity. It runs until SIGINT or
 // SIGTERM, then shuts the transport down cleanly and exits 0.
 //
-// It does NOT run Raft, replicate, host the storage engine, serve clients, or
-// elect leaders — Phase 7 exists to prove the networking infrastructure
-// (docs/TRANSPORT.md §11).
+// By default it runs the Phase 7 probe demo (no Raft, no storage, no client
+// serving). With -raft it instead runs a single Phase 9 Raft group over the same
+// transport (docs/RAFT.md): it elects a leader, appends the mandatory no-op,
+// replicates, and persists its log under -data-dir. It still hosts no storage
+// engine and serves no clients — Raft is the consensus core, not the whole system.
 //
 //	dkvd -id node-1 -listen 127.0.0.1:7001 \
-//	     -peers node-2=127.0.0.1:7002,node-3=127.0.0.1:7003
+//	     -peers node-2=127.0.0.1:7002,node-3=127.0.0.1:7003 [-raft -data-dir DIR]
 //
 // Output is machine-readable "event=... key=value" lines on stdout, so a test or
-// an operator can observe startup, connectivity, probes, and shutdown.
+// an operator can observe startup, connectivity, elections, replication, and
+// shutdown.
 package main
 
 import (
@@ -25,11 +28,14 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/adivishall/quorum/internal/raft"
+	"github.com/adivishall/quorum/internal/raftnode"
 	"github.com/adivishall/quorum/internal/transport"
 )
 
@@ -49,6 +55,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		listen   = fs.String("listen", "", "listen address host:port (required)")
 		peersArg = fs.String("peers", "", "comma-separated peers as id=host:port")
 		probeIvl = fs.Duration("probe-interval", 100*time.Millisecond, "how often to probe each peer")
+		raftMode = fs.Bool("raft", false, "run a single Raft group over the transport (Phase 9) instead of the probe demo")
+		dataDir  = fs.String("data-dir", "", "directory for the durable Raft log (raft mode; a temp dir if empty)")
+		tickIvl  = fs.Duration("tick-interval", 50*time.Millisecond, "raft logical tick duration")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -79,6 +88,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	lg.logf("event=ready node=%s addr=%s peers=%d", *id, tr.LocalAddr(), len(peers))
+
+	if *raftMode {
+		return runRaft(ctx, *id, peers, tr, *dataDir, *tickIvl, lg, stderr)
+	}
 
 	n := &node{
 		id:     transport.NodeID(*id),
@@ -202,6 +215,76 @@ func (n *node) probeLoop(ctx context.Context, interval time.Duration) {
 			}
 		}
 	}
+}
+
+// runRaft runs a single Raft group (Phase 9) over the already-built transport
+// instead of the probe demo. The group membership is this node plus its peers. It
+// emits machine-readable events — raft_leader, raft_follower, raft_commit — so a
+// test or an operator can watch an election and replication happen over real TCP.
+func runRaft(ctx context.Context, id string, peers map[transport.NodeID]string, tr *transport.TCPTransport, dataDir string, tick time.Duration, lg *logger, stderr io.Writer) int {
+	group := []raftnode.NodeID{raftnode.NodeID(id)}
+	for p := range peers {
+		group = append(group, raftnode.NodeID(p))
+	}
+	if dataDir == "" {
+		d, err := os.MkdirTemp("", "dkvd-raft-")
+		if err != nil {
+			fmt.Fprintf(stderr, "dkvd: %v\n", err)
+			return 2
+		}
+		dataDir = d
+	} else if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		fmt.Fprintf(stderr, "dkvd: %v\n", err)
+		return 2
+	}
+
+	n, err := raftnode.Start(ctx, raftnode.Config{
+		ID: raftnode.NodeID(id), Peers: group, Transport: tr,
+		LogPath:      filepath.Join(dataDir, "raft-"+id+".log"),
+		TickInterval: tick, Sync: true, Logf: lg.logf,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "dkvd: %v\n", err)
+		return 2
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTicker(20 * time.Millisecond)
+		defer t.Stop()
+		var loggedLeaderTerm, lastCommit uint64
+		var lastLeader raftnode.NodeID
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				role, term, leader, commit := n.Role(), n.Term(), n.LeaderID(), n.CommitIndex()
+				if role == raft.Leader && term > loggedLeaderTerm {
+					lg.logf("event=raft_leader node=%s term=%d", id, term)
+					loggedLeaderTerm = term
+				}
+				if role == raft.Follower && leader != "" && leader != lastLeader {
+					lg.logf("event=raft_follower node=%s term=%d leader=%s", id, term, leader)
+					lastLeader = leader
+				}
+				if commit != lastCommit {
+					lg.logf("event=raft_commit node=%s index=%d", id, commit)
+					lastCommit = commit
+				}
+			}
+		}
+	}()
+
+	<-ctx.Done()
+	lg.logf("event=shutdown_start node=%s", id)
+	_ = n.Close()
+	_ = tr.Close()
+	wg.Wait()
+	lg.logf("event=shutdown_done node=%s role=%s term=%d commit=%d", id, n.Role(), n.Term(), n.CommitIndex())
+	return 0
 }
 
 // parsePeers parses "id=host:port,id=host:port" into a map. It rejects empty
