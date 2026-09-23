@@ -40,6 +40,56 @@ jobs:
 
       # Real multi-process tests: builds cmd/dkvd from source and launches actual
       # OS processes over localhost TCP, including the Phase 9 Raft election and
-      # SIGKILL / HardState recovery tests. No prebuilt binaries.
+      # SIGKILL / HardState recovery tests and the Phase 10 real-process fault
+      # tests (SIGKILL, SIGSTOP, TCP-proxy partitions). No prebuilt binaries.
       - name: integration tests (real processes, race detector)
         run: make integration
+
+  faults:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          check-latest: true
+
+      # Phase 10: every chaos profile over 200 seeds each, in the deterministic
+      # simulator, plus the reproducibility checks — including the pinned trace
+      # hash, which must match the one recorded on another OS/architecture. Any
+      # failure prints its seed, the exact reproduction command, and a minimized
+      # script.
+      - name: deterministic fault schedules (200 seeds per profile)
+        run: make faults FAULT_SEEDS=200
+
+  mutation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          check-latest: true
+
+      # Every rule-violating edit (Phase 9 protocol rules, Phase 10 failure
+      # handling and fault-model fidelity) must be caught by the tests named for
+      # it; a surviving mutant fails the build.
+      - name: mutation testing
+        run: make mutation
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          check-latest: true
+
+      # A short pass over every fuzz target in the repository (discovered, not
+      # listed), including the fault-schedule fuzzer.
+      - name: fuzz every target (5s each)
+        run: make fuzz FUZZTIME=5s
