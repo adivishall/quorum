@@ -280,7 +280,7 @@ func runRaft(ctx context.Context, r raftRun) int {
 		defer wg.Done()
 		t := time.NewTicker(20 * time.Millisecond)
 		defer t.Stop()
-		var loggedLeaderTerm, lastCommit uint64
+		var loggedLeaderTerm, lastCommit, lastFollowTerm uint64
 		var lastLeader raftnode.NodeID
 		for {
 			select {
@@ -294,9 +294,11 @@ func runRaft(ctx context.Context, r raftRun) int {
 					lg.logf("event=raft_leader node=%s term=%d", id, st.Term)
 					loggedLeaderTerm = st.Term
 				}
-				if st.Role == raft.Follower && st.Leader != "" && st.Leader != lastLeader {
+				// A follower reports every (term, leader) it follows, so an observer
+				// sees a node re-elected in a new term, not only a change of leader.
+				if st.Role == raft.Follower && st.Leader != "" && (st.Leader != lastLeader || st.Term != lastFollowTerm) {
 					lg.logf("event=raft_follower node=%s term=%d leader=%s", id, st.Term, st.Leader)
-					lastLeader = st.Leader
+					lastLeader, lastFollowTerm = st.Leader, st.Term
 				}
 				if st.Commit != lastCommit {
 					lg.logf("event=raft_commit node=%s index=%d", id, st.Commit)
