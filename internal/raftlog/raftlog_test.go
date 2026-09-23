@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/adivishall/quorum/internal/fault"
 	"github.com/adivishall/quorum/internal/record"
+	"github.com/adivishall/quorum/internal/vfs"
 )
 
 func openTmp(t *testing.T) (string, *Log, *Recovered) {
@@ -229,6 +231,192 @@ func TestInspectReadsWithoutTruncating(t *testing.T) {
 	}
 	if after.Size() != before.Size() {
 		t.Fatalf("Inspect modified the file: size %d -> %d", before.Size(), after.Size())
+	}
+}
+
+// --- Phase 10: the durability boundary under injected faults (INV-F1, INV-R6) ---
+
+const memPath = "/node/raft.log"
+
+func openMem(t *testing.T, fsys vfs.FS) (*Log, *Recovered) {
+	t.Helper()
+	l, rec, err := Open(memPath, Options{Sync: true, FS: fsys})
+	if err != nil {
+		t.Fatalf("Open on %T: %v", fsys, err)
+	}
+	return l, rec
+}
+
+// TestSaveIsDurableWhenItReturns pins the fsync inside Save: once Save returns,
+// every byte it wrote survives a modeled power loss. Without the fsync the bytes
+// would only be cached, and a power loss would erase the HardState a vote reply
+// depended on. With Sync off (the unsafe test-only mode) the same Save is NOT
+// durable, which is exactly what DisableSync trades away.
+func TestSaveIsDurableWhenItReturns(t *testing.T) {
+	mem := fault.NewMemFS()
+	l, _ := openMem(t, mem)
+	if err := l.Save(&HardState{Term: 3, Vote: "n2"}, []Entry{{Index: 1, Term: 3, Data: []byte("x")}}); err != nil {
+		t.Fatal(err)
+	}
+	if !mem.FullySynced(memPath) {
+		t.Fatal("Save returned with bytes not yet fsynced — a reply sent now could outlive a power loss's memory of it")
+	}
+	mem.CrashPowerLoss(0)
+	rec, err := InspectFS(mem, memPath)
+	if err != nil || rec.HardState.Term != 3 || rec.HardState.Vote != "n2" || len(rec.Entries) != 1 {
+		t.Fatalf("after power loss: %+v %v, want term 3 vote n2 and 1 entry", rec, err)
+	}
+
+	unsafe := fault.NewMemFS()
+	lu, _, err := Open(memPath, Options{Sync: false, FS: unsafe})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lu.Save(&HardState{Term: 1}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if unsafe.FullySynced(memPath) {
+		t.Fatal("Sync:false still fsynced; the option is not doing what it says")
+	}
+}
+
+// TestFailedWriteLatchesAndLogStaysRecoverable proves the failure policy for a
+// torn (short) write: Save fails, every later Save is refused WITHOUT touching the
+// file — appending behind a partial record would make the log unopenable — and a
+// fresh Open truncates the torn record and recovers everything before it.
+func TestFailedWriteLatchesAndLogStaysRecoverable(t *testing.T) {
+	mem := fault.NewMemFS()
+	inj := fault.NewInjectFS(mem)
+	l, _ := openMem(t, inj)
+	if err := l.Save(&HardState{Term: 1, Vote: "n1"}, []Entry{{Index: 1, Term: 1}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The second record write of the next Save is torn after 5 bytes.
+	inj.Arm(fault.Injection{Op: fault.OpWrite, Nth: 2, Short: 5})
+	err := l.Save(&HardState{Term: 2, Vote: "n3"}, []Entry{{Index: 2, Term: 2}})
+	if !errors.Is(err, ErrFailed) || !errors.Is(err, fault.ErrInjected) {
+		t.Fatalf("torn Save: err = %v, want ErrFailed wrapping the injected error", err)
+	}
+	opsAtFailure := len(inj.Ops())
+
+	// Every later Save is refused, and nothing more reaches the file.
+	for i := 0; i < 3; i++ {
+		if err := l.Save(&HardState{Term: 9}, []Entry{{Index: 3, Term: 9}}); !errors.Is(err, ErrFailed) {
+			t.Fatalf("Save after a failure: err = %v, want ErrFailed", err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close of a failed log: %v", err)
+	}
+	for _, op := range inj.Ops()[opsAtFailure:] {
+		if op.Op == fault.OpWrite || op.Op == fault.OpSync || op.Op == fault.OpTruncate {
+			t.Fatalf("the failed log still performed %s after the failure", op.Op)
+		}
+	}
+
+	// A process crash keeps the cached bytes, torn record included; reopening
+	// repairs the tail and recovers the state before the failed Save's HardState.
+	mem.CrashProcess()
+	l2, rec, err := Open(memPath, Options{Sync: true, FS: mem})
+	if err != nil {
+		t.Fatalf("reopen after a torn write: %v (the log must stay recoverable)", err)
+	}
+	defer l2.Close()
+	if rec.HardState.Term != 1 || rec.HardState.Vote != "n1" {
+		t.Fatalf("recovered HardState %+v, want the last complete one {1 n1}", rec.HardState)
+	}
+	// Entry 2 was the Save's first record and completed before the torn write; a
+	// completed-but-unacknowledged record may survive (INV-F2 allows a prefix of
+	// an interrupted Save), and it must be well-formed if it does.
+	if n := len(rec.Entries); n < 1 || n > 2 || rec.Entries[0].Term != 1 {
+		t.Fatalf("recovered entries %+v, want entry 1 and at most the completed entry 2", rec.Entries)
+	}
+	if !mem.FullySynced(memPath) {
+		t.Fatal("the torn-tail repair was not fsynced before the log was reused")
+	}
+}
+
+// TestFailedSyncLatches proves the failure policy for an fsync failure: the Save
+// fails, later Saves are refused without writing, Close does not fsync again, and
+// the written-but-unsynced bytes are exactly what a power loss may erase.
+func TestFailedSyncLatches(t *testing.T) {
+	mem := fault.NewMemFS()
+	inj := fault.NewInjectFS(mem)
+	l, _ := openMem(t, inj)
+	if err := l.Save(&HardState{Term: 1, Vote: "n1"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	inj.Arm(fault.Injection{Op: fault.OpSync})
+	if err := l.Save(&HardState{Term: 2, Vote: "n2"}, nil); !errors.Is(err, ErrFailed) {
+		t.Fatalf("Save with failing fsync: err = %v, want ErrFailed", err)
+	}
+	opsAtFailure := len(inj.Ops())
+	if err := l.Save(&HardState{Term: 3}, nil); !errors.Is(err, ErrFailed) {
+		t.Fatalf("Save after fsync failure: err = %v, want ErrFailed", err)
+	}
+	_ = l.Close()
+	for _, op := range inj.Ops()[opsAtFailure:] {
+		if op.Op == fault.OpWrite || op.Op == fault.OpSync {
+			t.Fatalf("performed %s after an fsync failure", op.Op)
+		}
+	}
+
+	// Power loss: only the last fsynced HardState survives.
+	mem.CrashPowerLoss(0)
+	rec, err := InspectFS(mem, memPath)
+	if err != nil || rec.HardState.Term != 1 || rec.HardState.Vote != "n1" {
+		t.Fatalf("after power loss: %+v %v, want the synced {1 n1}", rec, err)
+	}
+}
+
+// TestOpenMakesRecoveredStateDurable pins the fix for a bug the Phase 10 simulator
+// found. A Save writes a vote and its fsync fails; the process stops; the page
+// cache still holds the vote, so the restarted process recovers it and would act
+// on it — re-granting that vote — although a power loss could still erase it,
+// after which the node could vote for someone else in the same term. Open must
+// therefore make whatever it recovered durable before returning.
+func TestOpenMakesRecoveredStateDurable(t *testing.T) {
+	mem := fault.NewMemFS()
+	inj := fault.NewInjectFS(mem)
+	l, _ := openMem(t, inj)
+	if err := l.Save(&HardState{Term: 1}, nil); err != nil {
+		t.Fatal(err)
+	}
+	inj.Arm(fault.Injection{Op: fault.OpSync})
+	if err := l.Save(&HardState{Term: 2, Vote: "c"}, nil); err == nil {
+		t.Fatal("expected the fsync failure")
+	}
+	mem.CrashProcess() // the node fail-stops; the cache keeps the written vote
+
+	l2, rec, err := Open(memPath, Options{Sync: true, FS: mem})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	if rec.HardState.Term != 2 || rec.HardState.Vote != "c" {
+		t.Fatalf("recovered %+v, want the cached vote {2 c}", rec.HardState)
+	}
+	if !mem.FullySynced(memPath) {
+		t.Fatal("Open returned state recovered from un-fsynced bytes without making it durable")
+	}
+	mem.CrashPowerLoss(0)
+	if rec, err := InspectFS(mem, memPath); err != nil || rec.HardState.Vote != "c" {
+		t.Fatalf("after power loss: %+v %v — the recovered vote was lost", rec, err)
+	}
+}
+
+// TestNewLogCreationIsDurable proves Open makes a new log file's directory entry
+// durable (SyncDir), so a power loss right after the first Save keeps the file.
+func TestNewLogCreationIsDurable(t *testing.T) {
+	mem := fault.NewMemFS()
+	l, _ := openMem(t, mem)
+	if err := l.Save(&HardState{Term: 1}, nil); err != nil {
+		t.Fatal(err)
+	}
+	mem.CrashPowerLoss(0)
+	if _, err := mem.Stat(memPath); err != nil {
+		t.Fatalf("log file lost to a power loss after Open+Save: %v", err)
 	}
 }
 

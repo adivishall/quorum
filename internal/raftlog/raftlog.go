@@ -13,6 +13,16 @@
 // other damage — a checksum mismatch with bytes following, a zero-filled header
 // with data after it, an unknown kind, a malformed payload, or an impossible index
 // progression — is fatal and refuses to open, never silently skipped.
+//
+// Failure policy (Phase 10, INV-F1): a write or fsync that fails poisons the Log.
+// Every later Save returns the original error and touches the file no more,
+// because after a failed or short write the file may end in a partial record, and
+// appending behind it would turn a recoverable torn tail into mid-log corruption;
+// and after a failed fsync, a later "successful" fsync proves nothing about the
+// earlier data. Recovery is a fresh Open, which truncates any torn tail.
+//
+// All file access goes through a vfs.FS (Options.FS; nil is the real OS), which is
+// the seam Phase 10 fault injection uses — the code here runs unchanged on it.
 package raftlog
 
 import (
@@ -25,6 +35,7 @@ import (
 
 	"github.com/adivishall/quorum/internal/record"
 	"github.com/adivishall/quorum/internal/replication"
+	"github.com/adivishall/quorum/internal/vfs"
 )
 
 // Record kinds in the Raft-log namespace (the framing's kind byte is per-log-type,
@@ -63,13 +74,19 @@ type Recovered struct {
 // refused. It wraps record.ErrCorrupt where the framing detected it.
 var ErrCorrupt = errors.New("raftlog: corrupt log")
 
+// ErrFailed means an earlier write or fsync failed and the Log has refused all
+// writes since (see the package's failure policy). The error returned by Save
+// wraps both ErrFailed and the original failure.
+var ErrFailed = errors.New("raftlog: log failed; no further writes")
+
 // Log is an append-only durable Raft log. It is not safe for concurrent use — the
 // driver's single goroutine owns it.
 type Log struct {
-	path string
-	f    *os.File
-	w    *record.Writer
-	sync bool
+	path   string
+	f      vfs.File
+	w      *record.Writer
+	sync   bool
+	failed error // the first write/fsync failure; sticky
 }
 
 // Options configures a Log.
@@ -77,22 +94,34 @@ type Options struct {
 	// Sync fsyncs after every Save. Required for the durability the Raft protocol
 	// assumes; tests may disable it for speed where durability is not under test.
 	Sync bool
+	// FS is the filesystem the log lives on. Nil means the real OS filesystem;
+	// tests substitute internal/fault's crash model or fault injector here.
+	FS vfs.FS
 }
 
 // Open opens (creating if absent) the durable log at path and replays it. It
 // truncates a torn final record and refuses to open on any other damage. The
 // parent directory is fsynced on first creation so the file itself is durable.
+//
+// Before returning, Open fsyncs the file: the state it recovered is durable
+// before the caller can act on it. That matters after a failed fsync. The
+// records a failed Save wrote may still be in the page cache, so a restarted
+// process reads them back — e.g. a vote — and would otherwise act on state that a
+// power loss could still erase (found by the Phase 10 simulator; docs/FAULTS.md).
+// This assumes a successful fsync is honest; a kernel that silently drops pages
+// after a write-back error ("fsyncgate") is outside what this can defend against.
 func Open(path string, opts Options) (*Log, *Recovered, error) {
+	fsys := vfs.Or(opts.FS)
 	created := false
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+	if _, err := fsys.Stat(path); errors.Is(err, os.ErrNotExist) {
 		created = true
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+	f, err := fsys.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, nil, err
 	}
 	if created {
-		if err := syncDir(filepath.Dir(path)); err != nil {
+		if err := fsys.SyncDir(filepath.Dir(path)); err != nil {
 			_ = f.Close()
 			return nil, nil, err
 		}
@@ -100,6 +129,11 @@ func Open(path string, opts Options) (*Log, *Recovered, error) {
 
 	rec, err := replay(f, path)
 	if err != nil {
+		_ = f.Close()
+		return nil, nil, err
+	}
+	// Make the recovered state (and any tail repair) durable before it is used.
+	if err := f.Sync(); err != nil {
 		_ = f.Close()
 		return nil, nil, err
 	}
@@ -113,8 +147,8 @@ func Open(path string, opts Options) (*Log, *Recovered, error) {
 }
 
 // replay reads the whole file, reconstructing the final entry set and last
-// HardState, and truncates a torn tail.
-func replay(f *os.File, path string) (*Recovered, error) {
+// HardState, and truncates a torn tail (Open then fsyncs the result).
+func replay(f vfs.File, path string) (*Recovered, error) {
 	info, err := f.Stat()
 	if err != nil {
 		return nil, err
@@ -126,7 +160,8 @@ func replay(f *os.File, path string) (*Recovered, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Truncate away any torn tail or stray trailing bytes past the last good record.
+	// Truncate away any torn tail or stray trailing bytes past the last good
+	// record, so nothing is ever appended behind garbage.
 	if next < info.Size() {
 		if err := f.Truncate(next); err != nil {
 			return nil, err
@@ -188,8 +223,11 @@ func readRecords(r io.Reader, name string, size int64) (*Recovered, int64, error
 // need to read persisted Entries/HardState (e.g. after a process was killed),
 // including while another process holds the file open. It applies the same crash
 // policy as Open (a torn tail stops the read; other damage is fatal).
-func Inspect(path string) (*Recovered, error) {
-	f, err := os.Open(path)
+func Inspect(path string) (*Recovered, error) { return InspectFS(nil, path) }
+
+// InspectFS is Inspect on an explicit filesystem (nil means the real OS).
+func InspectFS(fsys vfs.FS, path string) (*Recovered, error) {
+	f, err := vfs.Or(fsys).OpenFile(path, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -207,32 +245,51 @@ func Inspect(path string) (*Recovered, error) {
 // truncation. It writes entries in order, then the HardState, so that after a
 // crash a HardState referencing a commit index is never durable before the entries
 // it covers.
+//
+// If any write or the fsync fails, the Log is failed from then on: this and every
+// later Save return an error wrapping ErrFailed and the original cause, and no
+// further byte is written (INV-F1).
 func (l *Log) Save(hs *HardState, entries []Entry) error {
+	if l.failed != nil {
+		return l.failed
+	}
 	for _, e := range entries {
 		if _, err := l.w.Append(kindEntry, encodeEntry(e)); err != nil {
-			return err
+			return l.fail(err)
 		}
 	}
 	if hs != nil {
 		if _, err := l.w.Append(kindHardState, encodeHardState(*hs)); err != nil {
-			return err
+			return l.fail(err)
 		}
 	}
 	if l.sync {
-		return l.f.Sync()
+		if err := l.f.Sync(); err != nil {
+			return l.fail(err)
+		}
 	}
 	return nil
 }
 
-// Sync fsyncs the file.
-func (l *Log) Sync() error { return l.f.Sync() }
+// fail latches the first durability failure and returns it.
+func (l *Log) fail(err error) error {
+	l.failed = fmt.Errorf("%w: %w", ErrFailed, err)
+	return l.failed
+}
 
-// Close syncs and closes the file.
+// Err returns the latched durability failure, or nil if the Log is healthy.
+func (l *Log) Err() error { return l.failed }
+
+// Close closes the file. A healthy Log is fsynced first; a failed one is closed
+// without another fsync, which could not vouch for the data anyway.
 func (l *Log) Close() error {
 	if l.f == nil {
 		return nil
 	}
-	err := l.f.Sync()
+	var err error
+	if l.failed == nil {
+		err = l.f.Sync()
+	}
 	if cerr := l.f.Close(); err == nil {
 		err = cerr
 	}
@@ -340,17 +397,4 @@ func (r *payloadReader) done() error {
 		return fmt.Errorf("%w: trailing bytes in record payload", ErrCorrupt)
 	}
 	return nil
-}
-
-// syncDir fsyncs a directory so a file creation within it is durable.
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	if err := d.Sync(); err != nil {
-		_ = d.Close()
-		return err
-	}
-	return d.Close()
 }
