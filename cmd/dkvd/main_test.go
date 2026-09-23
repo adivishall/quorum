@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adivishall/quorum/internal/fault"
 	"github.com/adivishall/quorum/internal/transport"
 )
 
@@ -145,6 +146,69 @@ func TestRunStartsAndShutsDownCleanly(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "event=shutdown_done") {
 		t.Fatalf("no shutdown_done line; output:\n%s", out.String())
+	}
+}
+
+// TestRaftModeExitsNonZeroWhenTheLogFails drives the whole fail-stop path through
+// the real dkvd raft-mode code (INV-F1): the fsync that must make the node's
+// self-vote and election no-op durable fails. (fsync #1 is raftlog.Open making the
+// recovered log durable; #2 is the election's Save.) The process must report
+// event=raft_fatal and exit 1, and must never announce leadership it could not
+// persist.
+func TestRaftModeExitsNonZeroWhenTheLogFails(t *testing.T) {
+	tr, err := transport.NewTCPTransport(transport.Config{NodeID: "solo", ListenAddr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inj := fault.NewInjectFS(nil)
+	inj.Arm(fault.Injection{Op: fault.OpSync, Nth: 2})
+	out := &syncBuffer{}
+	done := make(chan int, 1)
+	go func() {
+		done <- runRaft(context.Background(), raftRun{
+			id: "solo", tr: tr, dataDir: t.TempDir(), tick: 5 * time.Millisecond,
+			lg: &logger{w: out}, stderr: io.Discard, fs: inj,
+		})
+	}()
+	select {
+	case code := <-done:
+		if code != 1 {
+			t.Fatalf("exit code = %d, want 1 after a durable-log failure; output:\n%s", code, out.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("dkvd kept running after its durable log failed; output:\n%s", out.String())
+	}
+	s := out.String()
+	if !strings.Contains(s, "event=raft_fatal node=solo") || !strings.Contains(s, "injected") {
+		t.Fatalf("no raft_fatal event naming the injected failure; output:\n%s", s)
+	}
+	if strings.Contains(s, "event=raft_leader") {
+		t.Fatalf("announced leadership it never made durable; output:\n%s", s)
+	}
+}
+
+// TestRaftModeCleanShutdownExitsZero proves the healthy path is unchanged: a
+// single raft-mode node elects itself, commits, and exits 0 on cancellation.
+func TestRaftModeCleanShutdownExitsZero(t *testing.T) {
+	tr, err := transport.NewTCPTransport(transport.Config{NodeID: "solo", ListenAddr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	out := &syncBuffer{}
+	done := make(chan int, 1)
+	go func() {
+		done <- runRaft(ctx, raftRun{id: "solo", tr: tr, dataDir: t.TempDir(), tick: 5 * time.Millisecond, lg: &logger{w: out}, stderr: io.Discard})
+	}()
+	waitFor(t, out, "event=raft_commit node=solo index=1", 5*time.Second)
+	cancel()
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0; output:\n%s", code, out.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("did not shut down")
 	}
 }
 

@@ -18,6 +18,11 @@
 // Output is machine-readable "event=... key=value" lines on stdout, so a test or
 // an operator can observe startup, connectivity, elections, replication, and
 // shutdown.
+//
+// Exit codes: 0 after a clean shutdown (SIGINT/SIGTERM); 2 for a configuration or
+// startup error; 1 if the Raft node fail-stops at runtime — its durable log could
+// not persist state a reply depended on (INV-F1) — logged as event=raft_fatal. A
+// node that cannot persist must not keep running as if it were a member.
 package main
 
 import (
@@ -37,6 +42,7 @@ import (
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftnode"
 	"github.com/adivishall/quorum/internal/transport"
+	"github.com/adivishall/quorum/internal/vfs"
 )
 
 func main() {
@@ -90,7 +96,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	lg.logf("event=ready node=%s addr=%s peers=%d", *id, tr.LocalAddr(), len(peers))
 
 	if *raftMode {
-		return runRaft(ctx, *id, peers, tr, *dataDir, *tickIvl, lg, stderr)
+		return runRaft(ctx, raftRun{id: *id, peers: peers, tr: tr, dataDir: *dataDir, tick: *tickIvl, lg: lg, stderr: stderr})
 	}
 
 	n := &node{
@@ -217,34 +223,54 @@ func (n *node) probeLoop(ctx context.Context, interval time.Duration) {
 	}
 }
 
+// raftRun is everything runRaft needs. fs is the filesystem for the durable log:
+// nil — always, in the real binary — is the OS; a test may substitute a fault
+// injector to drive the fail-stop path end to end.
+type raftRun struct {
+	id      string
+	peers   map[transport.NodeID]string
+	tr      transport.Transport
+	dataDir string
+	tick    time.Duration
+	lg      *logger
+	stderr  io.Writer
+	fs      vfs.FS
+}
+
 // runRaft runs a single Raft group (Phase 9) over the already-built transport
 // instead of the probe demo. The group membership is this node plus its peers. It
 // emits machine-readable events — raft_leader, raft_follower, raft_commit — so a
 // test or an operator can watch an election and replication happen over real TCP.
-func runRaft(ctx context.Context, id string, peers map[transport.NodeID]string, tr *transport.TCPTransport, dataDir string, tick time.Duration, lg *logger, stderr io.Writer) int {
+// Each event is derived from ONE consistent status snapshot, so a leader claim
+// always pairs a role with the term it was actually held in. It returns 0 on a
+// clean shutdown, 2 on a startup error, and 1 (after event=raft_fatal) if the node
+// fail-stops at runtime.
+func runRaft(ctx context.Context, r raftRun) int {
+	id, lg := r.id, r.lg
 	group := []raftnode.NodeID{raftnode.NodeID(id)}
-	for p := range peers {
+	for p := range r.peers {
 		group = append(group, raftnode.NodeID(p))
 	}
+	dataDir := r.dataDir
 	if dataDir == "" {
 		d, err := os.MkdirTemp("", "dkvd-raft-")
 		if err != nil {
-			fmt.Fprintf(stderr, "dkvd: %v\n", err)
+			fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
 			return 2
 		}
 		dataDir = d
 	} else if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		fmt.Fprintf(stderr, "dkvd: %v\n", err)
+		fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
 		return 2
 	}
 
 	n, err := raftnode.Start(ctx, raftnode.Config{
-		ID: raftnode.NodeID(id), Peers: group, Transport: tr,
+		ID: raftnode.NodeID(id), Peers: group, Transport: r.tr,
 		LogPath:      filepath.Join(dataDir, "raft-"+id+".log"),
-		TickInterval: tick, Logf: lg.logf, // durable by default (DisableSync left false)
+		TickInterval: r.tick, Logf: lg.logf, FS: r.fs, // durable by default (DisableSync left false)
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "dkvd: %v\n", err)
+		fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
 		return 2
 	}
 
@@ -260,31 +286,42 @@ func runRaft(ctx context.Context, id string, peers map[transport.NodeID]string, 
 			select {
 			case <-ctx.Done():
 				return
+			case <-n.Done():
+				return
 			case <-t.C:
-				role, term, leader, commit := n.Role(), n.Term(), n.LeaderID(), n.CommitIndex()
-				if role == raft.Leader && term > loggedLeaderTerm {
-					lg.logf("event=raft_leader node=%s term=%d", id, term)
-					loggedLeaderTerm = term
+				st := n.Status() // one snapshot: role, term, leader and commit agree
+				if st.Role == raft.Leader && st.Term > loggedLeaderTerm {
+					lg.logf("event=raft_leader node=%s term=%d", id, st.Term)
+					loggedLeaderTerm = st.Term
 				}
-				if role == raft.Follower && leader != "" && leader != lastLeader {
-					lg.logf("event=raft_follower node=%s term=%d leader=%s", id, term, leader)
-					lastLeader = leader
+				if st.Role == raft.Follower && st.Leader != "" && st.Leader != lastLeader {
+					lg.logf("event=raft_follower node=%s term=%d leader=%s", id, st.Term, st.Leader)
+					lastLeader = st.Leader
 				}
-				if commit != lastCommit {
-					lg.logf("event=raft_commit node=%s index=%d", id, commit)
-					lastCommit = commit
+				if st.Commit != lastCommit {
+					lg.logf("event=raft_commit node=%s index=%d", id, st.Commit)
+					lastCommit = st.Commit
 				}
 			}
 		}
 	}()
 
-	<-ctx.Done()
+	code := 0
+	select {
+	case <-ctx.Done():
+	case <-n.Done():
+		if err := n.Err(); err != nil {
+			lg.logf("event=raft_fatal node=%s err=%v", id, err)
+			code = 1
+		}
+	}
 	lg.logf("event=shutdown_start node=%s", id)
 	_ = n.Close()
-	_ = tr.Close()
+	_ = r.tr.Close()
 	wg.Wait()
-	lg.logf("event=shutdown_done node=%s role=%s term=%d commit=%d", id, n.Role(), n.Term(), n.CommitIndex())
-	return 0
+	st := n.Status()
+	lg.logf("event=shutdown_done node=%s role=%s term=%d commit=%d", id, st.Role, st.Term, st.Commit)
+	return code
 }
 
 // parsePeers parses "id=host:port,id=host:port" into a map. It rejects empty
