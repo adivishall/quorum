@@ -193,7 +193,16 @@ On restart the driver reads the durable log → `currentTerm`, `votedFor`, entri
 `commitIndex` (clamped). It builds a `MemoryLog` from the entries, sets `commitIndex`, and
 constructs the core in Follower state at the recovered term. Recovery verifies indexes are still
 contiguous, terms non-decreasing, and `currentTerm` does not move backward; incoherent state is
-refused, not repaired. Snapshot recovery is **not** Phase 9. Where the storage engine is eventually
+refused, not repaired. Snapshot recovery is **not** Phase 9.
+
+Durable HardState recovery is verified against real process death: `TestHardStateSurvivesSIGKILL`
+SIGKILLs a live `dkvd -raft` and reads the recovered `currentTerm` and `votedFor` back from the
+log file (via `raftlog.Inspect`, a read-only no-truncate reader), and
+`TestCurrentTermMonotonicAcrossRestart` shows `currentTerm` climbs across a real restart (reachable
+only if it was recovered, not reset). The persist-before-reply ordering is tested on the actual
+driver path — not just the core's `Ready` — by `TestPersistBeforeReplyOnDriverPath`, whose hook
+transport reads the durable log at the instant a reply is sent and requires the HardState to
+already be there. Where the storage engine is eventually
 involved, the documented `engine.appliedIndex ≤ raft.lastIndex` invariant is preserved.
 
 ## 12. Determinism and the simulated network

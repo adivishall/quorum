@@ -193,6 +193,45 @@ func TestGapInIndexesIsFatal(t *testing.T) {
 	}
 }
 
+// TestInspectReadsWithoutTruncating proves Inspect returns the recovered state
+// read-only: it reports the same entries/HardState as Open, and it does not modify
+// the file even when a torn tail is present (so it is safe to call on a live or
+// just-killed log).
+func TestInspectReadsWithoutTruncating(t *testing.T) {
+	path, l, _ := openTmp(t)
+	if err := l.Save(&HardState{Term: 4, Vote: "n2", Commit: 2}, []Entry{{Index: 1, Term: 3}, {Index: 2, Term: 4}}); err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+
+	// Append a torn (incomplete) record, as a crash mid-append would leave.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = f.Write([]byte{0xaa, 0xbb, 0xcc})
+	f.Close()
+
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := Inspect(path)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if rec.HardState.Term != 4 || rec.HardState.Vote != "n2" || rec.HardState.Commit != 2 || len(rec.Entries) != 2 {
+		t.Fatalf("Inspect recovered %+v, want term4/n2/commit2/2 entries", rec)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() != before.Size() {
+		t.Fatalf("Inspect modified the file: size %d -> %d", before.Size(), after.Size())
+	}
+}
+
 // FuzzDecodeEntry and FuzzDecodeHardState prove the payload decoders never panic.
 func FuzzDecodeEntry(f *testing.F) {
 	f.Add(encodeEntry(Entry{Index: 1, Term: 1, Data: []byte("x")}))

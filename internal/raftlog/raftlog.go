@@ -122,45 +122,57 @@ func replay(f *os.File, path string) (*Recovered, error) {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
-	r := record.NewReader(f, path, info.Size())
+	rec, next, err := readRecords(f, path, info.Size())
+	if err != nil {
+		return nil, err
+	}
+	// Truncate away any torn tail or stray trailing bytes past the last good record.
+	if next < info.Size() {
+		if err := f.Truncate(next); err != nil {
+			return nil, err
+		}
+	}
+	return rec, nil
+}
+
+// readRecords reconstructs the recovered state from a record stream of exactly
+// size bytes and returns it together with the offset just past the last good
+// record (the safe truncation/append point). It does not mutate the stream. A
+// torn final record stops the read (recoverable); any other damage is fatal.
+func readRecords(r io.Reader, name string, size int64) (*Recovered, int64, error) {
+	rd := record.NewReader(r, name, size)
 	rec := &Recovered{}
 	for {
-		kind, payload, err := r.Next()
+		kind, payload, err := rd.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			if errors.Is(err, record.ErrTornTail) {
-				break // a crash mid-append; truncate below to the last good offset
+				break // a crash mid-append; the last good offset is the append point
 			}
-			return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
+			return nil, 0, fmt.Errorf("%w: %v", ErrCorrupt, err)
 		}
 		switch kind {
 		case kindEntry:
 			e, err := decodeEntry(payload)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			// "set index, drop above": enforce a contiguous, hole-free progression.
 			if e.Index == 0 || e.Index > uint64(len(rec.Entries))+1 {
-				return nil, fmt.Errorf("%w: entry index %d creates a gap (have %d)", ErrCorrupt, e.Index, len(rec.Entries))
+				return nil, 0, fmt.Errorf("%w: entry index %d creates a gap (have %d)", ErrCorrupt, e.Index, len(rec.Entries))
 			}
 			rec.Entries = rec.Entries[:e.Index-1]
 			rec.Entries = append(rec.Entries, e)
 		case kindHardState:
 			hs, err := decodeHardState(payload)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			rec.HardState = hs
 		default:
-			return nil, fmt.Errorf("%w: unknown record kind %d", ErrCorrupt, kind)
-		}
-	}
-	// Truncate away any torn tail or stray trailing bytes past the last good record.
-	if r.NextOffset() < info.Size() {
-		if err := f.Truncate(r.NextOffset()); err != nil {
-			return nil, err
+			return nil, 0, fmt.Errorf("%w: unknown record kind %d", ErrCorrupt, kind)
 		}
 	}
 	// Clamp the persisted commit to what the log actually holds (it is an
@@ -168,7 +180,26 @@ func replay(f *os.File, path string) (*Recovered, error) {
 	if rec.HardState.Commit > uint64(len(rec.Entries)) {
 		rec.HardState.Commit = uint64(len(rec.Entries))
 	}
-	return rec, nil
+	return rec, rd.NextOffset(), nil
+}
+
+// Inspect reopens a durable log read-only and returns its recovered state WITHOUT
+// truncating or otherwise modifying the file. It is for tests and tooling that
+// need to read persisted Entries/HardState (e.g. after a process was killed),
+// including while another process holds the file open. It applies the same crash
+// policy as Open (a torn tail stops the read; other damage is fatal).
+func Inspect(path string) (*Recovered, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	rec, _, err := readRecords(f, path, info.Size())
+	return rec, err
 }
 
 // Save durably records a Ready's HardState (if any) and entries in one fsync. On a
