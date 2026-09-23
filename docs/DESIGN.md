@@ -407,10 +407,12 @@ Handshake on connect: `"DKV1"` magic + 4-byte protocol version + length-prefixed
 misdirected or wrong-version connection fails immediately instead of being interpreted as a
 frame. Exact grammar, sizes, and timeouts: `docs/TRANSPORT.md` §3.
 
-Message types: `Probe` and `ProbeResponse` (liveness) are implemented in Phase 7.
-`RequestVote`, `AppendEntries`, `InstallSnapshot`, `Forward` (client request proxied to a
-leader) and their responses are **reserved kind identifiers** for Phases 9/13/14; Phase 7
-defines no codec or semantics for them.
+Message types: `Probe` and `ProbeResponse` (liveness) are implemented in Phase 7. `RequestVote`,
+`AppendEntries` and their responses are **implemented in Phase 9** — the codec lives in
+`internal/raft` and `internal/raftnode` maps message types to these frame kinds (ADR-016), so the
+transport still carries them as opaque bytes. `InstallSnapshot` and `Forward` (client request
+proxied to a leader) and their responses remain **reserved kind identifiers** for Phases 14/13 with
+no codec or semantics yet.
 
 Payloads use a hand-written binary codec (explicit `Marshal`/`Unmarshal`, varints, no
 reflection). Not gob, not JSON, not protobuf. Reasons, in order of weight:

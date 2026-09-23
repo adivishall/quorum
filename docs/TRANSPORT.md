@@ -121,26 +121,29 @@ after the handshake both ends run a reader loop and share a mutex-guarded writer
 
 ## 5. Message kinds
 
-The 1-byte frame `kind` is the message type. Phase 7 implements two and reserves the rest:
+The 1-byte frame `kind` is the message type. Phase 7 implemented the probe kinds; Phase 9 activated
+the four Raft kinds; the rest remain reserved:
 
 | kind | name | status |
 |---|---|---|
 | 1 | `Probe` | implemented (§7) |
 | 2 | `ProbeResponse` | implemented (§7) |
-| 16 | `RequestVote` | reserved for Phase 9 — no codec, no semantics |
-| 17 | `RequestVoteResponse` | reserved for Phase 9 |
-| 18 | `AppendEntries` | reserved for Phase 9 |
-| 19 | `AppendEntriesResponse` | reserved for Phase 9 |
+| 16 | `RequestVote` | implemented (Phase 9) — codec in `internal/raft`, carried by `internal/raftnode` |
+| 17 | `RequestVoteResponse` | implemented (Phase 9) |
+| 18 | `AppendEntries` | implemented (Phase 9) |
+| 19 | `AppendEntriesResponse` | implemented (Phase 9) |
 | 20 | `InstallSnapshot` | reserved for Phase 14 |
 | 21 | `InstallSnapshotResponse` | reserved for Phase 14 |
 | 32 | `Forward` | reserved for Phase 13 |
 | 33 | `ForwardResponse` | reserved for Phase 13 |
 
-The reserved kinds are **identifiers only**. Their payloads depend on Raft/forwarding types that
-do not exist yet, and inventing fields for them now would be inventing Raft behaviour (Phase 7
-is forbidden from that). A frame with a reserved-but-unimplemented kind is accepted at the frame
-layer and rejected at dispatch as `ErrUnimplementedKind` until its phase lands. An entirely
-unknown kind is `ErrUnknownKind` at the frame layer.
+The Raft kinds carry a hand-written bounded codec that lives in `internal/raft` (not here — the
+transport stays ignorant of what a term means, ADR-013/ADR-016); `internal/raftnode` maps message
+types to these kinds. The still-reserved kinds (`InstallSnapshot`, `Forward`) are **identifiers
+only**: their payloads depend on types that do not exist yet, and inventing fields for them now
+would be inventing later-phase behaviour. A frame with a reserved-but-unimplemented kind is accepted
+at the frame layer and ignored by a node that has no handler for it; an entirely unknown kind is
+`ErrUnknownKind` at the frame layer.
 
 ## 6. Codec
 
@@ -216,19 +219,23 @@ present any id. What is enforced regardless: bounded frame size, bounded handsha
 id, bounded allocations, and rejection (never a panic) on any malformed input. Authentication
 and transport encryption are out of scope for v1 (`docs/LIMITATIONS.md`).
 
-## 11. What Phase 7 proves — and does not
+## 11. What this transport proves — and does not
 
-**Proves:** real OS-process nodes; a real internal TCP transport with a checksummed framing, a
-version handshake, hand-written bounded codecs, one bidirectional long-lived connection per peer
-pair, automatic dialer-side reconnect, concurrent-safe sends, per-connection frame ordering, and
-deterministic clean shutdown — demonstrated end to end by three real `cmd/dkvd` processes
-exchanging `Probe`/`ProbeResponse` over localhost TCP and all exiting cleanly.
+**Proves (Phase 7):** real OS-process nodes; a real internal TCP transport with a checksummed
+framing, a version handshake, hand-written bounded codecs, one bidirectional long-lived connection
+per peer pair, automatic dialer-side reconnect, concurrent-safe sends, per-connection frame
+ordering, and deterministic clean shutdown — demonstrated end to end by three real `cmd/dkvd`
+processes exchanging `Probe`/`ProbeResponse` over localhost TCP and all exiting cleanly.
 
-**Does not prove / not implemented:** replication, Raft, leader election, voting, log
-replication, commit index, state-machine replication, request forwarding, shard serving, an HTTP
-API, a dashboard, dynamic membership, snapshots, fault injection, or any cross-node consistency.
-`Probe` is a liveness probe, not a heartbeat that drives consensus. The transport is built so
-those phases can be added on top of it without changing this layer.
+**What now rides on it (Phase 9):** the transport carries real **Raft** traffic — `dkvd -raft` runs
+elections, `RequestVote`/`AppendEntries`, and commit over it (`internal/raftnode`, `docs/RAFT.md`),
+proven by a real 3-process election and a SIGKILL recovery test. The transport itself is unchanged
+and still does not know what a term or a log index means; it only moves the bytes.
+
+**Still not built (on top of the transport):** request forwarding, shard/client serving, an HTTP
+API, a dashboard, dynamic membership, snapshots, systematic fault injection, and end-to-end
+cross-node consistency verification. The `InstallSnapshot`/`Forward` kinds remain reserved. `Probe`
+is a liveness probe, not a Raft heartbeat.
 
 ## 12. Invariants
 
