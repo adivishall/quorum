@@ -113,6 +113,11 @@ after the handshake both ends run a reader loop and share a mutex-guarded writer
 - **Reconnect is the dialer's job.** The smaller-id side runs a per-peer dial loop that retries
   at a fixed bounded interval (`DialRetryInterval`, default 500 ms — no exponential backoff)
   until connected, and stops on transport shutdown. The larger-id side waits to be redialed.
+  The interval applies after a *dead connection* exactly as after a failed dial (Phase 10):
+  without it, a peer that accepts and instantly closes — a crash-looping process, or a
+  partition that resets connections — turns the dial loop into a reconnect storm (measured at
+  roughly one attempt per 250 µs, burning an ephemeral port and two log lines each).
+  `TestDialerBacksOffWhenPeerKeepsClosingConnections` pins the pacing.
 - **Concurrent sends** on one connection are serialised by a per-connection writer mutex, so two
   goroutines' frames never interleave their bytes. A blocked write is bounded by the write
   deadline and unblocked by shutdown.
@@ -185,7 +190,7 @@ All bounded; none is an arbitrary huge value. Defaults, all configurable:
 | dial timeout | 3 s | dial fails, dial loop retries |
 | handshake timeout | 5 s | connection closed |
 | write deadline (per frame) | 5 s | write fails → connection torn down |
-| read idle deadline | 0 (disabled by default) | if set, a peer silent longer than this is treated as dead and the connection is torn down |
+| read idle deadline | 0 in the library (disabled); `cmd/dkvd` sets ~120 ticks | a connection that delivers no frame for this long is treated as dead and torn down, so the dialer reconnects |
 
 Correctness does not depend on any of these firing (safety is not timing-dependent,
 `docs/FAILURE_MODEL.md` §2); they exist so nothing blocks forever. Shutdown unblocks a blocked

@@ -82,12 +82,27 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	// readIdle: a connection that has delivered no frame for this long is treated
+	// as dead and torn down, so the dialer reconnects. Without it a connection
+	// that is established but silently delivers nothing — a peer that vanished
+	// without sending a FIN, or one reached through a network element that accepts
+	// bytes but never forwards them — parks the reader in Read forever; and because
+	// a registered connection suppresses redialling and writes into such a socket
+	// still succeed, the node believes it has a live peer it can never actually
+	// reach (Phase 10, docs/FAULTS.md §13). It sits well above the Raft heartbeat
+	// interval (HeartbeatTicks=2) and one election timeout (ElectionTicks in
+	// [10,20) ticks), so a heartbeated link is never torn down; at ~120 ticks it is
+	// 6–12× an election timeout, detecting a dead link within a couple of them. A
+	// link that legitimately carries no traffic (two followers of the same leader)
+	// is torn down and immediately redialled; that reconnect is harmless.
+	readIdle := 120 * *tickIvl
 	lg := &logger{w: stdout}
 	tr, err := transport.NewTCPTransport(transport.Config{
-		NodeID:     transport.NodeID(*id),
-		ListenAddr: *listen,
-		Peers:      peers,
-		Logf:       lg.logf,
+		NodeID:          transport.NodeID(*id),
+		ListenAddr:      *listen,
+		Peers:           peers,
+		Logf:            lg.logf,
+		ReadIdleTimeout: readIdle,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "dkvd: %v\n", err)

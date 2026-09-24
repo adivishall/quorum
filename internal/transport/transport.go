@@ -223,6 +223,13 @@ func (t *TCPTransport) dialLoop(peer NodeID, addr string) {
 		}
 		_ = nc.SetWriteDeadline(time.Time{})
 		t.serve(peer, nc, "outbound") // blocks until the connection dies
+		// A dead connection waits the same retry interval as a failed dial.
+		// Redialling immediately would spin at CPU speed against a peer that
+		// accepts and instantly closes — a crash-looping peer, or a partition
+		// that resets connections — burning ports and flooding logs.
+		if t.sleep(t.cfg.DialRetryInterval) {
+			return
+		}
 	}
 }
 

@@ -242,6 +242,31 @@ mutant "network-drop-rule" internal/fault/transport.go \
 			return pass, nil' \
   ./internal/fault 'TestDropRuleByKindAndCount'
 
+# 23. Remove the dialer's back-off after a connection dies (redial immediately),
+#     so a peer that accepts-and-resets becomes a reconnect storm (Phase 10, bug 6).
+mutant "dialer-backs-off-after-dead-conn" internal/transport/transport.go \
+  '		t.serve(peer, nc, "outbound") // blocks until the connection dies
+		// A dead connection waits the same retry interval as a failed dial.
+		// Redialling immediately would spin at CPU speed against a peer that
+		// accepts and instantly closes — a crash-looping peer, or a partition
+		// that resets connections — burning ports and flooding logs.
+		if t.sleep(t.cfg.DialRetryInterval) {
+			return
+		}' \
+  '		t.serve(peer, nc, "outbound") // blocks until the connection dies' \
+  ./internal/transport 'TestDialerBacksOffWhenPeerKeepsClosingConnections'
+
+# 24. Ignore the read idle deadline, so a silent (established-but-dead) connection
+#     blocks the reader forever and the peer is never reconnected (Phase 10, bug 6).
+mutant "read-idle-timeout-detects-dead-conn" internal/transport/transport.go \
+  '		if t.cfg.ReadIdleTimeout > 0 {
+			_ = c.nc.SetReadDeadline(time.Now().Add(t.cfg.ReadIdleTimeout))
+		}' \
+  '		if false {
+			_ = c.nc.SetReadDeadline(time.Time{})
+		}' \
+  ./internal/transport 'TestReaderIdleTimeoutReconnectsASilentConnection'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
 if [ "$FAIL" -ne 0 ]; then

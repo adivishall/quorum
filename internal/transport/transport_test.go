@@ -7,6 +7,7 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -179,6 +180,111 @@ func TestReconnectAfterConnectionDrop(t *testing.T) {
 	env := recv(t, b, 2*time.Second)
 	if p, _ := ParseProbe(env.Payload); p.RequestID != 2 {
 		t.Fatalf("after reconnect got id %d, want 2", p.RequestID)
+	}
+}
+
+// TestDialerBacksOffWhenPeerKeepsClosingConnections pins the dial loop's retry
+// pacing at the connection level, not only the dial level: against a peer that
+// accepts and instantly closes every connection (a crash-looping process, or a
+// partition that resets connections), the dialer must wait its retry interval
+// after the connection dies, not redial at CPU speed. Without that backoff the
+// dialer reconnects roughly every 250µs (measured against a resetting proxy),
+// burning an ephemeral port and two log lines per cycle.
+func TestDialerBacksOffWhenPeerKeepsClosingConnections(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var accepted atomic.Int64
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted.Add(1)
+			_ = c.Close()
+		}
+	}()
+
+	a, err := NewTCPTransport(Config{
+		NodeID: "a", ListenAddr: "127.0.0.1:0",
+		Peers:             map[NodeID]string{"b": ln.Addr().String()},
+		DialRetryInterval: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	time.Sleep(650 * time.Millisecond)
+	got := accepted.Load()
+	if got == 0 {
+		t.Fatal("the dialer never attempted a connection; the test proved nothing")
+	}
+	// At one attempt per 100ms interval, 650ms allows ~7 attempts; 15 leaves
+	// slack for scheduling. A dialer without the backoff makes thousands.
+	if got > 15 {
+		t.Fatalf("%d connection attempts in 650ms with a 100ms retry interval: the dialer must back off after a connection dies, not spin", got)
+	}
+}
+
+// TestReaderIdleTimeoutReconnectsASilentConnection pins the read-idle-timeout: a
+// connection that is established but silently delivers nothing must be torn down
+// so the dialer reconnects. This is the Phase 10 real-process flake's root cause
+// — a proxied link (and, in production, a peer that vanished without closing the
+// socket) can leave the dialer with a connection whose writes succeed into a dead
+// socket while its reader blocks in Read forever; because a registered connection
+// suppresses redialling, the node then believes it has a peer it can never reach.
+// The black-hole peer accepts connections and holds them open, never sending a
+// frame; with the idle timeout the dialer must tear each down and redial. Without
+// it (ReadIdleTimeout == 0) the dialer registers the first connection and blocks
+// forever: exactly one accept.
+func TestReaderIdleTimeoutReconnectsASilentConnection(t *testing.T) {
+	bh, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bh.Close()
+	var accepts atomic.Int64
+	go func() {
+		var held []net.Conn
+		defer func() {
+			for _, c := range held {
+				_ = c.Close()
+			}
+		}()
+		for {
+			c, err := bh.Accept()
+			if err != nil {
+				return
+			}
+			accepts.Add(1)
+			held = append(held, c) // hold open: never read, never send, never close
+		}
+	}()
+
+	const idle = 200 * time.Millisecond
+	a, err := NewTCPTransport(Config{
+		NodeID: "a", ListenAddr: "127.0.0.1:0",
+		Peers:             map[NodeID]string{"b": bh.Addr().String()},
+		DialRetryInterval: 50 * time.Millisecond,
+		ReadIdleTimeout:   idle,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	// Each silent connection is torn down after ~idle and redialled after the
+	// retry interval, so several accepts occur within a few idle periods.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && accepts.Load() < 3 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := accepts.Load(); got < 3 {
+		t.Fatalf("black-hole peer saw %d connection(s) in 3s; with a %s read idle timeout a silent connection must be torn down and redialled, not held open forever", got, idle)
 	}
 }
 
