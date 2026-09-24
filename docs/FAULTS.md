@@ -326,6 +326,34 @@ Bugs, each fixed with a test that fails without the fix:
 5. `dkvd` built its `raft_leader` events from four separately locked reads (a torn read could
    announce leadership of a term the node never led), kept running as a zombie after its node
    failed, and did not report a follower re-following the same leader in a new term. Fixed.
+6. **Found by a flaky real-process restart test: a silent connection was never detected, so a peer
+   was never reconnected.** `TestRealRestartWhileIsolated` failed roughly 1 run in 15: after the
+   old leader was killed and restarted, a survivor sometimes never re-established a usable link to
+   it, so no leader was elected within the timeout. The transport tore a connection down only on a
+   read or write *failure*; but a connection established through the test's TCP proxy during the
+   restart window could end up delivering nothing while never erroring — writes into it succeeded
+   (into a dead socket buffer) and the reader blocked in `Read` forever. Because a registered
+   connection also suppresses the dial loop (`hasConn`), the survivor believed it held a live peer
+   it could never reach, and its votes vanished. The goroutine dump was decisive: the dial loop was
+   parked in `readLoop`→`Read` on a registered connection to the restarted node, and that node's
+   Raft log showed sends failing only to the *dead* third node, never to the peer it was wedged
+   against. Two fixes: the dialer now waits its retry interval after a connection *dies* (not only
+   after a failed dial), so a peer that accepts-and-resets cannot become a reconnect storm; and the
+   Raft deployment (`cmd/dkvd`) enables `transport.Config.ReadIdleTimeout` (~120 ticks) so a
+   connection that delivers no frame for that long is torn down and redialled. The read-idle-timeout
+   is the fix for the root cause — proven by re-running the exact reproduction (the dialer spinning,
+   which reliably reproduced the hang) with the timeout enabled: 0 failures where the hang had been
+   reliable. TCP keepalive was rejected: a connection stuck in a listener's accept backlog is
+   kernel-established, so its probes are answered and it is never seen as dead; only an
+   application-level idle deadline catches it. Regression tests:
+   `internal/transport`: `TestReaderIdleTimeoutReconnectsASilentConnection`,
+   `TestDialerBacksOffWhenPeerKeepsClosingConnections` (both shown to fail without their fix). The
+   three sibling restart-through-proxy tests (`TestRealLeaderCrashAndReelection`,
+   `TestRealFollowerCrashAndCatchUp`, `TestRealRepeatedCrashRestart`) shared the same exposure and
+   are covered by the same fix. A *second*, independent flake in the same test — a wait pinned to a
+   leader that a legitimate rejoin-forced re-election had replaced — was also fixed, by waiting for
+   the group to converge on *some* leader everyone follows (`waitStable`) rather than for a specific
+   leader to keep its term.
 
 Test gaps the Phase 9 suite had, now closed: removing the fsync from `raftlog.Save` passed every
 existing test (the ordering test read through the page cache); counting duplicated vote responses

@@ -1,8 +1,10 @@
 package integration
 
 import (
+	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -27,6 +29,24 @@ type tcpProxy struct {
 	closed bool
 	conns  map[net.Conn]struct{}
 	wg     sync.WaitGroup
+
+	logMu sync.Mutex
+	log   strings.Builder
+}
+
+// logf records a timestamped line of the proxy's own activity, dumped by the
+// harness when a test fails, so a failing run shows what the proxy actually did
+// with each connection rather than leaving it to inference.
+func (p *tcpProxy) logf(format string, args ...any) {
+	p.logMu.Lock()
+	fmt.Fprintf(&p.log, time.Now().Format("15:04:05.000000")+" "+format+"\n", args...)
+	p.logMu.Unlock()
+}
+
+func (p *tcpProxy) debugLog() string {
+	p.logMu.Lock()
+	defer p.logMu.Unlock()
+	return p.log.String()
 }
 
 func startProxy(t *testing.T, target string) *tcpProxy {
@@ -54,27 +74,34 @@ func (p *tcpProxy) acceptLoop() {
 		p.mu.Lock()
 		if p.cut || p.closed {
 			p.mu.Unlock()
+			p.logf("accept client=%s refused (cut)", c.RemoteAddr())
 			_ = c.Close()
 			continue
 		}
 		p.conns[c] = struct{}{}
 		p.wg.Add(1)
 		p.mu.Unlock()
+		p.logf("accept client=%s", c.RemoteAddr())
 		go p.serve(c)
 	}
 }
 
 func (p *tcpProxy) serve(c net.Conn) {
 	defer p.wg.Done()
+	start := time.Now()
 	up, err := net.DialTimeout("tcp", p.target, 2*time.Second)
 	if err != nil {
+		p.logf("updial client=%s err=%v took=%s", c.RemoteAddr(), err, time.Since(start))
 		p.forget(c)
 		_ = c.Close()
 		return
 	}
+	p.logf("updial client=%s up_local=%s up_remote=%s took=%s",
+		c.RemoteAddr(), up.LocalAddr(), up.RemoteAddr(), time.Since(start))
 	p.mu.Lock()
 	if p.cut || p.closed {
 		p.mu.Unlock()
+		p.logf("drop client=%s (cut after updial)", c.RemoteAddr())
 		p.forget(c)
 		_ = c.Close()
 		_ = up.Close()
@@ -85,8 +112,20 @@ func (p *tcpProxy) serve(c net.Conn) {
 
 	var pipes sync.WaitGroup
 	pipes.Add(2)
-	go func() { defer pipes.Done(); _, _ = io.Copy(up, c); _ = up.Close(); _ = c.Close() }()
-	go func() { defer pipes.Done(); _, _ = io.Copy(c, up); _ = c.Close(); _ = up.Close() }()
+	go func() {
+		defer pipes.Done()
+		n, err := io.Copy(up, c)
+		p.logf("pipe client->up done client=%s bytes=%d err=%v", c.RemoteAddr(), n, err)
+		_ = up.Close()
+		_ = c.Close()
+	}()
+	go func() {
+		defer pipes.Done()
+		n, err := io.Copy(c, up)
+		p.logf("pipe up->client done client=%s bytes=%d err=%v", c.RemoteAddr(), n, err)
+		_ = c.Close()
+		_ = up.Close()
+	}()
 	pipes.Wait()
 	p.forget(c)
 	p.forget(up)
@@ -100,6 +139,7 @@ func (p *tcpProxy) forget(c net.Conn) {
 
 // Cut severs the link: every live connection is closed and new ones are refused.
 func (p *tcpProxy) Cut() {
+	p.logf("CUT")
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.cut = true
@@ -110,6 +150,7 @@ func (p *tcpProxy) Cut() {
 
 // Heal lets new connections through again (the dialer's retry loop reconnects).
 func (p *tcpProxy) Heal() {
+	p.logf("HEAL")
 	p.mu.Lock()
 	p.cut = false
 	p.mu.Unlock()

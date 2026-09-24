@@ -211,7 +211,43 @@ func (c *rcluster) waitLeader(ids []string, minTerm uint64, d time.Duration) (st
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	c.t.Fatalf("no confirmed leader among %v above term %d within %s\n%s", ids, minTerm, d, c.outputs())
+	c.t.Fatalf("no confirmed leader among %v above term %d within %s\nps: %s\n%s", ids, minTerm, d, c.postMortem(), c.outputs())
+	return "", 0
+}
+
+// waitStable waits until the group has settled: some leader l in a term above
+// minTerm is confirmed (latestLeader), and every other id's current process
+// reports following l at exactly that term. Unlike a wait pinned to one expected
+// leader, this survives the legitimate re-elections a restarted or rejoining
+// node can force: Raft promises the group converges on one leader, not that a
+// particular leader keeps its seat — a node that campaigned while unreachable
+// rejoins with an inflated term and deposes a healthy leader (§5.2 of the paper;
+// docs/FAULTS.md §11), so asserting "everyone follows the leader elected before
+// the rejoin" races with that disruption and was the cause of a real flake.
+func (c *rcluster) waitStable(ids []string, minTerm uint64, d time.Duration) (string, uint64) {
+	c.t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if l, tm, ok := c.latestLeader(ids); ok && tm > minTerm {
+			settled := true
+			for _, id := range ids {
+				if id == l {
+					continue
+				}
+				p := c.procs[id]
+				if p == nil || !strings.Contains(p.out.String(),
+					fmt.Sprintf("event=raft_follower node=%s term=%d leader=%s", id, tm, l)) {
+					settled = false
+					break
+				}
+			}
+			if settled {
+				return l, tm
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	c.t.Fatalf("no stable leader among %v above term %d within %s\nps: %s\n%s", ids, minTerm, d, c.postMortem(), c.outputs())
 	return "", 0
 }
 
@@ -244,7 +280,7 @@ func (c *rcluster) waitCommit(ids []string, idx uint64, d time.Duration) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	c.t.Fatalf("%v did not all commit through %d within %s\n%s", ids, idx, d, c.outputs())
+	c.t.Fatalf("%v did not all commit through %d within %s\nps: %s\n%s", ids, idx, d, c.postMortem(), c.outputs())
 }
 
 // waitFollows waits until id's current process reports following leader in a term
@@ -260,7 +296,7 @@ func (c *rcluster) waitFollows(id, leader string, term uint64, d time.Duration) 
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	c.t.Fatalf("%s never followed %s at term >= %d within %s\n%s", id, leader, term, d, c.outputs())
+	c.t.Fatalf("%s never followed %s at term >= %d within %s\nps: %s\n%s", id, leader, term, d, c.postMortem(), c.outputs())
 }
 
 // liveLog reads a node's durable log (read-only; safe while the process runs).
@@ -379,7 +415,33 @@ func (c *rcluster) outputs() string {
 			fmt.Fprintf(&b, "--- %s ---\n%s\n", id, p.out.String())
 		}
 	}
+	for k, p := range c.proxies {
+		fmt.Fprintf(&b, "--- proxy %s->%s (listen %s target %s) ---\n%s\n", k[0], k[1], p.Addr(), p.target, p.debugLog())
+	}
 	return b.String()
+}
+
+// postMortem captures the state of every running process at the moment a wait
+// failed: ps says whether each process was even runnable, and SIGQUIT makes the
+// Go runtime dump every goroutine's stack to stderr — which lands in the node's
+// captured output, printed by outputs(). Call it before outputs() in a Fatalf.
+func (c *rcluster) postMortem() string {
+	var pids []string
+	for _, id := range c.running() {
+		pids = append(pids, strconv.Itoa(c.procs[id].cmd.Process.Pid))
+	}
+	if len(pids) == 0 {
+		return "(no running processes)"
+	}
+	ps, _ := exec.Command("ps", "-o", "pid,stat,time,command", "-p", strings.Join(pids, ",")).CombinedOutput()
+	for _, id := range c.running() {
+		// SIGCONT first: if the process was somehow stopped, ps above has already
+		// recorded that (STAT T), and continuing it lets the SIGQUIT dump appear.
+		_ = c.procs[id].cmd.Process.Signal(syscall.SIGCONT)
+		_ = c.procs[id].cmd.Process.Signal(syscall.SIGQUIT)
+	}
+	time.Sleep(2 * time.Second) // let the runtime write the goroutine dumps
+	return string(ps)
 }
 
 func others(ids []string, x string) []string {
@@ -407,8 +469,11 @@ func TestRealLeaderCrashAndReelection(t *testing.T) {
 	c.waitCommit(others(c.ids, l1), uint64(len(committed))+1, 20*time.Second) // l2's no-op
 
 	c.start(l1)
-	c.waitFollows(l1, l2, t2, 20*time.Second)
-	c.waitCommit(c.ids, c.commitOf(l2), 20*time.Second)
+	// The restarted l1 usually just follows l2 — but if its election timer fires
+	// before l2's first heartbeat reaches it, its complete log lets it win a new
+	// election, legitimately. Require convergence, not l2's continued reign.
+	lf, _ := c.waitStable(c.ids, t2-1, 20*time.Second)
+	c.waitCommit(c.ids, c.commitOf(lf), 20*time.Second)
 	c.finish(committed, c.committedPrefix(l2))
 }
 
@@ -434,7 +499,9 @@ func TestRealFollowerCrashAndCatchUp(t *testing.T) {
 	}
 
 	c.start(f)
-	c.waitFollows(f, l2, t2, 20*time.Second)
+	// The restarted f cannot win an election (its log misses committed entries),
+	// but its campaign can depose l2 and force a re-election among the others.
+	c.waitStable(c.ids, t2-1, 20*time.Second)
 	c.waitCommit(c.ids, uint64(len(behind)), 20*time.Second)
 	c.finish(behind)
 }
@@ -454,7 +521,11 @@ func TestRealFrozenLeaderStepsDown(t *testing.T) {
 	l2, t2 := c.waitLeader(others(c.ids, l1), t1, 20*time.Second)
 	c.waitCommit(others(c.ids, l1), uint64(len(committed))+1, 20*time.Second)
 	c.signal(l1, syscall.SIGCONT)
-	c.waitFollows(l1, l2, t2, 20*time.Second)
+	// On resume the old leader learns the higher term from its first exchange
+	// and steps down. Its own election timer can also fire first and force one
+	// more election — which it cannot win, since l2 committed an entry it lacks
+	// — so wait for convergence rather than for l2 specifically to keep power.
+	c.waitStable(c.ids, t2-1, 20*time.Second)
 	c.finish(committed, c.committedPrefix(l2))
 }
 
@@ -501,10 +572,7 @@ func TestRealConnectionFlapping(t *testing.T) {
 			t.Fatalf("%s died during connection flapping (%v)\n%s", id, err, c.procs[id].out.String())
 		}
 	}
-	l, tl := c.waitLeader(c.ids, t1-1, 30*time.Second)
-	for _, id := range others(c.ids, l) {
-		c.waitFollows(id, l, tl, 20*time.Second)
-	}
+	l, _ := c.waitStable(c.ids, t1-1, 30*time.Second)
 	c.waitCommit(c.ids, c.commitOf(l), 20*time.Second)
 	c.finish(c.committedPrefix(l))
 }
@@ -532,10 +600,13 @@ func TestRealRestartWhileIsolated(t *testing.T) {
 	c.start(f) // restarts still isolated
 	time.Sleep(1500 * time.Millisecond)
 	c.healAll()
-	l3, t3 := c.waitLeader(c.ids, t2-1, 30*time.Second)
-	for _, id := range others(c.ids, l3) {
-		c.waitFollows(id, l3, t3, 20*time.Second)
-	}
+	// The rejoining f carries a term inflated by its isolated campaigning: its
+	// first exchange forces a new election, which it cannot win with its stale
+	// log — and which usually deposes the leader a pinned wait would expect.
+	// Require convergence on SOME leader everyone follows; finish() then proves
+	// nothing committed was lost (so f did not win). The deterministic form of
+	// this disruption is TestPartitionedNodeRestartsWhileIsolated (raftsim).
+	c.waitStable(c.ids, t2-1, 30*time.Second)
 	c.waitCommit(c.ids, uint64(len(committed)), 20*time.Second)
 	c.finish(committed)
 }
@@ -560,9 +631,6 @@ func TestRealRepeatedCrashRestart(t *testing.T) {
 		c.start(victim)
 		c.waitCommit([]string{victim}, uint64(len(checkpoints[len(checkpoints)-1])), 20*time.Second)
 	}
-	l, tl := c.waitLeader(c.ids, 0, 20*time.Second)
-	for _, id := range others(c.ids, l) {
-		c.waitFollows(id, l, tl, 20*time.Second)
-	}
+	c.waitStable(c.ids, 0, 20*time.Second)
 	c.finish(checkpoints...)
 }
