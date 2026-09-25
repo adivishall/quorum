@@ -6,7 +6,7 @@ Quorum is currently implementing its durable storage engine. No Raft library, no
 database, no consensus service — the storage engine and the consensus implementation are
 the project, and they are being built in that order.
 
-> **Status: Phase 11 of 25 — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, a working Raft consensus core, deterministic fault injection, and a proven crash-recovery model for the Raft node.**
+> **Status: Phase 12 of 25 — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, a working Raft consensus core, deterministic fault injection, a proven crash-recovery model for the Raft node, and client-visible linearizability of single-key operations on one Raft group, checked on real client histories.**
 >
 > **Implemented:** a write-ahead log, an ordered memtable, immutable on-disk SSTables, Bloom
 > filters, size-tiered compaction, crash-safe MANIFEST-based file publication, and restart
@@ -39,12 +39,23 @@ the project, and they are being built in that order.
 > independent record of what was persisted; seeded crash schedules; in-process and real-process
 > (`dkvd -crash-at`, a real SIGKILL at the exact point) crash tests. It found and fixed a window
 > that made a node unable to restart, and pins application as at-least-once across restarts.
+> Phase 12 adds **client-visible linearizability** (`docs/LINEARIZABILITY.md`): a replicated
+> in-memory key-value state machine (`internal/kv`), ReadIndex reads in the pure core, writes
+> acknowledged only when committed and applied in their proposal's term, a minimal test-facing
+> PUT/GET/DELETE protocol (`dkvd -client-listen`), and a linearizability checker
+> (`internal/lincheck`, `cmd/lincheck`) — validated first against an independent oracle, a
+> known-good/known-bad corpus and fuzzing — that checks client histories recorded from real
+> processes (concurrent clients, leader and follower SIGKILL, partitions, a minority leader that
+> still has a follower, a SIGKILL at every point of a write's life), the real driver, and 1,400
+> seeded simulator runs. 26 mutants of ReadIndex, write completion, the client and the checker
+> are killed.
 >
-> **Not implemented:** end-to-end linearizability verification, request forwarding, client/HTTP
-> API, linearizable-read serving (ReadIndex), dedup / exactly-once client semantics, snapshots,
-> dynamic membership, a dashboard, a storage engine hosted by the node. **Raft working under
-> faults and crashes is the consensus core, not the finished distributed database — no
-> end-to-end distributed consistency guarantee is claimed.** Those are Phases 12 and later. See
+> **What that claim is, exactly:** single-key PUT/GET/DELETE on **one** Raft group; every
+> recorded finite history linearizable, plus an argument with named assumptions — not a proof
+> over every execution; and only for histories that record each retry as its own operation
+> (hidden retries need Phase 13's dedup). **Not implemented:** request forwarding, the client/HTTP
+> API, dedup / exactly-once client semantics, multi-group routing, snapshots, dynamic membership,
+> a dashboard, the LSM engine as the replicated state machine. See
 > [docs/ROADMAP.md](docs/ROADMAP.md) for exactly what is done and what is not.
 >
 > The binary is still called `dkv`; that is the command name, not the project name.
@@ -106,8 +117,14 @@ crash point ───────▶│  named points in persist·send·advance�
                     │  real SIGKILL at the point (dkvd -crash-at)        │
                     └────────────────────────────────────────────────────┘
 
+                    ┌───────── implemented, Phase 12 (linearizability) ──┐
+client history ────▶│  ReadIndex · completion at commit+apply in term    │
+                    │  kv state machine · -client-listen test protocol   │
+                    │  validated checker over real/driver/sim histories  │
+                    └────────────────────────────────────────────────────┘
+
                     ┌──────────────── not implemented ───────────────────┐
-                    │  linearizability · forwarding · dedup              │ Phases 12+
+                    │  forwarding · request ids · dedup                  │ Phase 13
                     │  HTTP API · dashboard · snapshots                  │ Phases 14+
                     └────────────────────────────────────────────────────┘
 ```
@@ -353,6 +370,8 @@ it is being answered out of memory.
 | [REPLICATION.md](docs/REPLICATION.md) | The replica-group model, the local replicated-log interface and its index/term/copy semantics, conflicting-suffix rules, commit/apply bookkeeping, the state-machine seam, the INV-P invariants, and what Phase 8 explicitly does not guarantee |
 | [RAFT.md](docs/RAFT.md) | The deterministic core, persistent state and election timing, RequestVote/AppendEntries, the conflict hint, the commit rule and no-op, the apply path, persistence ordering and recovery, the simulated network, the INV-R invariants, and what Phase 9 does and does not prove |
 | [FAULTS.md](docs/FAULTS.md) | The fault model and its three tiers, the deterministic simulator, crash/power-loss/persistence-failure semantics, seeds/replay/minimization, the INV-F invariants, the bugs Phase 10 found, and what remains untested |
+| [CRASH_RECOVERY.md](docs/CRASH_RECOVERY.md) | The node's crash points, what each crash window leaves on disk and what recovery makes of it, the exhaustive crash matrix, the INV-CR invariants, and the Save record order Phase 11 fixed |
+| [LINEARIZABILITY.md](docs/LINEARIZABILITY.md) | The client-visible contract: the object model, write completion, ReadIndex and its safety argument, incomplete operations and retries, the checker and how it was validated, every real-process and simulator scenario, the mutants, and exactly what is and is not verified |
 
 ## Development
 
@@ -363,11 +382,17 @@ make check        # gofmt + gitignore guard + go vet + go test -race — the pha
 make build
 make test
 make race
-make integration  # real-process tests: SIGKILL recovery, Raft over TCP, kill/stop/partition faults
-make faults       # the deterministic fault schedules at a large seed budget (FAULT_SEEDS=200)
+make integration  # real-process tests: SIGKILL recovery, Raft over TCP, kill/stop/partition faults, linearizability
+make faults       # the deterministic fault schedules and client workloads at a large seed budget (FAULT_SEEDS=200)
 make mutation     # mutation testing: every rule-violating edit must be caught
 make fuzz         # every fuzz target in the repository (FUZZTIME=10s each)
 make bench        # indicative WAL measurements
+```
+
+Re-check a saved client history (a failing test's artifact, or a corpus file):
+
+```bash
+go run ./cmd/lincheck internal/lincheck/testdata/corpus/bad/stale-leader-read.hist
 ```
 
 Extended fuzzing of the storage round-trip contract:

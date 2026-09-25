@@ -213,7 +213,16 @@ second — cheap enough to run on every `go test`.
 |---|---|---|---|
 | Deterministic simulator (`internal/raftsim`) | `crashat` at driver and I/O points; the matrix; the `crashpoints` chaos profile; fuzz | the exact durable state at every boundary (INV-F2, INV-CR1..3), convergence after every crash, INV-R1..R10 throughout, all replayable from a seed or script | real timing, real TCP, real hardware |
 | Real driver, in-process (`internal/raftnode`) | `Config.Hook` aborts the actor at a point; a new `Node` on the same log and the *same* state machine object | the real actor stops cleanly at the point, real files hold what a SIGKILL would leave, the real recovery path accepts them, and the state machine sees the documented replay (§6) | power loss (real files) |
-| Real processes (`tests/integration`) | `dkvd -crash-at=POINT[:N]`: the process logs `event=crash_point` and SIGKILLs itself there | the seam fires where it says on a real process; the log a real SIGKILL leaves reopens and is coherent (no entry above the recovered term, commit within the log, term never below what was durable); the restarted process recovers exactly what the file holds; the group re-converges over real TCP with every committed prefix intact | which `Save` is "the Nth" (real timing decides); power loss |
+| Real processes (`tests/integration`) | `dkvd -crash-at=POINT[:N]`: the process logs `event=crash_point` and SIGKILLs itself there | the seam fires where it says on a real process; the log a real SIGKILL leaves reopens and is coherent (no entry above the recovered term, commit within the log, term never below what was durable); the restarted process recovers exactly what the file holds; the group re-converges over real TCP with every committed prefix intact | which `Save` is "the Nth" (real timing decides) — except with Phase 12's signal arming, below; power loss |
+
+**Phase 12 additions to the seam** (`docs/LINEARIZABILITY.md` §7.3). `-crash-armed-by-signal`
+makes driver and reply points count only occurrences after the process receives SIGUSR1 (it logs
+`event=crash_armed`): the test arms a quiesced leader and issues one write, so "the 1st Save after
+arming" *is* that write's Save — no longer a guess about real timing. Two points were added at the
+client protocol's response boundary, `before-reply` and `after-reply`. `TestRealWriteCrashWindows`
+uses both to kill a leader at every point of one PUT's life and proves each point's premise from
+the durable log the SIGKILL left: what the system did (entry present, commit covering it) and what
+the client knows (nothing, or OK after the reply) are recorded as separate facts.
 
 Real-process points exercised (`TestRealCrashAtPoints`: a deposed leader rejoining a live
 3-process group, whose catch-up Saves the new term and the new leader's no-op, sends replies,

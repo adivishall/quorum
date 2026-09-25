@@ -97,7 +97,10 @@ which a message moves only by an explicit event), and the **disk's crash behavio
 `healall`, `crash n2 process`, `crash n2 power 13`, `restart n2`, `pause n4`, `resume n4`,
 `failpersist n1 sync|write|short 5`, `disarm`, `release`, `propose n1 cmd`, `check-converged`,
 and (Phase 11) `crashat n2 after-save 3` / `crashat n1 write 2 power 16` — a crash at an exact
-driver or I/O boundary (`docs/CRASH_RECOVERY.md`).
+driver or I/O boundary (`docs/CRASH_RECOVERY.md`); and (Phase 12, `docs/LINEARIZABILITY.md` §8)
+client operations — `kvput n1 c1 "k0" "v"`, `kvget n2 c3 "k0"`, `kvdel n1 c2 "k1"`,
+`kvtimeout c1` — and `split n1,n2|n3,n4,n5`, a two-sided partition that replaces any earlier one.
+Runs without client events are unaffected (the golden trace hash did not change).
 A message is addressed by its link and its position among the messages in flight on that link,
 so a script stays meaningful when the minimizer deletes events; an event that no longer applies is
 skipped (and traced), never an error.

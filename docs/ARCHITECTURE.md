@@ -1,12 +1,15 @@
 # ARCHITECTURE
 
 Status: **specification.** Every claim here is a *design intent* for the finished system,
-not a description of what exists. As of Phase 10 these parts are real: the storage engine (WAL,
+not a description of what exists. As of Phase 12 these parts are real: the storage engine (WAL,
 memtable, SSTables, Bloom filters, compaction, MANIFEST — Phases 1–5), routing as a library
 (Phase 6), node processes and the TCP transport (Phase 7), the local replicated-log model (Phase
-8), a single Raft group with a durable log and node driver (Phase 9), and fault injection (Phase
-10). The client API, request serving and forwarding, one Raft group per hosted shard, the
-engine-as-state-machine wiring, snapshots and the dashboard are still design.
+8), a single Raft group with a durable log and node driver (Phase 9), fault injection (Phase 10),
+crash-window recovery (Phase 11), and — Phase 12 — a replicated key-value state machine
+(`internal/kv`, in memory), linearizable reads through ReadIndex, write completion at
+commit-and-apply, and a minimal test-facing operation protocol on each node's `-client-listen`
+port. The client API, request forwarding and deduplication, one Raft group per hosted shard, the
+LSM engine as the state machine, snapshots and the dashboard are still design.
 `docs/LIMITATIONS.md` and the per-phase reports record what is actually true of the code at any
 point in time.
 
@@ -141,6 +144,18 @@ through seeded, replayable fault schedules with every safety invariant checked a
 the real driver runs under injected disk and network faults; and real processes are killed,
 frozen and partitioned. `internal/raft` itself gained no fault code — the core stays pure.
 
+As of Phase 12 (`docs/LINEARIZABILITY.md`, ADR-019) the group serves **client operations** end to
+end: `internal/kv` is its state machine (`kv.Store`, the Phase 1 register semantics in memory,
+rebuilt by replay on restart) and its server (`kv.Server`: `PUT`/`DELETE` through
+`raftnode.Node.Write`, which completes only when the entry is committed and applied on this node in
+the proposal's term; `GET` through `raftnode.Node.ReadIndex`, which completes only when a quorum has
+confirmed this leader after the read was registered and the store has applied through the read
+index). The pure core gained ReadIndex (a heartbeat sequence echoed by every AppendEntries
+response) and stays pure. The histories clients observe — from real processes, the in-process
+driver and the simulator — are checked by `internal/lincheck`. The protocol that carries them
+(`kv.Serve`/`kv.Client`, framed TCP on `-client-listen`) is a test boundary, not the client API:
+no HTTP, no request ids, no forwarding, no deduplication.
+
 As of Phase 11 (`docs/CRASH_RECOVERY.md`, ADR-018) the node's **crash windows** are characterised
 and proven: the driver's persist → send → advance → apply cycle exposes named crash points
 (`raftnode.Point`), the durable log's record boundaries are crash points at the `vfs` seam, and the
@@ -264,6 +279,16 @@ as the multi-node demo.
 
 Step 8 is what lets us talk about linearizability. Answering at step 6 would be faster and
 would be a lie about read-your-writes.
+
+**Phase 12 — what is implemented of this path.** Steps 4–8 are real for one group, with the
+in-memory `kv.Store` in place of the engine (step 7) and the `-client-listen` protocol in place of
+HTTP (steps 1–3: a non-leader answers "not leader" with a hint and the client redirects; there is
+no forwarding and no `clientID/seqNo` — Phase 13). Step 8 is precise: the reply is sent only after
+the entry at the proposal's index is applied **with the proposal's term**; a different entry
+applied there means the write was lost (a definite no-effect); a deadline or a dead node means the
+outcome is unknown (`docs/LINEARIZABILITY.md` §3–§4). Reads do not enter the log: the leader
+registers a ReadIndex, confirms leadership with a quorum round begun after the read, and answers
+once applied through the read index (§5 there).
 
 ---
 

@@ -1,34 +1,34 @@
 # CONSISTENCY MODEL
 
-Status: **Phase 10 — the consensus core is verified in simulation and under injected faults; the
-end-to-end model is not.**
-The claims in §2 remain design targets, not yet properties of the running system. This file is
-updated after Phase 12 to say which claims are backed by passing tests and which are not.
+Status: **Phase 12 — client-visible linearizability of single-key operations is verified on
+recorded histories, for one Raft group, with the conditions below.** `docs/LINEARIZABILITY.md` is
+the full statement (object model, write completion, ReadIndex and its safety argument,
+incomplete operations, the checker and how it was validated, every scenario, every mutant).
 
-**Currently verified (Phase 9).** Raft's *safety* properties — election safety, log matching,
-leader completeness, state-machine safety, the §5.4.2 commit rule, and durable term/vote before a
-dependent reply — hold in a deterministic simulation, and durable Raft state survives process kill
-(`docs/RAFT.md`, `docs/INVARIANTS.md` INV-R1..R10). These are the mechanisms §4 relies on
-(single vote per term, current-term commit + no-op, fsync before reply). **Phase 10**
-(`docs/FAULTS.md`) re-verified them under injected drops, duplicates, delays, reordering,
-partitions, crashes, a modeled power loss, restarts and persistence failures — continuously, in a
-seed-replayable simulator — and on the real driver and real processes.
+**What is verified now (Phase 12).** For `PUT`/`GET`/`DELETE` on single keys, served by one Raft
+group through `internal/kv` — a write acknowledged only once committed and applied on the serving
+node in its proposal's term, a read served only through ReadIndex — every client-visible history
+recorded from real `dkvd` processes (concurrent clients; leader and follower SIGKILL and restart;
+partitions and heals; repeated leader changes; a SIGKILL at every point of a write's life), from the
+real driver in-process (message drops, duplicates, reordering), and from 1,400 seeded simulator
+runs under every fault family, is **linearizable**, as decided by a checker validated against an
+independent oracle on 20,000 arbitrary histories. The mechanisms are argued (write completion:
+LINEARIZABILITY §3; ReadIndex: §5.2) and pinned by 26 Phase 12 mutants.
 
-**Phase 11** (`docs/CRASH_RECOVERY.md`) characterised and verified the Raft node's crash windows:
-a crash at every boundary of persistence, message emission, commit, apply and recovery recovers
-exactly the last completed durable state plus a prefix of any interrupted one, never regresses
-term or vote, keeps the committed prefix, and re-applies the committed prefix exactly (INV-CR1..4).
-It confirmed C4 stage one precisely: application is **at-least-once across restarts and
-exactly-once within an incarnation**, because the applied index is volatile and every restart
-replays the recovered committed prefix from index 1; nothing deduplicates.
+That is C1 below **with its condition (d) replaced**: Phase 12 records every retry as its own
+operation (an unknown write is never silently retried), and the guarantee holds for those honest
+histories. It does not hold for a caller that hides a retry of an unknown write inside one
+operation — that is C4 stage two, Phase 13 (LINEARIZABILITY §4.3 shows the exact history).
 
-**Not yet verified.** End-to-end single-key linearizability
-against a real cluster under faults (Phase 12); client retry / dedup semantics (C4 stage two,
-Phase 13); the distributed API and `stale`/`linearizable` read serving including ReadIndex (§8.5,
-Phases 13/15); the crash windows of the storage engine while hosted by a node (the engine is not
-hosted yet); and real power-loss durability (untestable here). The claims C1–C5 below
-are therefore **still design targets**: Raft working is a necessary part of them, not the whole
-proof.
+**Still verified from earlier phases.** Raft's safety properties (INV-R1..R10; Phase 9), under
+injected faults (Phase 10, `docs/FAULTS.md`), and across crashes at every boundary of the node's
+cycle (Phase 11, `docs/CRASH_RECOVERY.md`: application is at-least-once across restarts, exactly-once
+within an incarnation — the applied index is volatile and a restart replays the committed prefix).
+
+**Not yet verified.** Dedup / exactly-once application under retries (C4 stage two, Phase 13);
+more than one Raft group and routed keys (the routing layer is not wired to Raft); the Phase 15 API
+and `stale` reads (C5 — no such mode exists yet); snapshots and membership change (Phase 14+);
+the storage engine hosted by a node; real power-loss durability.
 
 ---
 
@@ -50,8 +50,13 @@ Every `PUT`/`GET`/`DELETE` on key *k* is linearizable, provided:
 - (a) the write was acknowledged to the client (a timeout is *not* a failure — see C4);
 - (b) reads are served in `linearizable` mode (the default), which uses ReadIndex
   (`docs/DESIGN.md` §8.5) — not follower reads;
-- (c) no more than *f* of the shard's 2*f*+1 replicas have failed;
-- (d) the client's retries are deduplicated (see C4).
+- (c) no more than *f* of the shard's 2*f*+1 replicas have failed (for liveness; safety needs no
+  bound);
+- (d) the client's retries are deduplicated (see C4) — **or**, in Phases 12 and before, every retry
+  is recorded as a separate operation (LINEARIZABILITY §4.3).
+
+*Phase 12 status:* verified on recorded histories for one group, with (d) in its Phase 12 form
+(LINEARIZABILITY §7–§8). Only the ReadIndex path exists; there is no `stale` mode yet.
 
 **C2. Composition across keys.**
 Linearizability is a *local* property (Herlihy & Wing, 1990): a history is linearizable iff
@@ -80,7 +85,7 @@ committed. This is unavoidable; it is not a bug. Two stages:
 
 | Stage | Guarantee | Consequence |
 |---|---|---|
-| Phases 9–12 | **at-least-once** application (verified in Phase 11: a restart re-applies the whole recovered committed prefix; exactly-once holds only within one incarnation) | A retried `PUT` may be applied twice. For `PUT`/`DELETE` (idempotent given the same value) the final state is the same, but a retry that lands *after* a newer write from another client will clobber it. C1 does **not** hold under retries in this stage. |
+| Phases 9–12 | **at-least-once** application (verified in Phase 11: a restart re-applies the whole recovered committed prefix; exactly-once holds only within one incarnation) | A retried `PUT` may be applied twice. For `PUT`/`DELETE` (idempotent given the same value) the final state is the same, but a retry that lands *after* a newer write from another client will clobber it. C1 does **not** hold under *hidden* retries in this stage. Phase 12 made this concrete on real processes: an unacknowledged-but-committed `PUT(A)`, a `PUT(B)` by another client, then the retry of `PUT(A)` — linearizable as two operations, rejected by the checker as one (`TestRealIncompleteWriteThenRetry`). The Phase 12 test client therefore never retries an unknown write. |
 | Phase 13 onward | **exactly-once application** per `(clientID, seqNo)` | The state machine keeps a dedup table. A duplicate proposal is recognized at apply time and returns the original result without re-applying. C1 holds under retries. |
 
 Note the phrase: exactly-once **application**, not exactly-once delivery. Messages are still
@@ -124,7 +129,9 @@ The failure modes we are specifically defending against and testing:
 2. **Stale leader serving reads.** A partitioned leader that has not noticed. Prevented by the
    ReadIndex quorum round. This is the classic bug in naive Raft implementations that serve
    reads locally on the leader; if we skipped step 2 of §8.5 the system would be fast and
-   wrong.
+   wrong. *Phase 12:* attacked on real processes (`TestRealStaleLeaderNeverServesARead`: the
+   read times out, never returns), with delayed pre-read acknowledgements in the simulator
+   (`TestKVStaleLeaderReadIsNeverServed`), and by mutants 36, 37 and 43, each killed.
 3. **Committing an entry from a previous term by counting replicas.** Raft §5.4.2's figure-8
    scenario. Prevented by: a leader only advances `commitIndex` for entries in its **own**
    term, and appends a no-op on election so that it can.
@@ -133,7 +140,8 @@ The failure modes we are specifically defending against and testing:
 5. **Losing a committed entry on restart.** Prevented by fsync of log + HardState before the
    AppendEntries reply. This is the one most likely to be silently broken by an optimization,
    which is why the crash tests kill with SIGKILL rather than a graceful shutdown.
-6. **Duplicate application under retry.** C4 / Phase 13.
+6. **Duplicate application under retry.** C4 / Phase 13. *Phase 12:* made visible, not fixed
+   (LINEARIZABILITY §4.3).
 7. **Divergent replicas after compaction.** Different replicas compacting at different times
    must still expose identical logical state. Tested by comparing full key-space dumps across
    replicas after chaos.
@@ -157,6 +165,13 @@ single green light.
 ---
 
 ## 6. How the claims get verified (Phase 12)
+
+*Phase 12 status:* items 1–5 below are done; LINEARIZABILITY §6–§9 says exactly how, and §12 there
+lists what remains untested. Item 3 is implemented as `internal/lincheck` (validated against an
+independent oracle before being trusted) over histories from real processes, the real driver and
+the simulator; item 4 is the sequential baseline diffed against the model op by op, the store
+diffed against the model over the committed log (INV-X8), and the store against the Phase 2
+storage contract.
 
 A claim with no test behind it is a comment. The plan:
 

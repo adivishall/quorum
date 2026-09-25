@@ -11,6 +11,16 @@ Algorithm", against the repository-specific contract in `docs/DESIGN.md` §8.
 > request forwarding (Phases 13/15), linearizable-read serving / ReadIndex (later), snapshots
 > (Phase 14), or dynamic membership (never, in v1 — ADR-005). Raft working is not the finished
 > Quorum consistency model.
+>
+> **Phase 12 update (ADR-019, `docs/LINEARIZABILITY.md`).** The core gained **ReadIndex**
+> (`Raft.ReadIndex`, `Ready.ReadStates`): every AppendEntries carries a heartbeat sequence
+> `Message.Seq` that every response echoes; a read registered by a leader at
+> `max(commitIndex, own no-op index)` is confirmed once a quorum has answered a request sent after
+> it, and dropped on any role change. The driver completes a client write only when its entry is
+> applied in its proposal's term (`raftnode.Node.Write`, `Waiters`; otherwise `ErrLost`) and a
+> read only once the store has applied through its confirmed read index (`Node.ReadIndex`,
+> `Reads`). The core is still pure. End-to-end linearizability of client histories is verified
+> there, with its bounds.
 
 ---
 
@@ -293,7 +303,9 @@ catch).
 
 Phase 10 adds 14 mutants for its failure-handling rules and for the fault harness's own fidelity
 (`docs/FAULTS.md` §12), plus 2 for the transport's dead-connection handling; Phase 11 adds 9 for
-its crash-recovery rules (`docs/CRASH_RECOVERY.md` §11); `make mutation` runs all 33.
+its crash-recovery rules (`docs/CRASH_RECOVERY.md` §11); Phase 12 adds 26 for ReadIndex, write
+completion, the client protocol and policy, the state machine and the checker
+(`docs/LINEARIZABILITY.md` §11); `make mutation` runs all 59.
 
 ## 13. Multi-Raft and membership
 

@@ -354,11 +354,35 @@ consistency guarantee — Phase 8 adds no such claim anywhere.
 | INV-P8 | `appliedIndex` never exceeds `commitIndex`: applying an uncommitted index is rejected. | `TestApplyInitialAndMonotonic`, `TestCommittedRangeEnumeration`, `TestAgainstReferenceModel` (asserted after every step), `FuzzLogOperations` | VERIFIED |
 | INV-P9 | No entry is applied twice through the interface: application is a watermark, so a re-issued apply applies nothing and a state machine driven from `Unapplied` sees each index exactly once. | `TestNoDoubleApplication`, `TestCommittedRangeEnumeration` | VERIFIED |
 
-## Client semantics
+## Client semantics (Phase 12: linearizability; Phase 13: dedup; Phase 15: API)
+
+Phase 12 rows are enforced by `internal/raft` (ReadIndex), `internal/raftnode` (write and read
+completion), `internal/kv` (state machine, server, wire protocol) and `cmd/dkvd`; checked by
+`internal/lincheck` over histories from real processes (`tests/integration`), the real driver
+(`internal/kv`) and the simulator (`internal/raftsim`), where INV-X5..X8 are also checked directly
+at every completion; specified in `docs/LINEARIZABILITY.md` and introduced by ADR-019. "Verified"
+here means: every recorded history satisfied it and the mechanism's mutants are killed — a finite,
+bounded result, not a proof over all executions (LINEARIZABILITY §12).
 
 | ID | Invariant | Checked by | Status |
 |---|---|---|---|
-| INV-X1 | A write acknowledged to a client is readable by a subsequent linearizable read from *any* client. | Phase 12 linearizability checker | PLANNED |
-| INV-X2 | A duplicate request with the same `(clientID, seqNo)` is applied at most once. | Phase 13 dedup tests | PLANNED |
-| INV-X3 | A read in `linearizable` mode never returns a value older than any completed write that preceded the read's invocation in real time. | Phase 12 linearizability checker | PLANNED |
-| INV-X4 | A read in `stale` mode is never *presented* as linearizable — the API response carries the mode it was served under. | Phase 15 API test | PLANNED |
+| INV-X1 | A write acknowledged to a client is readable by a subsequent linearizable read from *any* client. | `lincheck` on every recorded history; explicitly: `TestRealCompletedWriteIsSeenByEveryLaterRead` (every node contacted first), `TestRealReadsAcrossLeaderChanges`, `TestRealWriteCrashWindows` (a committed write stays visible across the leader's SIGKILL, acknowledged or not); simulator: INV-X5 + INV-X7; mutants 40, 41, 43, 44 | VERIFIED (recorded histories; one Raft group) |
+| INV-X2 | A duplicate request with the same `(clientID, seqNo)` is applied at most once. | Phase 13 dedup tests. Phase 12 records the gap: `TestRealIncompleteWriteThenRetry` (a retried write IS applied twice; honest recording is linearizable, collapsed recording is not) | PLANNED |
+| INV-X3 | A read in `linearizable` mode never returns a value older than any completed write that preceded the read's invocation in real time. (The only read mode that exists.) | `lincheck` on every recorded history; `TestRealStaleLeaderNeverServesARead`, `TestRealMinorityLeaderWithAFollowerNeverServesARead` (five real processes), `TestKVStaleLeaderReadIsNeverServed`, `TestKVMinorityLeaderWithAFollowerNeverServesARead`, `TestKVNewLeaderReadWaitsForItsNoop`; INV-X7; the ReadIndex argument (LINEARIZABILITY §5.2); mutants 34–39, 42, 43, 54–57, 59 | VERIFIED (recorded histories; one Raft group) |
+| INV-X4 | A read in `stale` mode is never *presented* as linearizable — the API response carries the mode it was served under. | Phase 15 API test (no `stale` mode exists yet) | PLANNED |
+| INV-X5 | **Acknowledged means committed.** A write reported OK at (index *i*, term *t*) is the entry committed at *i*: its term is *t* and its bytes are the command proposed. | `internal/raftsim`: checked at the completion instant of every simulated write (`kvPoll`); `TestWaitersCompleteWritesOnlyInTheirTerm`, `TestKVWriteIsNotAcknowledgedBeforeCommit`; mutants 40, 41 | VERIFIED (simulation; driver unit) |
+| INV-X6 | **Lost means no effect.** A write reported lost (`ErrLost`) is not committed at its index — a different entry is. | `internal/raftsim`: checked at every lost completion; `TestKVWriteIsNotAcknowledgedBeforeCommit`; `TestWaitersCompleteWritesOnlyInTheirTerm` | VERIFIED (simulation; driver unit) |
+| INV-X7 | **ReadIndex freshness.** A read is served at a read index — and from a state machine applied through at least — the highest index committed **anywhere** in the cluster when the read was registered. | `internal/raftsim`: checked at every read completion across 1,400 seeded runs and the scripted attacks (it is what catches the no-quorum mutant in the seeded `kv-splits` runs); `TestAcksFromBeforeTheReadDoNotConfirmIt`, `TestNewLeaderReadIndexIsAtLeastItsNoop`, `TestIsolatedLeaderNeverConfirmsARead`; mutants 35–37, 42, 55 | VERIFIED (simulation; core unit) |
+| INV-X8 | **The state machine is the specification.** After convergence, every node's `kv.Store` equals the `lincheck` register model folded over the committed log (empty value present; delete idempotent). | `internal/raftsim`: `checkStores` after every seeded client run; `internal/kv`: `TestStoreMatchesTheStorageContract`, `TestStoreMatchesTheReferenceModel`; mutants 45, 46 | VERIFIED |
+| INV-X9 | **Unknown is never reported as known.** A request whose response was not received — deadline, dead connection, stopped node — is recorded `Incomplete`, never OK and never Rejected; an unknown write is never retried under the same operation; a timed-out connection is never reused, so a late response cannot answer a newer request. | `TestClientPolicy`, `TestWireClientNeverMatchesALateResponseToANewRequest`, `TestWireClientReportsUnknownWhenTheConnectionDies`, `TestRealWriteCrashWindows` (the client of a SIGKILLed leader hears nothing); mutants 47, 48 | VERIFIED |
+| INV-X10 | **The checker is right about the histories it judges.** It agrees with an independent oracle (no shared code, whole multi-key history) and with exhaustive enumeration; accepts every known-good and rejects every known-bad corpus history; and never reports a budget overrun as a verdict. | `internal/lincheck`: `TestCheckerAgreesWithIndependentOracle` (20,000 arbitrary histories), `FuzzCheckerMatchesOracle`, `TestCheckerAgreesWithBruteForce`, `TestKnownGoodAndKnownBadCorpus`, `TestBudgetReportsUncheckedNotLinearizable`; mutants 49–53 | VERIFIED (bounded: ≤ 7 ops × ≤ 2 keys exhaustively, larger by construction and fuzzing) |
+
+### Note on the X series and what it does not cover
+
+"Verified" for INV-X1/X3 is a statement about recorded, finite histories from one Raft group of
+three nodes — real processes, the real driver, and seeded simulations — plus an argument
+(LINEARIZABILITY §3, §5.2) whose assumptions are named. It is not a proof over every execution,
+and it does not cover routed multi-group deployments, snapshots, membership change, or hidden
+retries (INV-X2, Phase 13). INV-X5..X8 are implementation invariants checked at the instant they
+must hold in the simulator, independently of the history checker, so a checker bug could not hide
+a violation of them.

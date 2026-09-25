@@ -60,9 +60,10 @@ jobs:
       # Phase 10: every chaos profile over 200 seeds each (including Phase 11's
       # crashpoints profile), in the deterministic simulator, plus the
       # reproducibility checks — including the pinned trace hash, which must match
-      # the one recorded on another OS/architecture — and the Phase 11 crash
-      # matrix. Any failure prints its seed, the exact reproduction command, and a
-      # minimized script (or the exact crashat event).
+      # the one recorded on another OS/architecture — the Phase 11 crash
+      # matrix, and the Phase 12 client workloads (every history checked for
+      # linearizability). Any failure prints its seed, the exact reproduction
+      # command, and a minimized script (or the exact crashat event).
       - name: deterministic fault schedules (200 seeds per profile) and the crash matrix
         run: make faults FAULT_SEEDS=200
 
@@ -77,8 +78,9 @@ jobs:
           check-latest: true
 
       # Every rule-violating edit (Phase 9 protocol rules, Phase 10 failure
-      # handling and fault-model fidelity, Phase 11 crash-recovery rules) must be
-      # caught by the tests named for it; a surviving mutant fails the build.
+      # handling and fault-model fidelity, Phase 11 crash-recovery rules, Phase 12
+      # ReadIndex / completion / client / checker rules) must be caught by the
+      # tests named for it; a surviving mutant fails the build.
       - name: mutation testing
         run: make mutation
 

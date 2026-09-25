@@ -336,6 +336,13 @@ Consensus Algorithm"), sections 5.1–5.4 plus §7 snapshots.
 > processes (`dkvd -crash-at`) — and every recovery is checked (INV-F2, INV-CR1..4). Within one
 > Save a changed term or vote is written **before** the entries and the new commit **after** them
 > (`raftlog.SavePlan`), so a crash between any two records leaves a log recovery accepts.
+>
+> **Phase 12 update (ADR-019, docs/LINEARIZABILITY.md).** §8.5's ReadIndex is **implemented** in
+> the pure core as specified below, with the confirmation made precise (a heartbeat sequence that
+> every AppendEntries response echoes; only acknowledgements of a request sent after the read was
+> registered count) and the read index raised to the leader's own no-op. Writes complete to the
+> client only when committed and applied in their proposal's term (`raftnode.Node.Write`). The
+> client-visible histories are checked for linearizability.
 
 ### 8.1 Persistent state (fsynced before any RPC reply that depends on it)
 
@@ -385,10 +392,20 @@ round trips.
 
 A linearizable read does **not** go through the log. It does this:
 
-1. Leader records `readIndex = commitIndex`.
-2. Leader confirms it is still leader by exchanging heartbeats with a **quorum**.
+1. Leader records `readIndex = max(commitIndex, index of its own election no-op)`. *(Phase 12:
+   the no-op term is required — a new leader's `commitIndex` can lag entries its predecessor
+   committed until its own no-op commits, and every earlier entry is committed then.)*
+2. Leader confirms it is still leader by exchanging heartbeats with a **quorum**. *(Phase 12: the
+   heartbeat carries a sequence number `Seq`, incremented per broadcast; every AppendEntries
+   response — success or rejection — echoes it; the read is confirmed only when a quorum,
+   the leader included, has echoed a sequence at least that of the broadcast sent when the read
+   was registered. An acknowledgement of an earlier heartbeat proves leadership only up to when it
+   was sent and does not count. A leader that steps down drops every unconfirmed read.)*
 3. Leader waits until `appliedIndex >= readIndex`.
 4. Read from the state machine.
+
+The safety argument, the attacks it survives and the tests and mutants that pin each step are in
+`docs/LINEARIZABILITY.md` §5.
 
 Step 2 is required because a partitioned old leader still believes it is leader. We do **not**
 implement lease-based reads, which would let us skip step 2 at the cost of assuming bounded
