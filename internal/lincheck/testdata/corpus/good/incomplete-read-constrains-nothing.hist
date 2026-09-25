@@ -1,0 +1,5 @@
+# A read that never got an answer carries no observation and no constraint.
+1 c1 put "k" 1 2 ok value="A"
+2 c2 get "k" 3 0 incomplete
+3 c1 put "k" 4 5 ok value="B"
+4 c3 get "k" 6 7 ok output="B"

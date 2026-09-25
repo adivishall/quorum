@@ -1,0 +1,7 @@
+# An unanswered write may take effect at ANY time after its invocation — even
+# after a later write completed and was read. (In Raft this is a proposal that
+# sat in a deposed leader's log; see docs/LINEARIZABILITY.md §4.)
+1 c1 put "k" 1 0 incomplete value="A"
+2 c2 put "k" 2 3 ok value="B"
+3 c3 get "k" 4 5 ok output="B"
+4 c3 get "k" 6 7 ok output="A"

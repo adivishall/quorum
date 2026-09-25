@@ -1,0 +1,9 @@
+# Two concurrent writes, observed in opposite orders by two clients whose reads
+# are ordered in real time: c3 sees A then B, c4 sees B then A. Each write
+# happens once, so no single order explains both observers.
+1 c1 put "k" 1 100 ok value="A"
+2 c2 put "k" 2 101 ok value="B"
+3 c3 get "k" 10 20 ok output="A"
+4 c4 get "k" 15 25 ok output="B"
+5 c3 get "k" 30 40 ok output="B"
+6 c4 get "k" 35 45 ok output="A"

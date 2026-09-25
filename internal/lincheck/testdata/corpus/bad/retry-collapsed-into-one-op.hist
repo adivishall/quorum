@@ -1,0 +1,10 @@
+# The honest retry history (good/retry-recorded-honestly.hist) with the two
+# attempts collapsed into ONE logical put — what a client library that hid
+# its retries would report. A single put of A cannot be both before op 2 and
+# after op 4. Without deduplication (Phase 13) a client must not present an
+# unknown-then-retried write as one operation.
+1 c1 put "k" 1 9 ok value="A"
+2 c3 get "k" 2 3 ok output="A"
+3 c2 put "k" 4 5 ok value="B"
+4 c3 get "k" 6 7 ok output="B"
+6 c3 get "k" 10 11 ok output="A"

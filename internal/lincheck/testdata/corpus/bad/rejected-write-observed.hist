@@ -1,0 +1,4 @@
+# The server said the write definitely had no effect (lost / not leader); a
+# read that returns its unique value proves the claim false.
+1 c1 put "k" 1 2 rejected value="A"
+2 c2 get "k" 3 4 ok output="A"

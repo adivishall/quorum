@@ -1,0 +1,5 @@
+# The Phase 1 contract: an empty value is a present key, distinct from absence.
+1 c1 put "k" 1 2 ok value=""
+2 c2 get "k" 3 4 ok output=""
+3 c1 delete "k" 5 6 ok
+4 c2 get "k" 7 8 notfound

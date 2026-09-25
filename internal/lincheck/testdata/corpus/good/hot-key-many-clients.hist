@@ -1,0 +1,14 @@
+# Eight clients on one key, heavily overlapping writes and reads, one
+# unanswered write and one rejected write. Each read is explained by one
+# global order of the writes.
+1 c1 put "k" 1 6 ok value="v1"
+2 c2 put "k" 2 9 ok value="v2"
+3 c3 get "k" 3 7 ok output="v1"
+4 c4 put "k" 4 0 incomplete value="v4"
+5 c5 get "k" 5 10 ok output="v2"
+6 c6 put "k" 8 12 rejected value="v6"
+7 c7 delete "k" 11 14 ok
+8 c8 get "k" 13 15 notfound
+9 c1 put "k" 16 18 ok value="v9"
+10 c3 get "k" 17 19 ok output="v9"
+11 c5 get "k" 20 21 ok output="v4"

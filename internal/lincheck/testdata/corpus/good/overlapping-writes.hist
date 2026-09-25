@@ -1,0 +1,6 @@
+# Scenario C: two concurrent writes to one key; either may win. The reads after
+# both completed agree that Y was last, so X linearizes first.
+1 c1 put "k" 1 5 ok value="X"
+2 c2 put "k" 2 6 ok value="Y"
+3 c3 get "k" 7 8 ok output="Y"
+4 c1 get "k" 9 10 ok output="Y"

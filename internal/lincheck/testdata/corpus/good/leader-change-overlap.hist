@@ -1,0 +1,8 @@
+# Operations served by different leaders across a term change (node/term are
+# metadata, never used by the checker): a read on the new leader that overlaps
+# a write still in flight on the old one may or may not see it.
+1 c1 put "k" 1 2 ok value="A" node=n1 term=2 index=5
+2 c2 put "k" 3 0 incomplete value="B"
+3 c3 get "k" 4 5 ok output="A" node=n2 term=3 index=7
+4 c1 put "k" 6 7 ok value="C" node=n2 term=3 index=8
+5 c3 get "k" 8 9 ok output="C" node=n2 term=3 index=8

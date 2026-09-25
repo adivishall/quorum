@@ -1,0 +1,4 @@
+# An acknowledged write that vanishes: nothing deletes k, yet a read after the
+# put completed finds it absent (a lost acknowledged write).
+1 c1 put "k" 1 2 ok value="A"
+2 c2 get "k" 3 4 notfound

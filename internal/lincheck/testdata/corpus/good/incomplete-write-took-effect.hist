@@ -1,0 +1,5 @@
+# A write that never got a response (timeout, dead leader) MAY have taken
+# effect: here a later read observes it, so it did.
+1 c1 put "k" 1 2 ok value="A"
+2 c2 put "k" 3 0 incomplete value="B"
+3 c3 get "k" 4 5 ok output="B"

@@ -1,0 +1,8 @@
+# Every op overlaps the long write and delete, but the reads are sequential:
+# absent, A, absent, A would need A written twice.
+1 c1 put "k" 1 20 ok value="A"
+2 c2 delete "k" 2 21 ok
+3 c3 get "k" 3 4 notfound
+4 c3 get "k" 5 6 ok output="A"
+5 c3 get "k" 7 8 notfound
+6 c3 get "k" 9 10 ok output="A"

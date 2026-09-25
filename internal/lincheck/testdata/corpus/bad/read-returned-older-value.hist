@@ -1,0 +1,6 @@
+# Reads going backwards: a later read (invoked after an earlier read returned
+# B) returns the older A. No order of the two writes explains both.
+1 c1 put "k" 1 2 ok value="A"
+2 c1 put "k" 3 4 ok value="B"
+3 c2 get "k" 5 6 ok output="B"
+4 c2 get "k" 7 8 ok output="A"

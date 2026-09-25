@@ -1,0 +1,7 @@
+# The stale-leader read ReadIndex exists to prevent: n1 was deposed (n2 leads
+# term 3 and completed B), but n1 still believes it leads term 2 and serves a
+# read from its local state machine. The history exposes it regardless of the
+# node metadata, which the checker never uses.
+1 c1 put "k" 1 2 ok value="A" node=n1 term=2 index=4
+2 c2 put "k" 3 4 ok value="B" node=n2 term=3 index=6
+3 c3 get "k" 5 6 ok output="A" node=n1 term=2 index=4

@@ -1,0 +1,4 @@
+# The read returned a value whose only write was invoked after the read had
+# already completed: the read saw the future.
+1 c1 get "k" 1 2 ok output="A"
+2 c2 put "k" 3 4 ok value="A"

@@ -1,0 +1,5 @@
+# Scenario D: ...or after it, returning the new value, even though the write
+# has not completed yet when the read does.
+1 c1 put "k" 1 2 ok value="old"
+2 c1 put "k" 3 8 ok value="new"
+3 c2 get "k" 4 6 ok output="new"

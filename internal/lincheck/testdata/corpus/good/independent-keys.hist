@@ -1,0 +1,11 @@
+# Scenario B: concurrent clients on different keys. The object is the whole
+# key space; locality lets each key be checked on its own, and here every key
+# is a simple sequential story even though the ops overlap across keys.
+1 c1 put "a" 1 5 ok value="A1"
+2 c2 put "b" 2 6 ok value="B1"
+3 c1 get "a" 7 9 ok output="A1"
+4 c2 get "b" 8 10 ok output="B1"
+5 c3 delete "b" 11 14 ok
+6 c1 put "a" 12 13 ok value="A2"
+7 c2 get "b" 15 16 notfound
+8 c3 get "a" 17 18 ok output="A2"

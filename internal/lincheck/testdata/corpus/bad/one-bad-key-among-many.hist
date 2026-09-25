@@ -1,0 +1,8 @@
+# Locality: key "a" is fine, key "b" has a stale read. The history as a whole
+# is not linearizable, and the checker must name key "b".
+1 c1 put "a" 1 2 ok value="A1"
+2 c2 put "b" 3 4 ok value="B1"
+3 c1 get "a" 5 6 ok output="A1"
+4 c2 put "b" 7 8 ok value="B2"
+5 c3 get "b" 9 10 ok output="B1"
+6 c3 get "a" 11 12 ok output="A1"

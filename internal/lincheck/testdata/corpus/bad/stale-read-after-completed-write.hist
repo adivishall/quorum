@@ -1,0 +1,5 @@
+# Scenario F: B completed before the read was invoked, so the read must see B
+# (or something later). Returning A is a stale read.
+1 c1 put "k" 1 2 ok value="A"
+2 c1 put "k" 3 4 ok value="B"
+3 c2 get "k" 5 6 ok output="A"

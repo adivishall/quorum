@@ -1,0 +1,5 @@
+# Scenario D: a read that overlaps a write may linearize before it and return
+# the previous value.
+1 c1 put "k" 1 2 ok value="old"
+2 c1 put "k" 3 8 ok value="new"
+3 c2 get "k" 4 6 ok output="old"

@@ -1,0 +1,14 @@
+# A write with no response followed by a client RETRY of the same write, each
+# attempt recorded as its own operation (the Phase 12 contract: retries are
+# never hidden, and there is no deduplication until Phase 13). The first
+# attempt took effect (op 2 reads it) and the retry took effect again after
+# another client's write (op 6 reads it) — a double application. Recorded
+# honestly this is linearizable: op 1 before op 2, op 5 after op 4. Collapsing
+# ops 1 and 5 into ONE logical put is NOT linearizable — see
+# bad/retry-collapsed-into-one-op.hist; that is exactly what Phase 13 changes.
+1 c1 put "k" 1 0 incomplete value="A"
+2 c3 get "k" 2 3 ok output="A"
+3 c2 put "k" 4 5 ok value="B"
+4 c3 get "k" 6 7 ok output="B"
+5 c1 put "k" 8 9 ok value="A"
+6 c3 get "k" 10 11 ok output="A"

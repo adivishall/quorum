@@ -480,6 +480,33 @@ func (r *Recorder) Position() int64 {
 	return r.seq
 }
 
+// Op returns the operation with this id as recorded so far (an op that has not
+// ended is Incomplete), and whether it exists.
+func (r *Recorder) Op(id int) (Op, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if op, ok := r.ops[id]; ok {
+		cp := *op
+		cp.Outcome, cp.Complete = Incomplete, 0
+		return cp, true
+	}
+	for _, op := range r.done {
+		if op.ID == id {
+			return op, true
+		}
+	}
+	return Op{}, false
+}
+
+// Ended returns how many operations have ended (with any outcome). A test
+// synchronizes on it — "inject the fault once N more operations have
+// completed" — instead of sleeping for a guessed duration.
+func (r *Recorder) Ended() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.done)
+}
+
 // Mark advances the clock by one and returns the new position, so an external
 // event (a fault) can be placed in the history's real-time order.
 func (r *Recorder) Mark() int64 {

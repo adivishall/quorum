@@ -1,0 +1,7 @@
+# The same value written twice by different operations: a read of "A" after
+# the second write is explained by it, not by the first.
+1 c1 put "k" 1 2 ok value="A"
+2 c2 put "k" 3 4 ok value="B"
+3 c3 get "k" 5 6 ok output="B"
+4 c1 put "k" 7 8 ok value="A"
+5 c3 get "k" 9 10 ok output="A"

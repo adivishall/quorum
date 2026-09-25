@@ -1,0 +1,4 @@
+# A delete completed; a read invoked afterwards still returns the deleted value.
+1 c1 put "k" 1 2 ok value="A"
+2 c1 delete "k" 3 4 ok
+3 c2 get "k" 5 6 ok output="A"
