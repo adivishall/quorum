@@ -42,6 +42,7 @@ type rcluster struct {
 	bin     string
 	ids     []string
 	addrs   map[string]string
+	kvAddrs map[string]string // each node's Phase 12 client port (-client-listen)
 	dirs    map[string]string
 	proxies map[[2]string]*tcpProxy // keyed by (dialer, accepter), dialer < accepter
 	procs   map[string]*dkvNode     // the current process of each node (nil = not running)
@@ -50,8 +51,15 @@ type rcluster struct {
 
 func newRCluster(t *testing.T, n int) *rcluster {
 	t.Helper()
+	return newRClusterArgs(t, n)
+}
+
+// newRClusterArgs is newRCluster with extra dkvd flags on every node's FIRST
+// start (restarts through start use the plain flags).
+func newRClusterArgs(t *testing.T, n int, extra ...string) *rcluster {
+	t.Helper()
 	c := &rcluster{
-		t: t, bin: buildDkvd(t), addrs: map[string]string{}, dirs: map[string]string{},
+		t: t, bin: buildDkvd(t), addrs: map[string]string{}, kvAddrs: map[string]string{}, dirs: map[string]string{},
 		proxies: map[[2]string]*tcpProxy{}, procs: map[string]*dkvNode{},
 	}
 	root := t.TempDir()
@@ -59,6 +67,7 @@ func newRCluster(t *testing.T, n int) *rcluster {
 		id := fmt.Sprintf("n%d", i)
 		c.ids = append(c.ids, id)
 		c.addrs[id] = freeTCPAddr(t)
+		c.kvAddrs[id] = freeTCPAddr(t)
 		c.dirs[id] = filepath.Join(root, id)
 	}
 	for i, a := range c.ids {
@@ -67,7 +76,7 @@ func newRCluster(t *testing.T, n int) *rcluster {
 		}
 	}
 	for _, id := range c.ids {
-		c.start(id)
+		c.startWith(id, extra...)
 	}
 	t.Cleanup(c.killAll)
 	return c
@@ -78,26 +87,7 @@ func newRCluster(t *testing.T, n int) *rcluster {
 // their entry is only a placeholder the transport validates and never dials.
 func (c *rcluster) start(id string) {
 	c.t.Helper()
-	var peers []string
-	for _, other := range c.ids {
-		switch {
-		case other == id:
-		case id < other:
-			peers = append(peers, other+"="+c.proxies[[2]string{id, other}].Addr())
-		default:
-			peers = append(peers, other+"="+c.addrs[other])
-		}
-	}
-	buf := &safeBuf{}
-	cmd := exec.Command(c.bin, "-id", id, "-listen", c.addrs[id], "-peers", strings.Join(peers, ","),
-		"-raft", "-data-dir", c.dirs[id], "-tick-interval", "25ms")
-	cmd.Stdout, cmd.Stderr = buf, buf
-	if err := cmd.Start(); err != nil {
-		c.t.Fatalf("start %s: %v", id, err)
-	}
-	p := &dkvNode{id: id, addr: c.addrs[id], cmd: cmd, out: buf}
-	c.procs[id] = p
-	c.history = append(c.history, p)
+	c.startWith(id)
 }
 
 // kill SIGKILLs a node and reaps it: no shutdown path runs.
