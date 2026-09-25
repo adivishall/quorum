@@ -89,12 +89,15 @@ var ErrApply = errors.New("raftnode: state machine apply failed")
 // failed and never drive core again (INV-F1). This is the single implementation of
 // the ordering, shared by the node's actor loop and the deterministic simulator.
 func DrainReady(core *raft.Raft, st Storage, send func(raft.Message)) error {
-	return DrainReadyAt(core, st, send, nil)
+	return DrainReadyAt(core, st, send, nil, nil)
 }
 
-// DrainReadyAt is DrainReady with crash points: at observes each boundary of
-// every cycle and may abort there (see Hook). A nil at is DrainReady.
-func DrainReadyAt(core *raft.Raft, st Storage, send func(raft.Message), at Hook) error {
+// DrainReadyAt is DrainReady with crash points and confirmed reads: at observes
+// each boundary of every cycle and may abort there (see Hook); reads, if
+// non-nil, receives each ReadIndex request the core confirmed in this Ready
+// (Phase 12) — after the Ready's persistence, before its messages; a confirmed
+// read depends on nothing being persisted. A nil at and nil reads is DrainReady.
+func DrainReadyAt(core *raft.Raft, st Storage, send func(raft.Message), reads func(raft.ReadState), at Hook) error {
 	for core.HasReady() {
 		rd := core.Ready()
 		var hs *raftlog.HardState
@@ -110,6 +113,11 @@ func DrainReadyAt(core *raft.Raft, st Storage, send func(raft.Message), at Hook)
 			}
 			if err := at.hit(AfterSave, 0); err != nil {
 				return err
+			}
+		}
+		if reads != nil {
+			for _, rs := range rd.ReadStates {
+				reads(rs)
 			}
 		}
 		for i, m := range rd.Messages {
@@ -132,10 +140,13 @@ func DrainReadyAt(core *raft.Raft, st Storage, send func(raft.Message), at Hook)
 // ApplyCommitted feeds the committed-but-unapplied entries to sm in index order,
 // recording each through AppliedTo only after its Apply returned nil (so an apply
 // failure never advances appliedIndex — INV-R7's driver half). A nil sm applies
-// nothing but still advances. It returns a state-machine failure wrapped in
-// ErrApply (the remaining entries are left unapplied for the next cycle), or a
-// hook's abort as-is. It is shared by the node's actor loop and the simulator.
-func ApplyCommitted(core *raft.Raft, sm StateMachine, at Hook) error {
+// nothing but still advances. applied, if non-nil, is told of each entry AFTER it
+// has been applied and recorded (Phase 12: this is where a client's write or read
+// barrier completes — never before the application it reports). It returns a
+// state-machine failure wrapped in ErrApply (the remaining entries are left
+// unapplied for the next cycle), or a hook's abort as-is. It is shared by the
+// node's actor loop and the simulator.
+func ApplyCommitted(core *raft.Raft, sm StateMachine, at Hook, applied func(raft.Entry)) error {
 	for _, e := range core.NextApply() {
 		if err := at.hit(BeforeApply, e.Index); err != nil {
 			return err
@@ -153,6 +164,9 @@ func ApplyCommitted(core *raft.Raft, sm StateMachine, at Hook) error {
 		}
 		if err := at.hit(AfterAppliedTo, e.Index); err != nil {
 			return err
+		}
+		if applied != nil {
+			applied(e)
 		}
 	}
 	return nil

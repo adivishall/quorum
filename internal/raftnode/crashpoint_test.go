@@ -76,11 +76,11 @@ func drive(core *raft.Raft, at func(p Point, arg uint64) error) (events []string
 		return at(p, arg)
 	}
 	send := func(m raft.Message) { events = append(events, "send:"+m.Type.String()+">"+string(m.To)) }
-	err = DrainReadyAt(core, storageTap{st, func() { events = append(events, st.saves[len(st.saves)-1]) }}, send, hook)
+	err = DrainReadyAt(core, storageTap{st, func() { events = append(events, st.saves[len(st.saves)-1]) }}, send, nil, hook)
 	if err != nil {
 		return events, err
 	}
-	err = ApplyCommitted(core, smTap{sm, func(i uint64) { events = append(events, fmt.Sprintf("apply:%d", i)) }}, hook)
+	err = ApplyCommitted(core, smTap{sm, func(i uint64) { events = append(events, fmt.Sprintf("apply:%d", i)) }}, hook, nil)
 	return events, err
 }
 
@@ -219,7 +219,7 @@ func TestApplyFailureIsWrappedAndLeavesTheRestPending(t *testing.T) {
 	}
 	failAt := uint64(2)
 	sm := failingSM{at: failAt}
-	err := ApplyCommitted(core, sm, nil)
+	err := ApplyCommitted(core, sm, nil, nil)
 	if !errors.Is(err, ErrApply) {
 		t.Fatalf("apply failure returned %v, want ErrApply", err)
 	}

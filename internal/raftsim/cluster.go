@@ -625,7 +625,7 @@ func (c *Cluster) deliver(f *flight) *node {
 // fail-stops the node exactly as the real driver does, then it applies committed
 // entries.
 func (c *Cluster) drain(n *node) {
-	err := raftnode.DrainReadyAt(n.core, n.shadow, func(m raft.Message) { c.send(n, m) }, c.hook(n))
+	err := raftnode.DrainReadyAt(n.core, n.shadow, func(m raft.Message) { c.send(n, m) }, nil, c.hook(n))
 	if err != nil {
 		if n.fired != nil {
 			c.crashFired(n)
@@ -653,7 +653,7 @@ func (c *Cluster) send(n *node, m raft.Message) {
 // points in effect.
 func (c *Cluster) apply(n *node) {
 	sm := &simSM{c: c, n: n}
-	err := raftnode.ApplyCommitted(n.core, sm, c.hook(n))
+	err := raftnode.ApplyCommitted(n.core, sm, c.hook(n), nil)
 	if sm.last > 0 {
 		c.trace.add(c.step, "apply %s %d..%d", n.id, sm.first, sm.last)
 	}

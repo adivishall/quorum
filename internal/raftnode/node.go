@@ -172,7 +172,11 @@ type Node struct {
 
 	recvCh    chan raft.Message
 	proposeCh chan proposal
+	writeCh   chan writeReq
+	readCh    chan readReq
 	outboxes  map[NodeID]chan raft.Message
+	waiters   *Waiters // requests waiting for an apply (actor-owned)
+	reads     *Reads   // unconfirmed ReadIndex requests (actor-owned)
 
 	mu     sync.Mutex
 	status Status
@@ -182,6 +186,30 @@ type Node struct {
 type proposal struct {
 	data   []byte
 	result chan error
+}
+
+// writeReq is a Write: the actor answers with the entry's index and term and the
+// channel its apply Outcome will arrive on, or an error.
+type writeReq struct {
+	data   []byte
+	result chan writeAccepted
+}
+
+type writeAccepted struct {
+	index, term uint64
+	done        <-chan Outcome
+	err         error
+}
+
+// readReq is a ReadIndex: the actor answers with the channel the confirmed,
+// applied read index will arrive on, or an error.
+type readReq struct {
+	result chan readAccepted
+}
+
+type readAccepted struct {
+	done <-chan Outcome
+	err  error
 }
 
 // Status is one consistent snapshot of a node's Raft state, taken by the actor
@@ -216,7 +244,11 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		ctx: nctx, cancel: cancel, done: make(chan struct{}),
 		recvCh:    make(chan raft.Message, 256),
 		proposeCh: make(chan proposal),
+		writeCh:   make(chan writeReq),
+		readCh:    make(chan readReq),
 		outboxes:  map[NodeID]chan raft.Message{},
+		waiters:   NewWaiters(),
+		reads:     NewReads(),
 	}
 	n.snapshotStatus()
 
@@ -265,6 +297,84 @@ func (n *Node) Propose(ctx context.Context, data []byte) error {
 	}
 }
 
+// Write proposes a client command and returns only once the entry has been
+// COMMITTED and APPLIED on this node in the term it was proposed in — the Phase
+// 12 write-completion rule (docs/LINEARIZABILITY.md §3, docs/ARCHITECTURE.md §8
+// step 8): success means every later linearizable read, from any client, sees
+// the write. It returns the entry's index and term. Errors:
+//
+//   - raft.ErrNotLeader: this node did not accept the proposal; nothing was
+//     appended. The client should retry at the leader (LeaderID). Definite.
+//   - ErrLost: the entry was appended but a DIFFERENT entry was committed at its
+//     index (this node lost leadership first). The write had no effect. Definite.
+//   - ctx.Err(): the outcome is UNKNOWN — the entry may still commit and apply.
+//     A client must treat it exactly as a timeout (docs/CONSISTENCY.md C4).
+//   - raft.ErrStopped, or a persistence failure: the node stopped. If the
+//     proposal had been accepted the outcome is likewise unknown.
+func (n *Node) Write(ctx context.Context, data []byte) (index, term uint64, err error) {
+	req := writeReq{data: append([]byte(nil), data...), result: make(chan writeAccepted, 1)}
+	select {
+	case n.writeCh <- req:
+	case <-n.ctx.Done():
+		return 0, 0, raft.ErrStopped
+	case <-ctx.Done():
+		return 0, 0, ctx.Err()
+	}
+	var acc writeAccepted
+	select {
+	case acc = <-req.result:
+	case <-n.ctx.Done():
+		return 0, 0, raft.ErrStopped
+	case <-ctx.Done():
+		return 0, 0, ctx.Err()
+	}
+	if acc.err != nil {
+		return 0, 0, acc.err
+	}
+	select {
+	case out := <-acc.done:
+		return acc.index, acc.term, out.Err
+	case <-ctx.Done():
+		return acc.index, acc.term, ctx.Err()
+	}
+}
+
+// ReadIndex performs the ReadIndex protocol (docs/DESIGN.md §8.5) on this node
+// and returns once it is safe to serve a linearizable read from the local state
+// machine: the read index was confirmed by a quorum acknowledging this leader
+// after the read was registered, and the state machine has applied through it.
+// The returned index is that read index. Errors: raft.ErrNotLeader (this node is
+// not the leader, or stopped leading before the read was confirmed — retry at
+// the leader; a read has no effect either way), ctx.Err() (give up; no effect),
+// raft.ErrStopped.
+func (n *Node) ReadIndex(ctx context.Context) (uint64, error) {
+	req := readReq{result: make(chan readAccepted, 1)}
+	select {
+	case n.readCh <- req:
+	case <-n.ctx.Done():
+		return 0, raft.ErrStopped
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	var acc readAccepted
+	select {
+	case acc = <-req.result:
+	case <-n.ctx.Done():
+		return 0, raft.ErrStopped
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	if acc.err != nil {
+		return 0, acc.err
+	}
+	select {
+	case out := <-acc.done:
+		return out.Index, out.Err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
 // Status returns one consistent snapshot of the node's state. Use it (not the
 // single-field accessors) whenever more than one field is needed together.
 func (n *Node) Status() Status { n.mu.Lock(); defer n.mu.Unlock(); return n.status }
@@ -298,6 +408,11 @@ func (n *Node) Close() error {
 func (n *Node) actorLoop() {
 	defer n.wg.Done()
 	defer close(n.done)
+	defer func() {
+		// Whoever is still waiting learns nothing more from this incarnation.
+		n.waiters.FailAll(raft.ErrStopped)
+		n.reads.FailAll(raft.ErrStopped)
+	}()
 	ticker := time.NewTicker(n.cfg.TickInterval)
 	defer ticker.Stop()
 	for {
@@ -314,6 +429,22 @@ func (n *Node) actorLoop() {
 				p.result <- err
 			} else {
 				accepted = &p
+			}
+		case w := <-n.writeCh:
+			if err := n.core.Propose(w.data); err != nil {
+				w.result <- writeAccepted{err: err}
+			} else {
+				// The entry is the log's tail, in the current term; it completes
+				// when that index is applied — with this term, or as ErrLost.
+				idx, term := n.core.LastIndex(), n.core.Term()
+				w.result <- writeAccepted{index: idx, term: term, done: n.waiters.Add(idx, term, n.core.AppliedIndex())}
+			}
+		case r := <-n.readCh:
+			rs, err := n.core.ReadIndex()
+			if err != nil {
+				r.result <- readAccepted{err: err}
+			} else {
+				r.result <- readAccepted{done: n.reads.Add(rs.ID, n.core.Term())}
 			}
 		}
 		if err := n.processReady(); err != nil {
@@ -336,17 +467,32 @@ func (n *Node) actorLoop() {
 // crash-point abort (Config.Hook). A state-machine failure is logged and left for
 // the next cycle: appliedIndex does not advance past it, and the node keeps running.
 func (n *Node) processReady() error {
-	if err := DrainReadyAt(n.core, n.log, n.enqueue, n.cfg.Hook); err != nil {
+	if err := DrainReadyAt(n.core, n.log, n.enqueue, n.confirmRead, n.cfg.Hook); err != nil {
 		return err
 	}
-	if err := ApplyCommitted(n.core, n.sm, n.cfg.Hook); err != nil {
+	if err := ApplyCommitted(n.core, n.sm, n.cfg.Hook, n.applied); err != nil {
 		if !errors.Is(err, ErrApply) {
 			return err // a crash point fired
 		}
 		n.logf("event=raft_apply_failed node=%s err=%v", n.cfg.ID, err)
 	}
+	// A read registered in a term this node no longer leads will never be
+	// confirmed (the core dropped it): tell its client to go elsewhere.
+	n.reads.DropStale(n.core.Term(), n.core.Role() == raft.Leader)
 	n.snapshotStatus()
 	return nil
+}
+
+// confirmRead is DrainReadyAt's hand-off of a confirmed ReadIndex: the read now
+// waits only for the state machine to reach its index.
+func (n *Node) confirmRead(rs raft.ReadState) {
+	n.reads.Confirmed(rs, n.waiters, n.core.AppliedIndex())
+}
+
+// applied is ApplyCommitted's hand-off after an entry is applied and recorded:
+// the write that proposed it (or a read barrier at its index) completes now.
+func (n *Node) applied(e raft.Entry) {
+	n.waiters.Applied(e.Index, e.Term)
 }
 
 // fail records a persistence failure and stops every goroutine of the node. The
@@ -359,6 +505,8 @@ func (n *Node) fail(err error) {
 	}
 	n.mu.Unlock()
 	n.logf("event=raft_persist_failed node=%s err=%v", n.cfg.ID, err)
+	n.waiters.FailAll(err)
+	n.reads.FailAll(err)
 	n.cancel()
 }
 
