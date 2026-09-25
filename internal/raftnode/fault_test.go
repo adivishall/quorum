@@ -3,6 +3,7 @@ package raftnode
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"syscall"
@@ -348,6 +349,19 @@ func (fc *faultCluster) waitLeaderAmong(ids []NodeID, minTerm uint64, timeout ti
 	return ""
 }
 
+// waitUntil polls cond until it holds or timeout passes, then fails the test.
+func (fc *faultCluster) waitUntil(timeout time.Duration, cond func() bool, format string, args ...any) {
+	fc.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	fc.t.Fatalf("not within %s: %s", timeout, fmt.Sprintf(format, args...))
+}
+
 func (fc *faultCluster) waitCommit(ids []NodeID, idx uint64, timeout time.Duration) {
 	fc.t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -524,11 +538,26 @@ func TestDuplicatedAndReorderedTrafficAppliesOnce(t *testing.T) {
 	fc.net.AddRule(fault.Rule{Action: fault.Duplicate, Copies: 2})
 	for burst := 0; burst < 4; burst++ {
 		hold := fc.net.AddRule(fault.Rule{Kinds: []transport.MsgKind{transport.MsgAppendEntries}, Action: fault.Hold})
+		heldBefore := fc.net.Stats().Held
+		accepted := 0
 		for i := 0; i < 5; i++ {
 			// The leader may change under reordering; propose wherever leads now.
 			l := fc.waitLeaderAmong(fc.ids, 0, 5*time.Second)
-			_ = proposeWithin(fc.nodes[l], []byte{byte('A' + burst), byte('0' + i)})
+			if proposeWithin(fc.nodes[l], []byte{byte('A' + burst), byte('0' + i)}) == nil {
+				accepted++
+			}
 		}
+		if accepted == 0 {
+			t.Fatalf("burst %d: no proposal was accepted, so the burst reorders nothing", burst)
+		}
+		// A burst reorders nothing unless the hold caught an AppendEntries, and
+		// Propose only enqueues: the leader's actor emits the message on its next
+		// cycle, within microseconds when the machine is idle — but a loaded
+		// machine can starve the actor past this whole burst, after which the
+		// anti-vacuity check below reports Held:0. Wait for the hold to engage
+		// (a heartbeat bounds the wait) instead of racing the scheduler.
+		fc.waitUntil(5*time.Second, func() bool { return fc.net.Stats().Held > heldBefore },
+			"burst %d: the hold caught no AppendEntries", burst)
 		fc.net.RemoveRule(hold)
 		fc.net.Release(true) // deliver the held AppendEntries newest-first
 	}
