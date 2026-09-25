@@ -105,6 +105,27 @@ func (c *rcluster) recoveredTerm(id string) (term, lastIndex uint64) {
 	return term, lastIndex
 }
 
+// waitNoopCommitted waits until leader l's durable log holds an entry of term t
+// (its election no-op) and l reports it committed, and returns that index.
+func (c *rcluster) waitNoopCommitted(l string, t uint64, d time.Duration) uint64 {
+	c.t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		entries := c.liveLog(l).Entries
+		for i := len(entries) - 1; i >= 0; i-- {
+			if entries[i].Term == t {
+				if idx := entries[i].Index; c.commitOf(l) >= idx {
+					return idx
+				}
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	c.t.Fatalf("%s never committed its term-%d no-op within %s\n%s", l, t, d, c.outputs())
+	return 0
+}
+
 // TestRealCrashAtPoints kills a real dkvd process at each crash point in turn —
 // driver points and I/O boundaries — while it rejoins a live 3-process group as a
 // deposed leader: the others elected a new leader while it was down, so its
@@ -112,11 +133,14 @@ func (c *rcluster) recoveredTerm(id string) (term, lastIndex uint64) {
 // re-applies its recovered prefix at boot — every point has something to die
 // inside. (A follower rejoining a quiet group would never Save again: dkvd has no
 // client, so the only entries are election no-ops.) Only points that occur on
-// EVERY timing path are targeted: the catch-up is one Save when the new leader's
-// first AppendEntries matches the old leader's log directly, or two when its own
-// election timer fires first — so "the 2nd Save" and "the 3rd fsync" exist on one
-// path only, and are not used. It requires: the seam fired at the named
-// point; the durable log the SIGKILL left reopens (read-only inspection, so the
+// EVERY timing path are targeted, and the premise they need — the victim's
+// durable log lacks both the new term and the new no-op — is enforced, not
+// assumed (see the body). Given it, the catch-up is one Save when the new
+// leader's first AppendEntries matches the old leader's log directly, or two when
+// the victim's own election timer fires first — so "the 2nd Save" and "the 3rd
+// fsync" exist on one path only and are not used, while the 2nd and 3rd writes
+// (an entry after a term record, then the commit) exist on both. It requires:
+// the seam fired at the named point; the durable log the SIGKILL left reopens (read-only inspection, so the
 // file is untouched) and is coherent — no entry term above the HardState term,
 // the commit within the log, the term never below the one the node had durably
 // established; the restarted process recovers exactly the inspected term and
@@ -135,13 +159,42 @@ func TestRealCrashAtPoints(t *testing.T) {
 			c.waitCommit(c.ids, 1, 20*time.Second)
 			committed := c.committedPrefix(l1)
 
-			// Depose the leader: the others elect a new one and commit its no-op
-			// (an entry the old leader lacks). Then restart the old leader armed to
-			// die at the point while it catches up.
+			// Depose the leader: the others elect a new one and commit its no-op.
+			// Every point below relies on the victim's durable log lacking BOTH the
+			// new leader's term and its no-op, so that its catch-up must Save a term
+			// change, an entry and a commit: only then do "write:2" and "write:3"
+			// exist on every timing path. Killing the leader does not guarantee
+			// that: on a slow machine (CI under the race detector) a follower's
+			// timer fires and deposes the leader BEFORE the kill, and the victim
+			// dies already holding the new term, or the new no-op too — its
+			// catch-up is then a single commit record and "write:2" never comes
+			// (found by CI). So read what the victim actually holds (it is dead;
+			// the file is quiescent) and depose the group's current leader again
+			// until the group's committed no-op lies beyond it: the victim cannot
+			// follow along, so every round makes the gap real.
 			victim := l1
 			c.kill(victim)
-			l2, _ := c.waitLeader(others(c.ids, victim), t1, 20*time.Second)
-			c.waitCommit(others(c.ids, victim), uint64(len(committed))+1, 20*time.Second)
+			logPath := filepath.Join(c.dirs[victim], "raft-"+victim+".log")
+			held, err := raftlog.Inspect(logPath)
+			if err != nil {
+				t.Fatalf("inspect the victim's durable log: %v", err)
+			}
+			rest := others(c.ids, victim)
+			l2, t2 := c.waitLeader(rest, t1, 20*time.Second)
+			noop := c.waitNoopCommitted(l2, t2, 20*time.Second)
+			for round := 1; t2 <= held.HardState.Term || noop <= uint64(len(held.Entries)); round++ {
+				if round > 3 {
+					t.Fatalf("the group (term %d, no-op at %d) is still not ahead of the victim's durable log (term %d, %d entries) after %d re-elections",
+						t2, noop, held.HardState.Term, len(held.Entries), round-1)
+				}
+				t.Logf("the victim was deposed before it was killed: it holds term %d and %d entries, the group's no-op is index %d of term %d; deposing %s again (round %d)",
+					held.HardState.Term, len(held.Entries), noop, t2, l2, round)
+				c.kill(l2)
+				c.start(l2)
+				l2, t2 = c.waitLeader(rest, t2, 20*time.Second)
+				noop = c.waitNoopCommitted(l2, t2, 20*time.Second)
+			}
+			c.waitCommit(rest, noop, 20*time.Second)
 			committed2 := c.committedPrefix(l2)
 			c.startWith(victim, "-crash-at", spec)
 			wantPoint, wantNth := spec, 1
@@ -155,7 +208,6 @@ func TestRealCrashAtPoints(t *testing.T) {
 			}
 
 			// The log the SIGKILL left: it must reopen, and be coherent.
-			logPath := filepath.Join(c.dirs[victim], "raft-"+victim+".log")
 			rec, err := raftlog.Inspect(logPath)
 			if err != nil {
 				t.Fatalf("the durable log after a SIGKILL at %s does not reopen: %v", spec, err)

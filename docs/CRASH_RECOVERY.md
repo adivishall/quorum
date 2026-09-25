@@ -218,9 +218,14 @@ second — cheap enough to run on every `go test`.
 Real-process points exercised (`TestRealCrashAtPoints`: a deposed leader rejoining a live
 3-process group, whose catch-up Saves the new term and the new leader's no-op, sends replies,
 and re-applies its recovered prefix at boot — a follower rejoining a quiet group would never
-Save again, since `dkvd` has no client and the only entries are election no-ops; and only points
+Save again, since `dkvd` has no client and the only entries are election no-ops; only points
 that occur on every timing path are targeted, since the catch-up is one Save or two depending on
-whether the node's election timer fires before the leader's first AppendEntries):
+whether the node's election timer fires before the leader's first AppendEntries; and the premise
+those points rest on — the victim's durable log lacks both the new term and the new no-op — is
+enforced, not assumed: after the kill the test inspects the victim's log and re-deposes the
+group until its committed no-op lies beyond both, because on a slow runner a follower can depose
+the leader *before* the kill, leaving the victim already caught up and its "catch-up" a single
+commit record with no second write — which is exactly how the first CI run of this phase failed):
 `before-save:1`, `after-save:1`, `after-send:1`, `before-advance:2`, `after-advance:2`,
 `before-apply:1`, `after-apply:1`, `after-applied-to:1`, `write:2`, `write:3`, `fsync:1` (a
 crash during recovery's own fsync), `fsync:2`; and (`TestRealCrashAtEveryEarlyPointIsRecoverable`, a single-node group, whose election
