@@ -252,25 +252,44 @@ func TestCrashAfterSaveBeforeAdvanceRestartsFromDurableState(t *testing.T) {
 }
 
 // TestRecoverRefusesATermBelowItsLog pins the recovery guard: a durable log whose
-// last entry's term exceeds its HardState's term is incoherent (the Save order
-// never produces it), and Recover must refuse it rather than invent a term.
+// last entry's term exceeds its HardState's term is incoherent, and Recover must
+// refuse it rather than invent a term. The first artifact is byte-for-byte what
+// the pre-Phase-11 record order left when the process died between the entry
+// and HardState records of a single-node election's Save (an entry of term 1 and
+// no HardState record at all — reproduced at the log level by raftlog's
+// TestPrePhase11OrderLeftAnUnrecoverableLog): a node with that log could never
+// restart. The production order never produces either artifact.
 func TestRecoverRefusesATermBelowItsLog(t *testing.T) {
-	logPath := filepath.Join(t.TempDir(), "bad.log")
-	l, _, err := raftlog.Open(logPath, raftlog.Options{Sync: true})
-	if err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name  string
+		write func(l *raftlog.Log) error
+	}{
+		{"old-order artifact: entry of term 1, no HardState record", func(l *raftlog.Log) error {
+			return l.Save(nil, []raftlog.Entry{{Index: 1, Term: 1}})
+		}},
+		{"entry of term 5 under a HardState of term 2", func(l *raftlog.Log) error {
+			if err := l.Save(nil, []raftlog.Entry{{Index: 1, Term: 5}}); err != nil {
+				return err
+			}
+			return l.Save(&raftlog.HardState{Term: 2}, nil)
+		}},
 	}
-	// Write the entry first, then a HardState of a lower term — bypassing the
-	// driver, which never asks for this.
-	if err := l.Save(nil, []raftlog.Entry{{Index: 1, Term: 5}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := l.Save(&raftlog.HardState{Term: 2}, nil); err != nil {
-		t.Fatal(err)
-	}
-	_ = l.Close()
-	_, err = Recover(Config{ID: "n0", Peers: []NodeID{"n0"}, LogPath: logPath, Rand: rand.New(rand.NewSource(1))})
-	if !errors.Is(err, raft.ErrTermRegression) {
-		t.Fatalf("Recover = %v, want ErrTermRegression", err)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			logPath := filepath.Join(t.TempDir(), "bad.log")
+			l, _, err := raftlog.Open(logPath, raftlog.Options{Sync: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Bypassing the driver, which never asks the log for this.
+			if err := c.write(l); err != nil {
+				t.Fatal(err)
+			}
+			_ = l.Close()
+			_, err = Recover(Config{ID: "n0", Peers: []NodeID{"n0"}, LogPath: logPath, Rand: rand.New(rand.NewSource(1))})
+			if !errors.Is(err, raft.ErrTermRegression) {
+				t.Fatalf("Recover = %v, want ErrTermRegression", err)
+			}
+		})
 	}
 }

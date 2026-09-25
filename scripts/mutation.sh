@@ -276,7 +276,7 @@ mutant "read-idle-timeout-detects-dead-conn" internal/transport/transport.go \
 mutant "term-durable-before-entries-of-that-term" internal/raftlog/raftlog.go \
   '	if len(entries) > 0 && (hs.Term != prev.Term || hs.Vote != prev.Vote) {' \
   '	if false && len(entries) > 0 && (hs.Term != prev.Term || hs.Vote != prev.Vote) {' \
-  './internal/raftlog ./internal/raftsim' 'TestTermChangeIsDurableBeforeEntriesOfThatTerm|TestSingleNodeCrashInsideItsElectionSave'
+  './internal/raftlog ./internal/raftsim' 'TestTermChangeIsDurableBeforeEntriesOfThatTerm|TestPrePhase11OrderLeftAnUnrecoverableLog|TestSingleNodeCrashInsideItsElectionSave'
 
 # 26. Let the leading HardState record carry the NEW commit: a crash before the
 #     replacing entries leaves the old, conflicting entries under a commit that

@@ -754,3 +754,79 @@ func TestCrashBeforeDirectorySyncLosesOnlyAFreshLog(t *testing.T) {
 		t.Fatalf("a fresh node recovered %+v", rec)
 	}
 }
+
+// oldOrderSave is the pre-Phase-11 Save, kept ONLY as a test oracle: the entries,
+// then the HardState, then the fsync. The production Save writes SavePlan's order.
+func oldOrderSave(l *Log, hs *HardState, entries []Entry) error {
+	for _, e := range entries {
+		if _, err := l.w.Append(kindEntry, encodeEntry(e)); err != nil {
+			return err
+		}
+	}
+	if hs != nil {
+		if _, err := l.w.Append(kindHardState, encodeHardState(*hs)); err != nil {
+			return err
+		}
+	}
+	return l.f.Sync()
+}
+
+// TestPrePhase11OrderLeftAnUnrecoverableLog is the permanent record of the bug the
+// crash matrix found, reproduced deliberately: the old entries-first order, the
+// process dying between the entry record and the HardState record of the one
+// Save a single-node election is (term, self-vote, no-op). It proves three things
+// in order — the old order really left the incoherent log; recovery does NOT
+// repair it (the incoherence is visible, and the core refuses exactly this
+// artifact: internal/raftnode's TestRecoverRefusesATermBelowItsLog); and the
+// production order, dying at the same write, leaves a coherent log. The third
+// part fails if the old order is ever restored (mutant
+// term-durable-before-entries-of-that-term); the second fails if recovery ever
+// starts inventing a term or dropping the entry to hide the damage.
+func TestPrePhase11OrderLeftAnUnrecoverableLog(t *testing.T) {
+	hs := &HardState{Term: 1, Vote: "n1", Commit: 1}
+	entries := []Entry{{Index: 1, Term: 1}}
+
+	// 1. The old order, dying before its second write — the HardState record.
+	mem := fault.NewMemFS()
+	inj := fault.NewInjectFS(mem)
+	l, _ := openMem(t, inj)
+	crashBeforeWrite(mem, inj, 2)
+	if err := oldOrderSave(l, hs, entries); !errors.Is(err, fault.ErrCrashed) {
+		t.Fatalf("old-order Save = %v, want the crash before the HardState record", err)
+	}
+	// 2. What it left: an entry of term 1 under currentTerm 0. Recovery opens it
+	// (it is not damage the log can judge) and reports it unchanged.
+	l2, rec, err := Open(memPath, Options{Sync: true, FS: mem})
+	if err != nil {
+		t.Fatalf("Open of the old-order artifact: %v (recovery must report it, not refuse or repair it)", err)
+	}
+	_ = l2.Close()
+	if len(rec.Entries) != 1 || rec.Entries[0].Term != 1 || rec.HardState.Term != 0 || rec.HardState.Vote != "" {
+		t.Fatalf("old-order artifact recovered as %+v, want exactly the entry of term 1 under term 0 and no vote (no silent repair)", rec)
+	}
+	if last := rec.Entries[len(rec.Entries)-1].Term; last <= rec.HardState.Term {
+		t.Fatalf("the old order did not reproduce the incoherence (entry term %d, currentTerm %d)", last, rec.HardState.Term)
+	}
+
+	// 3. The production order, dying at the very same write: coherent — the term
+	// and vote landed, the entry did not, and nothing claims the entry's term.
+	mem2 := fault.NewMemFS()
+	inj2 := fault.NewInjectFS(mem2)
+	l3, _ := openMem(t, inj2)
+	crashBeforeWrite(mem2, inj2, 2)
+	if err := l3.Save(hs, entries); !errors.Is(err, fault.ErrCrashed) {
+		t.Fatalf("Save = %v, want the crash before write 2", err)
+	}
+	l4, rec2, err := Open(memPath, Options{Sync: true, FS: mem2})
+	if err != nil {
+		t.Fatalf("Open after the crash: %v", err)
+	}
+	_ = l4.Close()
+	if n := len(rec2.Entries); n > 0 && rec2.Entries[n-1].Term > rec2.HardState.Term {
+		t.Fatalf("the production order recovered an entry of term %d under currentTerm %d — the old bug is back",
+			rec2.Entries[n-1].Term, rec2.HardState.Term)
+	}
+	if rec2.HardState.Term != 1 || rec2.HardState.Vote != "n1" || rec2.HardState.Commit != 0 || len(rec2.Entries) != 0 {
+		t.Fatalf("recovered %+v, want term 1, vote n1, commit 0 and no entry", rec2)
+	}
+}

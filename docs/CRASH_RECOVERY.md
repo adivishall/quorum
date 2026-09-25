@@ -141,7 +141,14 @@ vote over the old log and old commit; those plus a prefix of the new entries; or
 is a state the core accepts and Raft permits (a node that persisted a term or a vote and died,
 or one that appended entries it never acknowledged). `TestTermChangeIsDurableBeforeEntriesOfThatTerm`
 and `TestCommitNeverCoversEntriesTheSaveHadNotWritten` pin the two constraints at the log level;
-the matrix pins them at every boundary of a scenario; mutants 25–26 remove each in turn.
+the matrix pins them at every boundary of a scenario; mutants 25–26 remove each in turn. The old
+order itself is kept as a test oracle: `TestPrePhase11OrderLeftAnUnrecoverableLog` writes it
+deliberately, dies at the same record boundary, and shows the artifact it leaves (an entry of
+term 1 and no `HardState` record), that recovery reports that artifact unchanged rather than
+repairing it, and that the production order at the same boundary leaves a coherent log;
+`internal/raftnode`'s `TestRecoverRefusesATermBelowItsLog` proves the core refuses exactly that
+artifact. Recovery was **not** broadened to repair it: a term above the log's is the core's rule to
+enforce, and inventing one would hide the very bug.
 
 Everything else about the log is unchanged from Phase 9/10: a torn final record — an incomplete
 record, or one whose checksum fails with **no bytes after it** — is truncated and the state is
@@ -270,7 +277,7 @@ rule, each with a killer that fails; `make mutation` runs all 33.
 
 | Mutant | Bug represented | Killed by |
 |---|---|---|
-| term-durable-before-entries-of-that-term | the old entries-first order: a crash bricks the node | `TestTermChangeIsDurableBeforeEntriesOfThatTerm`, `TestSingleNodeCrashInsideItsElectionSave` |
+| term-durable-before-entries-of-that-term | the old entries-first order: a crash bricks the node | `TestTermChangeIsDurableBeforeEntriesOfThatTerm`, `TestPrePhase11OrderLeftAnUnrecoverableLog`, `TestSingleNodeCrashInsideItsElectionSave` |
 | commit-not-durable-before-its-entries | the leading `HardState` carries the new commit over old entries | `TestCommitNeverCoversEntriesTheSaveHadNotWritten` |
 | recovered-commit-clamped-to-log | a persisted commit beyond the log is trusted | `TestCommitBeyondRecoveredLogIsClamped` |
 | torn-tail-truncated-on-recovery | the torn tail stays and the next append lands behind it | `TestTornTailIsTruncated` |
