@@ -3,6 +3,8 @@ package raftsim
 import (
 	"fmt"
 	"math/rand"
+
+	"github.com/adivishall/quorum/internal/raftnode"
 )
 
 // Profile weights the kinds of events a seeded chaos run generates. The weights
@@ -17,6 +19,7 @@ type Profile struct {
 	Partition, Heal               int
 	Crash, Restart, Pause, Resume int
 	FailPersist                   int
+	CrashAt                       int // arm a crash at a driver or I/O crash point (Phase 11)
 	FIFOPercent                   int // chance a delivery takes the oldest message (else a random one: reordering)
 	PowerLossPercent              int // chance a crash also models power loss on the node's disk
 	MaxDelay, MaxTorn             int // bounds on Delay steps and torn-tail bytes
@@ -45,7 +48,25 @@ var Profiles = []Profile{
 	{Name: "messages", Nodes: 5, Steps: 3000,
 		Tick: 300, Deliver: 600, Propose: 80, Drop: 60, Duplicate: 60, Delay: 60, Pause: 5, Resume: 30,
 		FIFOPercent: 30, MaxDelay: 60},
+	// crashpoints (Phase 11): every crash lands on an exact boundary of the
+	// persist → send → advance → apply cycle or of the durable log's I/O — before
+	// a Save, after it, between record writes, before the fsync, after one message
+	// of a Ready, between Apply and AppliedTo — half of them with a power loss
+	// keeping a torn tail. Restarts recover through the real startup path.
+	{Name: "crashpoints", Nodes: 3, Steps: 3000,
+		Tick: 300, Deliver: 600, Propose: 100, CrashAt: 12, Restart: 40,
+		FIFOPercent: 80, PowerLossPercent: 50, MaxTorn: 128},
 }
+
+// crashPointNames are the crash points a seeded run may arm: the driver's, then
+// the durable log's I/O boundaries.
+var crashPointNames = func() []string {
+	var out []string
+	for _, p := range raftnode.Points {
+		out = append(out, p.String())
+	}
+	return append(out, IOPoints...)
+}()
 
 // ProfileByName returns the named built-in profile.
 func ProfileByName(name string) (Profile, bool) {
@@ -212,7 +233,7 @@ func (c *Cluster) generate(rng *rand.Rand, p Profile) Event {
 			opts = append(opts, option{w, fn})
 		}
 	}
-	var running, down, paused, armable []NodeID
+	var running, down, paused, armable, crashable []NodeID
 	for _, id := range c.ids {
 		n := c.nodes[id]
 		switch {
@@ -225,6 +246,9 @@ func (c *Cluster) generate(rng *rand.Rand, p Profile) Event {
 		}
 		if n.up && n.inj.Armed() == 0 {
 			armable = append(armable, id)
+		}
+		if n.up && n.inj.Armed() == 0 && n.armed == nil {
+			crashable = append(crashable, id)
 		}
 	}
 	var deliverable []*flight
@@ -317,6 +341,14 @@ func (c *Cluster) generate(rng *rand.Rand, p Profile) Event {
 	add(p.Restart, len(down) > 0, func() Event { return Event{Kind: Restart, Node: pick(down)} })
 	add(p.Pause, len(running) > 0, func() Event { return Event{Kind: Pause, Node: pick(running)} })
 	add(p.Resume, len(paused) > 0, func() Event { return Event{Kind: Resume, Node: pick(paused)} })
+	add(p.CrashAt, len(crashable) > 0, func() Event {
+		e := Event{Kind: CrashAt, Node: pick(crashable), Point: crashPointNames[rng.Intn(len(crashPointNames))], Nth: 1 + rng.Intn(3)}
+		if rng.Intn(100) < p.PowerLossPercent {
+			e.Power = true
+			e.N = rng.Intn(p.MaxTorn + 1)
+		}
+		return e
+	})
 	add(p.FailPersist, len(armable) > 0, func() Event {
 		e := Event{Kind: FailPersist, Node: pick(armable)}
 		switch rng.Intn(3) {

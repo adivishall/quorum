@@ -16,6 +16,11 @@ import (
 // NodeID is a Raft node id.
 type NodeID = raft.NodeID
 
+type (
+	raftlogHardState = raftlog.HardState
+	raftEntry        = raft.Entry
+)
+
 // logPath is where every simulated node keeps its durable log. Each node has its
 // own disk, so one path suffices.
 const logPath = "/raft/raft.log"
@@ -53,6 +58,7 @@ type Stats struct {
 	MaxTerm                                                   uint64
 	LeaderElections                                           int
 	MaxCommit                                                 uint64
+	PointCrashes                                              int // crashes fired at an armed crash point (Phase 11)
 }
 
 // flight is a message in the network.
@@ -88,7 +94,50 @@ type node struct {
 	term   uint64
 	commit uint64
 	lv     *leaderView
+
+	// Phase 11 crash points (docs/CRASH_RECOVERY.md).
+	armed         *armedCrash        // a crash waiting to fire at a driver point
+	fired         *firedCrash        // set by the hook when a crash fired, consumed by drain/apply
+	hits          map[string]int     // occurrences of each driver point since boot (enumeration)
+	hist          []applied          // every application by every incarnation, in order
+	lastRecovered *raftlog.Recovered // what the latest boot recovered
 }
+
+// armedCrash is a crash armed at a driver point: it fires the nth time the
+// point is reached, counting from arming.
+type armedCrash struct {
+	point string
+	nth   int
+	seen  int
+	power bool
+	torn  int
+}
+
+// firedCrash records a crash that fired at a crash point.
+type firedCrash struct {
+	point string
+	nth   int
+	power bool
+	torn  int
+	step  int
+}
+
+// applied is one state-machine application by one incarnation of a node.
+type applied struct {
+	inc int
+	e   raft.Entry
+}
+
+// PointHit is one occurrence of a crash point on a node: the nth time the node
+// reached the point since it booted — the address a CrashAt event uses.
+type PointHit struct {
+	Node  NodeID
+	Point string
+	Nth   int
+}
+
+// errCrashPoint is the hook's abort: the node's process died at a crash point.
+var errCrashPoint = errors.New("raftsim: crashed at a crash point")
 
 // leaderView is what a node looked like as leader of one term in one incarnation:
 // its log (for Leader Append-Only) and how much of the committed record it has
@@ -128,6 +177,11 @@ type Cluster struct {
 	// OnViolation, if set, is called once with the first violation (e.g. to fail
 	// a test immediately with a full report).
 	OnViolation func(*Violation)
+
+	// Crash-point recording (StartRecordingPoints / Points).
+	recordPoints bool
+	points       []PointHit
+	opBase       map[NodeID]int // op-log length per node when recording started
 }
 
 // New boots a cluster: every node starts from an empty disk through the real
@@ -148,7 +202,7 @@ func New(cfg Config) (*Cluster, error) {
 		id := NodeID(fmt.Sprintf("n%d", i))
 		c.ids = append(c.ids, id)
 		mem := fault.NewMemFS()
-		c.nodes[id] = &node{id: id, idx: i, disk: mem, inj: fault.NewInjectFS(mem), shadow: &shadowStore{}}
+		c.nodes[id] = &node{id: id, idx: i, disk: mem, inj: fault.NewInjectFS(mem), shadow: &shadowStore{}, hits: map[string]int{}}
 	}
 	c.trace.add(0, "boot nodes=%d seed=%d election=%d heartbeat=%d", cfg.Nodes, cfg.Seed, cfg.ElectionTicks, cfg.HeartbeatTicks)
 	for _, id := range c.ids {
@@ -258,13 +312,8 @@ func (c *Cluster) boot(n *node) error {
 		n.inc--
 		return err
 	}
-	if !n.shadow.matches(rc.State) {
-		c.violate("INV-F2", "%s recovered term=%d vote=%q commit=%d entries=%d, which is neither its last persisted state nor that plus a prefix of its interrupted save (%s)",
-			n.id, rc.State.HardState.Term, rc.State.HardState.Vote, rc.State.HardState.Commit, len(rc.State.Entries), n.shadow.describe())
-	}
-	if rc.State.HardState.Commit < n.prevApplied {
-		c.violate("INV-R8", "%s recovered commit %d below the %d it had already applied before crashing", n.id, rc.State.HardState.Commit, n.prevApplied)
-	}
+	c.checkRecovered(n, rc.State)
+	n.lastRecovered = &raftlog.Recovered{Entries: append([]raft.Entry(nil), rc.State.Entries...), HardState: rc.State.HardState}
 	n.shadow.rebase(rc.Log, rc.State)
 	n.core, n.mem, n.up, n.paused = rc.Core, rc.Mem, true, false
 	n.applied, n.verified, n.lv = 0, 0, nil
@@ -403,6 +452,20 @@ func (c *Cluster) Apply(e Event) {
 		if err := c.boot(n); err != nil {
 			c.stats.RestartFailures++
 			c.trace.add(c.step, "restart-failed %s err=%v", n.id, err)
+			if n.fired != nil {
+				// The crash point was an I/O boundary of recovery itself (the
+				// torn-tail truncate, the fsync of the recovered state): the
+				// process died during Open, before it was up.
+				f := n.fired
+				n.fired = nil
+				c.stats.PointCrashes++
+				c.trace.add(c.step, "crashpoint %s %s #%d (during recovery)", n.id, f.point, f.nth)
+				if f.power {
+					c.stats.PowerLosses++
+					n.disk.CrashPowerLoss(f.torn)
+					c.trace.add(c.step, "powerloss %s torn<=%d", n.id, f.torn)
+				}
+			}
 			return
 		}
 		c.stats.Restarts++
@@ -441,8 +504,21 @@ func (c *Cluster) Apply(e Event) {
 	case Disarm:
 		for _, id := range c.ids {
 			c.nodes[id].inj.Disarm()
+			c.nodes[id].armed = nil
 		}
 		c.trace.add(c.step, "disarm")
+	case CrashAt:
+		n := c.nodes[e.Node]
+		if n == nil || e.Nth < 1 || (n.armed != nil && !IsIOPoint(e.Point)) {
+			c.skip(e)
+			return
+		}
+		if _, ok := raftnode.ParsePoint(e.Point); !ok && !IsIOPoint(e.Point) {
+			c.skip(e)
+			return
+		}
+		c.arm(n, e)
+		c.trace.add(c.step, "arm %s %s", n.id, e)
 	case Release:
 		for _, f := range c.flights {
 			f.holdUntil = 0
@@ -549,8 +625,12 @@ func (c *Cluster) deliver(f *flight) *node {
 // fail-stops the node exactly as the real driver does, then it applies committed
 // entries.
 func (c *Cluster) drain(n *node) {
-	err := raftnode.DrainReady(n.core, n.shadow, func(m raft.Message) { c.send(n, m) })
+	err := raftnode.DrainReadyAt(n.core, n.shadow, func(m raft.Message) { c.send(n, m) }, c.hook(n))
 	if err != nil {
+		if n.fired != nil {
+			c.crashFired(n)
+			return
+		}
 		c.stats.PersistFailures++
 		c.trace.add(c.step, "persist-failed %s err=%v", n.id, err)
 		c.kill(n, "fail-stop after persistence failure")
@@ -568,21 +648,178 @@ func (c *Cluster) send(n *node, m raft.Message) {
 	c.trace.add(c.step, "send #%d %s>%s %s", c.seq, m.From, m.To, describe(m))
 }
 
-// apply feeds committed entries to the (recorded) state machine in order.
+// apply feeds committed entries to the node's recording state machine through
+// the driver's own apply path (raftnode.ApplyCommitted), with the node's crash
+// points in effect.
 func (c *Cluster) apply(n *node) {
-	es := n.core.NextApply()
-	if len(es) == 0 {
+	sm := &simSM{c: c, n: n}
+	err := raftnode.ApplyCommitted(n.core, sm, c.hook(n))
+	if sm.last > 0 {
+		c.trace.add(c.step, "apply %s %d..%d", n.id, sm.first, sm.last)
+	}
+	if err == nil {
 		return
 	}
-	for _, e := range es {
-		c.checkApply(n, e)
-		if err := n.core.AppliedTo(e.Index); err != nil {
-			c.violate("INV-R7", "%s AppliedTo(%d): %v", n.id, e.Index, err)
-			return
-		}
-		n.applied = e.Index
+	if n.fired != nil {
+		c.crashFired(n)
+		return
 	}
-	c.trace.add(c.step, "apply %s %d..%d", n.id, es[0].Index, es[len(es)-1].Index)
+	c.violate("INV-R7", "%s apply: %v", n.id, err)
+}
+
+// simSM is a node's state machine in the simulator: it runs the apply-time checks
+// and records every application, across incarnations, so re-application after a
+// restart is visible (docs/CRASH_RECOVERY.md, INV-CR4).
+type simSM struct {
+	c           *Cluster
+	n           *node
+	first, last uint64
+}
+
+func (s *simSM) Apply(index uint64, _ []byte) error {
+	e, err := s.n.mem.At(index)
+	if err != nil {
+		return err
+	}
+	s.c.checkApply(s.n, e)
+	s.n.applied = index
+	s.n.hist = append(s.n.hist, applied{inc: s.n.inc, e: e})
+	if s.first == 0 {
+		s.first = index
+	}
+	s.last = index
+	return nil
+}
+
+// --- crash points (Phase 11) ---
+
+// hook returns the node's crash-point hook: it counts every point reached (for
+// enumeration) and fires an armed crash on its nth occurrence.
+func (c *Cluster) hook(n *node) raftnode.Hook {
+	return func(p raftnode.Point, arg uint64) error {
+		name := p.String()
+		n.hits[name]++
+		if c.recordPoints {
+			c.points = append(c.points, PointHit{Node: n.id, Point: name, Nth: n.hits[name]})
+		}
+		if a := n.armed; a != nil && a.point == name {
+			a.seen++
+			if a.seen >= a.nth {
+				n.armed = nil
+				return c.fire(n, a)
+			}
+		}
+		return nil
+	}
+}
+
+// arm arms a CrashAt event: a driver point on the node, or an I/O boundary as an
+// observation point at the vfs seam (fault.Injection.At) that kills the process
+// when reached.
+func (c *Cluster) arm(n *node, e Event) {
+	a := &armedCrash{point: e.Point, nth: e.Nth, power: e.Power, torn: e.N}
+	if !IsIOPoint(e.Point) {
+		n.armed = a
+		return
+	}
+	var op fault.Op
+	switch e.Point {
+	case "write":
+		op = fault.OpWrite
+	case "fsync":
+		op = fault.OpSync
+	case "truncate":
+		op = fault.OpTruncate
+	}
+	n.inj.Arm(fault.Injection{Op: op, Path: logPath, Nth: e.Nth, At: func() { _ = c.fire(n, a) }})
+}
+
+// fire is the moment of death at a crash point: the disk's process is gone (its
+// handles die; the kernel keeps every accepted byte), and the abort propagates
+// out of the driver step so nothing after the point happens. The bookkeeping —
+// power loss, statistics, trace — is done by crashFired once the step unwinds.
+func (c *Cluster) fire(n *node, a *armedCrash) error {
+	n.fired = &firedCrash{point: a.point, nth: a.nth, power: a.power, torn: a.torn, step: c.step}
+	n.disk.CrashProcess()
+	return errCrashPoint
+}
+
+// crashFired completes a crash that fired inside a driver step.
+func (c *Cluster) crashFired(n *node) {
+	f := n.fired
+	n.fired = nil
+	c.stats.PointCrashes++
+	c.stats.ProcessCrashes++
+	c.trace.add(c.step, "crashpoint %s %s #%d", n.id, f.point, f.nth)
+	c.kill(n, "crash at "+f.point)
+	if f.power {
+		c.stats.PowerLosses++
+		n.disk.CrashPowerLoss(f.torn)
+		c.trace.add(c.step, "powerloss %s torn<=%d", n.id, f.torn)
+	}
+}
+
+// StartRecordingPoints makes the cluster record every crash point each node
+// reaches from now on (Points), so a crash matrix can enumerate them. Call it
+// right after New, before any event: a CrashAt armed as the first event of a
+// fresh cluster then counts occurrences from exactly the same origin.
+func (c *Cluster) StartRecordingPoints() {
+	c.recordPoints = true
+	c.opBase = map[NodeID]int{}
+	for _, id := range c.ids {
+		c.nodes[id].hits = map[string]int{}
+		c.opBase[id] = len(c.nodes[id].inj.Ops())
+	}
+}
+
+// Points returns every crash point the nodes reached since StartRecordingPoints:
+// the driver points in the order they occurred, then, per node, the I/O
+// boundaries counted from the durable log's op log. Each is the address a
+// CrashAt event armed at recording time would use to crash there.
+func (c *Cluster) Points() []PointHit {
+	out := append([]PointHit(nil), c.points...)
+	for _, id := range c.ids {
+		counts := map[string]int{}
+		ops := c.nodes[id].inj.Ops()
+		if c.opBase != nil {
+			ops = ops[c.opBase[id]:]
+		}
+		for _, op := range ops {
+			var name string
+			switch op.Op {
+			case fault.OpWrite:
+				name = "write"
+			case fault.OpSync:
+				name = "fsync"
+			case fault.OpTruncate:
+				name = "truncate"
+			default:
+				continue
+			}
+			counts[name]++
+			out = append(out, PointHit{Node: id, Point: name, Nth: counts[name]})
+		}
+	}
+	return out
+}
+
+// Recovered returns what a node's latest boot recovered (nil if never booted).
+func (c *Cluster) Recovered(id NodeID) *raftlog.Recovered { return c.nodes[id].lastRecovered }
+
+// Applications returns every application a node's state machine ever saw, across
+// all its incarnations, in order: (incarnation, entry).
+func (c *Cluster) Applications(id NodeID) []Application {
+	var out []Application
+	for _, a := range c.nodes[id].hist {
+		out = append(out, Application{Incarnation: a.inc, Entry: a.e})
+	}
+	return out
+}
+
+// Application is one state-machine application by one incarnation of a node.
+type Application struct {
+	Incarnation int
+	Entry       raft.Entry
 }
 
 // describe renders a message's type-specific fields for the trace.

@@ -57,7 +57,7 @@ func fuzzEvent(c *Cluster, k, a, b byte) Event {
 		}
 		return Event{Kind: kind, From: f.msg.From, To: f.msg.To, Pos: pos, N: 1 + int(a)%50}
 	}
-	switch k % 16 {
+	switch k % 17 {
 	case 0, 1, 2:
 		return Event{Kind: Tick, Node: id}
 	case 3, 4, 5:
@@ -80,6 +80,8 @@ func fuzzEvent(c *Cluster, k, a, b byte) Event {
 		return Event{Kind: Restart, Node: id}
 	case 14:
 		return Event{Kind: FailPersist, Node: id, Op: PersistOp(1 + int(b)%3), N: 1 + int(b)%20}
+	case 15:
+		return Event{Kind: CrashAt, Node: id, Point: crashPointNames[int(b)%len(crashPointNames)], Nth: 1 + int(a)%3, Power: a%2 == 1, N: int(b) % 64}
 	default:
 		if c.Paused(id) {
 			return Event{Kind: Resume, Node: id}

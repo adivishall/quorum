@@ -13,9 +13,13 @@
 // Faults are events: drop, duplicate, delay and reorder individual messages;
 // partition links (one-way, symmetric, isolate a node); crash a process (the disk
 // keeps every written byte) or lose power (only fsynced bytes survive, plus a torn
-// prefix); restart through recovery; pause and resume a node; and fail or tear a
-// durable-log write or fsync. After every event the continuous invariant checks
-// (check.go) run — INV-R1..R10 and the Phase 10 INV-F series — and the first
+// prefix); restart through recovery; pause and resume a node; fail or tear a
+// durable-log write or fsync; and (Phase 11, docs/CRASH_RECOVERY.md) crash a node
+// at an exact crash point — a boundary of the driver's persist → send → advance →
+// apply cycle (raftnode.Point) or an I/O boundary of the durable log — with
+// RunCrashMatrix doing so at every point a scenario reaches. After every event
+// the continuous invariant checks (check.go) run — INV-R1..R10, the Phase 10
+// INV-F series, and at every restart the Phase 11 INV-CR series — and the first
 // violation stops the run.
 //
 // Everything is deterministic: no goroutines, no clock, no map-order dependence,

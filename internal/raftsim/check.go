@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/adivishall/quorum/internal/raft"
+	"github.com/adivishall/quorum/internal/raftlog"
 )
 
 // checker is the cross-node history the continuous invariants are checked
@@ -50,6 +51,52 @@ func (c *Cluster) violate(inv, format string, args ...any) {
 	c.trace.add(c.step, "VIOLATION %s: %s", inv, c.viol.Detail)
 	if c.OnViolation != nil {
 		c.OnViolation(c.viol)
+	}
+}
+
+// checkRecovered runs at the instant a node boots, against the shadow's
+// independent record of every Save it completed (docs/CRASH_RECOVERY.md).
+//
+// INV-F2: the recovered state is the last completed Save's state, extended by at
+// most a prefix of an interrupted Save's records. The Phase 11 checks sharpen it:
+// INV-CR1, term and vote never regress across a crash — the recovered term is at
+// least the durably established one, and a vote cast in that term is never
+// forgotten (though a vote the interrupted Save was casting may or may not have
+// landed); INV-CR2, the durably committed prefix is recovered bit-identical and
+// the recovered commit is no lower than the durable one; INV-CR3, an entry is
+// applied only after the commit covering it is durable, so the recovered commit
+// is never below what the previous incarnation had applied.
+func (c *Cluster) checkRecovered(n *node, rec *raftlog.Recovered) {
+	if !n.shadow.matches(rec) {
+		c.violate("INV-F2", "%s recovered term=%d vote=%q commit=%d entries=%d, which is neither its last persisted state nor that plus a prefix of its interrupted save (%s)",
+			n.id, rec.HardState.Term, rec.HardState.Vote, rec.HardState.Commit, len(rec.Entries), n.shadow.describe())
+		return
+	}
+	p := n.shadow.persisted
+	if rec.HardState.Term < p.hs.Term {
+		c.violate("INV-CR1", "%s recovered term %d below its durable term %d", n.id, rec.HardState.Term, p.hs.Term)
+		return
+	}
+	if rec.HardState.Term == p.hs.Term && p.hs.Vote != "" && rec.HardState.Vote != p.hs.Vote {
+		c.violate("INV-CR1", "%s recovered vote %q in term %d but had durably voted for %q", n.id, rec.HardState.Vote, p.hs.Term, p.hs.Vote)
+		return
+	}
+	durableCommit := p.hs.Commit
+	if durableCommit > uint64(len(p.entries)) {
+		durableCommit = uint64(len(p.entries))
+	}
+	if rec.HardState.Commit < durableCommit {
+		c.violate("INV-CR2", "%s recovered commit %d below its durable commit %d", n.id, rec.HardState.Commit, durableCommit)
+		return
+	}
+	for i := uint64(0); i < durableCommit; i++ {
+		if i >= uint64(len(rec.Entries)) || !sameEntry(rec.Entries[i], p.entries[i]) {
+			c.violate("INV-CR2", "%s recovered a different entry at committed index %d (durable (t%d,%q))", n.id, i+1, p.entries[i].Term, p.entries[i].Data)
+			return
+		}
+	}
+	if rec.HardState.Commit < n.prevApplied {
+		c.violate("INV-CR3", "%s recovered commit %d below the %d it had already applied before crashing", n.id, rec.HardState.Commit, n.prevApplied)
 	}
 }
 

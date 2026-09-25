@@ -103,7 +103,7 @@ func TestRandomizedFaultSchedules(t *testing.T) {
 func requireProgressAndFaults(t *testing.T, p Profile, s Stats) {
 	t.Helper()
 	injected := s.DroppedInjected + s.Duplicated + s.Delayed + s.DroppedPartition + s.ProcessCrashes +
-		s.PowerLosses + s.PersistFailures + s.Pauses
+		s.PowerLosses + s.PersistFailures + s.Pauses + s.PointCrashes
 	if s.MaxCommit <= 1 || s.LeaderElections == 0 || injected == 0 {
 		t.Fatalf("profile %s run proved nothing: commit=%d elections=%d faults injected=%d (%+v)",
 			p.Name, s.MaxCommit, s.LeaderElections, injected, s)
@@ -128,6 +128,8 @@ func requireEveryFaultOccurred(t *testing.T, p Profile, s Stats) {
 	need(p.Crash > 0 && p.PowerLossPercent > 0, s.PowerLosses > 0, "a power loss")
 	need(p.FailPersist > 0, s.PersistFailures > 0, "a persistence failure")
 	need(p.Pause > 0, s.Pauses > 0, "a pause")
+	need(p.CrashAt > 0, s.PointCrashes > 0 && s.Restarts > 0, "a crash at a crash point and a restart")
+	need(p.CrashAt > 0 && p.PowerLossPercent > 0, s.PowerLosses > 0, "a power loss at a crash point")
 	if len(missing) > 0 {
 		t.Fatalf("profile %s: no run in the seed set produced %s — it does not exercise what it claims (%+v)",
 			p.Name, strings.Join(missing, ", "), s)
@@ -144,6 +146,7 @@ func addStats(a, b Stats) Stats {
 	a.PowerLosses += b.PowerLosses
 	a.PersistFailures += b.PersistFailures
 	a.Pauses += b.Pauses
+	a.PointCrashes += b.PointCrashes
 	return a
 }
 

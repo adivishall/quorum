@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/adivishall/quorum/internal/raftnode"
 )
 
 // Kind is an event type in a simulation script.
@@ -52,6 +54,14 @@ const (
 	Propose
 	// CheckConverged asserts post-fault convergence (INV-F3).
 	CheckConverged
+	// CrashAt arms a crash on Node at a crash point (Phase 11): the Nth time,
+	// counting from arming, the node reaches Point its process dies exactly there.
+	// With Power the disk also loses power, keeping at most N torn bytes. Point is
+	// a driver point (raftnode.Point: before-save, after-save, after-send,
+	// before-advance, after-advance, before-apply, after-apply, after-applied-to)
+	// or an I/O boundary of the durable log — write, fsync, truncate — meaning
+	// "before the Nth such operation on the node's log".
+	CrashAt
 )
 
 var kindNames = map[Kind]string{
@@ -59,7 +69,7 @@ var kindNames = map[Kind]string{
 	Block: "block", Unblock: "unblock", Cut: "cut", Isolate: "isolate", HealAll: "healall",
 	Crash: "crash", Restart: "restart", Pause: "pause", Resume: "resume",
 	FailPersist: "failpersist", Disarm: "disarm", Release: "release", Propose: "propose",
-	CheckConverged: "check-converged",
+	CheckConverged: "check-converged", CrashAt: "crashat",
 }
 
 func (k Kind) String() string {
@@ -94,6 +104,7 @@ func (o PersistOp) String() string { return persistNames[o] }
 //	Crash                                     Node, Power, N (torn bytes kept)
 //	FailPersist                               Node, Op, N (short-write length)
 //	Propose                                   Node, Data
+//	CrashAt                                   Node, Point, Nth, Power, N (torn bytes kept)
 //
 // A message is addressed by its link and its position among the messages
 // currently in flight on that link, oldest first (Pos 0 = the oldest). Addressing
@@ -110,6 +121,25 @@ type Event struct {
 	Power bool
 	Op    PersistOp
 	Data  string
+	Point string // CrashAt: the crash point's name
+	Nth   int    // CrashAt: which occurrence fires, counting from arming (1 = the next)
+}
+
+// IOPoints are the I/O-boundary crash points of the durable log, addressed at
+// the vfs seam: "write", "fsync", "truncate" — a crash before the Nth such
+// operation on the node's log file. (The directory fsync that makes a brand-new
+// log's creation durable happens once, at a fresh node's first boot, before any
+// crash can be armed; its window is pinned in internal/raftlog instead.)
+var IOPoints = []string{"write", "fsync", "truncate"}
+
+// IsIOPoint reports whether a crash point name is an I/O boundary.
+func IsIOPoint(name string) bool {
+	for _, p := range IOPoints {
+		if p == name {
+			return true
+		}
+	}
+	return false
 }
 
 // String renders an event in the script syntax ParseEvent reads back.
@@ -135,6 +165,11 @@ func (e Event) String() string {
 		return fmt.Sprintf("failpersist %s %s", e.Node, e.Op)
 	case Propose:
 		return fmt.Sprintf("propose %s %s", e.Node, e.Data)
+	case CrashAt:
+		if e.Power {
+			return fmt.Sprintf("crashat %s %s %d power %d", e.Node, e.Point, e.Nth, e.N)
+		}
+		return fmt.Sprintf("crashat %s %s %d", e.Node, e.Point, e.Nth)
 	default:
 		return e.Kind.String()
 	}
@@ -216,6 +251,19 @@ func ParseEvent(line string) (Event, error) {
 	case Propose:
 		if err = need(3); err == nil {
 			e.Node, e.Data = NodeID(f[1]), f[2]
+		}
+	case CrashAt:
+		switch {
+		case len(f) == 4 || (len(f) == 6 && f[4] == "power"):
+			e.Node, e.Point = NodeID(f[1]), f[2]
+			if _, ok := raftnode.ParsePoint(e.Point); !ok && !IsIOPoint(e.Point) {
+				err = fmt.Errorf("raftsim: unknown crash point %q in %q", e.Point, line)
+			} else if e.Nth, err = atoi(f[3]); err == nil && len(f) == 6 {
+				e.Power = true
+				e.N, err = atoi(f[5])
+			}
+		default:
+			err = fmt.Errorf("raftsim: bad crashat %q", line)
 		}
 	default:
 		err = need(1)
