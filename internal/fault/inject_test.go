@@ -162,3 +162,72 @@ func TestInjectOverRealFiles(t *testing.T) {
 		t.Fatalf("real file holds %q, %v", b, err)
 	}
 }
+
+// TestInjectAtObservesTheNthOperationWithoutFailingIt proves an At injection is
+// an observation point: it fires exactly once, on the Nth matching operation,
+// BEFORE that operation is performed, and the operation itself (and every later
+// one) proceeds normally — nothing is failed, torn or delayed.
+func TestInjectAtObservesTheNthOperationWithoutFailingIt(t *testing.T) {
+	mem := NewMemFS()
+	inj := NewInjectFS(mem)
+	f, err := inj.OpenFile("/d/log", os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fired := 0
+	var seenBefore string
+	inj.Arm(Injection{Op: OpWrite, Nth: 2, At: func() {
+		fired++
+		b, _ := mem.Cached("/d/log")
+		seenBefore = string(b) // what the file held when the point was reached
+	}})
+	for _, s := range []string{"a", "b", "c"} {
+		if _, err := f.Write([]byte(s)); err != nil {
+			t.Fatalf("write %q failed: %v (an observation point must not fail the operation)", s, err)
+		}
+	}
+	if fired != 1 {
+		t.Fatalf("At fired %d times, want exactly once", fired)
+	}
+	if seenBefore != "a" {
+		t.Fatalf("At saw %q, want %q: it must run before the Nth operation, not after", seenBefore, "a")
+	}
+	if b, _ := mem.Cached("/d/log"); string(b) != "abc" {
+		t.Fatalf("file holds %q, want abc: the observed write must still have been performed", b)
+	}
+	if inj.Armed() != 0 {
+		t.Fatal("observation point still armed after firing")
+	}
+}
+
+// TestInjectAtCanCrashTheProcessAtAnIOBoundary is the simulator's use of At: the
+// callback marks the disk's owning process as crashed at the exact boundary, so
+// the observed operation fails with ErrCrashed and writes nothing — the file holds
+// exactly what preceded that boundary, which is what a process dying between two
+// writes leaves behind.
+func TestInjectAtCanCrashTheProcessAtAnIOBoundary(t *testing.T) {
+	mem := NewMemFS()
+	inj := NewInjectFS(mem)
+	f, _ := inj.OpenFile("/d/log", os.O_RDWR|os.O_CREATE, 0o644)
+	inj.Arm(Injection{Op: OpWrite, Nth: 2, At: mem.CrashProcess})
+	if _, err := f.Write([]byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	n, err := f.Write([]byte("second"))
+	if !errors.Is(err, ErrCrashed) || n != 0 {
+		t.Fatalf("write at the crash point: n=%d err=%v, want 0 bytes and ErrCrashed", n, err)
+	}
+	if err := f.Sync(); !errors.Is(err, ErrCrashed) {
+		t.Fatalf("fsync after the crash: err=%v, want ErrCrashed (the handle is dead)", err)
+	}
+	if b, _ := mem.Cached("/d/log"); string(b) != "first" {
+		t.Fatalf("file holds %q, want exactly the bytes written before the crash point", b)
+	}
+	// The op log shows the crashed write as a failed, non-injected (real) error:
+	// the injection observed, the crashed disk failed.
+	ops := inj.Ops()
+	last := ops[len(ops)-1]
+	if last.Op != OpSync || last.Err == nil {
+		t.Fatalf("op log tail = %+v, want the failed fsync", last)
+	}
+}

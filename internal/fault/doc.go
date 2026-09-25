@@ -23,4 +23,9 @@
 // honest and models lost un-synced data as a prefix, never as holes or reordered
 // sectors. It says nothing about real hardware, and real power-loss durability
 // remains untested.
+//
+// Phase 11 (docs/CRASH_RECOVERY.md) adds Injection.At: an observation point at an
+// I/O boundary — "before the Nth write/fsync/truncate of this file" — through which
+// the simulator crashes a process between two record writes and a real dkvd
+// process kills itself there.
 package fault

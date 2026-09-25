@@ -65,6 +65,17 @@ type Injection struct {
 	// a disk that is slow, not broken (e.g. an fsync that takes seconds). Err and
 	// Short are ignored for a stall. Stalls apply to OpWrite, OpSync and OpTruncate.
 	Gate <-chan struct{}
+	// At, if non-nil, turns the injection into an OBSERVATION POINT instead of a
+	// failure: it is called when the matching operation is reached, before the
+	// operation is performed, and the operation then proceeds normally. It is how
+	// a crash is placed at an exact I/O boundary (Phase 11, docs/CRASH_RECOVERY.md):
+	// a real process kills itself in At, so nothing after that point happens; the
+	// simulator marks the disk's process as crashed in At, so the operation — and
+	// every later one on the same handles — fails with ErrCrashed. (An operation
+	// that has no handle — OpenFile, SyncDir — still completes after At; a
+	// simulated crash before those is modelled with a failing injection instead.)
+	// Err, Short and Gate are ignored when At is set.
+	At func()
 }
 
 // OpRecord is one entry in an InjectFS op log.
@@ -170,13 +181,19 @@ func (f *InjectFS) record(r OpRecord) {
 func (f *InjectFS) OpenFile(name string, flag int, perm fs.FileMode) (vfs.File, error) {
 	name = filepath.Clean(name)
 	f.mu.Lock()
-	if inj, ok := f.take(OpOpen, name); ok {
+	inj, fire := f.take(OpOpen, name)
+	f.mu.Unlock()
+	if fire && inj.At != nil {
+		inj.At()
+		fire = false
+	}
+	if fire {
 		err := injectedErr(OpOpen, name, inj)
+		f.mu.Lock()
 		f.record(OpRecord{Op: OpOpen, Path: name, Err: err, Injected: true})
 		f.mu.Unlock()
 		return nil, err
 	}
-	f.mu.Unlock()
 	file, err := f.base.OpenFile(name, flag, perm)
 	f.mu.Lock()
 	f.record(OpRecord{Op: OpOpen, Path: name, Err: err})
@@ -194,13 +211,19 @@ func (f *InjectFS) Stat(name string) (fs.FileInfo, error) { return f.base.Stat(n
 func (f *InjectFS) SyncDir(dir string) error {
 	dir = filepath.Clean(dir)
 	f.mu.Lock()
-	if inj, ok := f.take(OpSyncDir, dir); ok {
+	inj, fire := f.take(OpSyncDir, dir)
+	f.mu.Unlock()
+	if fire && inj.At != nil {
+		inj.At()
+		fire = false
+	}
+	if fire {
 		err := injectedErr(OpSyncDir, dir, inj)
+		f.mu.Lock()
 		f.record(OpRecord{Op: OpSyncDir, Path: dir, Err: err, Injected: true})
 		f.mu.Unlock()
 		return err
 	}
-	f.mu.Unlock()
 	err := f.base.SyncDir(dir)
 	f.mu.Lock()
 	f.record(OpRecord{Op: OpSyncDir, Path: dir, Err: err})
@@ -215,9 +238,14 @@ type injectFile struct {
 	path string
 }
 
-// stall blocks on a firing stall injection's gate and reports whether the
-// operation should then proceed normally (true) or fail as injected (false).
-func stall(inj Injection) bool {
+// proceed handles a firing injection that is not a failure — an observation
+// point (At) or a stall (Gate) — and reports whether the operation should then
+// proceed normally (true) or fail as injected (false).
+func proceed(inj Injection) bool {
+	if inj.At != nil {
+		inj.At()
+		return true
+	}
 	if inj.Gate == nil {
 		return false
 	}
@@ -229,7 +257,7 @@ func (h *injectFile) Write(p []byte) (int, error) {
 	h.fs.mu.Lock()
 	inj, fire := h.fs.take(OpWrite, h.path)
 	h.fs.mu.Unlock()
-	if fire && stall(inj) {
+	if fire && proceed(inj) {
 		fire = false
 	}
 	if fire {
@@ -261,7 +289,7 @@ func (h *injectFile) Sync() error {
 	h.fs.mu.Lock()
 	inj, fire := h.fs.take(OpSync, h.path)
 	h.fs.mu.Unlock()
-	if fire && stall(inj) {
+	if fire && proceed(inj) {
 		fire = false
 	}
 	if fire {
@@ -282,7 +310,7 @@ func (h *injectFile) Truncate(size int64) error {
 	h.fs.mu.Lock()
 	inj, fire := h.fs.take(OpTruncate, h.path)
 	h.fs.mu.Unlock()
-	if fire && stall(inj) {
+	if fire && proceed(inj) {
 		fire = false
 	}
 	if fire {
