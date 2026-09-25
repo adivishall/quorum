@@ -441,6 +441,24 @@ func (c *Cluster) Apply(e Event) {
 	case HealAll:
 		c.links.HealAll()
 		c.trace.add(c.step, "healall")
+	case Split:
+		a, b, ok := splitSides(e.Data)
+		if !ok {
+			c.skip(e)
+			return
+		}
+		for _, id := range append(append([]string(nil), a...), b...) {
+			if c.nodes[NodeID(id)] == nil {
+				c.skip(e)
+				return
+			}
+		}
+		// The network is now split into exactly these two sides: any earlier
+		// partition is replaced, not accumulated (accumulated splits fragment
+		// the group into sides with no majority, and nothing progresses).
+		c.links.HealAll()
+		c.links.Split(a, b)
+		c.trace.add(c.step, "split %s", e.Data)
 	case Crash:
 		n := c.nodes[e.Node]
 		if n == nil || (!n.up && !e.Power) {

@@ -376,6 +376,11 @@ var KVProfiles = []Profile{
 		KVPut: 60, KVGet: 60, KVDelete: 15, Clients: 4, Keys: 3, FIFOPercent: 90},
 	{Name: "kv-partitions", Nodes: 5, Steps: 2500, Tick: 300, Deliver: 600, Partition: 12, Heal: 12,
 		KVPut: 50, KVGet: 60, KVDelete: 10, KVTimeout: 8, Clients: 6, Keys: 2, FIFOPercent: 80},
+	// Two-sided splits of a 5-node group: the minority side can keep a leader
+	// AND a follower acknowledging its heartbeats in the old term — the
+	// sharpest stale-leader case for ReadIndex's quorum rule.
+	{Name: "kv-splits", Nodes: 5, Steps: 2500, Tick: 300, Deliver: 600, Split: 3, Heal: 1,
+		KVPut: 50, KVGet: 70, KVDelete: 10, KVTimeout: 8, Clients: 6, Keys: 2, FIFOPercent: 80},
 	{Name: "kv-crashes", Nodes: 3, Steps: 2500, Tick: 300, Deliver: 600, Crash: 10, Restart: 40,
 		KVPut: 50, KVGet: 60, KVDelete: 10, KVTimeout: 8, Clients: 5, Keys: 2, FIFOPercent: 80, PowerLossPercent: 40, MaxTorn: 128},
 	{Name: "kv-messages", Nodes: 5, Steps: 2500, Tick: 300, Deliver: 600, Drop: 50, Duplicate: 50, Delay: 50, Pause: 4, Resume: 30,

@@ -88,7 +88,7 @@ func TestReadsConfirmAndDropStale(t *testing.T) {
 	c2 := r.Add(2, 3)
 	c3 := r.Add(3, 3)
 	r.Confirmed(raft.ReadState{ID: 1, Index: 10}, w, 12)
-	if out := <-c1; out.Err != nil || out.Index != 10 {
+	if out := recvNow(t, c1); out.Err != nil || out.Index != 10 {
 		t.Fatalf("already-applied read: %+v", out)
 	}
 	r.Confirmed(raft.ReadState{ID: 2, Index: 15}, w, 12)
@@ -98,7 +98,7 @@ func TestReadsConfirmAndDropStale(t *testing.T) {
 	default:
 	}
 	w.Applied(15, 3)
-	if out := <-c2; out.Err != nil || out.Index != 15 {
+	if out := recvNow(t, c2); out.Err != nil || out.Index != 15 {
 		t.Fatalf("barrier read: %+v", out)
 	}
 	r.DropStale(3, true) // still leading in term 3: nothing dropped
@@ -106,16 +106,30 @@ func TestReadsConfirmAndDropStale(t *testing.T) {
 		t.Fatalf("len %d", r.Len())
 	}
 	r.DropStale(4, true) // a new term: the term-3 read is gone
-	if out := <-c3; !errors.Is(out.Err, raft.ErrNotLeader) {
+	if out := recvNow(t, c3); !errors.Is(out.Err, raft.ErrNotLeader) {
 		t.Fatalf("stale read: %+v, want ErrNotLeader", out)
 	}
 	c4 := r.Add(4, 4)
 	r.DropStale(4, false) // same term, but no longer leader
-	if out := <-c4; !errors.Is(out.Err, raft.ErrNotLeader) {
+	if out := recvNow(t, c4); !errors.Is(out.Err, raft.ErrNotLeader) {
 		t.Fatalf("read on a deposed leader: %+v", out)
 	}
 	r.Confirmed(raft.ReadState{ID: 99, Index: 1}, w, 0) // unknown id: ignored
 	if r.Len() != 0 || w.Len() != 0 {
 		t.Fatalf("stray state: reads %d waiters %d", r.Len(), w.Len())
+	}
+}
+
+// recvNow receives an outcome that must ALREADY have been delivered: the tables
+// complete requests synchronously, so a missing outcome is a bug, reported at
+// once rather than as a hang.
+func recvNow(t *testing.T, ch <-chan Outcome) Outcome {
+	t.Helper()
+	select {
+	case out := <-ch:
+		return out
+	default:
+		t.Fatal("no outcome was delivered")
+		return Outcome{}
 	}
 }

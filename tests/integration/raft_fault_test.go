@@ -127,6 +127,22 @@ func (c *rcluster) isolate(id string) {
 	}
 }
 
+// split cuts every link between the two sides; links within a side work.
+func (c *rcluster) split(a, b []string) {
+	side := map[string]int{}
+	for _, id := range a {
+		side[id] = 1
+	}
+	for _, id := range b {
+		side[id] = 2
+	}
+	for k, p := range c.proxies {
+		if side[k[0]] != 0 && side[k[1]] != 0 && side[k[0]] != side[k[1]] {
+			p.Cut()
+		}
+	}
+}
+
 func (c *rcluster) healAll() {
 	for _, p := range c.proxies {
 		p.Heal()

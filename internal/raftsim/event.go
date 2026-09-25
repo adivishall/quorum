@@ -71,6 +71,11 @@ const (
 	// KVTimeout makes Client give up on its outstanding operation: the
 	// operation is Incomplete (a write may still take effect).
 	KVTimeout
+	// Split replaces any partition with a two-sided one, Data = "a,b|c,d,e":
+	// every link between the sides is cut both ways, every link within a side
+	// works (Phase 12 — a minority side that keeps a leader AND a follower
+	// acknowledging it, which single-link faults rarely produce).
+	Split
 )
 
 var kindNames = map[Kind]string{
@@ -79,7 +84,7 @@ var kindNames = map[Kind]string{
 	Crash: "crash", Restart: "restart", Pause: "pause", Resume: "resume",
 	FailPersist: "failpersist", Disarm: "disarm", Release: "release", Propose: "propose",
 	CheckConverged: "check-converged", CrashAt: "crashat",
-	KVPut: "kvput", KVGet: "kvget", KVDelete: "kvdel", KVTimeout: "kvtimeout",
+	KVPut: "kvput", KVGet: "kvget", KVDelete: "kvdel", KVTimeout: "kvtimeout", Split: "split",
 }
 
 func (k Kind) String() string {
@@ -118,6 +123,7 @@ func (o PersistOp) String() string { return persistNames[o] }
 //	KVPut                                     Node, Client, Key, Data (the value)
 //	KVGet, KVDelete                           Node, Client, Key
 //	KVTimeout                                 Client
+//	Split                                     Data ("a,b|c,d,e")
 //
 // A message is addressed by its link and its position among the messages
 // currently in flight on that link, oldest first (Pos 0 = the oldest). Addressing
@@ -194,6 +200,8 @@ func (e Event) String() string {
 		return fmt.Sprintf("%s %s %s %s", e.Kind, e.Node, e.Client, strconv.Quote(e.Key))
 	case KVTimeout:
 		return fmt.Sprintf("kvtimeout %s", e.Client)
+	case Split:
+		return fmt.Sprintf("split %s", e.Data)
 	default:
 		return e.Kind.String()
 	}
@@ -305,6 +313,13 @@ func ParseEvent(line string) (Event, error) {
 		if err = need(2); err == nil {
 			e.Client = f[1]
 		}
+	case Split:
+		if err = need(2); err == nil {
+			if _, _, ok := splitSides(f[1]); !ok {
+				err = fmt.Errorf("raftsim: bad split %q", line)
+			}
+			e.Data = f[1]
+		}
 	default:
 		err = need(1)
 	}
@@ -312,6 +327,15 @@ func ParseEvent(line string) (Event, error) {
 		return Event{}, err
 	}
 	return e, nil
+}
+
+// splitSides parses a Split's "a,b|c,d,e".
+func splitSides(s string) (a, b []string, ok bool) {
+	parts := strings.Split(s, "|")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return nil, nil, false
+	}
+	return strings.Split(parts[0], ","), strings.Split(parts[1], ","), true
 }
 
 // FormatScript renders a script, one event per line.

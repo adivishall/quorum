@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -395,6 +396,60 @@ func TestRealStaleLeaderNeverServesARead(t *testing.T) {
 	if op.Attempts[0].Node != l1 || !strings.HasPrefix(op.Attempts[0].Result, "not-leader") {
 		r.fail("the deposed leader %s must refuse the read: %+v", l1, op.Attempts)
 	}
+	r.check()
+	c.waitStable(c.ids, 0, 30*time.Second)
+	c.finish()
+}
+
+// TestRealMinorityLeaderWithAFollowerNeverServesARead is the stale-leader attack
+// at its sharpest, on five real processes: the group splits {L1, F} | {the
+// other three} while L1 leads. F never hears of the new term, so it keeps
+// acknowledging L1's heartbeats — L1 receives fresh acknowledgements, in its
+// own term, sent after the read, from a live follower. Two of five is still
+// not a quorum: the read must time out, never return A after the majority's
+// leader completed PUT(B). (Isolating L1 completely, as the test above does,
+// would leave it with no acknowledgements at all — a weaker attack that a
+// broken quorum rule survives; this one it does not.)
+func TestRealMinorityLeaderWithAFollowerNeverServesARead(t *testing.T) {
+	c := newRCluster(t, 5)
+	l1, t1 := c.waitLeader(c.ids, 0, 20*time.Second)
+	c.waitClientReady(20 * time.Second)
+	r := newLinRun(t, c)
+	ctx := context.Background()
+	w := r.client("writer", 10*time.Second, 6)
+	w.Prefer(l1)
+	r.require(w.Put(ctx, "k", []byte("A")), lincheck.OK, "")
+	c.waitCommit(c.ids, c.commitOf(l1), 20*time.Second)
+
+	f := others(c.ids, l1)[0]
+	minority, majority := []string{l1, f}, others(others(c.ids, l1), f)
+	r.event("split %v | %v (leader %s of term %d)", minority, majority, l1, t1)
+	c.split(minority, majority)
+	l2, t2 := c.waitLeader(majority, t1, 20*time.Second)
+	r.event("%s leads term %d", l2, t2)
+	w.Prefer(l2)
+	r.require(w.Put(ctx, "k", []byte("B")), lincheck.OK, "")
+
+	stale := r.client("stale-reader", 3*time.Second, 1)
+	stale.Prefer(l1)
+	op := stale.Get(ctx, "k")
+	if op.Outcome != lincheck.Incomplete {
+		r.fail("the minority leader %s (with follower %s) answered a read after %s completed PUT(B) in term %d: %s", l1, f, l2, t2, op)
+	}
+	// Premise, checked after the fact: the follower stayed with the minority
+	// leader's term throughout (it never reported a later one).
+	for _, m := range reFollower.FindAllStringSubmatch(c.procs[f].out.String(), -1) {
+		if tm, _ := strconv.ParseUint(m[2], 10, 64); tm >= t2 {
+			r.fail("premise: %s left the minority leader's term before the read (it followed %s in term %d)", f, m[3], tm)
+		}
+	}
+
+	r.event("heal")
+	c.healAll()
+	c.waitFollows(l1, l2, t2, 20*time.Second)
+	rd := r.client("reader", 10*time.Second, 6)
+	rd.Prefer(l1)
+	r.require(rd.Get(ctx, "k"), lincheck.OK, "B")
 	r.check()
 	c.waitStable(c.ids, 0, 30*time.Second)
 	c.finish()

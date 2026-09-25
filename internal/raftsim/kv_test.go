@@ -354,6 +354,59 @@ func TestKVStaleLeaderReadIsNeverServed(t *testing.T) {
 	}
 }
 
+// TestKVMinorityLeaderWithAFollowerNeverServesARead is the stale-leader attack
+// at its sharpest: the group of five splits {n1, n2} | {n3, n4, n5} while n1
+// leads. n2 never hears of the new term, so it keeps acknowledging n1's
+// heartbeats — n1 gets FRESH acknowledgements, sent after the read, in its own
+// term, from a live follower. It still must not serve: two of five is not a
+// quorum. (A rule that counted any post-read acknowledgement, or the leader
+// alone, would serve A after the majority completed B.)
+func TestKVMinorityLeaderWithAFollowerNeverServesARead(t *testing.T) {
+	s := newKVSim(t, 5)
+	s.electLeader("n1")
+	s.put("n1", "c1", "k", "A")
+	s.DeliverAll()
+	s.heartbeat("n1")
+	if op := s.last("c1"); op.Outcome != lincheck.OK {
+		t.Fatalf("put(A): %s", op)
+	}
+	s.do(Event{Kind: Split, Data: "n1,n2|n3,n4,n5"})
+	s.electLeader("n3")
+	s.put("n3", "c2", "k", "B")
+	s.DeliverAll()
+	s.heartbeat("n3")
+	if op := s.last("c2"); op.Outcome != lincheck.OK {
+		t.Fatalf("put(B) on the majority: %s", op)
+	}
+	if st := s.State("n1"); st.Role != raft.Leader || st.Term != 1 {
+		t.Fatalf("premise: n1 still believes it leads term 1: %+v", st)
+	}
+	s.get("n1", "c3", "k")
+	acked := s.Stats().Delivered
+	for i := 0; i < 5; i++ {
+		s.heartbeat("n1") // n2 answers every one of these, in term 1
+	}
+	if s.Stats().Delivered-acked < 10 {
+		t.Fatalf("premise: n1 and n2 must keep exchanging heartbeats (%d deliveries)", s.Stats().Delivered-acked)
+	}
+	if !s.Busy("c3") {
+		t.Fatalf("the minority leader served a read with a follower's acknowledgements: %s", s.last("c3"))
+	}
+	s.do(Event{Kind: HealAll})
+	s.heartbeat("n3")
+	s.DeliverAll()
+	if op := s.last("c3"); op.Outcome != lincheck.Rejected {
+		t.Fatalf("after the heal the stale read must fail definitely: %s", op)
+	}
+	s.get("n3", "c4", "k")
+	s.DeliverAll()
+	s.heartbeat("n3")
+	if op := s.last("c4"); op.Outcome != lincheck.OK || string(op.Output) != "B" {
+		t.Fatalf("read after heal: %s", op)
+	}
+	s.requireLinearizable()
+}
+
 // TestKVNewLeaderReadWaitsForItsNoop is the no-op rule: n1 commits put(A) at
 // index 2 with n2's acknowledgement and dies before telling anyone; n2 wins
 // term 2 holding A but with commit index 1 — it does not know A committed. A

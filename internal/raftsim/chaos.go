@@ -3,6 +3,8 @@ package raftsim
 import (
 	"fmt"
 	"math/rand"
+	"sort"
+	"strings"
 
 	"github.com/adivishall/quorum/internal/lincheck"
 	"github.com/adivishall/quorum/internal/raftnode"
@@ -18,6 +20,7 @@ type Profile struct {
 	Tick, Deliver, Propose        int
 	Drop, Duplicate, Delay        int
 	Partition, Heal               int
+	Split                         int // a two-sided partition (Phase 12)
 	Crash, Restart, Pause, Resume int
 	FailPersist                   int
 	CrashAt                       int // arm a crash at a driver or I/O crash point (Phase 11)
@@ -330,6 +333,22 @@ func (c *Cluster) generate(rng *rand.Rand, p Profile) Event {
 			}
 			return Event{Kind: Block, From: a, To: b} // one-way
 		}
+	})
+	add(p.Split, len(c.ids) > 2, func() Event {
+		// A random nonempty proper subset against the rest.
+		perm := rng.Perm(len(c.ids))
+		k := 1 + rng.Intn(len(c.ids)-1)
+		var a, b []string
+		for i, j := range perm {
+			if i < k {
+				a = append(a, string(c.ids[j]))
+			} else {
+				b = append(b, string(c.ids[j]))
+			}
+		}
+		sort.Strings(a)
+		sort.Strings(b)
+		return Event{Kind: Split, Data: strings.Join(a, ",") + "|" + strings.Join(b, ",")}
 	})
 	blocked := c.links.BlockedLinks()
 	add(p.Heal, len(blocked) > 0, func() Event {

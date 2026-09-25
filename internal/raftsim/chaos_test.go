@@ -124,6 +124,7 @@ func requireEveryFaultOccurred(t *testing.T, p Profile, s Stats) {
 	need(p.Duplicate > 0, s.Duplicated > 0, "a duplicate")
 	need(p.Delay > 0, s.Delayed > 0, "a delay")
 	need(p.Partition > 0, s.DroppedPartition > 0, "a message lost to a partition")
+	need(p.Split > 0, s.DroppedPartition > 0, "a message lost to a split")
 	need(p.Crash > 0, s.ProcessCrashes > 0 && s.Restarts > 0, "a crash and a restart")
 	need(p.Crash > 0 && p.PowerLossPercent > 0, s.PowerLosses > 0, "a power loss")
 	need(p.FailPersist > 0, s.PersistFailures > 0, "a persistence failure")
