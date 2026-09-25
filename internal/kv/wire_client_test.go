@@ -225,7 +225,20 @@ func TestWireClientReportsUnknownWhenTheConnectionDies(t *testing.T) {
 		t.Fatal(err)
 	}
 	scancel() // the server goes away, closing every connection
-	time.Sleep(50 * time.Millisecond)
+	// Synchronize on the listener being gone (a dial is refused), not on a
+	// guessed delay.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		probe, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second)
+		if err != nil {
+			break
+		}
+		probe.Close()
+		if time.Now().After(deadline) {
+			t.Fatal("the server's listener never closed")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 	_, err = cl.Put(ctx, []byte("k"), []byte("w"))
 	if !errors.Is(err, kv.ErrUnknown) && !errors.Is(err, kv.ErrUnavailable) {
 		t.Fatalf("after the server died: %v, want ErrUnknown or ErrUnavailable", err)

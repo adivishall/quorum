@@ -59,6 +59,12 @@ type Options struct {
 	// Stop, if non-nil, ends every client's loop early once it returns true
 	// (checked before each operation).
 	Stop func() bool
+	// Backoff, if > 0, is how long a client waits before its next attempt after
+	// a definite refusal that names no usable leader (node unavailable, or not
+	// leader with no hint) — as a real client would, instead of spinning
+	// through the nodes while an election is in progress. It shapes load only:
+	// every attempt is still recorded, and no outcome depends on it.
+	Backoff time.Duration
 }
 
 // Stats counts what the clients saw.
@@ -178,8 +184,60 @@ func (c *client) target() Endpoint {
 	return ep
 }
 
-// op runs one operation to completion under the documented policy.
-func (c *client) op(ctx context.Context, kind lincheck.Kind, key string, value []byte) {
+// Client is one history-recording client with exactly the policy Run's clients
+// follow, for scripted scenarios: each call is one operation, recorded as Run
+// records it, and returns the operation as recorded. It is not safe for
+// concurrent use (a client has one operation outstanding at a time).
+type Client struct{ c *client }
+
+// NewClient returns a scripted client named name. opts supplies Timeout and
+// MaxAttempts (the workload fields are ignored).
+func NewClient(name string, eps []Endpoint, opts Options, rec *lincheck.Recorder) *Client {
+	if opts.MaxAttempts <= 0 {
+		opts.MaxAttempts = 4
+	}
+	if opts.Timeout <= 0 {
+		opts.Timeout = 2 * time.Second
+	}
+	return &Client{c: &client{name: name, eps: eps, opts: opts, rec: rec}}
+}
+
+// Prefer makes the next attempt go to the named endpoint (as a leader hint does).
+func (c *Client) Prefer(node string) { c.c.hint = node }
+
+// Put, Get and Delete run one operation under the documented policy.
+func (c *Client) Put(ctx context.Context, key string, value []byte) lincheck.Op {
+	return c.run(ctx, lincheck.Put, key, value)
+}
+func (c *Client) Get(ctx context.Context, key string) lincheck.Op {
+	return c.run(ctx, lincheck.Get, key, nil)
+}
+func (c *Client) Delete(ctx context.Context, key string) lincheck.Op {
+	return c.run(ctx, lincheck.Delete, key, nil)
+}
+
+func (c *Client) run(ctx context.Context, kind lincheck.Kind, key string, value []byte) lincheck.Op {
+	id := c.c.op(ctx, kind, key, value)
+	op, _ := c.c.rec.Op(id)
+	return op
+}
+
+// Stats returns what this client saw.
+func (c *Client) Stats() Stats { return c.c.st }
+
+func (c *client) backoff(ctx context.Context) {
+	if c.opts.Backoff <= 0 {
+		return
+	}
+	select {
+	case <-time.After(c.opts.Backoff):
+	case <-ctx.Done():
+	}
+}
+
+// op runs one operation to completion under the documented policy and returns
+// its id in the history.
+func (c *client) op(ctx context.Context, kind lincheck.Kind, key string, value []byte) int {
 	c.st.Ops++
 	id := c.rec.Begin(c.name, kind, key, value)
 	unknown := false
@@ -209,13 +267,13 @@ func (c *client) op(ctx context.Context, kind lincheck.Kind, key string, value [
 			c.rec.End(id, lincheck.OK, out, ep.Name(), m.Term, m.Index)
 			c.hint = ep.Name()
 			c.st.OK++
-			return
+			return id
 		case errors.Is(err, kv.ErrNotFound):
 			c.rec.AttemptDone(id, a, true, "notfound", m.Term)
 			c.rec.End(id, lincheck.NotFound, nil, ep.Name(), m.Term, m.Index)
 			c.hint = ep.Name()
 			c.st.NotFound++
-			return
+			return id
 		case errors.As(err, &nl):
 			c.rec.AttemptDone(id, a, true, "not-leader("+nl.Leader+")", m.Term)
 			c.st.Redirects++
@@ -223,26 +281,31 @@ func (c *client) op(ctx context.Context, kind lincheck.Kind, key string, value [
 			if c.hint == ep.Name() {
 				c.hint = "" // a node naming itself while refusing: do not spin on it
 			}
+			if c.hint == "" {
+				c.backoff(ctx)
+			}
 		case errors.Is(err, raft.ErrNotLeader):
 			c.rec.AttemptDone(id, a, true, "not-leader", m.Term)
 			c.st.Redirects++
 			c.hint = ""
+			c.backoff(ctx)
 		case errors.Is(err, kv.ErrUnavailable):
 			c.rec.AttemptDone(id, a, true, "unavailable", 0)
 			c.st.Unavailable++
 			c.hint = ""
+			c.backoff(ctx)
 		case errors.Is(err, kv.ErrLost):
 			c.rec.AttemptDone(id, a, true, "lost", m.Term)
 			c.rec.End(id, lincheck.Rejected, nil, ep.Name(), m.Term, m.Index)
 			c.st.Rejected++
 			c.st.Lost++
-			return
+			return id
 		case errors.Is(err, kv.ErrInvalid):
 			c.rec.AttemptDone(id, a, true, "invalid", 0)
 			c.rec.End(id, lincheck.Rejected, nil, ep.Name(), 0, 0)
 			c.st.Rejected++
 			c.st.Invalid++
-			return
+			return id
 		default:
 			// A deadline, a dead connection, a stopped node: no answer.
 			c.rec.AttemptDone(id, a, false, "unknown: "+err.Error(), m.Term)
@@ -252,7 +315,7 @@ func (c *client) op(ctx context.Context, kind lincheck.Kind, key string, value [
 			if kind != lincheck.Get {
 				c.rec.End(id, lincheck.Incomplete, nil, "", 0, 0)
 				c.st.Incomplete++
-				return
+				return id
 			}
 			c.st.ReadRetries++
 		}
@@ -262,8 +325,9 @@ func (c *client) op(ctx context.Context, kind lincheck.Kind, key string, value [
 	if unknown {
 		c.rec.End(id, lincheck.Incomplete, nil, "", 0, 0)
 		c.st.Incomplete++
-		return
+		return id
 	}
 	c.rec.End(id, lincheck.Rejected, nil, "", 0, 0)
 	c.st.Rejected++
+	return id
 }

@@ -121,38 +121,82 @@ func TestHotKeyConcurrentWritesAndReads(t *testing.T) {
 	}
 }
 
-// untilDone runs schedule in the background and returns a workload Stop
-// predicate that ends the clients once the schedule has finished — so the
-// faults intersect the workload by construction, not by luck of timing.
-func untilDone(schedule func()) func() bool {
-	var done atomic.Bool
-	go func() {
-		schedule()
-		done.Store(true)
-	}()
-	return done.Load
+// served counts the operations the cluster answered (OK or NotFound).
+func served(rec *lincheck.Recorder) int {
+	s := rec.History().Summary()
+	return s.OK + s.NotFound
+}
+
+// waitServed is a synchronization point on client progress: it returns once n
+// more operations than now have been served. Fault schedules inject at these
+// points, never after a guessed sleep.
+func waitServed(t *testing.T, rec *lincheck.Recorder, n int, d time.Duration) {
+	t.Helper()
+	want := served(rec) + n
+	deadline := time.Now().Add(d)
+	for served(rec) < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of %d operations served within %s", served(rec), want, d)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// waitFor polls a condition (a fault engaging, a leader appearing) — a
+// synchronization point, bounded by d.
+func waitFor(t *testing.T, what string, d time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s did not happen within %s", what, d)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// runFaults runs the workload in the background while schedule runs on the
+// test goroutine (so its waits can fail the test); the clients stop once the
+// schedule returns.
+func runFaults(t *testing.T, c *cluster, opts workload.Options, schedule func(rec *lincheck.Recorder)) (*lincheck.Recorder, workload.Stats) {
+	t.Helper()
+	rec := lincheck.NewRecorder()
+	ctx, cancel := context.WithTimeout(c.ctx, 120*time.Second)
+	defer cancel()
+	var stop atomic.Bool
+	opts.Stop = stop.Load
+	done := make(chan workload.Stats, 1)
+	go func() { done <- workload.Run(ctx, c.endpoints(), opts, rec) }()
+	schedule(rec)
+	stop.Store(true)
+	return rec, <-done
 }
 
 // TestLinearizableUnderMessageFaults: scenario I(1–3) — delay (hold and release
 // in reverse), drop and duplication of Raft traffic while eight clients run.
+// Each fault is held until it has demonstrably engaged (the network's own
+// counters), and the clients make progress between rounds.
 func TestLinearizableUnderMessageFaults(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := startCluster(t, ctx, 3, true)
 	c.waitLeader(0, 10*time.Second)
 	c.net.AddRule(fault.Rule{Action: fault.Duplicate, Copies: 1})
-	stop := untilDone(func() {
+	rec, st := runFaults(t, c, workload.Options{Clients: 8, OpsPerClient: 1 << 20, Keys: 3, Timeout: 3 * time.Second, Seed: 5, GetPct: 40, DeletePct: 10, MaxAttempts: 6, Backoff: 5 * time.Millisecond}, func(rec *lincheck.Recorder) {
+		waitServed(t, rec, 20, 30*time.Second)
 		for i := 0; i < 6; i++ {
+			held := c.net.Stats().Held
 			hold := c.net.AddRule(fault.Rule{Kinds: []transport.MsgKind{transport.MsgAppendEntries}, Action: fault.Hold})
-			time.Sleep(40 * time.Millisecond)
+			waitFor(t, "holding AppendEntries", 10*time.Second, func() bool { return c.net.Stats().Held >= held+4 })
 			c.net.RemoveRule(hold)
 			c.net.Release(true) // newest first: reordering
+			dropped := c.net.Stats().Dropped
 			drop := c.net.AddRule(fault.Rule{Action: fault.Drop, Count: 5})
-			time.Sleep(20 * time.Millisecond)
+			waitFor(t, "dropping five messages", 10*time.Second, func() bool { return c.net.Stats().Dropped >= dropped+5 })
 			c.net.RemoveRule(drop)
+			waitServed(t, rec, 10, 30*time.Second)
 		}
 	})
-	rec, st := run(t, c, workload.Options{Clients: 8, OpsPerClient: 1 << 20, Keys: 3, Timeout: 3 * time.Second, Seed: 5, GetPct: 40, DeletePct: 10, MaxAttempts: 6, Stop: stop})
 	c.net.ClearRules()
 	c.net.Release(false)
 	check(t, rec, st)
@@ -170,14 +214,15 @@ func TestLinearizableAcrossLeaderCrashAndRestart(t *testing.T) {
 	defer cancel()
 	c := startCluster(t, ctx, 3, false)
 	l := c.waitLeader(0, 10*time.Second)
-	stop := untilDone(func() {
-		time.Sleep(150 * time.Millisecond)
+	t1 := c.node(l).Status().Term
+	rec, st := runFaults(t, c, workload.Options{Clients: 6, OpsPerClient: 1 << 20, Keys: 3, Timeout: 2 * time.Second, Seed: 11, GetPct: 40, DeletePct: 10, MaxAttempts: 6, Backoff: 5 * time.Millisecond}, func(rec *lincheck.Recorder) {
+		waitServed(t, rec, 40, 30*time.Second)
 		c.crash(l)
-		time.Sleep(400 * time.Millisecond)
+		c.waitLeader(t1, 10*time.Second)
+		waitServed(t, rec, 30, 30*time.Second)
 		c.startNode(l)
-		time.Sleep(300 * time.Millisecond)
+		waitServed(t, rec, 30, 30*time.Second)
 	})
-	rec, st := run(t, c, workload.Options{Clients: 6, OpsPerClient: 1 << 20, Keys: 3, Timeout: 2 * time.Second, Seed: 11, GetPct: 40, DeletePct: 10, MaxAttempts: 6, Pace: 2 * time.Millisecond, Stop: stop})
 	check(t, rec, st)
 	if st.Unknown+st.Unavailable+st.Redirects == 0 {
 		t.Fatalf("the crash did not intersect the workload: %s", st)
@@ -187,16 +232,9 @@ func TestLinearizableAcrossLeaderCrashAndRestart(t *testing.T) {
 	l2 := c.waitLeader(0, 10*time.Second)
 	srvL, _ := c.eps[l2].current()
 	srvR, _ := c.eps[l].current()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if srvR.Node().Status().Applied >= srvL.Node().Status().Commit {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("restarted node did not catch up: applied %d, leader commit %d", srvR.Node().Status().Applied, srvL.Node().Status().Commit)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitFor(t, "the restarted node catching up", 10*time.Second, func() bool {
+		return srvR.Node().Status().Applied >= srvL.Node().Status().Commit
+	})
 	a, b := srvL.Store().Snapshot(), srvR.Store().Snapshot()
 	if len(a) != len(b) {
 		t.Fatalf("stores differ in size: %d vs %d", len(a), len(b))
@@ -217,14 +255,16 @@ func TestLinearizableAcrossPartitionAndHeal(t *testing.T) {
 	defer cancel()
 	c := startCluster(t, ctx, 3, true)
 	l := c.waitLeader(0, 10*time.Second)
-	stop := untilDone(func() {
-		time.Sleep(150 * time.Millisecond)
+	t1 := c.node(l).Status().Term
+	rec, st := runFaults(t, c, workload.Options{Clients: 6, OpsPerClient: 1 << 20, Keys: 3, Timeout: 1500 * time.Millisecond, Seed: 17, GetPct: 40, DeletePct: 10, MaxAttempts: 6, Backoff: 5 * time.Millisecond}, func(rec *lincheck.Recorder) {
+		waitServed(t, rec, 40, 30*time.Second)
 		c.net.Isolate(string(l), c.members())
-		time.Sleep(700 * time.Millisecond)
+		c.waitLeader(t1, 10*time.Second)
+		waitServed(t, rec, 40, 30*time.Second)
 		c.net.HealAll()
-		time.Sleep(300 * time.Millisecond)
+		waitFor(t, "the old leader stepping down", 10*time.Second, func() bool { return c.node(l).Status().Term > t1 })
+		waitServed(t, rec, 30, 30*time.Second)
 	})
-	rec, st := run(t, c, workload.Options{Clients: 6, OpsPerClient: 1 << 20, Keys: 3, Timeout: 1500 * time.Millisecond, Seed: 17, GetPct: 40, DeletePct: 10, MaxAttempts: 6, Pace: 2 * time.Millisecond, Stop: stop})
 	check(t, rec, st)
 	if st.Unknown+st.Redirects == 0 {
 		t.Fatalf("the partition did not intersect the workload: %s", st)
