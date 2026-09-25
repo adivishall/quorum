@@ -18,4 +18,9 @@
 //	             That needs the data to have reached the physical device, which
 //	             a userspace test on a laptop cannot verify. See
 //	             docs/FAILURE_MODEL.md §4.
+//
+// raft_crash_test.go (Phase 11, docs/CRASH_RECOVERY.md §8) kills real dkvd
+// processes at exact crash points with `dkvd -crash-at` — the process logs the
+// point and SIGKILLs itself there — and requires the log it leaves to reopen, the
+// restart to recover exactly what the file holds, and the group to re-converge.
 package integration

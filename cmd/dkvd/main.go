@@ -34,11 +34,13 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/adivishall/quorum/internal/fault"
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftnode"
 	"github.com/adivishall/quorum/internal/transport"
@@ -64,8 +66,14 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		raftMode = fs.Bool("raft", false, "run a single Raft group over the transport (Phase 9) instead of the probe demo")
 		dataDir  = fs.String("data-dir", "", "directory for the durable Raft log (raft mode; a temp dir if empty)")
 		tickIvl  = fs.Duration("tick-interval", 50*time.Millisecond, "raft logical tick duration")
+		crashAt  = fs.String("crash-at", "", "TEST SEAM (raft mode): kill this process with SIGKILL at a crash point, e.g. after-save:2 (the 2nd time it is reached) or fsync:3 (before the 3rd fsync of the durable log); see docs/CRASH_RECOVERY.md")
 	)
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	crash, err := parseCrashAt(*crashAt)
+	if err != nil {
+		fmt.Fprintf(stderr, "dkvd: %v\n", err)
 		return 2
 	}
 
@@ -111,7 +119,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	lg.logf("event=ready node=%s addr=%s peers=%d", *id, tr.LocalAddr(), len(peers))
 
 	if *raftMode {
-		return runRaft(ctx, raftRun{id: *id, peers: peers, tr: tr, dataDir: *dataDir, tick: *tickIvl, lg: lg, stderr: stderr})
+		r := raftRun{id: *id, peers: peers, tr: tr, dataDir: *dataDir, tick: *tickIvl, lg: lg, stderr: stderr}
+		if crash != nil {
+			r.hook, r.fs = crash.install(lg, *id)
+		}
+		return runRaft(ctx, r)
 	}
 
 	n := &node{
@@ -250,6 +262,7 @@ type raftRun struct {
 	lg      *logger
 	stderr  io.Writer
 	fs      vfs.FS
+	hook    raftnode.Hook // -crash-at driver point; nil in normal operation
 }
 
 // runRaft runs a single Raft group (Phase 9) over the already-built transport
@@ -283,6 +296,7 @@ func runRaft(ctx context.Context, r raftRun) int {
 		ID: raftnode.NodeID(id), Peers: group, Transport: r.tr,
 		LogPath:      filepath.Join(dataDir, "raft-"+id+".log"),
 		TickInterval: r.tick, Logf: lg.logf, FS: r.fs, // durable by default (DisableSync left false)
+		Hook: r.hook, // nil unless -crash-at (a test seam)
 	})
 	if err != nil {
 		fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
@@ -339,6 +353,81 @@ func runRaft(ctx context.Context, r raftRun) int {
 	st := n.Status()
 	lg.logf("event=shutdown_done node=%s role=%s term=%d commit=%d", id, st.Role, st.Term, st.Commit)
 	return code
+}
+
+// crashPoint is a parsed -crash-at: a driver point (raftnode.Point) or an I/O
+// boundary of the durable log ("write", "fsync", "truncate"), and which
+// occurrence fires. It is a test seam for the Phase 11 real-process crash tests
+// (docs/CRASH_RECOVERY.md §8): at the point the process logs event=crash_point
+// and kills itself with SIGKILL, so nothing after that boundary happens — the
+// same points the deterministic simulator crashes at, on a real process, real
+// files and a real restart. Unset in normal operation, it costs nothing.
+type crashPoint struct {
+	name   string
+	driver raftnode.Point // zero for an I/O point
+	op     fault.Op       // zero for a driver point
+	nth    int
+}
+
+func parseCrashAt(spec string) (*crashPoint, error) {
+	if spec == "" {
+		return nil, nil
+	}
+	name, nth := spec, 1
+	if i := strings.LastIndexByte(spec, ':'); i >= 0 {
+		name = spec[:i]
+		n, err := strconv.Atoi(spec[i+1:])
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("-crash-at %q: occurrence must be a positive integer", spec)
+		}
+		nth = n
+	}
+	cp := &crashPoint{name: name, nth: nth}
+	if p, ok := raftnode.ParsePoint(name); ok {
+		cp.driver = p
+		return cp, nil
+	}
+	switch name {
+	case "write":
+		cp.op = fault.OpWrite
+	case "fsync":
+		cp.op = fault.OpSync
+	case "truncate":
+		cp.op = fault.OpTruncate
+	default:
+		return nil, fmt.Errorf("-crash-at %q: unknown crash point", spec)
+	}
+	return cp, nil
+}
+
+// install returns the driver hook and the durable log's filesystem that make the
+// process die at the point. Driver points count occurrences from startup; I/O
+// points count that operation on the log file from startup too (the first fsync
+// is the one Open issues on the recovered state).
+func (cp *crashPoint) install(lg *logger, id string) (raftnode.Hook, vfs.FS) {
+	die := func() {
+		lg.logf("event=crash_point node=%s point=%s n=%d", id, cp.name, cp.nth)
+		_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		select {} // SIGKILL is not deliverable to ourselves any later than now
+	}
+	if cp.driver != 0 {
+		seen := 0
+		return func(p raftnode.Point, _ uint64) error {
+			if p == cp.driver {
+				seen++
+				if seen == cp.nth {
+					die()
+				}
+			}
+			return nil
+		}, nil
+	}
+	// The injecting filesystem (real OS underneath) records every operation on
+	// the log for the process's lifetime — acceptable for a process that exists
+	// to die at its Nth one, which is the only reason this flag is ever set.
+	ifs := fault.NewInjectFS(nil)
+	ifs.Arm(fault.Injection{Op: cp.op, Nth: cp.nth, At: die})
+	return nil, ifs
 }
 
 // parsePeers parses "id=host:port,id=host:port" into a map. It rejects empty
