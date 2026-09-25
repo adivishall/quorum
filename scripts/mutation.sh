@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
 # mutation.sh — Raft mutation testing: the Phase 9 protocol rules (docs/RAFT.md
-# §12a) and the Phase 10 failure-handling rules and fault-model fidelity
-# (docs/FAULTS.md §9).
+# §12a), the Phase 10 failure-handling rules and fault-model fidelity
+# (docs/FAULTS.md §12), and the Phase 11 crash-recovery rules
+# (docs/CRASH_RECOVERY.md §10).
 #
 # For each mutant it applies a real source edit that violates a specific Raft rule,
 # runs the test(s) that should catch that violation, and requires them to FAIL (the
@@ -108,7 +109,7 @@ mutant "higher-term-step-down" internal/raft/raft.go \
   ./internal/raft 'TestHigherTermForcesStepDown|TestLeaderCompleteness'
 
 # 8. Violate persist-before-dependent-reply (skip the durable Save entirely).
-mutant "persist-before-reply" internal/raftnode/node.go \
+mutant "persist-before-reply" internal/raftnode/crashpoint.go \
   'if hs != nil || len(rd.Entries) > 0 {' \
   'if false && (hs != nil || len(rd.Entries) > 0) {' \
   ./internal/raftnode 'TestPersistBeforeReplyOnDriverPath'
@@ -145,7 +146,7 @@ mutant "durability-failure-latches" internal/raftlog/raftlog.go \
   ./internal/raftlog 'TestFailedWriteLatchesAndLogStaysRecoverable|TestFailedSyncLatches'
 
 # 12. The driver ignores a persistence failure and sends the Ready's messages anyway.
-mutant "fail-stop-on-persist-failure" internal/raftnode/node.go \
+mutant "fail-stop-on-persist-failure" internal/raftnode/crashpoint.go \
   '			if err := st.Save(hs, rd.Entries); err != nil {
 				return err
 			}' \
@@ -266,6 +267,100 @@ mutant "read-idle-timeout-detects-dead-conn" internal/transport/transport.go \
 			_ = c.nc.SetReadDeadline(time.Time{})
 		}' \
   ./internal/transport 'TestReaderIdleTimeoutReconnectsASilentConnection'
+
+# --- Phase 11: crash-recovery rules (docs/CRASH_RECOVERY.md §10) ---
+
+# 25. Write a Save's entries before its term change (the pre-Phase-11 order): a
+#     crash between the two records leaves entries of a term above the durable
+#     currentTerm, and recovery refuses the log — the node can never restart.
+mutant "term-durable-before-entries-of-that-term" internal/raftlog/raftlog.go \
+  '	if len(entries) > 0 && (hs.Term != prev.Term || hs.Vote != prev.Vote) {' \
+  '	if false && len(entries) > 0 && (hs.Term != prev.Term || hs.Vote != prev.Vote) {' \
+  './internal/raftlog ./internal/raftsim' 'TestTermChangeIsDurableBeforeEntriesOfThatTerm|TestSingleNodeCrashInsideItsElectionSave'
+
+# 26. Let the leading HardState record carry the NEW commit: a crash before the
+#     replacing entries leaves the old, conflicting entries under a commit that
+#     covers them.
+mutant "commit-not-durable-before-its-entries" internal/raftlog/raftlog.go \
+  '		lead = &HardState{Term: hs.Term, Vote: hs.Vote, Commit: prev.Commit}' \
+  '		lead = &HardState{Term: hs.Term, Vote: hs.Vote, Commit: hs.Commit}' \
+  ./internal/raftlog 'TestCommitNeverCoversEntriesTheSaveHadNotWritten'
+
+# 27. Trust a persisted commit beyond the entries actually recovered.
+mutant "recovered-commit-clamped-to-log" internal/raftlog/raftlog.go \
+  '	if rec.HardState.Commit > uint64(len(rec.Entries)) {' \
+  '	if false && rec.HardState.Commit > uint64(len(rec.Entries)) {' \
+  ./internal/raftlog 'TestCommitBeyondRecoveredLogIsClamped'
+
+# 28. Do not truncate a torn tail on recovery, so the next append lands behind
+#     garbage and the log becomes unopenable.
+mutant "torn-tail-truncated-on-recovery" internal/raftlog/raftlog.go \
+  '	if next < info.Size() {' \
+  '	if false && next < info.Size() {' \
+  ./internal/raftlog 'TestTornTailIsTruncated'
+
+# 29. Treat every framing failure as a torn tail — silently skipping mid-log
+#     corruption instead of refusing to open.
+mutant "mid-log-corruption-is-fatal" internal/raftlog/raftlog.go \
+  '			if errors.Is(err, record.ErrTornTail) {
+				break // a crash mid-append; the last good offset is the append point
+			}' \
+  '			if true {
+				break // a crash mid-append; the last good offset is the append point
+			}' \
+  ./internal/raftlog 'TestMidCorruptionIsFatal'
+
+# 30. Accept a recovered currentTerm below the term of an entry in the log
+#     (recovery inventing coherence instead of refusing an incoherent log).
+mutant "recover-refuses-term-below-log" internal/raft/config.go \
+  '		if c.Term < lt {
+			return nil, ErrTermRegression
+		}' \
+  '		if false && c.Term < lt {
+			return nil, ErrTermRegression
+		}' \
+  ./internal/raftnode 'TestRecoverRefusesATermBelowItsLog'
+
+# 31. Restore volatile leader state on restart: a recovered node believes it
+#     still leads its recovered term.
+mutant "restart-as-follower-never-leader" internal/raft/raft.go \
+  '		role:           Follower,' \
+  '		role:           Leader,' \
+  ./internal/raftsim 'TestCrashMatrix|TestCrashDuringSuffixReplacement'
+
+# 32. Record an entry as applied BEFORE the state machine applies it, so a crash
+#     between the two loses the application.
+mutant "applied-recorded-only-after-apply" internal/raftnode/crashpoint.go \
+  '		if sm != nil {
+			if err := sm.Apply(e.Index, e.Data); err != nil {
+				return fmt.Errorf("%w: index %d: %w", ErrApply, e.Index, err)
+			}
+		}
+		if err := at.hit(AfterApply, e.Index); err != nil {
+			return err
+		}
+		if err := core.AppliedTo(e.Index); err != nil {
+			return fmt.Errorf("%w: AppliedTo(%d): %w", ErrApply, e.Index, err)
+		}' \
+  '		if err := core.AppliedTo(e.Index); err != nil {
+			return fmt.Errorf("%w: AppliedTo(%d): %w", ErrApply, e.Index, err)
+		}
+		if sm != nil {
+			if err := sm.Apply(e.Index, e.Data); err != nil {
+				return fmt.Errorf("%w: index %d: %w", ErrApply, e.Index, err)
+			}
+		}
+		if err := at.hit(AfterApply, e.Index); err != nil {
+			return err
+		}' \
+  ./internal/raftnode 'TestCrashPointAbortStopsExactlyThere|TestApplyFailureIsWrappedAndLeavesTheRestPending'
+
+# 33. Forget the durable vote on restart: a node that voted in its current term
+#     could vote again, for someone else.
+mutant "recover-restores-vote" internal/raftnode/node.go \
+  '		Term: rec.HardState.Term, Vote: rec.HardState.Vote,' \
+  '		Term: rec.HardState.Term, Vote: "",' \
+  ./internal/raftsim 'TestVoterCrashAroundPersistingItsVote|TestCrashMatrix'
 
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
