@@ -14,11 +14,19 @@ dependent reply — hold in a deterministic simulation, and durable Raft state s
 partitions, crashes, a modeled power loss, restarts and persistence failures — continuously, in a
 seed-replayable simulator — and on the real driver and real processes.
 
+**Phase 11** (`docs/CRASH_RECOVERY.md`) characterised and verified the Raft node's crash windows:
+a crash at every boundary of persistence, message emission, commit, apply and recovery recovers
+exactly the last completed durable state plus a prefix of any interrupted one, never regresses
+term or vote, keeps the committed prefix, and re-applies the committed prefix exactly (INV-CR1..4).
+It confirmed C4 stage one precisely: application is **at-least-once across restarts and
+exactly-once within an incarnation**, because the applied index is volatile and every restart
+replays the recovered committed prefix from index 1; nothing deduplicates.
+
 **Not yet verified.** End-to-end single-key linearizability
 against a real cluster under faults (Phase 12); client retry / dedup semantics (C4 stage two,
 Phase 13); the distributed API and `stale`/`linearizable` read serving including ReadIndex (§8.5,
-Phases 13/15); crash recovery across every failure window of a node that hosts the storage
-engine (Phase 11); and real power-loss durability (untestable here). The claims C1–C5 below
+Phases 13/15); the crash windows of the storage engine while hosted by a node (the engine is not
+hosted yet); and real power-loss durability (untestable here). The claims C1–C5 below
 are therefore **still design targets**: Raft working is a necessary part of them, not the whole
 proof.
 
@@ -72,7 +80,7 @@ committed. This is unavoidable; it is not a bug. Two stages:
 
 | Stage | Guarantee | Consequence |
 |---|---|---|
-| Phases 9–12 | **at-least-once** application | A retried `PUT` may be applied twice. For `PUT`/`DELETE` (idempotent given the same value) the final state is the same, but a retry that lands *after* a newer write from another client will clobber it. C1 does **not** hold under retries in this stage. |
+| Phases 9–12 | **at-least-once** application (verified in Phase 11: a restart re-applies the whole recovered committed prefix; exactly-once holds only within one incarnation) | A retried `PUT` may be applied twice. For `PUT`/`DELETE` (idempotent given the same value) the final state is the same, but a retry that lands *after* a newer write from another client will clobber it. C1 does **not** hold under retries in this stage. |
 | Phase 13 onward | **exactly-once application** per `(clientID, seqNo)` | The state machine keeps a dedup table. A duplicate proposal is recognized at apply time and returns the original result without re-applying. C1 holds under retries. |
 
 Note the phrase: exactly-once **application**, not exactly-once delivery. Messages are still

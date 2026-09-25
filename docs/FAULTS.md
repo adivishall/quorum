@@ -95,7 +95,9 @@ which a message moves only by an explicit event), and the **disk's crash behavio
 **Events** form a script, one per line — `tick n1`, `deliver n1 n2 0`, `drop n1 n2 1`,
 `dup n2 n1 0`, `delay n1 n3 0 40`, `block n1 n2`, `unblock n1 n2`, `cut n1 n2`, `isolate n3`,
 `healall`, `crash n2 process`, `crash n2 power 13`, `restart n2`, `pause n4`, `resume n4`,
-`failpersist n1 sync|write|short 5`, `disarm`, `release`, `propose n1 cmd`, `check-converged`.
+`failpersist n1 sync|write|short 5`, `disarm`, `release`, `propose n1 cmd`, `check-converged`,
+and (Phase 11) `crashat n2 after-save 3` / `crashat n1 write 2 power 16` — a crash at an exact
+driver or I/O boundary (`docs/CRASH_RECOVERY.md`).
 A message is addressed by its link and its position among the messages in flight on that link,
 so a script stays meaningful when the minimizer deletes events; an event that no longer applies is
 skipped (and traced), never an error.
@@ -281,7 +283,9 @@ check matching and survival across crashes, not a workload.
 ## 12. Mutation testing
 
 `make mutation` applies each rule-violating edit, runs the named tests, requires them to fail, and
-reverts. Phase 10 adds 14 mutants to Phase 9's 8; all 22 are killed.
+reverts. Phase 10 adds 14 mutants to Phase 9's 8, plus 2 for the transport's dead-connection
+handling; Phase 11 adds 9 for its crash-recovery rules (`docs/CRASH_RECOVERY.md` §11); all 33 are
+killed.
 
 | Mutant (Phase 10) | Killed by |
 |---|---|
@@ -378,6 +382,8 @@ passed the entire `internal/raft` suite.
 - **Liveness is only claimed after faults stop** (INV-F3, bounded rounds, simulation). There is no
   PreVote or CheckQuorum, so a rejoining node with an inflated term costs one extra election.
 - **The storage engine** (WAL, LSM, compaction) is not hosted by a node yet; its crash windows are
-  covered by the Phase 2–4 SIGKILL tests and belong to Phase 11's harness.
+  covered by the Phase 2–4 SIGKILL tests and belong to the phase that hosts it. The crash windows
+  of the Raft node itself — every boundary of persistence, sending, advancing, applying and
+  recovery — are Phase 11's (`docs/CRASH_RECOVERY.md`).
 - The real-process election-safety monitor samples every 20 ms and can miss a violation that
   lasts less; the simulator's check sees every event.

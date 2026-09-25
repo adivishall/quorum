@@ -260,7 +260,7 @@ above. Each is a property of the system under injected failure, not of the test 
 | ID | Invariant | Checked by | Status |
 |---|---|---|---|
 | INV-F1 | A durable-log write or fsync failure is **fail-stop**: none of the failing Ready's messages is sent, the node processes no further event, the log accepts no further write, `dkvd` exits 1, and the log remains openable (a torn record is truncated on reopen). | `internal/raftlog`: `TestFailedWriteLatchesAndLogStaysRecoverable`, `TestFailedSyncLatches`; `internal/raftnode`: `TestPersistFailureIsFailStop` (disk full, torn write, fsync failure — the op log shows no write or fsync after the failure); `cmd/dkvd`: `TestRaftModeExitsNonZeroWhenTheLogFails`; `internal/raftsim`: `TestVoteNotSentWhenItCannotBePersisted`, `TestTornWriteIsTruncatedOnRestart`, `TestDiskFullOnLeaderStopsItAndClusterMovesOn`, the `disk` profile | VERIFIED (injected software I/O errors) |
-| INV-F2 | A restarted node resumes from exactly its durable state: its recovered term, vote, log and commit equal what it last successfully persisted, extended by at most a prefix of the records of a save that was interrupted — after a process crash and after a modeled power loss — and that recovered state is made durable before the node acts on it. | `internal/raftsim`: at every restart, against an independent record of every Save (continuous), `TestFollowerCrashAndCatchUp`, `TestNoAckOfUnsyncedEntriesAfterFailedFsync`, the `crashes`/`disk`/`mixed` profiles; `internal/raftlog`: `TestOpenMakesRecoveredStateDurable`; `tests/integration`: committed prefixes survive real SIGKILL/restart | VERIFIED (simulation; process kill) |
+| INV-F2 | A restarted node resumes from exactly its durable state: its recovered term, vote, log and commit equal what it last successfully persisted, extended by at most a prefix of the records of a save that was interrupted (in the order `raftlog.SavePlan` writes them) — after a process crash and after a modeled power loss — and that recovered state is made durable before the node acts on it. | `internal/raftsim`: at every restart, against an independent record of every Save (continuous), `TestFollowerCrashAndCatchUp`, `TestNoAckOfUnsyncedEntriesAfterFailedFsync`, the `crashes`/`disk`/`mixed` profiles; **Phase 11:** at every cell of `TestCrashMatrix` (a crash at every driver and I/O boundary, in three crash modes) and the `crashpoints` profile; `internal/raftlog`: `TestOpenMakesRecoveredStateDurable`; `tests/integration`: committed prefixes survive real SIGKILL/restart, `TestRealCrashAtPoints` | VERIFIED (simulation incl. every crash boundary; process kill) |
 | INV-F3 | **Liveness after faults stop**: once every node is up, every partition healed and the schedule fair, one leader is elected, commits an entry of its own term, and every node's log, commit and applied index converge to it within 400 rounds. | `internal/raftsim`: `check-converged` ends every seeded run and fuzz input; `TestRepeatedCrashRestart`, `TestPartitionedNodeRestartsWhileIsolated` | VERIFIED (simulation only) |
 | INV-F4 | Faults never fabricate or duplicate a command: every applied command was accepted by a leader and occupies exactly one log index, under any mix of drop, duplicate, reorder, delay and crash. | `internal/raftsim`: at every apply (continuous); `internal/raftnode`: `TestDuplicatedAndReorderedTrafficAppliesOnce` (real TCP) | VERIFIED |
 | INV-F5 | The driver never blocks its Raft actor on the network: a peer whose sends block delays only its own messages; heartbeats and replication to the other peers continue and no election is triggered. | `internal/raftnode`: `TestWedgedPeerDoesNotStallTheLeader` (real TCP; fails with a synchronous send) | VERIFIED (driver) |
@@ -275,6 +275,34 @@ untested, exactly as for INV-S1 and INV-M1. INV-F3 is a liveness property proven
 simulator, and only after faults stop (FLP: no claim is possible while they continue). The storage
 WAL's own durability latch, INV-W10, is a different layer and stays PLANNED: no node hosts the
 engine yet.
+
+## Crash recovery (Phase 11)
+
+Enforced by `internal/raftlog`, `internal/raftnode` and `cmd/dkvd`; exercised by `internal/raftsim`
+(the crash matrix, the `crashpoints` profile and the scripted crash windows), `internal/raftnode`
+and `tests/integration/raft_crash_test.go`; specified in `docs/CRASH_RECOVERY.md` and introduced by
+ADR-018. The `CR` series is the crash-recovery namespace, distinct from every series above (`C` is
+already both routing and compaction). Each is checked in the simulator at the instant a node boots,
+against an independent record of every Save it completed, at every crash point of every scenario,
+matrix cell and chaos seed; INV-F2 remains the umbrella and INV-R1..R10 stay in force throughout.
+
+| ID | Invariant | Checked by | Status |
+|---|---|---|---|
+| INV-CR1 | **Term and vote never regress across a crash.** The recovered `currentTerm` is at least the last durably established one; if equal, a vote durably cast in it is recovered (a vote an interrupted Save was casting may or may not have landed). | `internal/raftsim`: `checkRecovered` at every boot; `TestFollowerCrashAfterAdoptingAHigherTerm`, `TestVoterCrashAroundPersistingItsVote`, `TestSingleNodeCrashInsideItsElectionSave`; `internal/raftlog`: `TestTermChangeIsDurableBeforeEntriesOfThatTerm`; `tests/integration`: the term a SIGKILL leaves is never below the one the node had established (`TestRealCrashAtPoints`) | VERIFIED (simulation incl. modeled power loss; process kill) |
+| INV-CR2 | **The durably committed prefix is recovered bit-identical**, and the recovered commit is never below the durable one. | `internal/raftsim`: `checkRecovered` at every boot, `TestCrashDuringSuffixReplacement`; `internal/raftlog`: `TestCommitNeverCoversEntriesTheSaveHadNotWritten`, `TestCommitBeyondRecoveredLogIsClamped` | VERIFIED (simulation; process kill) |
+| INV-CR3 | **Commit is durable before apply.** An entry is applied only after a HardState whose commit covers it is fsynced, so the recovered commit is never below what the dead incarnation had applied. | `internal/raftsim`: `checkRecovered` at every boot, `TestCommitIsDurableBeforeApply`; `internal/raftnode`: `TestCrashAfterApplyReappliesOnRestart` | VERIFIED |
+| INV-CR4 | **Replay is exact and at-least-once.** After a restart `appliedIndex` is 0 and the node re-applies exactly its recovered committed prefix, in order, each index once per incarnation, with entries identical to those any earlier incarnation applied there. No exactly-once claim across restarts. | `internal/raftsim`: `checkApply` (INV-P9 per incarnation, INV-R5 across), `TestCrashAroundApply`, `TestRepeatedCrashesAtPoints`; `internal/raftnode`: `TestCrashAfterApplyReappliesOnRestart`, `TestCrashBeforeApplyAppliesOnceOnRestart` | VERIFIED |
+
+### Note on the CR series and what it does not cover
+
+INV-CR1..3 are proven against a **process crash** on real files and processes, and against a
+**modeled** power loss (`fault.MemFS`) in the simulator — real power loss is untested, as everywhere
+in this project. INV-CR4 states the replay contract the driver actually provides — at-least-once
+across restarts — and deliberately claims no more: the applied index is volatile by design, and
+exactly-once application is Phase 13's dedup table, not a property of the driver. The order of a
+Save's records that INV-CR1/CR2 depend on (`raftlog.SavePlan`) was the one Phase 11 bug: the old
+entries-first order let a crash between a Save's entry and HardState records leave a log recovery
+refused (`docs/CRASH_RECOVERY.md` §5).
 
 ## Routing / cluster
 

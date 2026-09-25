@@ -328,13 +328,23 @@ Consensus Algorithm"), sections 5.1–5.4 plus §7 snapshots.
 > log latches the error and refuses further writes, the driver sends none of the dependent
 > messages and stops, and `dkvd` exits 1 (INV-F1). The raft log does all file I/O through a small
 > `vfs.FS` seam, which is where persistence faults are injected.
+>
+> **Phase 11 update (ADR-018, docs/CRASH_RECOVERY.md).** The cycle in §8.1 has named crash points
+> (`raftnode.Point`: before/after the Save, after each message, around Advance, around Apply and
+> AppliedTo) and the durable log's record writes and fsync are crash points at the `vfs` seam; the
+> node is killed at every one of them — exhaustively in the simulator, in-process, and on real
+> processes (`dkvd -crash-at`) — and every recovery is checked (INV-F2, INV-CR1..4). Within one
+> Save a changed term or vote is written **before** the entries and the new commit **after** them
+> (`raftlog.SavePlan`), so a crash between any two records leaves a log recovery accepts.
 
 ### 8.1 Persistent state (fsynced before any RPC reply that depends on it)
 
 `currentTerm`, `votedFor`, and the log. `commitIndex` is persisted as an optimization only —
 it is recoverable, never required. The raft log file is a record stream (§2 framing) holding
 both `Entry` records and `HardState` records, so one fsync covers both, and the last
-`HardState` record in the file wins on replay.
+`HardState` record in the file wins on replay. Within one Save, a changed term/vote record
+precedes the entries and a changed commit follows them (Phase 11, `raftlog.SavePlan`): a term is
+never below an entry's term, and a commit never covers entries not yet on disk.
 
 ### 8.2 State transitions
 
@@ -448,7 +458,9 @@ inspectable with `curl` during a demo.
 3.  Replay engine WAL segments >= logNumber into a fresh memtable.
         Torn tail → truncate (§2). Mid-log corruption → abort.
 4.  Open the raft log; replay Entry and HardState records; truncate a torn tail; fsync.
-        → currentTerm, votedFor, entries[]   (durable before the node acts on them — Phase 10)
+        → currentTerm, votedFor, entries[]   (durable before the node acts on them — Phase 10;
+          every crash window of this step and of the cycle it recovers from is
+          tested in Phase 11, docs/CRASH_RECOVERY.md)
 5.  Reconcile: engine.appliedIndex must be <= raft.lastIndex.
         If engine.appliedIndex > raft.lastIndex → ErrInconsistent, refuse to start.
         (This means the state machine is ahead of its own log: impossible unless the

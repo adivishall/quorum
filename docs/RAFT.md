@@ -157,7 +157,11 @@ applies each command to the state-machine seam **in order**, and only then calls
 `Apply`). An uncommitted entry is never applied (INV-R7), `appliedIndex ≤ commitIndex` always
 (Phase 8 enforces it), and an apply failure does not advance `appliedIndex`. Phase 9 drives a
 minimal deterministic state machine to verify these semantics; it adds no dedup and claims no
-exactly-once client application (`docs/CONSISTENCY.md` C4).
+exactly-once client application (`docs/CONSISTENCY.md` C4). `appliedIndex` is **volatile**: a
+restart re-applies the whole recovered committed prefix from index 1, so application is
+at-least-once across restarts and exactly-once within an incarnation — pinned in Phase 11
+(`docs/CRASH_RECOVERY.md` §6, INV-CR4). The apply loop is one shared function,
+`raftnode.ApplyCommitted`, with the driver's crash points in it.
 
 ## 10. Persistence and ordering (`internal/raftlog`)
 
@@ -172,6 +176,16 @@ order and applies each `Entry` at index `i` as "set `i`, drop anything above `i`
 the last `HardState` wins. Every append that a reply depends on is `f.Sync()`'d **before** the
 reply is sent — the `Ready` contract makes this structural: the driver persists all of a `Ready`'s
 `HardState` and `Entries` before sending any of its `Messages`.
+
+**Record order inside one Save (Phase 11, `raftlog.SavePlan`).** A crash between two records of a
+`Save` must leave a log recovery accepts. A changed term or vote is written **first** — carrying
+the previously durable commit — then the entries, then the `HardState` with the new commit if it
+changed. The first rule keeps `currentTerm` at or above every entry's term (the core refuses the
+reverse, and the pre-Phase-11 entries-first order let a single-node election's crash brick the
+node); the second keeps a commit index from ever being durable before the entries it covers,
+which on a suffix replacement would mark the old conflicting entries committed. `SavePlan` is one
+pure function, shared with the simulator's model of what a crash may leave (`docs/CRASH_RECOVERY.md`
+§5).
 
 **Durability is the default, not an opt-in.** `raftnode.Config` is durable at its zero value: the
 driver fsyncs every `Save` unless `DisableSync` is explicitly set, and `DisableSync` exists only for
@@ -206,7 +220,10 @@ loss would still erase — the Phase 10 simulator found exactly that, `docs/FAUL
 startup path is one function, `raftnode.Recover`, which the deterministic simulator uses too. It builds a `MemoryLog` from the entries, sets `commitIndex`, and
 constructs the core in Follower state at the recovered term. Recovery verifies indexes are still
 contiguous, terms non-decreasing, and `currentTerm` does not move backward; incoherent state is
-refused, not repaired. Snapshot recovery is **not** Phase 9.
+refused, not repaired (`TestRecoverRefusesATermBelowItsLog`). Snapshot recovery is **not** Phase 9.
+Phase 11 (`docs/CRASH_RECOVERY.md`) crashes the node at every boundary of this cycle and of
+recovery itself and checks what each restart recovers against an independent record of every
+`Save` (INV-F2, INV-CR1..4).
 
 Durable HardState recovery is verified against real process death: `TestHardStateSurvivesSIGKILL`
 SIGKILLs a live `dkvd -raft` and reads the recovered `currentTerm` and `votedFor` back from the
@@ -275,7 +292,8 @@ the no-op is its load-bearing partner (whose removal `TestFigure8`/`TestNoOpAppe
 catch).
 
 Phase 10 adds 14 mutants for its failure-handling rules and for the fault harness's own fidelity
-(`docs/FAULTS.md` §12); `make mutation` runs all 22.
+(`docs/FAULTS.md` §12), plus 2 for the transport's dead-connection handling; Phase 11 adds 9 for
+its crash-recovery rules (`docs/CRASH_RECOVERY.md` §11); `make mutation` runs all 33.
 
 ## 13. Multi-Raft and membership
 

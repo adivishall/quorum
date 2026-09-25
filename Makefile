@@ -27,7 +27,7 @@ integration:
 	$(GO) test -race -count=1 -v ./tests/integration/
 
 ## mutation — mutation testing (Phase 9 Raft rules, Phase 10 failure handling and
-## fault-model fidelity). Applies deliberate rule-violating edits to the source,
+## fault-model fidelity, Phase 11 crash-recovery rules). Applies deliberate rule-violating edits to the source,
 ## runs the tests that must catch each, and requires every mutant to be killed
 ## (edits are reverted via git). Needs a clean working tree for the files it
 ## mutates. See docs/RAFT.md §12a and docs/FAULTS.md.
@@ -35,11 +35,14 @@ mutation:
 	./scripts/mutation.sh
 
 ## faults — Phase 10 deterministic fault schedules at a large seed budget (plain
-## `go test` runs a small seed set). Every run is replayable: a failure prints the
-## exact command and a minimized script. See docs/FAULTS.md.
+## `go test` runs a small seed set), plus the Phase 11 crash matrix (a crash at
+## every driver and I/O boundary a scenario reaches, in every crash mode). Every
+## run is replayable: a failure prints the exact command and a minimized script
+## (or, for the matrix, the exact crashat event). See docs/FAULTS.md and
+## docs/CRASH_RECOVERY.md.
 FAULT_SEEDS ?= 200
 faults:
-	$(GO) test -count=1 -run 'TestRandomizedFaultSchedules|TestSameSeedSameTrace|TestTraceIsPlatformIndependent' ./internal/raftsim -raftsim.seeds=$(FAULT_SEEDS)
+	$(GO) test -count=1 -run 'TestRandomizedFaultSchedules|TestSameSeedSameTrace|TestTraceIsPlatformIndependent|TestCrashMatrix' ./internal/raftsim -raftsim.seeds=$(FAULT_SEEDS)
 
 ## fuzz — run every fuzz target in the repository for FUZZTIME each (default 10s).
 FUZZTIME ?= 10s

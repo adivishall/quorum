@@ -1,7 +1,10 @@
 # FAILURE MODEL
 
 Status: **specification (Phase 0); the fault-injection matrix in §7 is implemented and verified
-in Phase 10** (`docs/FAULTS.md`, ADR-017), with the scope and qualifiers stated there.
+in Phase 10** (`docs/FAULTS.md`, ADR-017), with the scope and qualifiers stated there; **the crash
+windows of the Raft node are characterised and verified in Phase 11** (`docs/CRASH_RECOVERY.md`,
+ADR-018) — a crash at every boundary of persistence, message emission, commit and apply, and
+recovery, with the durable state each leaves and what recovery makes of it.
 
 A distributed system is only meaningful relative to the failures it claims to survive. This
 document states the assumptions. Anything not assumed here is something we do **not** tolerate,
@@ -15,7 +18,9 @@ and saying so is the point.
 
 - A node may stop at any instant — between any two instructions, including in the middle of a
   write to disk. Crashes are modeled as `SIGKILL`, never as graceful shutdown, in every
-  crash test.
+  crash test. *Phase 11 makes "any instant" concrete:* the process is killed at every named
+  boundary of its persist → send → advance → apply cycle and between the record writes of one
+  durable-log `Save`, in the simulator exhaustively and on real processes with `dkvd -crash-at`.
 - A crashed node may restart with its durable state intact and rejoin. It may do so any number
   of times.
 - A node does **not** lie. It does not send messages it did not compute, does not forge terms,
@@ -143,7 +148,8 @@ under any timing.
 |---|---|---|---|---|
 | Node crash (SIGKILL) | real process kill; simulated process crash | committed data survives; election happens | `TestRealLeaderCrashAndReelection`, `TestRealFollowerCrashAndCatchUp`, `TestRealRepeatedCrashRestart`; `TestLeaderCrashAndReelection`, `crashes` profile | VERIFIED |
 | Node restart | real process restart on the same data dir; simulated restart via `raftnode.Recover` | recovery, catch-up, no divergence | INV-F2 at every simulated restart; `TestRealFollowerCrashAndCatchUp`, `TestRealRestartWhileIsolated` | VERIFIED |
-| Leader crash mid-write | crashes while proposals are in flight (chaos profiles) | no lost acknowledged write, no phantom write | no committed entry lost (INV-R4) and no fabricated command (INV-F4) under every schedule; an *acknowledged* write needs client acks (Phases 12/13) | PARTIAL |
+| Crash at an exact boundary (Phase 11) | `raftnode.Point` crash points and I/O boundaries: before/after a Save, between its record writes, before its fsync, after each message, around Advance, around Apply/AppliedTo, during recovery's own truncate and fsync | recovered state = last completed Save + a prefix of the interrupted one; term/vote never regress; committed prefix stable; commit durable before apply; replay exact and at-least-once | `TestCrashMatrix` (1,440 cells, 0 failures), the `crashpoints` chaos profile, the scenario tests in `internal/raftsim/crash_test.go`, `internal/raftnode/crash_test.go`; real processes: `TestRealCrashAtPoints`, `TestRealCrashAtEveryEarlyPointIsRecoverable` | VERIFIED (simulation incl. modeled power loss; process kill) |
+| Leader crash mid-write | crashes while proposals are in flight (chaos profiles); Phase 11: the leader dies before its Save of a proposal, after it, between its record writes, before its fsync, after one AppendEntries | no lost acknowledged write, no phantom write | no committed entry lost (INV-R4) and no fabricated command (INV-F4) under every schedule; `TestLeaderCrashBeforeSavingAProposal`, `TestLeaderCrashAfterSavingBeforeSending`, `TestLeaderCrashAfterSendingToOnePeer`, `TestLeaderCrashBetweenRecordWritesOfOneSave` pin what each window loses; an *acknowledged* write needs client acks (Phases 12/13) | PARTIAL (no client acks yet) |
 | Symmetric partition | simulator links; `fault.Network`; TCP proxy cut | minority unavailable; majority progresses; no split brain | `TestLeaderIsolatedFromMajority`, `TestIsolatedLeaderCannotCommitAndRejoins`, `TestRealIsolatedLeaderRejoinsAfterPartition`, `partitions` profile | VERIFIED |
 | Asymmetric partition | one-way simulator link; one-way `fault.Network` link | no livelock; stale leader steps down | `partitions`/`mixed` profiles (one-way blocks) with convergence after healing (INV-F3). TCP is bidirectional, so a real one-way cut is not produced | VERIFIED (simulation) |
 | Message drop (p%) | simulator `drop`; `fault.Network` Drop | retry/backoff correctness | `TestMessageLoss`, `messages` profile | VERIFIED |

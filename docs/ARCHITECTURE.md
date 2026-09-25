@@ -141,6 +141,16 @@ through seeded, replayable fault schedules with every safety invariant checked a
 the real driver runs under injected disk and network faults; and real processes are killed,
 frozen and partitioned. `internal/raft` itself gained no fault code — the core stays pure.
 
+As of Phase 11 (`docs/CRASH_RECOVERY.md`, ADR-018) the node's **crash windows** are characterised
+and proven: the driver's persist → send → advance → apply cycle exposes named crash points
+(`raftnode.Point`), the durable log's record boundaries are crash points at the `vfs` seam, and the
+same points are exercised three ways — exhaustively in the simulator (a crash at every point a
+scenario reaches, in every crash mode, each followed by a real recovery and checked against an
+independent record of what was persisted), in-process on the real driver, and on real `dkvd`
+processes that SIGKILL themselves at the point. What a crash leaves and what recovery makes of it
+is stated per boundary; the one window that bricked a node (a Save's record order) was found and
+fixed. The core is still untouched.
+
 Each shard is an **independent Raft group** with its own log, its own leader, and its own
 storage directory. A 3-node cluster with 16 shards runs 16 Raft groups; every node is a
 member of every shard's group when RF == cluster size, and of a subset otherwise.

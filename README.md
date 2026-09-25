@@ -6,7 +6,7 @@ Quorum is currently implementing its durable storage engine. No Raft library, no
 database, no consensus service — the storage engine and the consensus implementation are
 the project, and they are being built in that order.
 
-> **Status: Phase 10 of 25 — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, a working Raft consensus core, and deterministic fault injection.**
+> **Status: Phase 11 of 25 — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, a working Raft consensus core, deterministic fault injection, and a proven crash-recovery model for the Raft node.**
 >
 > **Implemented:** a write-ahead log, an ordered memtable, immutable on-disk SSTables, Bloom
 > filters, size-tiered compaction, crash-safe MANIFEST-based file publication, and restart
@@ -32,13 +32,19 @@ the project, and they are being built in that order.
 > loss, restarts, pauses and disk failures, checking every safety invariant after every event —
 > plus real-driver and real-process fault tests (SIGKILL, SIGSTOP, TCP-level partitions). It found
 > and fixed three real bugs, including one that let a restarted node acknowledge entries a power
-> loss could still erase.
+> loss could still erase. Phase 11 adds the **crash-recovery model** (`docs/CRASH_RECOVERY.md`):
+> named crash points at every boundary of the node's persist → send → advance → apply cycle and
+> between the record writes of one durable-log Save; a bounded exhaustive matrix that kills a node
+> at every point a scenario reaches, in every crash mode, and checks each recovery against an
+> independent record of what was persisted; seeded crash schedules; in-process and real-process
+> (`dkvd -crash-at`, a real SIGKILL at the exact point) crash tests. It found and fixed a window
+> that made a node unable to restart, and pins application as at-least-once across restarts.
 >
 > **Not implemented:** end-to-end linearizability verification, request forwarding, client/HTTP
 > API, linearizable-read serving (ReadIndex), dedup / exactly-once client semantics, snapshots,
-> dynamic membership, a dashboard. **Raft working under faults is the consensus core, not the
-> finished distributed database — no end-to-end distributed consistency guarantee is claimed.**
-> Those are Phases 11 and later. See
+> dynamic membership, a dashboard, a storage engine hosted by the node. **Raft working under
+> faults and crashes is the consensus core, not the finished distributed database — no
+> end-to-end distributed consistency guarantee is claimed.** Those are Phases 12 and later. See
 > [docs/ROADMAP.md](docs/ROADMAP.md) for exactly what is done and what is not.
 >
 > The binary is still called `dkv`; that is the command name, not the project name.
@@ -94,8 +100,14 @@ seed / script ─────▶│  deterministic simulator · drop/dup/delay/r
                     │  real driver + real processes: kill/stop/partition │
                     └────────────────────────────────────────────────────┘
 
+                    ┌───────── implemented, Phase 11 (crash recovery) ───┐
+crash point ───────▶│  named points in persist·send·advance·apply cycle  │
+                    │  exhaustive crash matrix · seeded crash schedules  │
+                    │  real SIGKILL at the point (dkvd -crash-at)        │
+                    └────────────────────────────────────────────────────┘
+
                     ┌──────────────── not implemented ───────────────────┐
-                    │  crash harness · linearizability · forwarding      │ Phases 11+
+                    │  linearizability · forwarding · dedup              │ Phases 12+
                     │  HTTP API · dashboard · snapshots                  │ Phases 14+
                     └────────────────────────────────────────────────────┘
 ```
