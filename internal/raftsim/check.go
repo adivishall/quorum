@@ -19,6 +19,12 @@ type checker struct {
 	applied      map[uint64]raft.Entry
 	proposals    map[string]int    // INV-F4: accepted commands -> step
 	appliedCmd   map[string]uint64 // INV-F4: command -> the one index it was applied at
+	// kvCommands are the accepted key-value commands (Phase 12). They carry no
+	// request identity until Phase 13, so two clients deleting one key — or one
+	// client writing the same value twice — propose byte-identical commands
+	// that are rightly applied at two indexes: INV-F4's "exactly one index"
+	// half does not apply to them; its "really proposed" half does.
+	kvCommands map[string]bool
 }
 
 type voteKey struct {
@@ -38,6 +44,7 @@ func (k *checker) init() {
 	k.applied = map[uint64]raft.Entry{}
 	k.proposals = map[string]int{}
 	k.appliedCmd = map[string]uint64{}
+	k.kvCommands = map[string]bool{}
 }
 
 func (k *checker) proposed(data string, step int) { k.proposals[data] = step }
@@ -172,6 +179,9 @@ func (c *Cluster) checkApply(n *node, e raft.Entry) {
 		cmd := string(e.Data)
 		if _, ok := c.chk.proposals[cmd]; !ok {
 			c.violate("INV-F4", "%s applied command %q at index %d that no leader ever accepted", n.id, cmd, e.Index)
+			return
+		}
+		if c.chk.kvCommands[cmd] {
 			return
 		}
 		if idx, ok := c.chk.appliedCmd[cmd]; ok && idx != e.Index {

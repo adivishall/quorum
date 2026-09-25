@@ -62,6 +62,15 @@ const (
 	// or an I/O boundary of the durable log — write, fsync, truncate — meaning
 	// "before the Nth such operation on the node's log".
 	CrashAt
+	// KVPut, KVGet and KVDelete make Client invoke a key-value operation on
+	// Node (Phase 12, kv.go): Key, and for KVPut the value Data. A client with
+	// an operation outstanding cannot invoke another (the event is skipped).
+	KVPut
+	KVGet
+	KVDelete
+	// KVTimeout makes Client give up on its outstanding operation: the
+	// operation is Incomplete (a write may still take effect).
+	KVTimeout
 )
 
 var kindNames = map[Kind]string{
@@ -70,6 +79,7 @@ var kindNames = map[Kind]string{
 	Crash: "crash", Restart: "restart", Pause: "pause", Resume: "resume",
 	FailPersist: "failpersist", Disarm: "disarm", Release: "release", Propose: "propose",
 	CheckConverged: "check-converged", CrashAt: "crashat",
+	KVPut: "kvput", KVGet: "kvget", KVDelete: "kvdel", KVTimeout: "kvtimeout",
 }
 
 func (k Kind) String() string {
@@ -105,6 +115,9 @@ func (o PersistOp) String() string { return persistNames[o] }
 //	FailPersist                               Node, Op, N (short-write length)
 //	Propose                                   Node, Data
 //	CrashAt                                   Node, Point, Nth, Power, N (torn bytes kept)
+//	KVPut                                     Node, Client, Key, Data (the value)
+//	KVGet, KVDelete                           Node, Client, Key
+//	KVTimeout                                 Client
 //
 // A message is addressed by its link and its position among the messages
 // currently in flight on that link, oldest first (Pos 0 = the oldest). Addressing
@@ -123,6 +136,11 @@ type Event struct {
 	Data  string
 	Point string // CrashAt: the crash point's name
 	Nth   int    // CrashAt: which occurrence fires, counting from arming (1 = the next)
+	// Client and Key address a key-value operation (Phase 12). Key and the
+	// value (Data) are written Go-quoted in a script, so either may be empty
+	// or contain any byte.
+	Client string
+	Key    string
 }
 
 // IOPoints are the I/O-boundary crash points of the durable log, addressed at
@@ -170,6 +188,12 @@ func (e Event) String() string {
 			return fmt.Sprintf("crashat %s %s %d power %d", e.Node, e.Point, e.Nth, e.N)
 		}
 		return fmt.Sprintf("crashat %s %s %d", e.Node, e.Point, e.Nth)
+	case KVPut:
+		return fmt.Sprintf("kvput %s %s %s %s", e.Node, e.Client, strconv.Quote(e.Key), strconv.Quote(e.Data))
+	case KVGet, KVDelete:
+		return fmt.Sprintf("%s %s %s %s", e.Kind, e.Node, e.Client, strconv.Quote(e.Key))
+	case KVTimeout:
+		return fmt.Sprintf("kvtimeout %s", e.Client)
 	default:
 		return e.Kind.String()
 	}
@@ -264,6 +288,22 @@ func ParseEvent(line string) (Event, error) {
 			}
 		default:
 			err = fmt.Errorf("raftsim: bad crashat %q", line)
+		}
+	case KVPut:
+		if err = need(5); err == nil {
+			e.Node, e.Client = NodeID(f[1]), f[2]
+			if e.Key, err = strconv.Unquote(f[3]); err == nil {
+				e.Data, err = strconv.Unquote(f[4])
+			}
+		}
+	case KVGet, KVDelete:
+		if err = need(4); err == nil {
+			e.Node, e.Client = NodeID(f[1]), f[2]
+			e.Key, err = strconv.Unquote(f[3])
+		}
+	case KVTimeout:
+		if err = need(2); err == nil {
+			e.Client = f[1]
 		}
 	default:
 		err = need(1)

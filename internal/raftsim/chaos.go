@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 
+	"github.com/adivishall/quorum/internal/lincheck"
 	"github.com/adivishall/quorum/internal/raftnode"
 )
 
@@ -20,9 +21,13 @@ type Profile struct {
 	Crash, Restart, Pause, Resume int
 	FailPersist                   int
 	CrashAt                       int // arm a crash at a driver or I/O crash point (Phase 11)
-	FIFOPercent                   int // chance a delivery takes the oldest message (else a random one: reordering)
-	PowerLossPercent              int // chance a crash also models power loss on the node's disk
-	MaxDelay, MaxTorn             int // bounds on Delay steps and torn-tail bytes
+	// Phase 12 client operations (kv.go): weights of put, get, delete and a
+	// client giving up, over Clients clients and Keys keys (k0..).
+	KVPut, KVGet, KVDelete, KVTimeout int
+	Clients, Keys                     int
+	FIFOPercent                       int // chance a delivery takes the oldest message (else a random one: reordering)
+	PowerLossPercent                  int // chance a crash also models power loss on the node's disk
+	MaxDelay, MaxTorn                 int // bounds on Delay steps and torn-tail bytes
 }
 
 // Profiles are the built-in chaos mixes. Every one exercises the continuous
@@ -88,6 +93,10 @@ type Result struct {
 	Violation *Violation
 	Tail      []string
 	Stats     Stats
+	// History is the client-visible history (empty for a run without clients),
+	// and KV its outcome counters (Phase 12).
+	History lincheck.History
+	KV      KVStats
 }
 
 // Run executes a seeded chaos run: Steps events drawn from the profile by a
@@ -128,6 +137,7 @@ func (c *Cluster) result(seed int64, profile string) *Result {
 	return &Result{
 		Seed: seed, Profile: profile, Script: c.Script(), TraceHash: c.trace.Hash(),
 		Violation: c.viol, Tail: c.trace.Tail(60), Stats: c.stats,
+		History: c.History(), KV: c.kv.stats,
 	}
 }
 
@@ -361,6 +371,7 @@ func (c *Cluster) generate(rng *rand.Rand, p Profile) Event {
 		}
 		return e
 	})
+	c.kvEvents(rng, p, add)
 
 	total := 0
 	for _, o := range opts {

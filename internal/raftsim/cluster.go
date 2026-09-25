@@ -7,6 +7,7 @@ import (
 	"math/rand"
 
 	"github.com/adivishall/quorum/internal/fault"
+	"github.com/adivishall/quorum/internal/kv"
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftlog"
 	"github.com/adivishall/quorum/internal/raftnode"
@@ -101,6 +102,12 @@ type node struct {
 	hits          map[string]int     // occurrences of each driver point since boot (enumeration)
 	hist          []applied          // every application by every incarnation, in order
 	lastRecovered *raftlog.Recovered // what the latest boot recovered
+
+	// Phase 12 client tier (kv.go): this incarnation's state machine and the
+	// driver's request tables. Nil while the node is down.
+	store   *kv.Store
+	waiters *raftnode.Waiters
+	reads   *raftnode.Reads
 }
 
 // armedCrash is a crash armed at a driver point: it fires the nth time the
@@ -182,6 +189,8 @@ type Cluster struct {
 	recordPoints bool
 	points       []PointHit
 	opBase       map[NodeID]int // op-log length per node when recording started
+
+	kv *kvState // Phase 12 clients and their history (kv.go)
 }
 
 // New boots a cluster: every node starts from an empty disk through the real
@@ -198,6 +207,7 @@ func New(cfg Config) (*Cluster, error) {
 	}
 	c := &Cluster{cfg: cfg, nodes: map[NodeID]*node{}, trace: newTrace()}
 	c.chk.init()
+	c.kvInit()
 	for i := 1; i <= cfg.Nodes; i++ {
 		id := NodeID(fmt.Sprintf("n%d", i))
 		c.ids = append(c.ids, id)
@@ -317,6 +327,7 @@ func (c *Cluster) boot(n *node) error {
 	n.shadow.rebase(rc.Log, rc.State)
 	n.core, n.mem, n.up, n.paused = rc.Core, rc.Mem, true, false
 	n.applied, n.verified, n.lv = 0, 0, nil
+	n.kvNodeUp()
 	n.role, n.term, n.commit = n.core.Role(), n.core.Term(), n.core.CommitIndex()
 	n.refresh()
 	c.trace.add(c.step, "up %s inc=%d term=%d vote=%q last=%d commit=%d", n.id, n.inc, n.term, n.core.VotedFor(), n.core.LastIndex(), n.commit)
@@ -330,6 +341,7 @@ func (c *Cluster) kill(n *node, why string) {
 	n.disk.CrashProcess()
 	n.prevApplied = n.applied
 	n.core, n.mem, n.up, n.paused, n.lv = nil, nil, false, false, nil
+	n.kvNodeDown()
 	n.shadow.detach()
 	c.trace.add(c.step, "down %s (%s)", n.id, why)
 }
@@ -351,6 +363,7 @@ func (c *Cluster) Apply(e Event) {
 	}
 	c.step++
 	c.script = append(c.script, e)
+	defer c.kvPoll() // complete every client whose request now has an outcome
 	var touched *node
 	switch e.Kind {
 	case Tick:
@@ -543,6 +556,10 @@ func (c *Cluster) Apply(e Event) {
 	case CheckConverged:
 		c.checkConverged()
 		return
+	case KVPut, KVGet, KVDelete:
+		touched = c.kvStart(e)
+	case KVTimeout:
+		c.kvTimeout(e)
 	default:
 		c.skip(e)
 		return
@@ -625,7 +642,8 @@ func (c *Cluster) deliver(f *flight) *node {
 // fail-stops the node exactly as the real driver does, then it applies committed
 // entries.
 func (c *Cluster) drain(n *node) {
-	err := raftnode.DrainReadyAt(n.core, n.shadow, func(m raft.Message) { c.send(n, m) }, nil, c.hook(n))
+	confirm := func(rs raft.ReadState) { n.reads.Confirmed(rs, n.waiters, n.core.AppliedIndex()) }
+	err := raftnode.DrainReadyAt(n.core, n.shadow, func(m raft.Message) { c.send(n, m) }, confirm, c.hook(n))
 	if err != nil {
 		if n.fired != nil {
 			c.crashFired(n)
@@ -637,6 +655,11 @@ func (c *Cluster) drain(n *node) {
 		return
 	}
 	c.apply(n)
+	if n.up {
+		// As the real driver does after every cycle: a read registered in a
+		// term this node no longer leads will never be confirmed.
+		n.reads.DropStale(n.core.Term(), n.core.Role() == raft.Leader)
+	}
 }
 
 // send is DrainReady's network hand-off: it runs the send-time checks and puts the
@@ -653,7 +676,7 @@ func (c *Cluster) send(n *node, m raft.Message) {
 // points in effect.
 func (c *Cluster) apply(n *node) {
 	sm := &simSM{c: c, n: n}
-	err := raftnode.ApplyCommitted(n.core, sm, c.hook(n), nil)
+	err := raftnode.ApplyCommitted(n.core, sm, c.hook(n), func(e raft.Entry) { n.waiters.Applied(e.Index, e.Term) })
 	if sm.last > 0 {
 		c.trace.add(c.step, "apply %s %d..%d", n.id, sm.first, sm.last)
 	}
@@ -682,6 +705,9 @@ func (s *simSM) Apply(index uint64, _ []byte) error {
 		return err
 	}
 	s.c.checkApply(s.n, e)
+	if err := s.n.applyToStore(index, e.Data); err != nil {
+		return err
+	}
 	s.n.applied = index
 	s.n.hist = append(s.n.hist, applied{inc: s.n.inc, e: e})
 	if s.first == 0 {
