@@ -22,10 +22,17 @@
 //     so one wedged peer delays only its own messages, never heartbeats to others.
 //   - Status returns one consistent snapshot, so an observer can never combine
 //     the role of one moment with the term of another.
+//
+// Phase 11 crash points (docs/CRASH_RECOVERY.md, ADR-018): the two loops above —
+// DrainReadyAt (persist, send, advance) and ApplyCommitted (apply, record) — have
+// named crash points (Point) at every boundary, observed through an optional Hook
+// (Config.Hook; nil in production). The deterministic simulator, the in-process
+// crash tests and `dkvd -crash-at` all crash at the same points.
 package raftnode
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -79,6 +86,11 @@ type Config struct {
 
 	Rand *rand.Rand // optional; defaults to a seed derived from ID
 	Logf func(string, ...any)
+
+	// Hook, if non-nil, observes the driver's crash points and may abort a cycle
+	// at one of them (see Point and Hook; Phase 11, docs/CRASH_RECOVERY.md). It
+	// is a test seam: production leaves it nil, and a nil Hook costs nothing.
+	Hook Hook
 }
 
 // raftlogOptions returns the durable-log options this config implies. The default
@@ -96,33 +108,6 @@ type NodeID = raft.NodeID
 // implements it.
 type Storage interface {
 	Save(hs *raftlog.HardState, entries []raftlog.Entry) error
-}
-
-// DrainReady performs every pending Ready of core in the order the Raft
-// persistence contract requires (ADR-016, INV-R6): persist the Ready's HardState
-// and entries through st (which fsyncs), THEN hand each of its Messages to send,
-// THEN Advance. It returns the first persistence failure WITHOUT sending that
-// Ready's messages and without advancing; the caller must then treat the node as
-// failed and never drive core again (INV-F1). This is the single implementation of
-// the ordering, shared by the node's actor loop and the deterministic simulator.
-func DrainReady(core *raft.Raft, st Storage, send func(raft.Message)) error {
-	for core.HasReady() {
-		rd := core.Ready()
-		var hs *raftlog.HardState
-		if rd.HardState != nil {
-			hs = &raftlog.HardState{Term: rd.HardState.Term, Vote: rd.HardState.Vote, Commit: rd.HardState.Commit}
-		}
-		if hs != nil || len(rd.Entries) > 0 {
-			if err := st.Save(hs, rd.Entries); err != nil {
-				return err
-			}
-		}
-		for _, m := range rd.Messages {
-			send(m)
-		}
-		core.Advance()
-	}
-	return nil
 }
 
 // Recovered is a core rebuilt from its durable log, together with the open log.
@@ -345,14 +330,21 @@ func (n *Node) actorLoop() {
 }
 
 // processReady performs the core's pending effects in the required order — persist
-// (fsync), then hand messages to the outboxes (DrainReady) — then applies committed
-// entries and publishes a status snapshot. A persistence failure is returned before
-// anything of that Ready is sent or applied.
+// (fsync), then hand messages to the outboxes (DrainReadyAt) — then applies
+// committed entries (ApplyCommitted) and publishes a status snapshot. A persistence
+// failure is returned before anything of that Ready is sent or applied; so is a
+// crash-point abort (Config.Hook). A state-machine failure is logged and left for
+// the next cycle: appliedIndex does not advance past it, and the node keeps running.
 func (n *Node) processReady() error {
-	if err := DrainReady(n.core, n.log, n.enqueue); err != nil {
+	if err := DrainReadyAt(n.core, n.log, n.enqueue, n.cfg.Hook); err != nil {
 		return err
 	}
-	n.applyCommitted()
+	if err := ApplyCommitted(n.core, n.sm, n.cfg.Hook); err != nil {
+		if !errors.Is(err, ErrApply) {
+			return err // a crash point fired
+		}
+		n.logf("event=raft_apply_failed node=%s err=%v", n.cfg.ID, err)
+	}
 	n.snapshotStatus()
 	return nil
 }
@@ -368,23 +360,6 @@ func (n *Node) fail(err error) {
 	n.mu.Unlock()
 	n.logf("event=raft_persist_failed node=%s err=%v", n.cfg.ID, err)
 	n.cancel()
-}
-
-// applyCommitted feeds committed-but-unapplied entries to the state machine in
-// order, advancing appliedIndex only after each Apply succeeds.
-func (n *Node) applyCommitted() {
-	for _, e := range n.core.NextApply() {
-		if n.sm != nil {
-			if err := n.sm.Apply(e.Index, e.Data); err != nil {
-				n.logf("event=raft_apply_failed node=%s index=%d err=%v", n.cfg.ID, e.Index, err)
-				return // do not advance appliedIndex past a failed apply
-			}
-		}
-		if err := n.core.AppliedTo(e.Index); err != nil {
-			n.logf("event=raft_applied_to_failed node=%s index=%d err=%v", n.cfg.ID, e.Index, err)
-			return
-		}
-	}
 }
 
 // enqueue hands a message (already persisted-for, by DrainReady's ordering) to its
