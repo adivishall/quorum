@@ -40,11 +40,13 @@ func (m Message) Marshal() []byte {
 			w.uvarint(e.Term)
 			w.bytes(e.Data)
 		}
+		w.uvarint(m.Seq)
 	case MsgAppendResponse:
 		w.bool(m.Success)
 		w.uvarint(m.MatchIndex)
 		w.uvarint(m.ConflictTerm)
 		w.uvarint(m.ConflictIndex)
+		w.uvarint(m.Seq)
 	}
 	return w.b
 }
@@ -106,6 +108,9 @@ func Unmarshal(payload []byte) (Message, error) {
 			entries = append(entries, e)
 		}
 		m.Entries = entries
+		if m.Seq, err = r.uvarint(); err != nil {
+			return Message{}, err
+		}
 	case MsgAppendResponse:
 		if m.Success, err = r.bool(); err != nil {
 			return Message{}, err
@@ -117,6 +122,9 @@ func Unmarshal(payload []byte) (Message, error) {
 			return Message{}, err
 		}
 		if m.ConflictIndex, err = r.uvarint(); err != nil {
+			return Message{}, err
+		}
+		if m.Seq, err = r.uvarint(); err != nil {
 			return Message{}, err
 		}
 	default:

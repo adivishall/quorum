@@ -99,6 +99,24 @@ type Message struct {
 	ConflictTerm  uint64
 	ConflictIndex uint64
 	MatchIndex    uint64 // on success, the last index the follower now matches
+
+	// Seq is the leader's heartbeat sequence (Phase 12, ReadIndex): every
+	// AppendEntries a leader sends carries the sequence current at that moment,
+	// and every AppendEntriesResponse echoes the sequence of the request it
+	// answers. A response with Seq >= s therefore proves the follower still
+	// accepted this leader AFTER the leader issued sequence s — the "confirm
+	// leadership with a quorum round after the read arrived" step of
+	// docs/DESIGN.md §8.5, without a separate heartbeat message type.
+	Seq uint64
+}
+
+// ReadState is a confirmed ReadIndex request (Phase 12, docs/DESIGN.md §8.5): once
+// the driver has applied entries through Index it may serve the read that
+// registered as ID from the state machine, and that read is linearizable with
+// respect to every write acknowledged before it was registered.
+type ReadState struct {
+	ID    uint64
+	Index uint64
 }
 
 // quorum returns the majority size for a group of n members: floor(n/2)+1. For

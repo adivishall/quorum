@@ -18,6 +18,8 @@ func TestMessageRoundTrip(t *testing.T) {
 			Entries: []Entry{{Index: 4, Term: 9, Data: []byte("hello")}, {Index: 5, Term: 9, Data: nil}, {Index: 6, Term: 9, Data: []byte{}}}},
 		{Type: MsgAppendResponse, Term: 9, Success: true, MatchIndex: 6},
 		{Type: MsgAppendResponse, Term: 9, Success: false, ConflictTerm: 4, ConflictIndex: 2},
+		{Type: MsgAppendRequest, Term: 9, PrevLogIndex: 3, PrevLogTerm: 2, LeaderCommit: 3, Seq: 1 << 40},
+		{Type: MsgAppendResponse, Term: 9, Success: true, MatchIndex: 6, Seq: 77},
 	}
 	for _, m := range msgs {
 		got, err := Unmarshal(m.Marshal())
@@ -36,7 +38,7 @@ func messagesEqual(a, b Message) bool {
 		a.PrevLogIndex != b.PrevLogIndex || a.PrevLogTerm != b.PrevLogTerm ||
 		a.LeaderCommit != b.LeaderCommit || a.Success != b.Success ||
 		a.ConflictTerm != b.ConflictTerm || a.ConflictIndex != b.ConflictIndex ||
-		a.MatchIndex != b.MatchIndex || len(a.Entries) != len(b.Entries) {
+		a.MatchIndex != b.MatchIndex || a.Seq != b.Seq || len(a.Entries) != len(b.Entries) {
 		return false
 	}
 	for i := range a.Entries {

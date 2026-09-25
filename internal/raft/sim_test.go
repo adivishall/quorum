@@ -38,6 +38,8 @@ type network struct {
 	blocked   map[[2]NodeID]bool // directional From->To links that drop
 	appendsTo map[NodeID]int     // AppendEntries requests actually delivered to a node
 	dropped   int
+
+	reads map[NodeID][]ReadState // confirmed ReadIndex requests drained from each node (Phase 12)
 }
 
 // key builds the directional-link key.
@@ -96,6 +98,7 @@ func newNetwork(t *testing.T, ids []NodeID, seedBase int64) *network {
 		applyCount: map[NodeID]uint64{},
 		blocked:    map[[2]NodeID]bool{},
 		appendsTo:  map[NodeID]int{},
+		reads:      map[NodeID][]ReadState{},
 	}
 	sort.Slice(nw.ids, func(i, j int) bool { return nw.ids[i] < nw.ids[j] })
 	for i, id := range nw.ids {
@@ -123,6 +126,7 @@ func (nw *network) drain(id NodeID) {
 	for r.HasReady() {
 		rd := r.Ready()
 		nw.queue = append(nw.queue, rd.Messages...)
+		nw.reads[id] = append(nw.reads[id], rd.ReadStates...)
 		r.Advance()
 	}
 	nw.applyCommitted(id)

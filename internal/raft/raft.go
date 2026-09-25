@@ -41,6 +41,20 @@ type Raft struct {
 	hsDirty             bool   // currentTerm/votedFor changed
 	unstable            uint64 // lowest log index written since Advance (0 = none)
 	lastPersistedCommit uint64 // to detect a commit change worth persisting
+
+	// ReadIndex state (Phase 12, docs/DESIGN.md §8.5), leader only.
+	hbSeq      uint64            // sequence carried by the next AppendEntries this leader sends
+	ackSeq     map[NodeID]uint64 // highest sequence each peer has echoed in the current term
+	termStart  uint64            // index of this leader's election no-op
+	nextReadID uint64
+	pending    []pendingRead // registered reads awaiting a quorum of post-registration acks, FIFO
+	readStates []ReadState   // confirmed reads, drained by Ready/Advance
+}
+
+// pendingRead is a ReadIndex request waiting for confirmation: it is confirmed
+// once a quorum (the leader included) has acknowledged a sequence >= seq.
+type pendingRead struct {
+	id, index, seq uint64
 }
 
 // New constructs a Raft core from cfg. The core starts as a Follower at the
@@ -110,6 +124,62 @@ func (r *Raft) Propose(data []byte) error {
 	return nil
 }
 
+// ReadIndex registers a linearizable read (Phase 12, docs/DESIGN.md §8.5,
+// ADR-019) and returns its id and read index. Only a leader may serve one
+// (ErrNotLeader otherwise; the caller redirects). The read index is the higher
+// of the current commit index and the index of this leader's election no-op —
+// a new leader's commit index can lag entries committed by its predecessors
+// until its own no-op commits, and every earlier entry is committed by then.
+//
+// The read is NOT yet safe to serve. The leader must first confirm it is still
+// the leader: it advances its heartbeat sequence and broadcasts AppendEntries
+// carrying it, and the read is confirmed only when a quorum (itself included)
+// has echoed a sequence at least that high — acknowledgements that were in
+// flight before the read was registered do not count, because they prove
+// leadership only up to the time they were sent. A confirmed read appears in
+// Ready.ReadStates; the driver serves it once it has applied through its index.
+// A single-node group is its own quorum and confirms immediately. Stepping down
+// drops every unconfirmed read (the driver reports them as not-leader).
+func (r *Raft) ReadIndex() (ReadState, error) {
+	if r.role != Leader {
+		return ReadState{}, ErrNotLeader
+	}
+	r.nextReadID++
+	rs := ReadState{ID: r.nextReadID, Index: r.log.CommitIndex()}
+	if r.termStart > rs.Index {
+		rs.Index = r.termStart
+	}
+	if quorum(len(r.peers)) == 1 {
+		r.readStates = append(r.readStates, rs)
+		return rs, nil
+	}
+	// The broadcast below carries hbSeq+1; only acks of that or a later sequence
+	// confirm this read.
+	r.pending = append(r.pending, pendingRead{id: rs.ID, index: rs.Index, seq: r.hbSeq + 1})
+	r.broadcastAppend()
+	return rs, nil
+}
+
+// confirmReads moves every pending read whose sequence a quorum has echoed into
+// readStates. Pending reads are FIFO with non-decreasing sequences, so
+// confirmation is a prefix.
+func (r *Raft) confirmReads() {
+	for len(r.pending) > 0 {
+		p := r.pending[0]
+		acks := 1 // self
+		for _, peer := range r.peers {
+			if peer != r.id && r.ackSeq[peer] >= p.seq {
+				acks++
+			}
+		}
+		if acks < quorum(len(r.peers)) {
+			return
+		}
+		r.readStates = append(r.readStates, ReadState{ID: p.id, Index: p.index})
+		r.pending = r.pending[1:]
+	}
+}
+
 // Step handles one inbound message. It is the only entry point for peer traffic.
 func (r *Raft) Step(m Message) error {
 	// Higher term: step down and adopt it before doing anything else. For an
@@ -156,6 +226,9 @@ func (r *Raft) becomeFollower(term uint64, leader NodeID) {
 		r.votedFor = ""
 		r.hsDirty = true
 	}
+	if r.role == Leader {
+		r.pending = nil // unconfirmed reads die with the leadership
+	}
 	r.role = Follower
 	r.leaderID = leader
 	r.resetElectionTimer()
@@ -165,6 +238,7 @@ func (r *Raft) becomeCandidate() {
 	r.currentTerm++
 	r.votedFor = r.id
 	r.hsDirty = true
+	r.pending = nil
 	r.role = Candidate
 	r.leaderID = ""
 	r.votesGranted = map[NodeID]bool{r.id: true}
@@ -198,7 +272,11 @@ func (r *Raft) becomeLeader() {
 		r.matchIndex[p] = 0
 	}
 	// The no-op entry in the current term is mandatory (docs/DESIGN.md §8.2,
-	// §5.4.2): without it a new leader cannot commit entries from prior terms.
+	// §5.4.2): without it a new leader cannot commit entries from prior terms —
+	// and a ReadIndex may not be served below it.
+	r.termStart = last + 1
+	r.ackSeq = make(map[NodeID]uint64, len(r.peers))
+	r.pending = nil
 	r.appendEntry(nil)
 	r.heartbeatElapsed = 0
 	r.broadcastAppend()
@@ -253,7 +331,7 @@ func (r *Raft) handleAppendRequest(m Message) {
 	if m.PrevLogIndex > last {
 		r.send(Message{
 			Type: MsgAppendResponse, To: m.From, Term: r.currentTerm, Success: false,
-			ConflictTerm: 0, ConflictIndex: last + 1,
+			ConflictTerm: 0, ConflictIndex: last + 1, Seq: m.Seq,
 		})
 		return
 	}
@@ -262,7 +340,7 @@ func (r *Raft) handleAppendRequest(m Message) {
 	if prevTerm != m.PrevLogTerm {
 		r.send(Message{
 			Type: MsgAppendResponse, To: m.From, Term: r.currentTerm, Success: false,
-			ConflictTerm: prevTerm, ConflictIndex: r.firstIndexOfTerm(prevTerm, m.PrevLogIndex),
+			ConflictTerm: prevTerm, ConflictIndex: r.firstIndexOfTerm(prevTerm, m.PrevLogIndex), Seq: m.Seq,
 		})
 		return
 	}
@@ -270,14 +348,14 @@ func (r *Raft) handleAppendRequest(m Message) {
 	// conflicting suffix (the Phase 8 log refuses to overwrite a committed entry).
 	if !r.appendFollowerEntries(m.PrevLogIndex, m.Entries) {
 		r.send(Message{Type: MsgAppendResponse, To: m.From, Term: r.currentTerm, Success: false,
-			ConflictTerm: 0, ConflictIndex: r.log.LastIndex() + 1})
+			ConflictTerm: 0, ConflictIndex: r.log.LastIndex() + 1, Seq: m.Seq})
 		return
 	}
 	lastNew := m.PrevLogIndex + uint64(len(m.Entries))
 	if m.LeaderCommit > r.log.CommitIndex() {
 		r.commitTo(minU64(m.LeaderCommit, lastNew))
 	}
-	r.send(Message{Type: MsgAppendResponse, To: m.From, Term: r.currentTerm, Success: true, MatchIndex: lastNew})
+	r.send(Message{Type: MsgAppendResponse, To: m.From, Term: r.currentTerm, Success: true, MatchIndex: lastNew, Seq: m.Seq})
 }
 
 func (r *Raft) handleAppendResponse(m Message) {
@@ -285,6 +363,13 @@ func (r *Raft) handleAppendResponse(m Message) {
 		return
 	}
 	peer := m.From
+	// Any response in our term — success or rejection — is the peer's
+	// acknowledgement that we were its leader when it answered the request
+	// carrying m.Seq (ReadIndex confirmation).
+	if m.Seq > r.ackSeq[peer] {
+		r.ackSeq[peer] = m.Seq
+		r.confirmReads()
+	}
 	if m.Success {
 		// Ignore a stale success that would not advance matchIndex.
 		if m.MatchIndex > r.matchIndex[peer] {
@@ -409,11 +494,14 @@ func (r *Raft) sendAppend(peer NodeID) {
 	r.send(Message{
 		Type: MsgAppendRequest, To: peer, Term: r.currentTerm,
 		PrevLogIndex: prevIndex, PrevLogTerm: prevTerm,
-		Entries: entries, LeaderCommit: r.log.CommitIndex(),
+		Entries: entries, LeaderCommit: r.log.CommitIndex(), Seq: r.hbSeq,
 	})
 }
 
+// broadcastAppend sends AppendEntries (a heartbeat when there is nothing to
+// replicate) to every peer, under a fresh heartbeat sequence.
 func (r *Raft) broadcastAppend() {
+	r.hbSeq++
 	for _, p := range r.peers {
 		if p == r.id {
 			continue

@@ -19,11 +19,15 @@ type Ready struct {
 	Entries []Entry
 	// Messages are the RPCs to send AFTER HardState and Entries are durable.
 	Messages []Message
+	// ReadStates are the ReadIndex requests confirmed since the last Advance
+	// (Phase 12): for each, once the driver has applied through Index it may
+	// serve the read registered as ID. They depend on nothing being persisted.
+	ReadStates []ReadState
 }
 
 // empty reports whether a Ready carries nothing to do.
 func (rd Ready) empty() bool {
-	return rd.HardState == nil && len(rd.Entries) == 0 && len(rd.Messages) == 0
+	return rd.HardState == nil && len(rd.Entries) == 0 && len(rd.Messages) == 0 && len(rd.ReadStates) == 0
 }
 
 // HasReady reports whether there are pending effects to collect with Ready. It
@@ -32,7 +36,8 @@ func (r *Raft) HasReady() bool {
 	return r.hsDirty ||
 		r.log.CommitIndex() != r.lastPersistedCommit ||
 		r.unstable != 0 ||
-		len(r.msgs) != 0
+		len(r.msgs) != 0 ||
+		len(r.readStates) != 0
 }
 
 // Ready returns the pending effects without draining them (call Advance after
@@ -52,6 +57,7 @@ func (r *Raft) Ready() Ready {
 		rd.Entries = es
 	}
 	rd.Messages = r.msgs
+	rd.ReadStates = r.readStates
 	return rd
 }
 
@@ -64,4 +70,5 @@ func (r *Raft) Advance() {
 	r.hsDirty = false
 	r.lastPersistedCommit = r.log.CommitIndex()
 	r.unstable = 0
+	r.readStates = nil
 }
