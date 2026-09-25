@@ -7,6 +7,8 @@
 // anything above i" — the Phase 8 TruncateAndAppend semantics per record — so the
 // final in-memory log is reconstructed from an append-only file and the last
 // HardState wins. commitIndex is persisted in HardState as an optimization only.
+// Within one Save the records are ordered so that a crash between any two of
+// them leaves a log recovery accepts (SavePlan, Phase 11).
 //
 // Crash policy (distinct from the WAL's): a torn final record truncates to the
 // last good offset (a crash mid-append whose dependent reply was never sent). Any
@@ -86,7 +88,8 @@ type Log struct {
 	f      vfs.File
 	w      *record.Writer
 	sync   bool
-	failed error // the first write/fsync failure; sticky
+	failed error     // the first write/fsync failure; sticky
+	hs     HardState // the last HardState durably written (recovered at Open)
 }
 
 // Options configures a Log.
@@ -142,7 +145,7 @@ func Open(path string, opts Options) (*Log, *Recovered, error) {
 		_ = f.Close()
 		return nil, nil, err
 	}
-	l := &Log{path: path, f: f, w: record.NewWriter(f), sync: opts.Sync}
+	l := &Log{path: path, f: f, w: record.NewWriter(f), sync: opts.Sync, hs: rec.HardState}
 	return l, rec, nil
 }
 
@@ -242,9 +245,19 @@ func InspectFS(fsys vfs.FS, path string) (*Recovered, error) {
 
 // Save durably records a Ready's HardState (if any) and entries in one fsync. On a
 // suffix replacement the entries simply extend the file; replay reconstructs the
-// truncation. It writes entries in order, then the HardState, so that after a
-// crash a HardState referencing a commit index is never durable before the entries
-// it covers.
+// truncation.
+//
+// The record order is chosen so that a crash between ANY two records of a Save
+// leaves a log recovery accepts without repair (Phase 11, docs/CRASH_RECOVERY.md
+// §5; found by the crash matrix). Two constraints pull in opposite directions:
+// the current term must never be below the term of an entry in the log (a
+// leader of that term existed), so a term change must precede entries of the new
+// term; and a commit index must never be durable before the entries it covers —
+// on a suffix replacement it would otherwise cover the OLD, conflicting entries
+// still on disk. So SavePlan writes a changed term/vote FIRST, carrying the
+// previously durable commit, then the entries, then the HardState with the new
+// commit if it changed. A Save with no entries is one HardState record; one
+// with an unchanged term and vote is the entries then the HardState.
 //
 // If any write or the fsync fails, the Log is failed from then on: this and every
 // later Save return an error wrapping ErrFailed and the original cause, and no
@@ -253,13 +266,19 @@ func (l *Log) Save(hs *HardState, entries []Entry) error {
 	if l.failed != nil {
 		return l.failed
 	}
+	lead, trail := SavePlan(l.hs, hs, entries)
+	if lead != nil {
+		if _, err := l.w.Append(kindHardState, encodeHardState(*lead)); err != nil {
+			return l.fail(err)
+		}
+	}
 	for _, e := range entries {
 		if _, err := l.w.Append(kindEntry, encodeEntry(e)); err != nil {
 			return l.fail(err)
 		}
 	}
-	if hs != nil {
-		if _, err := l.w.Append(kindHardState, encodeHardState(*hs)); err != nil {
+	if trail != nil {
+		if _, err := l.w.Append(kindHardState, encodeHardState(*trail)); err != nil {
 			return l.fail(err)
 		}
 	}
@@ -268,7 +287,30 @@ func (l *Log) Save(hs *HardState, entries []Entry) error {
 			return l.fail(err)
 		}
 	}
+	if hs != nil {
+		l.hs = *hs
+	}
 	return nil
+}
+
+// SavePlan is the record order of a Save, as a pure function: given the last
+// durably written HardState prev, it returns the HardState record written BEFORE
+// the entries (lead) and the one written AFTER them (trail); either may be nil.
+// The records of the Save are therefore: lead?, entries..., trail?. It is
+// exported so the deterministic simulator's model of what a crash may leave on
+// disk (INV-F2) is derived from the same rule the log writes by, never a copy.
+func SavePlan(prev HardState, hs *HardState, entries []Entry) (lead, trail *HardState) {
+	if hs == nil {
+		return nil, nil
+	}
+	if len(entries) > 0 && (hs.Term != prev.Term || hs.Vote != prev.Vote) {
+		lead = &HardState{Term: hs.Term, Vote: hs.Vote, Commit: prev.Commit}
+		if lead.Commit == hs.Commit {
+			return lead, nil // the leading record is already the final state
+		}
+	}
+	trail = &HardState{Term: hs.Term, Vote: hs.Vote, Commit: hs.Commit}
+	return lead, trail
 }
 
 // fail latches the first durability failure and returns it.

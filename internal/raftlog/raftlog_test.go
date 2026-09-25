@@ -2,6 +2,7 @@ package raftlog
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -292,7 +293,8 @@ func TestFailedWriteLatchesAndLogStaysRecoverable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The second record write of the next Save is torn after 5 bytes.
+	// The next Save changes the term, so its records are the HardState then the
+	// entry (SavePlan); the entry record — the second write — is torn after 5 bytes.
 	inj.Arm(fault.Injection{Op: fault.OpWrite, Nth: 2, Short: 5})
 	err := l.Save(&HardState{Term: 2, Vote: "n3"}, []Entry{{Index: 2, Term: 2}})
 	if !errors.Is(err, ErrFailed) || !errors.Is(err, fault.ErrInjected) {
@@ -316,21 +318,20 @@ func TestFailedWriteLatchesAndLogStaysRecoverable(t *testing.T) {
 	}
 
 	// A process crash keeps the cached bytes, torn record included; reopening
-	// repairs the tail and recovers the state before the failed Save's HardState.
+	// repairs the tail: the torn entry record is dropped whole, and the state is
+	// the completed prefix of the interrupted Save (INV-F2) — the new term and
+	// vote (their record completed before the torn write) over the old entries.
 	mem.CrashProcess()
 	l2, rec, err := Open(memPath, Options{Sync: true, FS: mem})
 	if err != nil {
 		t.Fatalf("reopen after a torn write: %v (the log must stay recoverable)", err)
 	}
 	defer l2.Close()
-	if rec.HardState.Term != 1 || rec.HardState.Vote != "n1" {
-		t.Fatalf("recovered HardState %+v, want the last complete one {1 n1}", rec.HardState)
+	if rec.HardState.Term != 2 || rec.HardState.Vote != "n3" || rec.HardState.Commit != 0 {
+		t.Fatalf("recovered HardState %+v, want the completed leading record {2 n3 0}", rec.HardState)
 	}
-	// Entry 2 was the Save's first record and completed before the torn write; a
-	// completed-but-unacknowledged record may survive (INV-F2 allows a prefix of
-	// an interrupted Save), and it must be well-formed if it does.
-	if n := len(rec.Entries); n < 1 || n > 2 || rec.Entries[0].Term != 1 {
-		t.Fatalf("recovered entries %+v, want entry 1 and at most the completed entry 2", rec.Entries)
+	if n := len(rec.Entries); n != 1 || rec.Entries[0].Term != 1 {
+		t.Fatalf("recovered entries %+v, want exactly entry 1 (the torn entry 2 dropped whole)", rec.Entries)
 	}
 	if !mem.FullySynced(memPath) {
 		t.Fatal("the torn-tail repair was not fsynced before the log was reused")
@@ -431,4 +432,325 @@ func FuzzDecodeHardState(f *testing.F) {
 	f.Add(encodeHardState(HardState{Term: 1, Vote: "n1", Commit: 1}))
 	f.Add([]byte{})
 	f.Fuzz(func(t *testing.T, data []byte) { _, _ = decodeHardState(data) })
+}
+
+// --- Phase 11: crash windows inside one Save (docs/CRASH_RECOVERY.md §5) ---
+
+// crashBeforeWrite returns a MemFS+InjectFS pair whose owning process dies just
+// before the nth write of the log after arming (fault.Injection.At): the file
+// then holds exactly the records written before that boundary.
+func crashBeforeWrite(mem *fault.MemFS, inj *fault.InjectFS, nth int) {
+	inj.Arm(fault.Injection{Op: fault.OpWrite, Path: memPath, Nth: nth, At: mem.CrashProcess})
+}
+
+// TestTermChangeIsDurableBeforeEntriesOfThatTerm pins the record order of a Save
+// that carries both a term change and entries of the new term — a single-node
+// election, whose one Save holds the term, the self-vote and the no-op. Whichever
+// record boundary the process dies at, the reopened log must never hold an entry
+// whose term exceeds the recovered currentTerm: that log would be refused by the
+// core (ErrTermRegression) and the node could never restart. Found by the Phase
+// 11 crash matrix; with the old entries-first order, dying between the entry
+// record and the HardState record bricked the node.
+func TestTermChangeIsDurableBeforeEntriesOfThatTerm(t *testing.T) {
+	for nth := 1; nth <= 3; nth++ {
+		t.Run(fmt.Sprintf("crash before write %d", nth), func(t *testing.T) {
+			mem := fault.NewMemFS()
+			inj := fault.NewInjectFS(mem)
+			l, _ := openMem(t, inj)
+			crashBeforeWrite(mem, inj, nth)
+			err := l.Save(&HardState{Term: 1, Vote: "n1", Commit: 1}, []Entry{{Index: 1, Term: 1}})
+			if !errors.Is(err, fault.ErrCrashed) {
+				t.Fatalf("Save = %v, want the crash at write %d", err, nth)
+			}
+			l2, rec, err := Open(memPath, Options{Sync: true, FS: mem})
+			if err != nil {
+				t.Fatalf("reopen after a crash before write %d: %v (a log the node wrote must reopen)", nth, err)
+			}
+			defer l2.Close()
+			if n := len(rec.Entries); n > 0 && rec.Entries[n-1].Term > rec.HardState.Term {
+				t.Fatalf("crash before write %d recovered an entry of term %d under currentTerm %d: the core refuses this log",
+					nth, rec.Entries[n-1].Term, rec.HardState.Term)
+			}
+			// What each boundary leaves: nothing; the term and vote (commit still 0);
+			// the term, vote and entry (commit still 0); the crash never reaches a
+			// fourth record, so the final commit only lands with a complete Save.
+			switch nth {
+			case 1:
+				if rec.HardState.Term != 0 || len(rec.Entries) != 0 {
+					t.Fatalf("before write 1: recovered %+v, want nothing", rec)
+				}
+			case 2:
+				if rec.HardState.Term != 1 || rec.HardState.Vote != "n1" || rec.HardState.Commit != 0 || len(rec.Entries) != 0 {
+					t.Fatalf("before write 2: recovered %+v, want term 1 vote n1 commit 0 and no entry", rec)
+				}
+			case 3:
+				if rec.HardState.Term != 1 || rec.HardState.Commit != 0 || len(rec.Entries) != 1 {
+					t.Fatalf("before write 3: recovered %+v, want term 1, commit 0, the entry", rec)
+				}
+			}
+		})
+	}
+}
+
+// TestCommitNeverCoversEntriesTheSaveHadNotWritten pins the other half of the
+// order: on a suffix replacement whose Save also raises the commit index, the
+// HardState written BEFORE the replacing entries carries the OLD commit. If it
+// carried the new one, a crash before the entries would leave the old,
+// conflicting entries on disk under a commit index that covers them — and the
+// restarted node would apply entries the cluster never committed.
+func TestCommitNeverCoversEntriesTheSaveHadNotWritten(t *testing.T) {
+	mem := fault.NewMemFS()
+	inj := fault.NewInjectFS(mem)
+	l, _ := openMem(t, inj)
+	// Term 1: entries 1..3, only index 1 committed.
+	if err := l.Save(&HardState{Term: 1, Vote: "n1", Commit: 1}, []Entry{{Index: 1, Term: 1}, {Index: 2, Term: 1, Data: []byte("old2")}, {Index: 3, Term: 1, Data: []byte("old3")}}); err != nil {
+		t.Fatal(err)
+	}
+	// A new leader in term 2 replaces 2..3 and its AppendEntries lets us commit 3:
+	// one Save with a term change, replacing entries, and a higher commit. Die
+	// before the first replacing entry record (write 2: the leading HardState is
+	// write 1).
+	crashBeforeWrite(mem, inj, 2)
+	err := l.Save(&HardState{Term: 2, Vote: "", Commit: 3}, []Entry{{Index: 2, Term: 2, Data: []byte("new2")}, {Index: 3, Term: 2, Data: []byte("new3")}})
+	if !errors.Is(err, fault.ErrCrashed) {
+		t.Fatalf("Save = %v, want the crash", err)
+	}
+	_, rec, err := Open(memPath, Options{Sync: true, FS: mem})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.HardState.Term != 2 {
+		t.Fatalf("recovered term %d, want 2 (the term change precedes the entries)", rec.HardState.Term)
+	}
+	if rec.HardState.Commit != 1 {
+		t.Fatalf("recovered commit %d over the old entries %q; want the previous commit 1 — a commit must never be durable before the entries it covers",
+			rec.HardState.Commit, [][]byte{rec.Entries[1].Data, rec.Entries[2].Data})
+	}
+	if string(rec.Entries[1].Data) != "old2" {
+		t.Fatalf("recovered entry 2 = %q, want the still-present old entry", rec.Entries[1].Data)
+	}
+}
+
+// TestSavePlanIsTheRecordOrder pins SavePlan itself, which both the log and the
+// simulator's crash model rely on: no HardState → no records around the entries;
+// no entries → one trailing record; an unchanged term and vote → one trailing
+// record after the entries; a changed term or vote → a leading record with the
+// previous commit, plus a trailing one only if the commit changed too.
+func TestSavePlanIsTheRecordOrder(t *testing.T) {
+	prev := HardState{Term: 3, Vote: "a", Commit: 5}
+	entries := []Entry{{Index: 6, Term: 4}}
+	type want struct{ lead, trail *HardState }
+	cases := []struct {
+		name    string
+		hs      *HardState
+		entries []Entry
+		want    want
+	}{
+		{"no hardstate", nil, entries, want{}},
+		{"hardstate only", &HardState{Term: 4, Vote: "b", Commit: 5}, nil, want{nil, &HardState{Term: 4, Vote: "b", Commit: 5}}},
+		{"commit only, with entries", &HardState{Term: 3, Vote: "a", Commit: 6}, entries, want{nil, &HardState{Term: 3, Vote: "a", Commit: 6}}},
+		{"term change, same commit", &HardState{Term: 4, Vote: "b", Commit: 5}, entries, want{&HardState{Term: 4, Vote: "b", Commit: 5}, nil}},
+		{"term change and commit", &HardState{Term: 4, Vote: "b", Commit: 6}, entries, want{&HardState{Term: 4, Vote: "b", Commit: 5}, &HardState{Term: 4, Vote: "b", Commit: 6}}},
+		{"vote change only", &HardState{Term: 3, Vote: "c", Commit: 5}, entries, want{&HardState{Term: 3, Vote: "c", Commit: 5}, nil}},
+	}
+	same := func(a, b *HardState) bool { return (a == nil && b == nil) || (a != nil && b != nil && *a == *b) }
+	for _, c := range cases {
+		lead, trail := SavePlan(prev, c.hs, c.entries)
+		if !same(lead, c.want.lead) || !same(trail, c.want.trail) {
+			t.Errorf("%s: SavePlan = lead %+v trail %+v, want lead %+v trail %+v", c.name, lead, trail, c.want.lead, c.want.trail)
+		}
+	}
+}
+
+// TestReplayIsIdempotentAcrossReopens: reopening a log that needs no repair
+// changes nothing on disk, and repeated reopens after a repair recover the same
+// state every time — recovery never rewrites history.
+func TestReplayIsIdempotentAcrossReopens(t *testing.T) {
+	mem := fault.NewMemFS()
+	l, _ := openMem(t, mem)
+	if err := l.Save(&HardState{Term: 2, Vote: "n2", Commit: 2}, []Entry{{Index: 1, Term: 1}, {Index: 2, Term: 2}}); err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Close()
+	// Leave a torn record behind, as a crash mid-append would.
+	f, _ := mem.OpenFile(memPath, os.O_WRONLY|os.O_APPEND, 0o644)
+	_, _ = f.Write([]byte{7, 7, 7, 7, 7})
+	_ = f.Close()
+	var first []byte
+	for i := 0; i < 4; i++ {
+		l, rec, err := Open(memPath, Options{Sync: true, FS: mem})
+		if err != nil {
+			t.Fatalf("reopen %d: %v", i, err)
+		}
+		_ = l.Close()
+		if rec.HardState.Term != 2 || rec.HardState.Commit != 2 || len(rec.Entries) != 2 {
+			t.Fatalf("reopen %d recovered %+v", i, rec)
+		}
+		b, _ := mem.Cached(memPath)
+		if first == nil {
+			first = b // the first reopen repaired the tail
+		} else if string(b) != string(first) {
+			t.Fatalf("reopen %d changed the file: recovery must not rewrite a log that needs no repair", i)
+		}
+	}
+	if !mem.FullySynced(memPath) {
+		t.Fatal("the repaired log was left un-fsynced")
+	}
+}
+
+// TestCorruptedFinalRecordIsTreatedAsTorn pins the documented policy for damage
+// in the LAST record: with no bytes following it, a checksum failure is
+// indistinguishable from an interrupted append, so it is truncated and the log
+// opens with everything before it; the same damage with a record after it is
+// mid-log corruption and refuses to open (TestMidCorruptionIsFatal).
+func TestCorruptedFinalRecordIsTreatedAsTorn(t *testing.T) {
+	path, l, _ := openTmp(t)
+	if err := l.Save(&HardState{Term: 1, Commit: 1}, []Entry{{Index: 1, Term: 1}, {Index: 2, Term: 1, Data: []byte("last")}}); err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[len(data)-1] ^= 0xff // inside the final record's payload
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	l2, rec, err := Open(path, Options{Sync: true})
+	if err != nil {
+		t.Fatalf("a corrupted FINAL record must be treated as a torn tail, got %v", err)
+	}
+	defer l2.Close()
+	// The final record was the trailing HardState carrying the commit (written
+	// after the entries): it is dropped whole, never partially applied, so the
+	// recovered state is the leading term record over both entries, commit 0.
+	if len(rec.Entries) != 2 || rec.HardState.Term != 1 || rec.HardState.Commit != 0 {
+		t.Fatalf("recovered %+v, want both entries, term 1 and commit 0 (the damaged final record dropped whole)", rec)
+	}
+	if info, _ := os.Stat(path); info.Size() >= int64(len(data)) {
+		t.Fatal("the damaged final record was not truncated away")
+	}
+}
+
+// TestCommitBeyondRecoveredLogIsClamped: a HardState whose commit exceeds the
+// entries actually recovered (possible only through damage or an interrupted
+// Save; never through the record order) is clamped, never trusted (docs/DESIGN.md
+// §8.1) — and a repeated HardState simply lets the last one win.
+func TestCommitBeyondRecoveredLogIsClamped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "raft.log")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := record.NewWriter(f)
+	mustAppend := func(k record.Kind, p []byte) {
+		t.Helper()
+		if _, err := w.Append(k, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustAppend(kindHardState, encodeHardState(HardState{Term: 1, Vote: "x", Commit: 0}))
+	mustAppend(kindEntry, encodeEntry(Entry{Index: 1, Term: 1}))
+	mustAppend(kindEntry, encodeEntry(Entry{Index: 2, Term: 1}))
+	mustAppend(kindHardState, encodeHardState(HardState{Term: 1, Vote: "x", Commit: 9})) // beyond the log
+	mustAppend(kindHardState, encodeHardState(HardState{Term: 2, Vote: "y", Commit: 7})) // repeated: last wins
+	f.Sync()
+	f.Close()
+	rec, err := Inspect(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.HardState.Term != 2 || rec.HardState.Vote != "y" {
+		t.Fatalf("recovered HardState %+v, want the last one (term 2, vote y)", rec.HardState)
+	}
+	if rec.HardState.Commit != 2 {
+		t.Fatalf("recovered commit %d, want it clamped to the 2 entries recovered", rec.HardState.Commit)
+	}
+}
+
+// TestPartialRecordsFromInterruptedSaves generates torn artifacts by actually
+// interrupting persistence — a short write cutting an Entry record and a
+// HardState record at every byte offset — and reopens each: a partial record is
+// dropped whole, everything before it survives, the repaired file is fsynced,
+// and Inspect (read-only) agrees with Open about the recovered state.
+func TestPartialRecordsFromInterruptedSaves(t *testing.T) {
+	entryLen := len(encodeEntry(Entry{Index: 2, Term: 1, Data: []byte("payload")})) + record.HeaderSize
+	hsLen := len(encodeHardState(HardState{Term: 1, Vote: "n1", Commit: 2})) + record.HeaderSize
+	type cut struct {
+		name  string
+		nth   int // which write of the Save is torn
+		short int
+	}
+	var cuts []cut
+	for b := 0; b < entryLen; b++ {
+		cuts = append(cuts, cut{fmt.Sprintf("entry@%d", b), 1, b})
+	}
+	for b := 0; b < hsLen; b++ {
+		cuts = append(cuts, cut{fmt.Sprintf("hardstate@%d", b), 2, b})
+	}
+	for _, c := range cuts {
+		mem := fault.NewMemFS()
+		inj := fault.NewInjectFS(mem)
+		l, _ := openMem(t, inj)
+		if err := l.Save(&HardState{Term: 1, Vote: "n1", Commit: 1}, []Entry{{Index: 1, Term: 1}}); err != nil {
+			t.Fatal(err)
+		}
+		// Same term and vote: the Save is the entry record then the HardState record.
+		inj.Arm(fault.Injection{Op: fault.OpWrite, Path: memPath, Nth: c.nth, Short: c.short})
+		if err := l.Save(&HardState{Term: 1, Vote: "n1", Commit: 2}, []Entry{{Index: 2, Term: 1, Data: []byte("payload")}}); err == nil {
+			t.Fatalf("%s: the torn write did not fail the Save", c.name)
+		}
+		_ = l.Close()
+		mem.CrashProcess()
+		ins, err := InspectFS(mem, memPath)
+		if err != nil {
+			t.Fatalf("%s: Inspect: %v", c.name, err)
+		}
+		l2, rec, err := Open(memPath, Options{Sync: true, FS: mem})
+		if err != nil {
+			t.Fatalf("%s: reopen: %v", c.name, err)
+		}
+		_ = l2.Close()
+		wantEntries, wantCommit := 1, uint64(1)
+		if c.nth == 2 {
+			wantEntries = 2 // the entry record completed; only the HardState is torn
+		}
+		if len(rec.Entries) != wantEntries || rec.HardState.Commit != wantCommit || rec.HardState.Term != 1 {
+			t.Fatalf("%s: recovered %d entries commit %d term %d, want %d entries commit %d term 1", c.name, len(rec.Entries), rec.HardState.Commit, rec.HardState.Term, wantEntries, wantCommit)
+		}
+		if len(ins.Entries) != len(rec.Entries) || ins.HardState != rec.HardState {
+			t.Fatalf("%s: Inspect recovered %+v but Open recovered %+v", c.name, ins, rec)
+		}
+		if !mem.FullySynced(memPath) {
+			t.Fatalf("%s: the repaired log was not fsynced", c.name)
+		}
+	}
+}
+
+// TestCrashBeforeDirectorySyncLosesOnlyAFreshLog: the one crash window of a
+// brand-new log — dying before the directory fsync that makes its creation
+// durable (modelled as that fsync never completing: Open fails, nothing is
+// returned to the node). A power loss then removes the file; the node boots
+// fresh again, which is safe because nothing had ever been saved into it (Open
+// syncs the directory before returning, so no Save can precede that fsync).
+func TestCrashBeforeDirectorySyncLosesOnlyAFreshLog(t *testing.T) {
+	mem := fault.NewMemFS()
+	inj := fault.NewInjectFS(mem)
+	inj.Arm(fault.Injection{Op: fault.OpSyncDir})
+	if _, _, err := Open(memPath, Options{Sync: true, FS: inj}); !errors.Is(err, fault.ErrInjected) {
+		t.Fatalf("Open = %v, want the failed directory sync", err)
+	}
+	mem.CrashPowerLoss(0)
+	if _, err := mem.Stat(memPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the un-synced new file survived a power loss: %v", err)
+	}
+	l, rec, err := Open(memPath, Options{Sync: true, FS: mem})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if len(rec.Entries) != 0 || rec.HardState.Term != 0 {
+		t.Fatalf("a fresh node recovered %+v", rec)
+	}
 }

@@ -679,20 +679,26 @@ func (s *shadowStore) rebase(l *raftlog.Log, rec *raftlog.Recovered) {
 }
 
 // candidates are the states a recovery may legitimately produce: the persisted
-// state, extended by any prefix of the records an interrupted Save was writing
-// (its entries in order, then its HardState) — INV-F2.
+// state, extended by any prefix of the records an interrupted Save was writing —
+// in the order the log writes them, which raftlog.SavePlan defines (a changed
+// term/vote first, then the entries, then the new commit) — INV-F2.
 func (s *shadowStore) candidates() []durableState {
 	out := []durableState{s.persisted.clone()}
 	if s.pending == nil {
 		return out
 	}
 	cur := s.persisted.clone()
+	lead, trail := raftlog.SavePlan(s.persisted.hs, s.pending.hs, s.pending.entries)
+	if lead != nil {
+		cur.hs = *lead
+		out = append(out, cur.clone())
+	}
 	for _, e := range s.pending.entries {
 		cur.put(e)
 		out = append(out, cur.clone())
 	}
-	if s.pending.hs != nil {
-		cur.hs = *s.pending.hs
+	if trail != nil {
+		cur.hs = *trail
 		out = append(out, cur.clone())
 	}
 	return out
