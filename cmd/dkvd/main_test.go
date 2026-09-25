@@ -47,6 +47,26 @@ func TestRunRejectsBadConfig(t *testing.T) {
 	}
 }
 
+// TestRunRejectsBadClientAndCrashSeamFlags: the Phase 12 client port and the
+// crash seam refuse combinations they cannot honour, before anything starts.
+func TestRunRejectsBadClientAndCrashSeamFlags(t *testing.T) {
+	base := []string{"-id", "a", "-listen", "127.0.0.1:0"}
+	for _, extra := range [][]string{
+		{"-client-listen", "127.0.0.1:0"},                                                     // without -raft
+		{"-raft", "-crash-armed-by-signal"},                                                   // arming nothing
+		{"-raft", "-crash-at", "fsync:2", "-crash-armed-by-signal"},                           // I/O points count from startup
+		{"-raft", "-crash-at", "before-reply:1"},                                              // a reply point with no client port
+		{"-raft", "-crash-at", "after-reply:0", "-client-listen", "127.0.0.1:0"},              // occurrence must be positive
+		{"-raft", "-crash-at", "during-reply:1", "-client-listen", "127.0.0.1:0"},             // unknown point
+		{"-raft", "-crash-at", "before-reply:x", "-client-listen", "127.0.0.1:0", "-id", "b"}, // bad occurrence
+	} {
+		var out, errb bytes.Buffer
+		if code := run(context.Background(), append(append([]string(nil), base...), extra...), &out, &errb); code != 2 {
+			t.Fatalf("%v: exit code %d, want 2 (stderr %q)", extra, code, errb.String())
+		}
+	}
+}
+
 // TestRunRejectsNonPositiveProbeInterval proves a zero or negative
 // -probe-interval is rejected as configuration (exit 2) with a stderr message,
 // and — crucially — never reaches time.NewTicker (a panic would fail the test

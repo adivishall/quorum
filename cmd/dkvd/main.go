@@ -9,11 +9,16 @@
 // By default it runs the Phase 7 probe demo (no Raft, no storage, no client
 // serving). With -raft it instead runs a single Phase 9 Raft group over the same
 // transport (docs/RAFT.md): it elects a leader, appends the mandatory no-op,
-// replicates, and persists its log under -data-dir. It still hosts no storage
-// engine and serves no clients — Raft is the consensus core, not the whole system.
+// replicates, and persists its log under -data-dir. Its state machine is the
+// Phase 12 key-value store (internal/kv), and with -client-listen it serves the
+// minimal Phase 12 operation protocol — PUT/GET/DELETE, writes completed when
+// committed and applied, reads through ReadIndex — which exists so real
+// processes can be driven by history-recording test clients
+// (docs/LINEARIZABILITY.md). It is not the client API: no request ids, no
+// forwarding, no deduplication (Phase 13), no HTTP (Phase 15).
 //
 //	dkvd -id node-1 -listen 127.0.0.1:7001 \
-//	     -peers node-2=127.0.0.1:7002,node-3=127.0.0.1:7003 [-raft -data-dir DIR]
+//	     -peers node-2=127.0.0.1:7002,node-3=127.0.0.1:7003 [-raft -data-dir DIR] [-client-listen ADDR]
 //
 // Output is machine-readable "event=... key=value" lines on stdout, so a test or
 // an operator can observe startup, connectivity, elections, replication, and
@@ -31,16 +36,19 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/adivishall/quorum/internal/fault"
+	"github.com/adivishall/quorum/internal/kv"
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftnode"
 	"github.com/adivishall/quorum/internal/transport"
@@ -66,13 +74,19 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		raftMode = fs.Bool("raft", false, "run a single Raft group over the transport (Phase 9) instead of the probe demo")
 		dataDir  = fs.String("data-dir", "", "directory for the durable Raft log (raft mode; a temp dir if empty)")
 		tickIvl  = fs.Duration("tick-interval", 50*time.Millisecond, "raft logical tick duration")
-		crashAt  = fs.String("crash-at", "", "TEST SEAM (raft mode): kill this process with SIGKILL at a crash point, e.g. after-save:2 (the 2nd time it is reached) or fsync:3 (before the 3rd fsync of the durable log); see docs/CRASH_RECOVERY.md")
+		crashAt  = fs.String("crash-at", "", "TEST SEAM (raft mode): kill this process with SIGKILL at a crash point, e.g. after-save:2 (the 2nd time it is reached), fsync:3 (before the 3rd fsync of the durable log) or before-reply:1 (before the 1st client response is written); see docs/CRASH_RECOVERY.md")
+		crashArm = fs.Bool("crash-armed-by-signal", false, "TEST SEAM: count -crash-at occurrences only after this process receives SIGUSR1 (it logs event=crash_armed), so a test can crash at the Nth occurrence after a point of its choosing; driver and reply points only")
+		clientAt = fs.String("client-listen", "", "raft mode: serve the Phase 12 key-value operation protocol (PUT/GET/DELETE, internal/kv) on this host:port; a test boundary, not the client API (docs/LINEARIZABILITY.md)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	crash, err := parseCrashAt(*crashAt)
 	if err != nil {
+		fmt.Fprintf(stderr, "dkvd: %v\n", err)
+		return 2
+	}
+	if err := crash.validate(*crashArm, *clientAt != ""); err != nil {
 		fmt.Fprintf(stderr, "dkvd: %v\n", err)
 		return 2
 	}
@@ -118,10 +132,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	lg.logf("event=ready node=%s addr=%s peers=%d", *id, tr.LocalAddr(), len(peers))
 
+	if *clientAt != "" && !*raftMode {
+		fmt.Fprintln(stderr, "dkvd: -client-listen requires -raft")
+		_ = tr.Close()
+		return 2
+	}
 	if *raftMode {
-		r := raftRun{id: *id, peers: peers, tr: tr, dataDir: *dataDir, tick: *tickIvl, lg: lg, stderr: stderr}
+		r := raftRun{id: *id, peers: peers, tr: tr, dataDir: *dataDir, tick: *tickIvl, lg: lg, stderr: stderr, clientAddr: *clientAt, crash: crash}
 		if crash != nil {
-			r.hook, r.fs = crash.install(lg, *id)
+			r.hook, r.fs = crash.install(ctx, lg, *id, *crashArm)
 		}
 		return runRaft(ctx, r)
 	}
@@ -263,6 +282,11 @@ type raftRun struct {
 	stderr  io.Writer
 	fs      vfs.FS
 	hook    raftnode.Hook // -crash-at driver point; nil in normal operation
+	// clientAddr, if set, serves the Phase 12 key-value protocol (internal/kv)
+	// on that address: PUT/DELETE complete when committed and applied here,
+	// GET goes through ReadIndex. The node's state machine is a kv.Store.
+	clientAddr string
+	crash      *crashPoint // -crash-at; nil in normal operation
 }
 
 // runRaft runs a single Raft group (Phase 9) over the already-built transport
@@ -292,15 +316,31 @@ func runRaft(ctx context.Context, r raftRun) int {
 		return 2
 	}
 
+	store := kv.NewStore()
 	n, err := raftnode.Start(ctx, raftnode.Config{
 		ID: raftnode.NodeID(id), Peers: group, Transport: r.tr,
 		LogPath:      filepath.Join(dataDir, "raft-"+id+".log"),
+		StateMachine: store,
 		TickInterval: r.tick, Logf: lg.logf, FS: r.fs, // durable by default (DisableSync left false)
 		Hook: r.hook, // nil unless -crash-at (a test seam)
 	})
 	if err != nil {
 		fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
 		return 2
+	}
+	var clientLn net.Listener
+	if r.clientAddr != "" {
+		clientLn, err = net.Listen("tcp", r.clientAddr)
+		if err != nil {
+			fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
+			_ = n.Close()
+			return 2
+		}
+		if r.crash != nil && r.crash.reply != 0 {
+			clientLn = &crashListener{Listener: clientLn, cp: r.crash}
+		}
+		go kv.Serve(ctx, clientLn, kv.NewServer(id, n, store), lg.logf)
+		lg.logf("event=client_ready node=%s addr=%s", id, clientLn.Addr())
 	}
 
 	var wg sync.WaitGroup
@@ -347,6 +387,9 @@ func runRaft(ctx context.Context, r raftRun) int {
 		}
 	}
 	lg.logf("event=shutdown_start node=%s", id)
+	if clientLn != nil {
+		_ = clientLn.Close()
+	}
 	_ = n.Close()
 	_ = r.tr.Close()
 	wg.Wait()
@@ -355,8 +398,9 @@ func runRaft(ctx context.Context, r raftRun) int {
 	return code
 }
 
-// crashPoint is a parsed -crash-at: a driver point (raftnode.Point) or an I/O
-// boundary of the durable log ("write", "fsync", "truncate"), and which
+// crashPoint is a parsed -crash-at: a driver point (raftnode.Point), an I/O
+// boundary of the durable log ("write", "fsync", "truncate") or a Phase 12
+// reply point of the client protocol ("before-reply", "after-reply"), and which
 // occurrence fires. It is a test seam for the Phase 11 real-process crash tests
 // (docs/CRASH_RECOVERY.md §8): at the point the process logs event=crash_point
 // and kills itself with SIGKILL, so nothing after that boundary happens — the
@@ -364,10 +408,26 @@ func runRaft(ctx context.Context, r raftRun) int {
 // files and a real restart. Unset in normal operation, it costs nothing.
 type crashPoint struct {
 	name   string
-	driver raftnode.Point // zero for an I/O point
-	op     fault.Op       // zero for a driver point
+	driver raftnode.Point // zero for an I/O or reply point
+	op     fault.Op       // zero for a driver or reply point
+	reply  int            // replyBefore or replyAfter for a reply point, else 0
 	nth    int
+
+	die   func()      // log the point and SIGKILL this process
+	armed atomic.Bool // occurrences count only once armed
+	mu    sync.Mutex  // guards seen (client connections write concurrently)
+	seen  int         // reply occurrences since arming
 }
+
+// Reply points are the client protocol's response boundary (Phase 12): the
+// Nth response frame the node is about to write (before-reply), or has just
+// handed to the kernel (after-reply). They complete the write-crash windows:
+// a write can be committed and applied, and the process die before or after
+// its client could learn so.
+const (
+	replyBefore = 1
+	replyAfter  = 2
+)
 
 func parseCrashAt(spec string) (*crashPoint, error) {
 	if spec == "" {
@@ -388,6 +448,10 @@ func parseCrashAt(spec string) (*crashPoint, error) {
 		return cp, nil
 	}
 	switch name {
+	case "before-reply":
+		cp.reply = replyBefore
+	case "after-reply":
+		cp.reply = replyAfter
 	case "write":
 		cp.op = fault.OpWrite
 	case "fsync":
@@ -400,34 +464,112 @@ func parseCrashAt(spec string) (*crashPoint, error) {
 	return cp, nil
 }
 
+// validate rejects combinations the seam cannot honour.
+func (cp *crashPoint) validate(armedBySignal, clientListen bool) error {
+	switch {
+	case cp == nil && armedBySignal:
+		return fmt.Errorf("-crash-armed-by-signal needs -crash-at")
+	case cp == nil:
+		return nil
+	case armedBySignal && cp.op != 0:
+		return fmt.Errorf("-crash-armed-by-signal: I/O points count from startup; arm a driver or reply point")
+	case cp.reply != 0 && !clientListen:
+		return fmt.Errorf("-crash-at %s needs -client-listen", cp.name)
+	}
+	return nil
+}
+
 // install returns the driver hook and the durable log's filesystem that make the
-// process die at the point. Driver points count occurrences from startup; I/O
+// process die at the point (a reply point is installed on the client listener
+// instead; see crashListener). Driver points count occurrences from startup; I/O
 // points count that operation on the log file from startup too (the first fsync
-// is the one Open issues on the recovered state).
-func (cp *crashPoint) install(lg *logger, id string) (raftnode.Hook, vfs.FS) {
-	die := func() {
+// is the one Open issues on the recovered state). With armedBySignal, driver
+// and reply points count only occurrences after the process receives SIGUSR1:
+// the test sends it, waits for event=crash_armed, then triggers exactly the
+// operation it wants the process to die inside.
+func (cp *crashPoint) install(ctx context.Context, lg *logger, id string, armedBySignal bool) (raftnode.Hook, vfs.FS) {
+	cp.die = func() {
 		lg.logf("event=crash_point node=%s point=%s n=%d", id, cp.name, cp.nth)
 		_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
 		select {} // SIGKILL is not deliverable to ourselves any later than now
 	}
+	if armedBySignal {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGUSR1)
+		go func() {
+			select {
+			case <-sig:
+				cp.armed.Store(true)
+				lg.logf("event=crash_armed node=%s point=%s n=%d", id, cp.name, cp.nth)
+			case <-ctx.Done():
+			}
+		}()
+	} else {
+		cp.armed.Store(true)
+	}
 	if cp.driver != 0 {
-		seen := 0
+		seen := 0 // the hook runs on the node's actor goroutine only
 		return func(p raftnode.Point, _ uint64) error {
-			if p == cp.driver {
+			if p == cp.driver && cp.armed.Load() {
 				seen++
 				if seen == cp.nth {
-					die()
+					cp.die()
 				}
 			}
 			return nil
 		}, nil
 	}
+	if cp.reply != 0 {
+		return nil, nil
+	}
 	// The injecting filesystem (real OS underneath) records every operation on
 	// the log for the process's lifetime — acceptable for a process that exists
 	// to die at its Nth one, which is the only reason this flag is ever set.
 	ifs := fault.NewInjectFS(nil)
-	ifs.Arm(fault.Injection{Op: cp.op, Nth: cp.nth, At: die})
+	ifs.Arm(fault.Injection{Op: cp.op, Nth: cp.nth, At: cp.die})
 	return nil, ifs
+}
+
+// replyHit counts one reply occurrence and reports whether it is the one.
+func (cp *crashPoint) replyHit() bool {
+	if !cp.armed.Load() {
+		return false
+	}
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	cp.seen++
+	return cp.seen == cp.nth
+}
+
+// crashListener wraps the client listener so the process can die at a reply
+// point: the kv protocol writes each response frame with exactly one Write.
+type crashListener struct {
+	net.Listener
+	cp *crashPoint
+}
+
+func (l *crashListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &crashConn{Conn: c, cp: l.cp}, nil
+}
+
+type crashConn struct {
+	net.Conn
+	cp *crashPoint
+}
+
+func (c *crashConn) Write(b []byte) (int, error) {
+	if c.cp.reply == replyBefore && c.cp.replyHit() {
+		c.cp.die()
+	}
+	n, err := c.Conn.Write(b)
+	if c.cp.reply == replyAfter && c.cp.replyHit() {
+		c.cp.die()
+	}
+	return n, err
 }
 
 // parsePeers parses "id=host:port,id=host:port" into a map. It rejects empty
