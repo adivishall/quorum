@@ -468,7 +468,19 @@ func TestCrashWithOverwritesAndDeletesAcrossFiles(t *testing.T) {
 	dir := t.TempDir()
 
 	c := startChildEnv(t, dir, "mutate-then-flush-loop", wal.SyncBatch, keys, lsmEnv(memTable))
-	time.Sleep(60 * time.Millisecond)
+	// Kill the child once the directory actually holds several SSTables — the
+	// property below is about resolution ACROSS files, so the crash must land
+	// after at least two flushes. A fixed delay before the kill assumed the
+	// child had flushed by then; on a slow runner under the race detector 60ms
+	// produced no SSTable at all (found by CI). The child loops until killed,
+	// so waiting on the files themselves is bounded and names what it needs.
+	deadline := time.Now().Add(20 * time.Second)
+	for len(inspectDir(t, dir).sstables) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the storm produced %d SSTables in 20s; the test needs several to mean anything", len(inspectDir(t, dir).sstables))
+		}
+		time.Sleep(time.Millisecond)
+	}
 	c.kill()
 
 	st := inspectDir(t, dir)
