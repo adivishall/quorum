@@ -1,0 +1,4 @@
+# Nothing ever wrote k, yet a read reports it present with an empty value.
+# Absent and present-and-empty are different states (the Phase 1 contract).
+1 c1 put "j" 1 2 ok value=""
+2 c2 get "k" 3 4 ok output=""

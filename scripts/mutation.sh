@@ -2,8 +2,11 @@
 #
 # mutation.sh — Raft mutation testing: the Phase 9 protocol rules (docs/RAFT.md
 # §12a), the Phase 10 failure-handling rules and fault-model fidelity
-# (docs/FAULTS.md §12), and the Phase 11 crash-recovery rules
-# (docs/CRASH_RECOVERY.md §10).
+# (docs/FAULTS.md §12), the Phase 11 crash-recovery rules
+# (docs/CRASH_RECOVERY.md §10), and the Phase 12 client-visible consistency
+# rules — ReadIndex, write completion, the client protocol and policy, the
+# state machine, and the linearizability checker itself
+# (docs/LINEARIZABILITY.md §11).
 #
 # For each mutant it applies a real source edit that violates a specific Raft rule,
 # runs the test(s) that should catch that violation, and requires them to FAIL (the
@@ -361,6 +364,193 @@ mutant "recover-restores-vote" internal/raftnode/node.go \
   '		Term: rec.HardState.Term, Vote: rec.HardState.Vote,' \
   '		Term: rec.HardState.Term, Vote: "",' \
   ./internal/raftsim 'TestVoterCrashAroundPersistingItsVote|TestCrashMatrix'
+
+echo "== Phase 12: client-visible consistency =="
+
+# 34. A follower registers a ReadIndex (and broadcasts as if it led).
+mutant "readindex-requires-leader" internal/raft/raft.go \
+  'func (r *Raft) ReadIndex() (ReadState, error) {
+	if r.role != Leader {' \
+  'func (r *Raft) ReadIndex() (ReadState, error) {
+	if false && r.role != Leader {' \
+  "./internal/raft ./internal/raftsim" 'TestReadIndexRequiresLeader|TestKVHistoryOfAScriptIsReplayable'
+
+# 35. A new leader's read index is its commit index alone, which can lag entries
+#     its predecessor committed: a read served below the new leader's no-op.
+mutant "readindex-at-least-the-noop" internal/raft/raft.go \
+  '	if r.termStart > rs.Index {' \
+  '	if false && r.termStart > rs.Index {' \
+  "./internal/raft ./internal/raftsim" 'TestNewLeaderReadIndexIsAtLeastItsNoop|TestKVNewLeaderReadWaitsForItsNoop'
+
+# 36. Acknowledgements of a heartbeat sent BEFORE the read confirm it (a stale
+#     ReadIndex response accepted): a deposed leader serves its old state.
+mutant "readindex-ignores-acks-sent-before-the-read" internal/raft/raft.go \
+  'seq: r.hbSeq + 1})' \
+  'seq: r.hbSeq})' \
+  "./internal/raft ./internal/raftsim" 'TestAcksFromBeforeTheReadDoNotConfirmIt|TestKVStaleLeaderReadIsNeverServed'
+
+# 37. A ReadIndex confirmed without a quorum (the leader alone suffices).
+mutant "readindex-needs-a-quorum" internal/raft/raft.go \
+  '		if acks < quorum(len(r.peers)) {' \
+  '		if acks < 1 {' \
+  "./internal/raft ./internal/raftsim" 'TestReadIndexIsConfirmedByAQuorumRound|TestIsolatedLeaderNeverConfirmsARead|TestKVStaleLeaderReadIsNeverServed|TestKVMinorityLeaderWithAFollowerNeverServesARead'
+
+# 38. Unconfirmed reads survive the leader stepping down in the core.
+mutant "unconfirmed-reads-die-with-leadership" internal/raft/raft.go \
+  '		r.pending = nil // unconfirmed reads die with the leadership' \
+  '		_ = r.pending // mutant: kept across the step-down' \
+  ./internal/raft 'TestPendingReadsAreDroppedOnStepDown'
+
+# 39. The driver ignores a leadership change: a read registered in a term the
+#     node no longer leads is never failed (its client learns nothing).
+mutant "driver-fails-reads-on-leadership-change" internal/raftnode/waiters.go \
+  '		if !leader || p.term != term {' \
+  '		if false {' \
+  "./internal/raftnode ./internal/raftsim" 'TestReadsConfirmAndDropStale|TestKVStaleLeaderReadIsNeverServed'
+
+# 40. A PUT completes when appended, before a quorum commits it.
+mutant "write-completes-only-when-committed-and-applied" internal/raftnode/waiters.go \
+  '	if term == 0 && index <= applied {' \
+  '	if index <= applied || term != 0 {' \
+  "./internal/raftnode ./internal/raftsim" 'TestWaitersCompleteWritesOnlyInTheirTerm|TestKVWriteIsNotAcknowledgedBeforeCommit'
+
+# 41. A write whose index was taken by a DIFFERENT committed entry reports success.
+mutant "lost-write-is-not-success" internal/raftnode/waiters.go \
+  '		case wt.term == 0 || wt.term == term:' \
+  '		case true:' \
+  "./internal/raftnode ./internal/raftsim" 'TestWaitersCompleteWritesOnlyInTheirTerm|TestKVWriteIsNotAcknowledgedBeforeCommit'
+
+# 42. A confirmed read is served before the state machine reaches its read index
+#     (the client sees state older than the index that was confirmed).
+mutant "read-waits-for-apply-to-reach-the-read-index" internal/raftnode/waiters.go \
+  '	if rs.Index <= applied {' \
+  '	if true {' \
+  "./internal/raftnode ./internal/raftsim" 'TestReadsConfirmAndDropStale|TestKVNewLeaderReadWaitsForItsNoop'
+
+# 43. Server.Get bypasses ReadIndex: a local read on whatever node was asked.
+mutant "server-get-goes-through-readindex" internal/kv/server.go \
+  '	idx, err := s.node.ReadIndex(ctx)' \
+  '	idx, err := s.node.CommitIndex(), error(nil)' \
+  "./internal/kv ./tests/integration" 'TestFollowerLocalReadIsCaughtAsNonLinearizable|TestRealStaleLeaderNeverServesARead'
+
+# 44. dkvd serves clients from a store that is not the node's state machine:
+#     committed state vanishes from the client-visible view.
+mutant "dkvd-serves-the-replicated-state-machine" cmd/dkvd/main.go \
+  'kv.NewServer(id, n, store)' \
+  'kv.NewServer(id, n, kv.NewStore())' \
+  ./tests/integration 'TestRealSequentialBaselineMatchesTheModel'
+
+# 45. DELETE does not remove the key from the state machine.
+mutant "store-delete-removes-the-key" internal/kv/store.go \
+  '		delete(s.m, string(c.Key))' \
+  '		_ = c.Key' \
+  "./internal/kv ./internal/raftsim" 'TestStoreMatchesTheStorageContract|TestStoreMatchesTheReferenceModel|TestKVSeededHistoriesAreLinearizable'
+
+# 46. PUT of an empty value is treated as absence (the Phase 1 contract: an
+#     empty value is a present key).
+mutant "store-empty-value-is-present" internal/kv/store.go \
+  '		s.m[string(c.Key)] = append([]byte{}, c.Value...)' \
+  '		if len(c.Value) == 0 {
+			delete(s.m, string(c.Key))
+		} else {
+			s.m[string(c.Key)] = append([]byte{}, c.Value...)
+		}' \
+  ./internal/kv 'TestStoreMatchesTheStorageContract|TestStoreMatchesTheReferenceModel|TestWireClientAgainstRealNodes'
+
+# 47. The client keeps a connection whose request timed out: the late response
+#     is read as the answer to the NEXT request.
+mutant "wire-client-abandons-a-timed-out-connection" internal/kv/wire.go \
+  '	payload, err := readFrame(c.conn, kindResponse)
+	if err != nil {
+		c.dropConn()' \
+  '	payload, err := readFrame(c.conn, kindResponse)
+	if err != nil {' \
+  ./internal/kv 'TestWireClientNeverMatchesALateResponseToANewRequest'
+
+# 48. The test client retries a write whose outcome is unknown (a hidden retry
+#     that could apply it twice under one recorded operation).
+mutant "workload-never-retries-an-unknown-write" internal/kv/workload/workload.go \
+  '			if kind != lincheck.Get {' \
+  '			if false && kind != lincheck.Get {' \
+  ./internal/kv/workload 'TestClientPolicy'
+
+echo "== Phase 12: the linearizability checker itself =="
+
+# 49. The checker ignores real-time order (any op may be linearized next).
+mutant "checker-respects-real-time" internal/lincheck/check.go \
+  '		if lin.has(i) || s.inv[i] >= minRes {' \
+  '		if lin.has(i) {' \
+  ./internal/lincheck 'TestKnownGoodAndKnownBadCorpus|TestCheckerAgreesWithIndependentOracle'
+
+# 50. The checker discards unanswered writes as if they never happened.
+mutant "checker-keeps-unanswered-writes-optional" internal/lincheck/check.go \
+  '		if !op.Effective() {
+			kr.excluded++' \
+  '		if !op.Effective() || op.Optional() {
+			kr.excluded++' \
+  ./internal/lincheck 'TestKnownGoodAndKnownBadCorpus|TestCheckerAgreesWithIndependentOracle'
+
+# 51. The checker forces definite rejections into the linearization.
+mutant "checker-excludes-definite-rejections" internal/lincheck/history.go \
+  'func (o Op) Effective() bool { return o.Outcome != Rejected }' \
+  'func (o Op) Effective() bool { return true }' \
+  ./internal/lincheck 'TestKnownGoodAndKnownBadCorpus|TestCheckerAgreesWithIndependentOracle'
+
+# 52. The checker memoizes on the linearized set alone, forgetting the register
+#     state (unsound pruning: linearizable histories rejected).
+mutant "checker-memo-includes-the-register-state" internal/lincheck/check.go \
+  '	key := lin.key(st)' \
+  '	key := lin.key(Initial)' \
+  ./internal/lincheck 'TestCheckerAgreesWithIndependentOracle'
+
+# 53. The model reads an absent key as a present empty value.
+mutant "model-absent-is-not-empty" internal/lincheck/model.go \
+  '		return s, s.Present && s.Value == string(op.Output)' \
+  '		return s, s.Value == string(op.Output)' \
+  ./internal/lincheck 'TestKnownGoodAndKnownBadCorpus|TestCheckerAgreesWithIndependentOracle'
+
+echo "== Phase 12: the same rules, killed by client-visible histories ALONE =="
+# The mutants above list unit killers next to history-level ones, so a kill
+# does not show that the history-level test has teeth by itself. These do: each
+# is killed with only a recorded-history test (simulated or real processes).
+
+# 54. No-quorum ReadIndex, on five real processes: a minority leader that still
+#     has a follower acknowledging it serves a stale read.
+mutant "readindex-needs-a-quorum (real processes)" internal/raft/raft.go \
+  '		if acks < quorum(len(r.peers)) {' \
+  '		if acks < 1 {' \
+  ./tests/integration 'TestRealMinorityLeaderWithAFollowerNeverServesARead'
+
+# 55. The same, in the simulator's scripted minority-leader attack.
+mutant "readindex-needs-a-quorum (simulated history)" internal/raft/raft.go \
+  '		if acks < quorum(len(r.peers)) {' \
+  '		if acks < 1 {' \
+  ./internal/raftsim 'TestKVMinorityLeaderWithAFollowerNeverServesARead'
+
+# 56. Pre-read acknowledgements confirm the read: the simulated stale leader
+#     serves its old value once the delayed acks arrive.
+mutant "readindex-ignores-acks-sent-before-the-read (simulated history)" internal/raft/raft.go \
+  'seq: r.hbSeq + 1})' \
+  'seq: r.hbSeq})' \
+  ./internal/raftsim 'TestKVStaleLeaderReadIsNeverServed'
+
+# 57. No no-op rule: the new leader serves below its predecessor's last commit.
+mutant "readindex-at-least-the-noop (simulated history)" internal/raft/raft.go \
+  '	if r.termStart > rs.Index {' \
+  '	if false && r.termStart > rs.Index {' \
+  ./internal/raftsim 'TestKVNewLeaderReadWaitsForItsNoop'
+
+# 58. Writes acknowledged at append: caught by the SEEDED workloads alone.
+mutant "write-completes-only-when-committed-and-applied (seeded histories)" internal/raftnode/waiters.go \
+  '	if term == 0 && index <= applied {' \
+  '	if index <= applied || term != 0 {' \
+  ./internal/raftsim 'TestKVSeededHistoriesAreLinearizable'
+
+# 59. Server.Get bypasses ReadIndex, on real processes.
+mutant "server-get-goes-through-readindex (real processes)" internal/kv/server.go \
+  '	idx, err := s.node.ReadIndex(ctx)' \
+  '	idx, err := s.node.CommitIndex(), error(nil)' \
+  ./tests/integration 'TestRealStaleLeaderNeverServesARead'
 
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
