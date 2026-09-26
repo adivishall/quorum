@@ -798,6 +798,7 @@ committed logs against the session model (`dedupEvidence`):
 | 88 | a duplicate reports the ORIGINAL execution's index | `TestStoreAgreesWithTheSessionModel`, `TestConcurrentDuplicatesAtTwoNodes`, `TestRealConcurrentDuplicatesThroughEveryNode` | killed |
 | 89 | a restart rebuilds the session table by replay (not: mark the recovered commit applied) | `TestRetryAfterEveryNodeRestarts`, `TestKVSimSessionsSurviveARestartOfEveryNode`, `TestRealSessionContractSurvivesFullClusterRestart` | killed |
 | 90 | a duration past `time.Duration` is a protocol error (§15.7 item 7) | `TestDurationsThatOverflowAreProtocolErrors`, `FuzzDecodeRequestIsTotal` (its regression seed) | killed |
+| 91 | `raftnode.Start` reads the core only before the actor owns it (§15.7 item 8) | `TestStartDoesNotTouchTheCoreOnceTheActorOwnsIt`, under `-race` | killed |
 
 ### 15.7 Found and fixed during Phase 13
 
@@ -835,6 +836,13 @@ history. What the phase found:
    input is a regression seed, `TestDurationsThatOverflowAreProtocolErrors` pins it, mutant 90
    removes the check and is killed; the forward fuzz target, which checked only totality and so
    missed the same bug, now checks canonicality too.
+8. **A data race in the Raft driver since Phase 9** (found by the race suite, `make check`, in the
+   Phase 13 gate — the retry tests restart a node that receives messages at once): `raftnode.Start`
+   started the actor goroutine, which owns the Raft core, and then read the core's term and last
+   index for its `raft_started` log line. Only the logged values could be torn; nothing else read
+   them. Start now reads them first; `TestStartDoesNotTouchTheCoreOnceTheActorOwnsIt` queues a
+   higher-term message before Start so the actor mutates the core at once — it reported the exact
+   race before the fix — and mutant 91 (the read moved back) is killed under `-race`.
 
 ### 15.8 What is and is not claimed
 
