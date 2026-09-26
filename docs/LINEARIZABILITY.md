@@ -756,7 +756,7 @@ committed logs against the session model (`dedupEvidence`):
 
 | Test | What it establishes |
 |---|---|
-| `TestRealSessionWorkloadsUnderFaults` (leader SIGKILL, leader partition, rolling restart) | six session clients, 15% concurrent duplicates: linearizable; writes retried after unanswered attempts; duplicate entries in the log answered from their originals |
+| `TestRealSessionWorkloadsUnderFaults` (leader killed mid-write, leader partition, rolling restart starting with the leader mid-write) | six session clients, 15% concurrent duplicates: linearizable; writes retried after unanswered attempts (the leader dies at its after-applied-to seam, so some client's write is unanswered by construction — its durable term proves it still led); duplicate entries in the log answered from their originals |
 | `TestRealSessionRetryAcrossCrashWindows` (8 points: before-save … after-reply) | the hardest case at every window; the victim's disk decides which case; a read between the crash and B lets the checker alone see a second execution |
 | `TestRealForwarderDiesBeforeRelaying` | a follower SIGKILLed before relaying the leader's answer; the retry is a duplicate |
 | `TestRealConcurrentDuplicatesThroughEveryNode` | one request sent at once to all three nodes — 20 PUT, 5 GET, 5 DELETE rounds: each write executes once, every other copy its duplicate at the same index; every GET copy really reads (reads are never deduplicated) |
@@ -826,7 +826,11 @@ history. What the phase found:
    unknown occurred); a duplicate-before-commit test held every AppendEntries, which silenced the
    heartbeats until a follower campaigned and deposed the leader (it now holds the
    acknowledgements, and asserts the leader led throughout); the workload counted the unanswered
-   attempt itself as a retry.
+   attempt itself as a retry; the in-process leader-crash schedule killed the leader at an
+   arbitrary instant, and a run under the full race suite found no request in flight there — no
+   unknown outcome, nothing retried (the leader now dies right after applying a client's write, and
+   the real-process kill schedules do the same through `dkvd`'s crash seam: a latent ~1% flake,
+   removed before it was observed there).
 7. **The wire decoder was not canonical for huge durations** (found by `make fuzz` in the Phase 13
    gate: `FuzzDecodeRequestIsTotal`, minimized to 15 bytes). A request's `timeoutMillis` of
    211,937,359,432,728 — a canonical varint — overflowed `time.Duration` on conversion, so the frame

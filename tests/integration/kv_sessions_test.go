@@ -155,23 +155,45 @@ func sessionWorkload(seed int64) workload.Options {
 	return o
 }
 
+// killLeaderMidWrite kills the leader of a cluster started with
+// "-crash-at after-applied-to:1 -crash-armed-by-signal" at the point right
+// after it applies an entry — during the workload, a client's write whose
+// answer it never sends — so that client's outcome is unknown by construction
+// (a SIGKILL at an arbitrary instant may find no write in flight). The
+// premise: the victim still led when it died, proved by its durable term
+// (a deposed leader would have persisted a higher one).
+func killLeaderMidWrite(c *rcluster, r *linRun) (string, uint64) {
+	l, tm := c.waitStable(c.ids, 0, 30*time.Second)
+	c.armCrash(l)
+	r.event("armed after-applied-to:1 on leader %s (term %d)", l, tm)
+	point, _ := c.waitKilledAtPoint(l, 30*time.Second)
+	held, err := raftlog.Inspect(filepath.Join(c.dirs[l], "raft-"+l+".log"))
+	if err != nil {
+		r.fail("inspect %s: %v", l, err)
+	}
+	r.premise(held.HardState.Term == tm, "%s's term moved from %d to %d before it died: it may not have led", l, tm, held.HardState.Term)
+	r.event("leader %s died at %s, mid-write", l, point)
+	return l, tm
+}
+
 // TestRealSessionWorkloadsUnderFaults: six session clients run while the
-// leader is SIGKILLed, the leader is partitioned, or every node is restarted in
-// turn. The history of logical requests must be linearizable; the clients must
-// have retried writes whose attempts went unanswered and sent concurrent
-// duplicates; and the committed log must show every identity executed at most
-// once, with every replica and the session model agreeing on every decision.
+// leader is killed mid-write, the leader is partitioned, or every node is
+// restarted in turn (the leader first, mid-write). The history of logical
+// requests must be linearizable; the clients must have retried writes whose
+// attempts went unanswered and sent concurrent duplicates; and the committed
+// log must show every identity executed at most once, with every replica and
+// the session model agreeing on every decision.
 func TestRealSessionWorkloadsUnderFaults(t *testing.T) {
+	seam := []string{"-crash-at", "after-applied-to:1", "-crash-armed-by-signal"}
 	schedules := []struct {
 		name  string
 		seed  int64
+		flags []string
 		sched func(c *rcluster, r *linRun)
 	}{
-		{"leader-kill", 131, func(c *rcluster, r *linRun) {
+		{"leader-kill", 131, seam, func(c *rcluster, r *linRun) {
 			r.waitServed(60, 60*time.Second)
-			l, tm := c.waitStable(c.ids, 0, 30*time.Second)
-			r.event("kill leader %s (term %d)", l, tm)
-			c.kill(l)
+			l, tm := killLeaderMidWrite(c, r)
 			l2, t2 := c.waitLeader(others(c.ids, l), tm, 20*time.Second)
 			r.event("%s leads term %d", l2, t2)
 			r.waitServed(40, 60*time.Second)
@@ -181,7 +203,7 @@ func TestRealSessionWorkloadsUnderFaults(t *testing.T) {
 			c.waitStable(c.ids, t2-1, 30*time.Second)
 			r.waitServed(40, 60*time.Second)
 		}},
-		{"leader-partition", 141, func(c *rcluster, r *linRun) {
+		{"leader-partition", 141, nil, func(c *rcluster, r *linRun) {
 			r.waitServed(60, 60*time.Second)
 			l, tm := c.waitStable(c.ids, 0, 30*time.Second)
 			r.event("isolate leader %s (term %d)", l, tm)
@@ -194,44 +216,54 @@ func TestRealSessionWorkloadsUnderFaults(t *testing.T) {
 			c.waitStable(c.ids, t2-1, 30*time.Second)
 			r.waitServed(60, 60*time.Second)
 		}},
-		{"rolling-restart", 151, func(c *rcluster, r *linRun) {
+		{"rolling-restart", 151, seam, func(c *rcluster, r *linRun) {
 			r.waitServed(40, 60*time.Second)
-			for _, id := range c.ids {
+			first, _ := killLeaderMidWrite(c, r)
+			restart := func(id string) {
+				c.start(id)
+				waitForLine(t, c.procs[id], "event=client_ready", 20*time.Second)
+				r.event("restarted %s", id)
+				c.waitStable(c.ids, 0, 30*time.Second)
+			}
+			l, tm := c.waitLeader(others(c.ids, first), 0, 20*time.Second)
+			r.event("%s leads term %d", l, tm)
+			r.waitServed(30, 60*time.Second)
+			restart(first)
+			for _, id := range others(c.ids, first) {
 				r.event("kill %s", id)
 				c.kill(id)
 				l, tm := c.waitLeader(others(c.ids, id), 0, 20*time.Second)
 				r.event("%s leads term %d", l, tm)
 				r.waitServed(30, 60*time.Second)
-				c.start(id)
-				waitForLine(t, c.procs[id], "event=client_ready", 20*time.Second)
-				r.event("restarted %s", id)
-				c.waitStable(c.ids, 0, 30*time.Second)
+				restart(id)
 			}
 			r.waitServed(30, 60*time.Second)
 		}},
 	}
 	for _, sc := range schedules {
 		t.Run(sc.name, func(t *testing.T) {
-			c := newRCluster(t, 3)
-			c.waitLeader(c.ids, 0, 20*time.Second)
-			c.waitClientReady(20 * time.Second)
-			r := newLinRun(t, c)
-			opts := sessionWorkload(sc.seed)
-			st := r.workload(opts, func() { sc.sched(c, r) })
-			r.check()
-			if st.Sessions != opts.Clients || st.DupSends == 0 || st.Duplicates == 0 {
-				r.fail("sessions were not exercised: %s", st)
-			}
-			if st.WriteRetries == 0 {
-				r.fail("the fault never left a session write unanswered, so nothing was retried: %s", st)
-			}
-			c.finish()
-			ev := c.requireDedupEvidence(kv.DefaultLimits)
-			if ev.duplicates == 0 {
-				t.Fatalf("the committed log holds no duplicate entry: %+v", ev)
-			}
-			t.Logf("%s; committed log: %d identified writes, %d duplicate entries answered from their original, %d identities executed once each",
-				st, ev.identified, ev.duplicates, len(ev.executedAt))
+			withPremise(t, func() {
+				c := newRClusterArgs(t, 3, sc.flags...)
+				c.waitLeader(c.ids, 0, 20*time.Second)
+				c.waitClientReady(20 * time.Second)
+				r := newLinRun(t, c)
+				opts := sessionWorkload(sc.seed)
+				st := r.workload(opts, func() { sc.sched(c, r) })
+				r.check()
+				if st.Sessions != opts.Clients || st.DupSends == 0 || st.Duplicates == 0 {
+					r.fail("sessions were not exercised: %s", st)
+				}
+				if st.WriteRetries == 0 {
+					r.fail("the fault never left a session write unanswered, so nothing was retried: %s", st)
+				}
+				c.finish()
+				ev := c.requireDedupEvidence(kv.DefaultLimits)
+				if ev.duplicates == 0 {
+					t.Fatalf("the committed log holds no duplicate entry: %+v", ev)
+				}
+				t.Logf("%s; committed log: %d identified writes, %d duplicate entries answered from their original, %d identities executed once each",
+					st, ev.identified, ev.duplicates, len(ev.executedAt))
+			})
 		})
 	}
 }
