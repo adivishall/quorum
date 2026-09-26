@@ -59,7 +59,7 @@ the project, and they are being built in that order.
 > hardest case (committed, reply lost, new leader, another write, retry) at all eight crash windows
 > of a real process, forwarders killed before relaying, concurrent copies through every node, a
 > full-cluster restart, and 1,200 more seeded simulator runs in which every replica's every
-> apply-time decision matches an independent model. 29 more mutants are killed.
+> apply-time decision matches an independent model. 30 more mutants are killed.
 >
 > **What that claim is, exactly:** single-key PUT/GET/DELETE on **one** Raft group; every
 > recorded finite history linearizable, plus an argument with named assumptions — not a proof

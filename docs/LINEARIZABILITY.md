@@ -797,6 +797,7 @@ committed logs against the session model (`dedupEvidence`):
 | 87 | requests are validated before they are proposed | `TestRequestValidationRejectsEveryOutOfContractField`, `TestValidatedRequestsAlwaysApply` | killed |
 | 88 | a duplicate reports the ORIGINAL execution's index | `TestStoreAgreesWithTheSessionModel`, `TestConcurrentDuplicatesAtTwoNodes`, `TestRealConcurrentDuplicatesThroughEveryNode` | killed |
 | 89 | a restart rebuilds the session table by replay (not: mark the recovered commit applied) | `TestRetryAfterEveryNodeRestarts`, `TestKVSimSessionsSurviveARestartOfEveryNode`, `TestRealSessionContractSurvivesFullClusterRestart` | killed |
+| 90 | a duration past `time.Duration` is a protocol error (§15.7 item 7) | `TestDurationsThatOverflowAreProtocolErrors`, `FuzzDecodeRequestIsTotal` (its regression seed) | killed |
 
 ### 15.7 Found and fixed during Phase 13
 
@@ -825,6 +826,15 @@ history. What the phase found:
    heartbeats until a follower campaigned and deposed the leader (it now holds the
    acknowledgements, and asserts the leader led throughout); the workload counted the unanswered
    attempt itself as a retry.
+7. **The wire decoder was not canonical for huge durations** (found by `make fuzz` in the Phase 13
+   gate: `FuzzDecodeRequestIsTotal`, minimized to 15 bytes). A request's `timeoutMillis` of
+   211,937,359,432,728 — a canonical varint — overflowed `time.Duration` on conversion, so the frame
+   decoded to a request that re-encodes to different bytes; the forward budget had the same
+   conversion. No consistency impact (a timeout never enters a log command, and the server clamps
+   it to 10 s). The decoder now refuses any duration past `time.Duration` as a protocol error, the
+   input is a regression seed, `TestDurationsThatOverflowAreProtocolErrors` pins it, mutant 90
+   removes the check and is killed; the forward fuzz target, which checked only totality and so
+   missed the same bug, now checks canonicality too.
 
 ### 15.8 What is and is not claimed
 

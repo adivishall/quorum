@@ -37,7 +37,7 @@ is a protocol error). Byte strings are a varint length followed by the bytes.
 | clientID | varint | the session (0: anonymous) |
 | requestID | varint | the request within the session (0 when anonymous) |
 | ackedBelow | varint | the client's watermark (0 when anonymous) |
-| timeoutMillis | varint | the client's budget for this attempt; 0 = the server default |
+| timeoutMillis | varint | the client's budget for this attempt; 0 = the server default; more than fits a `time.Duration` (≈292 years): protocol error |
 | key | bytes | ≤ 4 KiB (longer: protocol error) |
 | value | bytes | **PUT only** — absent for every other op; ≤ 1 MiB |
 
