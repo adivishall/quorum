@@ -149,7 +149,9 @@ out := s.Put(ctx, key, value, nil)   // one logical request; retried under its i
 s2 := kv.ResumeSession(endpoints, opts, s.ID(), s.Next())   // after a client restart that persisted both
 ```
 
-Per attempt: a `NOT_LEADER` hint is followed; `UNAVAILABLE` tries the next node after a back-off;
+Per attempt: a `NOT_LEADER` hint is followed; `UNAVAILABLE` tries the next node after a back-off
+(`Backoff`, doubling for each consecutive refusal that names no usable leader, capped at 1 s, reset
+when a leader is named — so a count of attempts spans an election under load);
 `UNKNOWN_OUTCOME`, `LOST` and a transport failure after sending are **retried with the same
 requestID**; `SESSION_LIMIT` backs off and retries; `SESSION_EXPIRED`, `REQUEST_CONFLICT`,
 `REQUEST_STALE` and `INVALID_REQUEST` stop. When the attempts run out after an unanswered one,

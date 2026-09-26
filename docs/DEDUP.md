@@ -175,7 +175,7 @@ does not — an evicted session's requests are refused, not re-executed (mutant 
   one execution per identity (`dedupEvidence`).
 - **Through client histories.** Retries and duplicates are recorded as sends of one logical
   operation and checked for linearizability (LINEARIZABILITY §15).
-- **Mutants 61–91** (`scripts/mutation.sh`): each rule above broken on purpose, each killed.
+- **Mutants 61–92** (`scripts/mutation.sh`): each rule above broken on purpose, each killed.
 
 ## 8. Cost (measured)
 
@@ -218,7 +218,8 @@ checker's logical merge (identity scope, accepted conflicts, invocation, complet
 commands) · 82 the model without deduplication · 83–86 the same rules killed by client-visible
 histories of real processes alone · 87 validation before proposal · 88 a duplicate reports the
 original's index · 89 a restart rebuilds the table by replay · 90 durations past `time.Duration`
-are protocol errors · 91 the driver's start does not race the actor. `LINEARIZABILITY.md` §15.6 has the
+are protocol errors · 91 the driver's start does not race the actor · 92 the session client's
+back-off doubles while no leader is known. `LINEARIZABILITY.md` §15.6 has the
 killers.
 
 ## 10. Limitations

@@ -799,6 +799,7 @@ committed logs against the session model (`dedupEvidence`):
 | 89 | a restart rebuilds the session table by replay (not: mark the recovered commit applied) | `TestRetryAfterEveryNodeRestarts`, `TestKVSimSessionsSurviveARestartOfEveryNode`, `TestRealSessionContractSurvivesFullClusterRestart` | killed |
 | 90 | a duration past `time.Duration` is a protocol error (§15.7 item 7) | `TestDurationsThatOverflowAreProtocolErrors`, `FuzzDecodeRequestIsTotal` (its regression seed) | killed |
 | 91 | `raftnode.Start` reads the core only before the actor owns it (§15.7 item 8) | `TestStartDoesNotTouchTheCoreOnceTheActorOwnsIt`, under `-race` | killed |
+| 92 | the session client's back-off doubles while no leader is known (§15.7 item 9) | `TestSessionRidesOutAnElectionLongerThanItsAttemptsTimesBackoff`, `TestBackoffDoublesUpToItsCap` | killed |
 
 ### 15.7 Found and fixed during Phase 13
 
@@ -847,6 +848,21 @@ history. What the phase found:
    them. Start now reads them first; `TestStartDoesNotTouchTheCoreOnceTheActorOwnsIt` queues a
    higher-term message before Start so the actor mutates the core at once — it reported the exact
    race before the fix — and mutant 91 (the read moved back) is killed under `-race`.
+9. **The session client gave up during an ordinary election** (found by `go test ./...` under
+   full parallel load in the gate: `TestRetryAtEveryCrashPointOfAWrite`). After the leader died,
+   every retry was refused NOT_LEADER naming no leader and the session slept a fixed 20 ms each
+   time: 20 attempts spanned half a second, the election under load took longer, and the client
+   reported unknown for a request that would have completed moments later. Not a safety defect
+   (unknown was reported as unknown), but the contract promises a client can keep asking. The
+   back-off now doubles for each consecutive refusal that names no usable leader, capped at 1 s,
+   and resets when a leader is named; `TestSessionRidesOutAnElectionLongerThanItsAttemptsTimesBackoff`
+   (400 ms without a leader, 12 attempts of 20 ms) and mutant 92 pin it.
+10. **Two more assertions depended on chance or on stable leadership**, fixed before they were
+   ever seen to fail: the concurrent-duplicate tests gave each copy one attempt (a spurious
+   election would fail a correct round), and the one-session concurrency tests forbade any
+   duplicate answer, though one is legitimate after an unanswered attempt. Copies now retry like
+   any request; the assertions are the contract's (one execution per request — checked from the
+   stores and the committed log — and no duplicate answer on a first attempt).
 
 ### 15.8 What is and is not claimed
 

@@ -30,7 +30,7 @@ logical operations — from real processes (the hardest case at every crash wind
 killed before relaying, concurrent copies through every node, a full-cluster restart with small
 limits), the real driver, and 1,200 more seeded simulator runs in which every replica's every
 apply-time decision is checked against an independent model — are linearizable (LINEARIZABILITY
-§15; INV-X2, X11–X14; 31 more mutants). Anonymous writes keep Phase 12's semantics.
+§15; INV-X2, X11–X14; 32 more mutants). Anonymous writes keep Phase 12's semantics.
 
 **Still verified from earlier phases.** Raft's safety properties (INV-R1..R10; Phase 9), under
 injected faults (Phase 10, `docs/FAULTS.md`), and across crashes at every boundary of the node's
