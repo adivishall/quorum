@@ -23,7 +23,13 @@ type sim struct {
 
 func newSim(t *testing.T, nodes int, seed int64) *sim {
 	t.Helper()
-	c, err := New(Config{Nodes: nodes, Seed: seed})
+	return newSimWith(t, Config{Nodes: nodes, Seed: seed})
+}
+
+// newSimWith is newSim with an explicit configuration (e.g. a snapshot policy).
+func newSimWith(t *testing.T, cfg Config) *sim {
+	t.Helper()
+	c, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -725,6 +725,30 @@ var KVProfiles = []Profile{
 		Partition: 6, Heal: 15, Crash: 5, Restart: 30, Pause: 5, Resume: 30, FailPersist: 3, CrashAt: 4,
 		KVPut: 50, KVGet: 40, KVDelete: 15, KVTimeout: 12, KVSessions: true, KVRegister: 30, KVRetry: 40, KVDup: 12,
 		Clients: 8, Keys: 3, FIFOPercent: 60, PowerLossPercent: 40, MaxDelay: 40, MaxTorn: 64},
+
+	// Phase 14: the same session clients while every node snapshots and
+	// compacts every few entries — a retry after a snapshot, a compaction and
+	// a restart (or an install) must still be answered as a duplicate, reads
+	// stay linearizable, and every store equals the model.
+	{Name: "kv-snapshots-crashes", Nodes: 3, Steps: 2500, Tick: 300, Deliver: 600, Crash: 10, Restart: 40,
+		KVPut: 50, KVGet: 40, KVDelete: 15, KVTimeout: 12, KVSessions: true, KVRegister: 30, KVRetry: 40, KVDup: 12,
+		SnapshotEvery: 8, SnapshotRetain: 1, SnapshotNow: 3,
+		Clients: 5, Keys: 2, FIFOPercent: 80, PowerLossPercent: 40, MaxTorn: 128},
+	{Name: "kv-snapshots-crashpoints", Nodes: 3, Steps: 2500, Tick: 300, Deliver: 600, CrashAt: 12, Restart: 40,
+		KVPut: 50, KVGet: 40, KVDelete: 15, KVTimeout: 12, KVSessions: true, KVRegister: 30, KVRetry: 40, KVDup: 12,
+		SnapshotEvery: 6, SnapshotRetain: 0,
+		Clients: 5, Keys: 2, FIFOPercent: 80, PowerLossPercent: 40, MaxTorn: 128},
+	{Name: "kv-snapshots-partitions", Nodes: 5, Steps: 2500, Tick: 300, Deliver: 600, Partition: 8, Split: 3, Heal: 10,
+		Drop: 15, Duplicate: 15, Delay: 15, CorruptChunk: 5,
+		KVPut: 50, KVGet: 40, KVDelete: 15, KVTimeout: 12, KVSessions: true, KVRegister: 30, KVRetry: 40, KVDup: 12,
+		SnapshotEvery: 8, SnapshotRetain: 2,
+		Clients: 6, Keys: 2, FIFOPercent: 70, MaxDelay: 40},
+	// Tiny session limits under snapshots: evictions, watermarks and the LRU
+	// order all travel in the snapshot.
+	{Name: "kv-snapshots-evict", Nodes: 3, Steps: 2500, Tick: 300, Deliver: 600, Crash: 6, Restart: 40,
+		KVPut: 50, KVGet: 30, KVDelete: 15, KVTimeout: 12, KVSessions: true, KVRegister: 40, KVRetry: 30, KVDup: 10,
+		KVLimits: kv.Limits{MaxSessions: 3, MaxUnacked: 2}, SnapshotEvery: 5, SnapshotRetain: 0,
+		Clients: 6, Keys: 2, FIFOPercent: 80},
 }
 
 // KVProfileByName returns the named client profile.
@@ -800,7 +824,7 @@ func (c *Cluster) kvEvents(rng *rand.Rand, p Profile, add func(int, bool, func()
 // converged state observed through the linearizable read path. It is a pure
 // function of (profile, seed); the Result carries the history.
 func RunKV(p Profile, seed int64) *Result {
-	c, err := New(Config{Nodes: p.Nodes, Seed: seed, KVLimits: p.KVLimits})
+	c, err := New(p.Config(seed))
 	if err != nil {
 		return &Result{Seed: seed, Profile: p.Name, Violation: &Violation{Invariant: "harness", Detail: err.Error()}}
 	}
@@ -898,58 +922,13 @@ func (c *Cluster) anyBusy() bool {
 // time (INV-X11), so a duplicate, a conflict or an expired session's command
 // has no effect in it either.
 func (c *Cluster) checkStores() {
-	l := c.kvLimits()
-	model := lincheck.NewSessionModel(lincheck.SessionLimits{MaxSessions: l.MaxSessions, MaxUnacked: l.MaxUnacked})
-	keys := map[string]bool{}
-	for i, ce := range c.chk.committed {
-		cmd, err := kv.Decode(ce.e.Data)
-		if err != nil {
-			continue // the no-op and plain Propose commands
-		}
-		mc := lincheck.SessionCommand{Index: uint64(i + 1), Register: cmd.Op == kv.OpRegister, ClientID: cmd.ClientID,
-			RequestID: cmd.RequestID, AckedBelow: cmd.AckedBelow, Kind: lincheck.Put, Key: string(cmd.Key), Value: string(cmd.Value)}
-		if cmd.Op == kv.OpDelete {
-			mc.Kind = lincheck.Delete
-		}
-		model.Apply(mc)
-		if cmd.Op != kv.OpRegister {
-			keys[string(cmd.Key)] = true
-		}
-	}
+	model, keys := c.modelThrough(uint64(len(c.chk.committed)))
 	for _, id := range c.ids {
 		n := c.nodes[id]
 		if !n.up {
 			continue
 		}
-		snap := n.store.Snapshot()
-		var diffs []string
-		for k := range keys {
-			st := model.State(k)
-			v, ok := snap[k]
-			if ok != st.Present || (ok && string(v) != st.Value) {
-				diffs = append(diffs, fmt.Sprintf("%q: store (%v,%q) model (%v,%q)", k, ok, v, st.Present, st.Value))
-			}
-		}
-		for k := range snap {
-			if !keys[k] {
-				diffs = append(diffs, fmt.Sprintf("%q present in the store, never written in the committed log", k))
-			}
-		}
-		table := n.store.Sessions()
-		ids := model.Sessions()
-		if len(ids) != len(table) {
-			diffs = append(diffs, fmt.Sprintf("the store holds %d sessions, the model %d", len(table), len(ids)))
-		}
-		for _, sid := range ids {
-			acked, rids, _ := model.SessionInfo(sid)
-			sort.Slice(rids, func(i, j int) bool { return rids[i] < rids[j] })
-			st, ok := table[sid]
-			if !ok || st.AckedBelow != acked || fmt.Sprint(st.Requests) != fmt.Sprint(rids) {
-				diffs = append(diffs, fmt.Sprintf("session %d: store %+v (present %v), model acked=%d rids=%v", sid, st, ok, acked, rids))
-			}
-		}
-		if len(diffs) > 0 {
-			sort.Strings(diffs)
+		if diffs := diffStore(n.store, model, keys); len(diffs) > 0 {
 			c.violate("INV-X8", "%s's store differs from the reference model over the committed log: %s", id, strings.Join(diffs, "; "))
 			return
 		}

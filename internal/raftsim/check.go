@@ -4,7 +4,7 @@ import (
 	"fmt"
 
 	"github.com/adivishall/quorum/internal/raft"
-	"github.com/adivishall/quorum/internal/raftlog"
+	"github.com/adivishall/quorum/internal/raftnode"
 )
 
 // checker is the cross-node history the continuous invariants are checked
@@ -25,6 +25,9 @@ type checker struct {
 	// that are rightly applied at two indexes: INV-F4's "exactly one index"
 	// half does not apply to them; its "really proposed" half does.
 	kvCommands map[string]bool
+	// snapStates is the SHA-256 of the state of every snapshot seen at each
+	// index (Phase 14): one index, one state.
+	snapStates map[uint64][32]byte
 }
 
 type voteKey struct {
@@ -45,6 +48,7 @@ func (k *checker) init() {
 	k.proposals = map[string]int{}
 	k.appliedCmd = map[string]uint64{}
 	k.kvCommands = map[string]bool{}
+	k.snapStates = map[uint64][32]byte{}
 }
 
 func (k *checker) proposed(data string, step int) { k.proposals[data] = step }
@@ -73,10 +77,30 @@ func (c *Cluster) violate(inv, format string, args ...any) {
 // the recovered commit is no lower than the durable one; INV-CR3, an entry is
 // applied only after the commit covering it is durable, so the recovered commit
 // is never below what the previous incarnation had applied.
-func (c *Cluster) checkRecovered(n *node, rec *raftlog.Recovered) {
-	if !n.shadow.matches(rec) {
-		c.violate("INV-F2", "%s recovered term=%d vote=%q commit=%d entries=%d, which is neither its last persisted state nor that plus a prefix of its interrupted save (%s)",
-			n.id, rec.HardState.Term, rec.HardState.Vote, rec.HardState.Commit, len(rec.Entries), n.shadow.describe())
+//
+// Phase 14: the log's boundary is part of the durable state compared; a
+// recovery that completed an interrupted install (appending the boundary
+// record the install did not write) matches a candidate plus that record; the
+// commit INV-CR3 compares is the recovered node's, which a restored snapshot
+// raises to its index; and INV-SN3 — the recovered log is never compacted past
+// the recovered snapshot, nor compacted at all without one.
+func (c *Cluster) checkRecovered(n *node, rc *raftnode.Recovered) {
+	rec := rc.State
+	ok := n.shadow.matches(rec)
+	if !ok && rc.Repaired && rc.Snapshot != nil {
+		ok = n.shadow.matchesAfter(rec, raftlogBoundary(rc.Snapshot.Index, rc.Snapshot.Term))
+	}
+	if !ok {
+		c.violate("INV-F2", "%s recovered boundary=%d term=%d vote=%q commit=%d entries=%d, which is neither its last persisted state nor that plus a prefix of its interrupted write (%s)",
+			n.id, rec.Boundary.Index, rec.HardState.Term, rec.HardState.Vote, rec.HardState.Commit, len(rec.Entries), n.shadow.describe())
+		return
+	}
+	switch {
+	case rc.Snapshot == nil && rec.Boundary.Index > 0:
+		c.violate("INV-SN3", "%s recovered a log compacted through %d with no snapshot", n.id, rec.Boundary.Index)
+		return
+	case rc.Snapshot != nil && rec.Boundary.Index > rc.Snapshot.Index:
+		c.violate("INV-SN3", "%s recovered a log compacted through %d past its snapshot at %d", n.id, rec.Boundary.Index, rc.Snapshot.Index)
 		return
 	}
 	p := n.shadow.persisted
@@ -88,22 +112,20 @@ func (c *Cluster) checkRecovered(n *node, rec *raftlog.Recovered) {
 		c.violate("INV-CR1", "%s recovered vote %q in term %d but had durably voted for %q", n.id, rec.HardState.Vote, p.hs.Term, p.hs.Vote)
 		return
 	}
-	durableCommit := p.hs.Commit
-	if durableCommit > uint64(len(p.entries)) {
-		durableCommit = uint64(len(p.entries))
-	}
+	durableCommit := p.commit()
 	if rec.HardState.Commit < durableCommit {
 		c.violate("INV-CR2", "%s recovered commit %d below its durable commit %d", n.id, rec.HardState.Commit, durableCommit)
 		return
 	}
-	for i := uint64(0); i < durableCommit; i++ {
-		if i >= uint64(len(rec.Entries)) || !sameEntry(rec.Entries[i], p.entries[i]) {
-			c.violate("INV-CR2", "%s recovered a different entry at committed index %d (durable (t%d,%q))", n.id, i+1, p.entries[i].Term, p.entries[i].Data)
+	for i := max(p.b.Index, rec.Boundary.Index) + 1; i <= durableCommit; i++ {
+		want := p.entries[i-p.b.Index-1]
+		if i > rec.LastIndex() || !sameEntry(rec.Entries[i-rec.Boundary.Index-1], want) {
+			c.violate("INV-CR2", "%s recovered a different entry at committed index %d (durable (t%d,%q))", n.id, i, want.Term, want.Data)
 			return
 		}
 	}
-	if rec.HardState.Commit < n.prevApplied {
-		c.violate("INV-CR3", "%s recovered commit %d below the %d it had already applied before crashing", n.id, rec.HardState.Commit, n.prevApplied)
+	if commit := rc.Core.CommitIndex(); commit < n.prevApplied {
+		c.violate("INV-CR3", "%s recovered commit %d below the %d it had already applied before crashing", n.id, commit, n.prevApplied)
 	}
 }
 
@@ -127,13 +149,18 @@ func (c *Cluster) checkSend(n *node, m raft.Message) {
 			n.id, describe(m), p.hs.Term, p.hs.Vote, n.core.Term(), n.core.VotedFor())
 		return
 	}
-	if uint64(len(p.entries)) != n.mem.LastIndex() {
-		c.violate("INV-R6", "%s sent %s with %d durable entries but %d in memory", n.id, describe(m), len(p.entries), n.mem.LastIndex())
+	if p.last() != n.mem.LastIndex() {
+		c.violate("INV-R6", "%s sent %s with a durable log ending at %d but %d in memory", n.id, describe(m), p.last(), n.mem.LastIndex())
+		return
+	}
+	if mb, mt := n.mem.Boundary(); p.b.Index != mb || p.b.Term != mt {
+		c.violate("INV-R6", "%s sent %s with durable boundary (%d,%d) but in-memory (%d,%d)", n.id, describe(m), p.b.Index, p.b.Term, mb, mt)
 		return
 	}
 	for i, e := range p.entries {
-		if t, _ := n.mem.Term(uint64(i + 1)); t != e.Term {
-			c.violate("INV-R6", "%s sent %s while durable entry %d has term %d but in-memory term %d", n.id, describe(m), i+1, e.Term, t)
+		idx := p.b.Index + uint64(i) + 1
+		if t, _ := n.mem.Term(idx); t != e.Term {
+			c.violate("INV-R6", "%s sent %s while durable entry %d has term %d but in-memory term %d", n.id, describe(m), idx, e.Term, t)
 			return
 		}
 	}
@@ -245,10 +272,30 @@ func (c *Cluster) afterEvent(n *node) {
 
 // recordCommits extends the global committed record with the node's newly
 // committed entries, and checks that every node agrees on each committed index
-// (INV-R5 at the point of commitment).
+// (INV-R5 at the point of commitment). Entries below the node's boundary are
+// not in its log (Phase 14): a snapshot covers them (checked by INV-SN1), and
+// the boundary's own term must be the committed entry's. A node records its
+// commits before it compacts, so the record never has a gap.
 func (c *Cluster) recordCommits(n *node) {
-	for i := n.verified + 1; i <= n.commit; i++ {
-		e := n.entries[i-1]
+	commit := n.core.CommitIndex()
+	base, baseTerm := n.mem.Boundary()
+	for i := n.verified + 1; i <= commit; i++ {
+		if i <= base {
+			if i == base && int(i) <= len(c.chk.committed) && c.chk.committed[i-1].e.Term != baseTerm {
+				c.violate("INV-R5", "%s's boundary (%d, term %d) contradicts the entry committed there (term %d)", n.id, i, baseTerm, c.chk.committed[i-1].e.Term)
+				return
+			}
+			continue
+		}
+		if int(i) > len(c.chk.committed)+1 {
+			c.violate("harness", "%s committed index %d but the global record ends at %d", n.id, i, len(c.chk.committed))
+			return
+		}
+		e, err := n.mem.At(i)
+		if err != nil {
+			c.violate("harness", "%s committed index %d it does not hold: %v", n.id, i, err)
+			return
+		}
 		if int(i) <= len(c.chk.committed) {
 			if ce := c.chk.committed[i-1]; !sameEntry(ce.e, e) {
 				c.violate("INV-R5", "index %d is committed as (t%d,%q) on %s but was committed as (t%d,%q) before",
@@ -257,9 +304,9 @@ func (c *Cluster) recordCommits(n *node) {
 			}
 			continue
 		}
-		c.chk.committed = append(c.chk.committed, committedEntry{e: e, commitTerm: n.term})
+		c.chk.committed = append(c.chk.committed, committedEntry{e: e, commitTerm: n.core.Term()})
 	}
-	n.verified = n.commit
+	n.verified = max(n.verified, commit)
 }
 
 // checkLeaders checks INV-R2 (a leader never rewrites an entry it holds, for the
@@ -277,29 +324,41 @@ func (c *Cluster) checkLeaders(touched *node) {
 		term := L.core.Term()
 		lv := L.lv
 		if lv == nil || lv.inc != L.inc || lv.term != term {
-			lv = &leaderView{inc: L.inc, term: term, entries: L.entries}
+			lv = &leaderView{inc: L.inc, term: term, base: L.base, entries: L.entries}
 			L.lv = lv
 		} else if L == touched {
-			if len(L.entries) < len(lv.entries) {
-				c.violate("INV-R2", "leader %s of term %d shrank its log from %d to %d", L.id, term, len(lv.entries), len(L.entries))
+			// Over the indexes both views hold (a compaction moves the base).
+			lvLast := lv.base + uint64(len(lv.entries))
+			if L.last() < lvLast {
+				c.violate("INV-R2", "leader %s of term %d shrank its log from %d to %d", L.id, term, lvLast, L.last())
 				return
 			}
-			for i := range lv.entries {
-				if !sameEntry(lv.entries[i], L.entries[i]) {
-					c.violate("INV-R2", "leader %s of term %d rewrote its own entry at index %d", L.id, term, i+1)
+			for i := max(lv.base, L.base) + 1; i <= lvLast; i++ {
+				if !sameEntry(lv.entries[i-lv.base-1], L.entries[i-L.base-1]) {
+					c.violate("INV-R2", "leader %s of term %d rewrote its own entry at index %d", L.id, term, i)
 					return
 				}
 			}
-			lv.entries = L.entries
+			lv.base, lv.entries = L.base, L.entries
 		}
 		for i := lv.r4Through; i < len(c.chk.committed); i++ {
 			ce := c.chk.committed[i]
+			idx := uint64(i + 1)
 			if ce.commitTerm >= term {
 				continue
 			}
-			if i >= len(L.entries) || !sameEntry(L.entries[i], ce.e) {
+			if idx <= L.base {
+				// Compacted: the leader holds it in its snapshot (INV-SN1); the
+				// boundary's term is still the committed entry's.
+				if idx == L.base && L.baseTerm != ce.e.Term {
+					c.violate("INV-R4", "leader %s of term %d has boundary (%d, term %d) but term %d is committed there", L.id, term, idx, L.baseTerm, ce.e.Term)
+					return
+				}
+				continue
+			}
+			if idx > L.last() || !sameEntry(L.entries[idx-L.base-1], ce.e) {
 				c.violate("INV-R4", "leader %s of term %d lacks entry %d (t%d,%q) committed in term %d",
-					L.id, term, i+1, ce.e.Term, ce.e.Data, ce.commitTerm)
+					L.id, term, idx, ce.e.Term, ce.e.Data, ce.commitTerm)
 				return
 			}
 		}
@@ -308,20 +367,18 @@ func (c *Cluster) checkLeaders(touched *node) {
 }
 
 // checkMatching checks INV-R3 (Log Matching) between two nodes: if their logs hold
-// an entry with the same index and term, they are identical through that index.
+// an entry with the same index and term, they are identical through that index —
+// over the indexes both still hold (Phase 14: below a boundary, a snapshot).
 func (c *Cluster) checkMatching(a, b *node) {
-	la, lb := a.entries, b.entries
-	hi := len(la)
-	if len(lb) < hi {
-		hi = len(lb)
-	}
-	for i := hi; i >= 1; i-- {
-		if la[i-1].Term != lb[i-1].Term {
+	lo := max(a.base, b.base)
+	hi := min(a.last(), b.last())
+	for i := hi; i > lo; i-- {
+		if a.termAt(i) != b.termAt(i) {
 			continue
 		}
-		for j := 0; j < i; j++ {
-			if !sameEntry(la[j], lb[j]) {
-				c.violate("INV-R3", "%s and %s share (index %d, term %d) but differ at index %d", a.id, b.id, i, la[i-1].Term, j+1)
+		for j := lo + 1; j <= i; j++ {
+			if !sameEntry(a.entries[j-a.base-1], b.entries[j-b.base-1]) {
+				c.violate("INV-R3", "%s and %s share (index %d, term %d) but differ at index %d", a.id, b.id, i, a.termAt(i), j)
 				return
 			}
 		}
@@ -381,17 +438,18 @@ func (c *Cluster) checkConverged() {
 			L.id, lterm, last, t, L.core.CommitIndex())
 		return
 	}
+	L.refresh()
 	for _, id := range c.ids {
 		n := c.nodes[id]
 		n.refresh()
-		if n.core.Term() != lterm || len(n.entries) != len(L.entries) {
-			c.violate("INV-F3", "%s (term %d, %d entries) has not converged to leader %s (term %d, %d entries)",
-				id, n.core.Term(), len(n.entries), L.id, lterm, len(L.entries))
+		if n.core.Term() != lterm || n.last() != L.last() {
+			c.violate("INV-F3", "%s (term %d, last index %d) has not converged to leader %s (term %d, last index %d)",
+				id, n.core.Term(), n.last(), L.id, lterm, L.last())
 			return
 		}
-		for i := range n.entries {
-			if !sameEntry(n.entries[i], L.entries[i]) {
-				c.violate("INV-F3", "%s differs from leader %s at index %d after stabilization", id, L.id, i+1)
+		for i := max(n.base, L.base) + 1; i <= last; i++ {
+			if !sameEntry(n.entries[i-n.base-1], L.entries[i-L.base-1]) {
+				c.violate("INV-F3", "%s differs from leader %s at index %d after stabilization", id, L.id, i)
 				return
 			}
 		}

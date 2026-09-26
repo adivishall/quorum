@@ -83,6 +83,16 @@ const (
 	// works (Phase 12 — a minority side that keeps a leader AND a follower
 	// acknowledging it, which single-link faults rarely produce).
 	Split
+	// SnapshotNow makes Node create a snapshot at its applied index now and
+	// compact its log behind it (Phase 14), as the trigger does.
+	SnapshotNow
+	// CorruptChunk flips byte N (modulo its length) of the in-flight snapshot
+	// chunk From -> To at Pos (Phase 14): the receiver must refuse the
+	// transfer, never install it.
+	CorruptChunk
+	// CorruptSnapshot flips byte N of down Node's published snapshot file on
+	// disk (Phase 14): its restart must refuse to start.
+	CorruptSnapshot
 )
 
 var kindNames = map[Kind]string{
@@ -93,6 +103,7 @@ var kindNames = map[Kind]string{
 	CheckConverged: "check-converged", CrashAt: "crashat",
 	KVPut: "kvput", KVGet: "kvget", KVDelete: "kvdel", KVTimeout: "kvtimeout", Split: "split",
 	KVRegister: "kvregister", KVRetry: "kvretry", KVDup: "kvdup",
+	SnapshotNow: "snapshot", CorruptChunk: "corrupt", CorruptSnapshot: "corruptsnap",
 }
 
 func (k Kind) String() string {
@@ -112,9 +123,15 @@ const (
 	ShortWrite
 	// FailSync fails the next fsync (the written bytes stay cached, not durable).
 	FailSync
+	// FailRename fails the next rename (Phase 14: a snapshot's publication, a
+	// log compaction's rewrite): it does not happen.
+	FailRename
+	// FailSyncDir fails the next directory fsync: the rename before it may be
+	// undone by a later power loss.
+	FailSyncDir
 )
 
-var persistNames = map[PersistOp]string{FailWrite: "write", ShortWrite: "short", FailSync: "sync"}
+var persistNames = map[PersistOp]string{FailWrite: "write", ShortWrite: "short", FailSync: "sync", FailRename: "rename", FailSyncDir: "syncdir"}
 
 func (o PersistOp) String() string { return persistNames[o] }
 
@@ -133,6 +150,9 @@ func (o PersistOp) String() string { return persistNames[o] }
 //	KVTimeout                                 Client
 //	KVRegister, KVRetry, KVDup                Node, Client
 //	Split                                     Data ("a,b|c,d,e")
+//	SnapshotNow                               Node
+//	CorruptChunk                              From, To, Pos, N (byte)
+//	CorruptSnapshot                           Node, N (byte)
 //
 // A message is addressed by its link and its position among the messages
 // currently in flight on that link, oldest first (Pos 0 = the oldest). Addressing
@@ -158,16 +178,20 @@ type Event struct {
 	Key    string
 }
 
-// IOPoints are the I/O-boundary crash points of the durable log, addressed at
+// IOPoints are the I/O-boundary crash points of a node's files, addressed at
 // the vfs seam: "write", "fsync", "truncate" — a crash before the Nth such
-// operation on the node's log file. (The directory fsync that makes a brand-new
-// log's creation durable happens once, at a fresh node's first boot, before any
-// crash can be armed; its window is pinned in internal/raftlog instead.)
+// operation on any of the node's files (the log and, since Phase 14, its
+// snapshot files).
 var IOPoints = []string{"write", "fsync", "truncate"}
+
+// SnapshotIOPoints are the Phase 14 I/O boundaries: a crash before the Nth
+// rename (a snapshot's publication, a compaction's rewrite) or directory fsync
+// (which makes a rename durable; every recovery performs one too).
+var SnapshotIOPoints = []string{"rename", "syncdir"}
 
 // IsIOPoint reports whether a crash point name is an I/O boundary.
 func IsIOPoint(name string) bool {
-	for _, p := range IOPoints {
+	for _, p := range append(append([]string(nil), IOPoints...), SnapshotIOPoints...) {
 		if p == name {
 			return true
 		}
@@ -191,6 +215,12 @@ func (e Event) String() string {
 			return fmt.Sprintf("crash %s power %d", e.Node, e.N)
 		}
 		return fmt.Sprintf("crash %s process", e.Node)
+	case SnapshotNow:
+		return fmt.Sprintf("snapshot %s", e.Node)
+	case CorruptChunk:
+		return fmt.Sprintf("corrupt %s %s %d %d", e.From, e.To, e.Pos, e.N)
+	case CorruptSnapshot:
+		return fmt.Sprintf("corruptsnap %s %d", e.Node, e.N)
 	case FailPersist:
 		if e.Op == ShortWrite {
 			return fmt.Sprintf("failpersist %s short %d", e.Node, e.N)
@@ -285,6 +315,10 @@ func ParseEvent(line string) (Event, error) {
 			e.Node, e.Op = NodeID(f[1]), FailWrite
 		case len(f) == 3 && f[2] == "sync":
 			e.Node, e.Op = NodeID(f[1]), FailSync
+		case len(f) == 3 && f[2] == "rename":
+			e.Node, e.Op = NodeID(f[1]), FailRename
+		case len(f) == 3 && f[2] == "syncdir":
+			e.Node, e.Op = NodeID(f[1]), FailSyncDir
 		case len(f) == 4 && f[2] == "short":
 			e.Node, e.Op = NodeID(f[1]), ShortWrite
 			e.N, err = atoi(f[3])
@@ -327,6 +361,22 @@ func ParseEvent(line string) (Event, error) {
 	case KVRegister, KVRetry, KVDup:
 		if err = need(3); err == nil {
 			e.Node, e.Client = NodeID(f[1]), f[2]
+		}
+	case SnapshotNow:
+		if err = need(2); err == nil {
+			e.Node = NodeID(f[1])
+		}
+	case CorruptChunk:
+		if err = need(5); err == nil {
+			e.From, e.To = NodeID(f[1]), NodeID(f[2])
+			if e.Pos, err = atoi(f[3]); err == nil {
+				e.N, err = atoi(f[4])
+			}
+		}
+	case CorruptSnapshot:
+		if err = need(3); err == nil {
+			e.Node = NodeID(f[1])
+			e.N, err = atoi(f[2])
 		}
 	case Split:
 		if err = need(2); err == nil {

@@ -12,6 +12,7 @@ import (
 	"github.com/adivishall/quorum/internal/raftlog"
 	"github.com/adivishall/quorum/internal/raftnode"
 	"github.com/adivishall/quorum/internal/replication"
+	"github.com/adivishall/quorum/internal/snapshot"
 )
 
 // NodeID is a Raft node id.
@@ -39,6 +40,19 @@ type Config struct {
 	// KVLimits are every node's session-table limits (zero: kv.DefaultLimits);
 	// the reference model uses the same (Phase 13).
 	KVLimits kv.Limits
+	// SnapshotEvery and SnapshotRetain are every node's snapshot policy (Phase
+	// 14, raftnode.Config); 0 never snapshots. ChunkSize is the size of the
+	// chunks a snapshot travels in (0: 256 bytes — small, so a transfer is many
+	// messages that can be dropped, duplicated, delayed and reordered).
+	SnapshotEvery, SnapshotRetain uint64
+	ChunkSize                     int
+}
+
+func (c Config) chunkSize() int {
+	if c.ChunkSize > 0 {
+		return c.ChunkSize
+	}
+	return 256
 }
 
 // Violation is a broken invariant, with the logical step at which it was seen.
@@ -63,12 +77,21 @@ type Stats struct {
 	LeaderElections                                           int
 	MaxCommit                                                 uint64
 	PointCrashes                                              int // crashes fired at an armed crash point (Phase 11)
+	// Phase 14: snapshots created, installed from a leader and restored at a
+	// restart; snapshot transfers started and chunks refused (corrupt, out of
+	// order, from a stale transfer).
+	Snapshots, Installs, Restores, SnapshotSends, ChunksRefused, ChunksCorrupted int
+	SnapshotPointCrashes                                                         int // crashes at a snapshot crash point
+	MaxBoundary                                                                  uint64
 }
 
-// flight is a message in the network.
+// flight is a message in the network. A snapshot travels as chunk flights
+// (Phase 14): msg is then the MsgSnapshot it realizes (for addressing and the
+// trace), and chunk the transport payload.
 type flight struct {
 	seq       uint64
 	msg       raft.Message
+	chunk     []byte
 	holdUntil int
 }
 
@@ -80,6 +103,10 @@ type node struct {
 	disk   *fault.MemFS
 	inj    *fault.InjectFS
 	shadow *shadowStore
+	dur    *raftnode.Durable // the log (through the shadow) and the snapshots; nil while down
+	// durableSnap is the index of the node's last completed snapshot
+	// publication (Phase 14): every later recovery must restore at least it.
+	durableSnap uint64
 
 	up     bool
 	paused bool
@@ -88,10 +115,12 @@ type node struct {
 	core   *raft.Raft
 	mem    *replication.MemoryLog
 
-	entries     []raft.Entry // the in-memory log, refreshed after every event touching the node
-	applied     uint64       // highest index applied in this incarnation
-	prevApplied uint64       // applied index when the last incarnation died
-	verified    uint64       // committed prefix already checked against the global record
+	entries     []raft.Entry // the in-memory log after its boundary, refreshed after every event touching the node
+	base        uint64       // the in-memory log's boundary (Phase 14), as of the last refresh
+	baseTerm    uint64
+	applied     uint64 // highest index applied in this incarnation
+	prevApplied uint64 // applied index when the last incarnation died
+	verified    uint64 // committed prefix already checked against the global record
 
 	// last observed, for transition tracing and step-local checks
 	role   raft.Role
@@ -101,6 +130,7 @@ type node struct {
 
 	// Phase 11 crash points (docs/CRASH_RECOVERY.md).
 	armed         *armedCrash        // a crash waiting to fire at a driver point
+	ioArmed       *armedCrash        // a crash waiting at a rename or directory fsync (Phase 14)
 	fired         *firedCrash        // set by the hook when a crash fired, consumed by drain/apply
 	hits          map[string]int     // occurrences of each driver point since boot (enumeration)
 	hist          []applied          // every application by every incarnation, in order
@@ -155,8 +185,13 @@ var errCrashPoint = errors.New("raftsim: crashed at a crash point")
 type leaderView struct {
 	inc       int
 	term      uint64
+	base      uint64 // the log's boundary when last seen (Phase 14)
 	entries   []raft.Entry
 	r4Through int
+}
+
+func raftlogBoundary(index, term uint64) raftlog.Boundary {
+	return raftlog.Boundary{Index: index, Term: term}
 }
 
 // Cluster is a deterministic simulated Raft group. Every node is a real
@@ -261,7 +296,9 @@ type NodeState struct {
 	Commit    uint64
 	Applied   uint64
 	LastIndex uint64
-	Log       []raft.Entry // copies
+	Log       []raft.Entry // copies of the entries after the boundary
+	// Phase 14: the log's boundary and the published snapshot's index.
+	Boundary, Snapshot uint64
 }
 
 // State returns a node's current state (zero Role/Term etc. if it is down).
@@ -276,7 +313,9 @@ func (c *Cluster) State(id NodeID) NodeState {
 	}
 	s.Role, s.Term, s.Vote, s.Leader = n.core.Role(), n.core.Term(), n.core.VotedFor(), n.core.LeaderID()
 	s.Commit, s.Applied, s.LastIndex = n.core.CommitIndex(), n.core.AppliedIndex(), n.core.LastIndex()
-	s.Log, _ = n.mem.Slice(1, n.mem.LastIndex()+1)
+	s.Log, _ = n.mem.Slice(n.mem.FirstIndex(), n.mem.LastIndex()+1)
+	s.Boundary, _ = n.mem.Boundary()
+	s.Snapshot = n.dur.Snap.Published().Index
 	return s
 }
 
@@ -316,23 +355,44 @@ func (c *Cluster) nodeSeed(n *node) int64 {
 // path — and checks what it recovered (INV-F2, INV-R8).
 func (c *Cluster) boot(n *node) error {
 	n.inc++
+	// The new incarnation's store exists before recovery: a published snapshot
+	// is restored into it (Phase 14).
+	n.kvNodeUp(c.kvLimits())
+	n.applied = 0
 	rc, err := raftnode.Recover(raftnode.Config{
 		ID: n.id, Peers: c.ids, LogPath: logPath, FS: n.inj,
 		Rand:          rand.New(rand.NewSource(c.nodeSeed(n))),
 		ElectionTicks: c.cfg.ElectionTicks, HeartbeatTicks: c.cfg.HeartbeatTicks,
+		StateMachine:  &snapSM{c: c, n: n},
+		SnapshotEvery: c.cfg.SnapshotEvery, SnapshotRetain: c.cfg.SnapshotRetain,
 	})
 	if err != nil {
 		n.inc--
+		n.kvNodeDown()
+		c.crashedBy(n, err) // a crash armed at a directory fsync of recovery itself
 		return err
 	}
-	c.checkRecovered(n, rc.State)
-	n.lastRecovered = &raftlog.Recovered{Entries: append([]raft.Entry(nil), rc.State.Entries...), HardState: rc.State.HardState}
+	c.checkRecovered(n, rc)
+	n.lastRecovered = &raftlog.Recovered{Boundary: rc.State.Boundary, Entries: append([]raft.Entry(nil), rc.State.Entries...), HardState: rc.State.HardState}
 	n.shadow.rebase(rc.Log, rc.State)
+	n.dur = &raftnode.Durable{Log: n.shadow, Snap: rc.Durable.Snap}
+	n.dur.Snap.Installed = func(index uint64) { c.installed(n, index) }
 	n.core, n.mem, n.up, n.paused = rc.Core, rc.Mem, true, false
-	n.applied, n.verified, n.lv = 0, 0, nil
-	n.kvNodeUp(c.kvLimits())
+	n.applied, n.verified, n.lv = rc.Core.AppliedIndex(), 0, nil
 	n.role, n.term, n.commit = n.core.Role(), n.core.Term(), n.core.CommitIndex()
 	n.refresh()
+	var restored uint64
+	if rc.Snapshot != nil {
+		restored = rc.Snapshot.Index
+	}
+	if restored < n.durableSnap {
+		c.violate("INV-SN3", "%s recovered snapshot %d, but it had completed publishing snapshot %d", n.id, restored, n.durableSnap)
+	}
+	n.durableSnap = restored
+	if rc.Snapshot != nil {
+		c.stats.Restores++
+		c.trace.add(c.step, "restore %s snapshot=%d/t%d repaired=%v", n.id, rc.Snapshot.Index, rc.Snapshot.Term, rc.Repaired)
+	}
 	c.trace.add(c.step, "up %s inc=%d term=%d vote=%q last=%d commit=%d", n.id, n.inc, n.term, n.core.VotedFor(), n.core.LastIndex(), n.commit)
 	return nil
 }
@@ -343,18 +403,35 @@ func (c *Cluster) boot(n *node) error {
 func (c *Cluster) kill(n *node, why string) {
 	n.disk.CrashProcess()
 	n.prevApplied = n.applied
-	n.core, n.mem, n.up, n.paused, n.lv = nil, nil, false, false, nil
+	n.core, n.mem, n.up, n.paused, n.lv, n.dur = nil, nil, false, false, nil, nil
 	n.kvNodeDown()
 	n.shadow.detach()
 	c.trace.add(c.step, "down %s (%s)", n.id, why)
 }
 
+// refresh re-reads the node's in-memory log: the entries after its boundary.
 func (n *node) refresh() {
 	if n.up {
-		n.entries, _ = n.mem.Slice(1, n.mem.LastIndex()+1)
+		n.base, n.baseTerm = n.mem.Boundary()
+		n.entries, _ = n.mem.Slice(n.base+1, n.mem.LastIndex()+1)
 	} else {
-		n.entries = nil
+		n.entries, n.base, n.baseTerm = nil, 0, 0
 	}
+}
+
+// last is the index of the node's last entry (as of the last refresh).
+func (n *node) last() uint64 { return n.base + uint64(len(n.entries)) }
+
+// termAt is the term at index in the node's log as of the last refresh (the
+// boundary's, or a held entry's; 0 if neither).
+func (n *node) termAt(i uint64) uint64 {
+	switch {
+	case i == n.base:
+		return n.baseTerm
+	case i > n.base && i <= n.last():
+		return n.entries[i-n.base-1].Term
+	}
+	return 0
 }
 
 // Apply executes one event. An event that does not apply to the current state
@@ -387,7 +464,11 @@ func (c *Cluster) Apply(e Event) {
 			return
 		}
 		c.remove(f)
-		touched = c.deliver(f)
+		if f.chunk != nil {
+			touched = c.deliverSnapshotFlight(f)
+		} else {
+			touched = c.deliver(f)
+		}
 	case Drop:
 		f := c.find(e.From, e.To, e.Pos)
 		if f == nil {
@@ -521,7 +602,8 @@ func (c *Cluster) Apply(e Event) {
 			c.skip(e)
 			return
 		}
-		inj := fault.Injection{Path: logPath}
+		// Any file of the node's: the log, and (Phase 14) its snapshot files.
+		var inj fault.Injection
 		switch e.Op {
 		case FailWrite:
 			inj.Op = fault.OpWrite
@@ -529,6 +611,10 @@ func (c *Cluster) Apply(e Event) {
 			inj.Op, inj.Short = fault.OpWrite, e.N
 		case FailSync:
 			inj.Op = fault.OpSync
+		case FailRename:
+			inj.Op = fault.OpRename
+		case FailSyncDir:
+			inj.Op = fault.OpSyncDir
 		default:
 			c.skip(e)
 			return
@@ -587,6 +673,37 @@ func (c *Cluster) Apply(e Event) {
 		touched = c.kvRetry(e)
 	case KVDup:
 		touched = c.kvDup(e)
+	case SnapshotNow:
+		n := c.runnable(e.Node)
+		if n == nil {
+			c.skip(e)
+			return
+		}
+		c.trace.add(c.step, "snapshot-now %s applied=%d", n.id, n.core.AppliedIndex())
+		c.recordCommits(n)
+		c.snapshot(n, true)
+		touched = n
+	case CorruptChunk:
+		f := c.find(e.From, e.To, e.Pos)
+		if f == nil || f.chunk == nil {
+			c.skip(e)
+			return
+		}
+		f.chunk = append([]byte(nil), f.chunk...)
+		f.chunk[e.N%len(f.chunk)] ^= 0x5a
+		c.stats.ChunksCorrupted++
+		c.trace.add(c.step, "corrupt #%d %s>%s byte %d", f.seq, f.msg.From, f.msg.To, e.N%len(f.chunk))
+	case CorruptSnapshot:
+		n := c.nodes[e.Node]
+		if n == nil || n.up {
+			c.skip(e) // the file of a down node: a running node holds it in memory anyway
+			return
+		}
+		if !n.disk.Corrupt(logPath+".snap", e.N) {
+			c.skip(e)
+			return
+		}
+		c.trace.add(c.step, "corrupt-snapshot %s byte %d", n.id, e.N)
 	default:
 		c.skip(e)
 		return
@@ -664,15 +781,35 @@ func (c *Cluster) deliver(f *flight) *node {
 	return n
 }
 
+// deliverSnapshotFlight delivers a chunk, unless its link is partitioned or its
+// recipient is down (then it is lost).
+func (c *Cluster) deliverSnapshotFlight(f *flight) *node {
+	m := f.msg
+	if c.links.Blocked(string(m.From), string(m.To)) {
+		c.stats.DroppedPartition++
+		c.trace.add(c.step, "drop #%d %s>%s Chunk (partition)", f.seq, m.From, m.To)
+		return nil
+	}
+	n := c.nodes[m.To]
+	if !n.up {
+		c.stats.DroppedDown++
+		c.trace.add(c.step, "drop #%d %s>%s Chunk (recipient down)", f.seq, m.From, m.To)
+		return nil
+	}
+	c.stats.Delivered++
+	c.trace.add(c.step, "deliver #%d %s>%s Chunk", f.seq, m.From, m.To)
+	return c.deliverChunk(n, f)
+}
+
 // drain performs the node's pending Ready effects through the REAL driver ordering
 // (raftnode.DrainReady): persist, then send, then advance. A persistence failure
 // fail-stops the node exactly as the real driver does, then it applies committed
 // entries.
 func (c *Cluster) drain(n *node) {
 	confirm := func(rs raft.ReadState) { n.reads.Confirmed(rs, n.waiters, n.core.AppliedIndex()) }
-	err := raftnode.DrainReadyAt(n.core, n.shadow, func(m raft.Message) { c.send(n, m) }, confirm, c.hook(n))
+	err := raftnode.DrainReadyAt(n.core, n.dur, func(m raft.Message) { c.send(n, m) }, confirm, c.hook(n))
 	if err != nil {
-		if n.fired != nil {
+		if c.crashedBy(n, err) {
 			c.crashFired(n)
 			return
 		}
@@ -682,6 +819,12 @@ func (c *Cluster) drain(n *node) {
 		return
 	}
 	c.apply(n)
+	if n.up && c.cfg.SnapshotEvery > 0 {
+		// The global committed record takes the node's newly committed entries
+		// before a compaction can discard them (Phase 14).
+		c.recordCommits(n)
+		c.snapshot(n, false)
+	}
 	if n.up {
 		// As the real driver does after every cycle: a read registered in a
 		// term this node no longer leads will never be confirmed.
@@ -690,12 +833,127 @@ func (c *Cluster) drain(n *node) {
 }
 
 // send is DrainReady's network hand-off: it runs the send-time checks and puts the
-// message in flight.
+// message in flight. A MsgSnapshot is realized as the driver realizes it (Phase
+// 14): the published snapshot, streamed in chunks — here, every chunk a flight.
 func (c *Cluster) send(n *node, m raft.Message) {
 	c.checkSend(n, m)
+	if m.Type == raft.MsgSnapshot {
+		c.sendSnapshot(n, m)
+		return
+	}
 	c.seq++
 	c.flights = append(c.flights, &flight{seq: c.seq, msg: m})
 	c.trace.add(c.step, "send #%d %s>%s %s", c.seq, m.From, m.To, describe(m))
+}
+
+// sendSnapshot streams the node's published snapshot to m.To. The core offers
+// its log boundary; the published snapshot is at or beyond it (INV-SN3).
+func (c *Cluster) sendSnapshot(n *node, m raft.Message) {
+	meta, file, err := n.dur.Snap.SendFile()
+	if err == nil && meta.Index < m.SnapshotIndex {
+		err = fmt.Errorf("published snapshot %d below the boundary %d", meta.Index, m.SnapshotIndex)
+	}
+	if err != nil {
+		c.violate("INV-SN3", "%s must send a snapshot covering its boundary %d: %v", n.id, m.SnapshotIndex, err)
+		return
+	}
+	c.stats.SnapshotSends++
+	chunks := snapshot.SplitSize(m.Term, meta, file, c.cfg.chunkSize())
+	c.trace.add(c.step, "send-snapshot %s>%s index=%d/t%d bytes=%d chunks=%d", m.From, m.To, meta.Index, meta.Term, len(file), len(chunks))
+	for _, ch := range chunks {
+		c.seq++
+		fm := raft.Message{Type: raft.MsgSnapshot, From: m.From, To: m.To, Term: m.Term, SnapshotIndex: meta.Index, SnapshotTerm: meta.Term}
+		c.flights = append(c.flights, &flight{seq: c.seq, msg: fm, chunk: ch.Marshal()})
+		c.trace.add(c.step, "send #%d %s>%s Chunk t=%d idx=%d off=%d/%d", c.seq, m.From, m.To, ch.Term, ch.Index, ch.Offset, ch.Total)
+	}
+}
+
+// deliverChunk hands one snapshot chunk to its recipient's driver
+// (Snapshots.Receive); a completed, valid snapshot is stepped into the core
+// as its MsgSnapshot and the Ready cycle that follows installs it.
+func (c *Cluster) deliverChunk(n *node, f *flight) *node {
+	m, err := n.dur.Snap.Receive(f.msg.From, f.chunk)
+	if err != nil {
+		if c.crashedBy(n, err) {
+			c.crashFired(n) // the process died writing the staged snapshot
+			return nil
+		}
+		c.stats.ChunksRefused++
+		c.trace.add(c.step, "chunk-refused %s from %s: %v", n.id, f.msg.From, err)
+		return n
+	}
+	if m == nil {
+		return n
+	}
+	m.To = n.id
+	c.trace.add(c.step, "snapshot-received %s from %s index=%d/t%d term=%d", n.id, m.From, m.SnapshotIndex, m.SnapshotTerm, m.Term)
+	stale := m.Term < n.core.Term()
+	var before r10Snap
+	if stale {
+		before = snapR10(n)
+	}
+	if err := n.core.Step(*m); err != nil {
+		c.violate("harness", "Step(%s <- %s %s): %v", n.id, m.From, m.Type, err)
+		return n
+	}
+	c.drain(n)
+	if n.up {
+		n.dur.Snap.Unstage()
+		if stale {
+			c.checkR10(n, before, *m)
+		}
+	}
+	return n
+}
+
+// snapshot runs the node's snapshot trigger (or, forced, creates one now)
+// through the driver's own function, with the node's crash points in effect.
+func (c *Cluster) snapshot(n *node, force bool) {
+	before := n.dur.Snap.Published().Index
+	var err error
+	if force {
+		err = n.dur.Snapshot(n.core, c.hook(n))
+	} else {
+		err = n.dur.MaybeSnapshot(n.core, c.hook(n))
+	}
+	if err != nil {
+		switch {
+		case c.crashedBy(n, err):
+			c.crashFired(n)
+		case errors.Is(err, snapshot.ErrTooLarge):
+			c.trace.add(c.step, "snapshot-skipped %s: %v", n.id, err)
+		default:
+			c.stats.PersistFailures++
+			c.trace.add(c.step, "snapshot-failed %s err=%v", n.id, err)
+			c.kill(n, "fail-stop after a snapshot failure")
+		}
+		return
+	}
+	if after := n.dur.Snap.Published(); after.Index != before {
+		if after.Index < before || after.Index <= n.durableSnap {
+			c.violate("INV-SN3", "%s published snapshot %d over %d", n.id, after.Index, max(before, n.durableSnap))
+			return
+		}
+		n.durableSnap = after.Index
+		c.stats.Snapshots++
+		b, _ := n.core.Boundary()
+		c.stats.MaxBoundary = max(c.stats.MaxBoundary, b)
+		c.trace.add(c.step, "snapshot %s index=%d/t%d boundary=%d", n.id, after.Index, after.Term, b)
+		c.checkSN3(n)
+	}
+}
+
+// installed is the driver's report that a node installed a leader's snapshot:
+// the waiters it covers settle (as in the real node) and INV-SN3 is checked.
+func (c *Cluster) installed(n *node, index uint64) {
+	c.stats.Installs++
+	c.trace.add(c.step, "install %s index=%d", n.id, index)
+	if index <= n.durableSnap {
+		c.violate("INV-SN3", "%s installed snapshot %d over its published %d", n.id, index, n.durableSnap)
+	}
+	n.durableSnap = index
+	n.waiters.Installed(index)
+	c.checkSN3(n)
 }
 
 // apply feeds committed entries to the node's recording state machine through
@@ -792,8 +1050,37 @@ func (c *Cluster) arm(n *node, e Event) {
 		op = fault.OpSync
 	case "truncate":
 		op = fault.OpTruncate
+	case "rename", "syncdir":
+		// A rename or directory fsync has no handle for a process crash to
+		// kill, so it cannot be observed and then left to fail: the injection
+		// fails it — it never happens — and the driver's error is recognized
+		// as this crash (crashedBy). Phase 14.
+		op = fault.OpRename
+		if e.Point == "syncdir" {
+			op = fault.OpSyncDir
+		}
+		n.ioArmed = a
+		n.inj.Arm(fault.Injection{Op: op, Nth: e.Nth, Err: errCrashPoint})
+		return
 	}
-	n.inj.Arm(fault.Injection{Op: op, Path: logPath, Nth: e.Nth, At: func() { _ = c.fire(n, a) }})
+	// Every file of the node's: the log, and (Phase 14) its snapshot files.
+	n.inj.Arm(fault.Injection{Op: op, Nth: e.Nth, At: func() { _ = c.fire(n, a) }})
+}
+
+// crashedBy reports whether err is the death of the node's process at a crash
+// point: one that fired in the hook or at a write or fsync (n.fired), or an
+// armed rename or directory fsync that the injection failed.
+func (c *Cluster) crashedBy(n *node, err error) bool {
+	if n.fired != nil {
+		return true
+	}
+	if a := n.ioArmed; a != nil && errors.Is(err, errCrashPoint) {
+		n.ioArmed = nil
+		n.fired = &firedCrash{point: a.point, nth: a.nth, power: a.power, torn: a.torn, step: c.step}
+		n.disk.CrashProcess()
+		return true
+	}
+	return false
 }
 
 // fire is the moment of death at a crash point: the disk's process is gone (its
@@ -812,6 +1099,9 @@ func (c *Cluster) crashFired(n *node) {
 	n.fired = nil
 	c.stats.PointCrashes++
 	c.stats.ProcessCrashes++
+	if isSnapshotPoint(f.point) {
+		c.stats.SnapshotPointCrashes++
+	}
 	c.trace.add(c.step, "crashpoint %s %s #%d", n.id, f.point, f.nth)
 	c.kill(n, "crash at "+f.point)
 	if f.power {
@@ -819,6 +1109,16 @@ func (c *Cluster) crashFired(n *node) {
 		n.disk.CrashPowerLoss(f.torn)
 		c.trace.add(c.step, "powerloss %s torn<=%d", n.id, f.torn)
 	}
+}
+
+// isSnapshotPoint reports whether a crash point is one Phase 14 added: a
+// driver point of snapshot creation or installation, a rename or a directory
+// fsync.
+func isSnapshotPoint(name string) bool {
+	if p, ok := raftnode.ParsePoint(name); ok {
+		return p > raftnode.AfterAppliedTo
+	}
+	return name == "rename" || name == "syncdir"
 }
 
 // StartRecordingPoints makes the cluster record every crash point each node
@@ -836,7 +1136,9 @@ func (c *Cluster) StartRecordingPoints() {
 
 // Points returns every crash point the nodes reached since StartRecordingPoints:
 // the driver points in the order they occurred, then, per node, the I/O
-// boundaries counted from the durable log's op log. Each is the address a
+// boundaries counted from the node's op log — every file of the node's: the
+// log and (Phase 14) its snapshot files, with their renames and directory
+// fsyncs. Each is the address a
 // CrashAt event armed at recording time would use to crash there.
 func (c *Cluster) Points() []PointHit {
 	out := append([]PointHit(nil), c.points...)
@@ -855,6 +1157,10 @@ func (c *Cluster) Points() []PointHit {
 				name = "fsync"
 			case fault.OpTruncate:
 				name = "truncate"
+			case fault.OpRename:
+				name = "rename"
+			case fault.OpSyncDir:
+				name = "syncdir"
 			default:
 				continue
 			}
@@ -902,46 +1208,91 @@ func describe(m raft.Message) string {
 
 // --- the durable-state shadow (INV-R6, INV-F2) ---
 
-// durableState is a logical image of a node's durable log: its HardState and
-// entries, reconstructed from the Save calls the driver made — independent of the
-// log's byte encoding, so comparing it with what raftlog recovers checks the
+// durableState is a logical image of a node's durable log: its boundary (Phase
+// 14), HardState and the entries after the boundary, reconstructed from the
+// Save, Install and Compact calls the driver made — independent of the log's
+// byte encoding, so comparing it with what raftlog recovers checks the
 // encoding, the crash policy and the recovery path end to end.
 type durableState struct {
+	b       raftlog.Boundary
 	hs      raftlog.HardState
 	entries []raft.Entry
 }
 
 func (d durableState) clone() durableState {
-	return durableState{hs: d.hs, entries: append([]raft.Entry(nil), d.entries...)}
+	return durableState{b: d.b, hs: d.hs, entries: append([]raft.Entry(nil), d.entries...)}
+}
+
+func (d durableState) last() uint64 { return d.b.Index + uint64(len(d.entries)) }
+
+// commit is the commit replay reports: clamped to the log, raised to the boundary.
+func (d durableState) commit() uint64 { return max(min(d.hs.Commit, d.last()), d.b.Index) }
+
+// term returns the term at index (the boundary's, or a held entry's; 0 if neither).
+func (d durableState) term(i uint64) uint64 {
+	switch {
+	case i == d.b.Index:
+		return d.b.Term
+	case i > d.b.Index && i <= d.last():
+		return d.entries[i-d.b.Index-1].Term
+	}
+	return 0
 }
 
 // put applies one Entry record: set its index and drop everything above (the
 // append-only truncation rule, ADR-016). A durableState's slice is never shared
 // (clone copies), so truncating in place is safe.
 func (d *durableState) put(e raft.Entry) {
-	if e.Index == 0 || e.Index > uint64(len(d.entries))+1 {
+	if e.Index <= d.b.Index || e.Index > d.last()+1 {
 		d.entries = append(d.entries, e) // impossible for a correct driver; the mismatch surfaces in checks
 		return
 	}
-	d.entries = append(d.entries[:e.Index-1], e)
+	d.entries = append(d.entries[:e.Index-d.b.Index-1], e)
 }
 
-// shadowStore sits between DrainReady and the node's raftlog.Log (it is the
-// raftnode.Storage the driver saves through). It forwards every Save unchanged and
-// records what the node was told is durable (persisted) and, when a Save fails,
-// what it was attempting (pending).
+// install applies a Boundary record: Raft's install rule (the log keeps what
+// follows the snapshot only if it holds the snapshot's entry).
+func (d *durableState) install(b raftlog.Boundary) {
+	if b.Index <= d.last() && b.Index > d.b.Index && d.term(b.Index) == b.Term {
+		d.entries = append([]raft.Entry(nil), d.entries[b.Index-d.b.Index:]...)
+	} else {
+		d.entries = nil
+	}
+	d.b = b
+}
+
+// compact is the rewrite: the entries through b.Index are gone.
+func (d *durableState) compact(b raftlog.Boundary) {
+	d.entries = append([]raft.Entry(nil), d.entries[b.Index-d.b.Index:]...)
+	d.b = b
+}
+
+// shadowStore sits between the driver and the node's raftlog.Log (it is the
+// raftnode.LogStore the node's Durable writes through). It forwards every call
+// unchanged and records what the node was told is durable (persisted) and, when
+// a call fails, what it was attempting (pending).
 type shadowStore struct {
 	log       *raftlog.Log
 	persisted durableState
-	pending   *pendingSave
+	pending   *pendingOp
 }
 
-type pendingSave struct {
+type opKind uint8
+
+const (
+	opSave opKind = iota + 1
+	opInstall
+	opCompact
+)
+
+type pendingOp struct {
+	kind    opKind
 	hs      *raftlog.HardState
 	entries []raft.Entry
+	b       raftlog.Boundary
 }
 
-var _ raftnode.Storage = (*shadowStore)(nil)
+var _ raftnode.LogStore = (*shadowStore)(nil)
 
 // Save forwards to the real log and, only if it succeeds, records the new durable
 // state.
@@ -951,7 +1302,7 @@ func (s *shadowStore) Save(hs *raftlog.HardState, entries []raftlog.Entry) error
 		v := *hs
 		hsCopy = &v
 	}
-	s.pending = &pendingSave{hs: hsCopy, entries: entries}
+	s.pending = &pendingOp{kind: opSave, hs: hsCopy, entries: entries}
 	if s.log == nil {
 		return errors.New("raftsim: save on a node with no open log")
 	}
@@ -968,25 +1319,75 @@ func (s *shadowStore) Save(hs *raftlog.HardState, entries []raftlog.Entry) error
 	return nil
 }
 
+// HardState is the log's last durable HardState.
+func (s *shadowStore) HardState() raftlog.HardState { return s.log.HardState() }
+
+// Install forwards a boundary record (Phase 14) and records it once durable. A
+// refusal (raftlog.ErrBoundary) wrote nothing.
+func (s *shadowStore) Install(index, term uint64) error {
+	b := raftlog.Boundary{Index: index, Term: term}
+	s.pending = &pendingOp{kind: opInstall, b: b}
+	err := s.log.Install(index, term)
+	if errors.Is(err, raftlog.ErrBoundary) {
+		s.pending = nil
+	}
+	if err != nil {
+		return err
+	}
+	s.persisted.install(b)
+	s.pending = nil
+	return nil
+}
+
+// Compact forwards a compaction (Phase 14) and records it once durable.
+func (s *shadowStore) Compact(index, term uint64) error {
+	b := raftlog.Boundary{Index: index, Term: term}
+	s.pending = &pendingOp{kind: opCompact, b: b}
+	err := s.log.Compact(index, term)
+	if errors.Is(err, raftlog.ErrBoundary) {
+		s.pending = nil
+	}
+	if err != nil {
+		return err
+	}
+	if b != s.persisted.b {
+		s.persisted.compact(b)
+	}
+	s.pending = nil
+	return nil
+}
+
 func (s *shadowStore) detach() { s.log = nil }
 
 // rebase adopts the state a restart recovered as the new durable baseline.
 func (s *shadowStore) rebase(l *raftlog.Log, rec *raftlog.Recovered) {
 	s.log = l
-	s.persisted = durableState{hs: rec.HardState, entries: append([]raft.Entry(nil), rec.Entries...)}
+	s.persisted = durableState{b: rec.Boundary, hs: rec.HardState, entries: append([]raft.Entry(nil), rec.Entries...)}
 	s.pending = nil
 }
 
 // candidates are the states a recovery may legitimately produce: the persisted
 // state, extended by any prefix of the records an interrupted Save was writing —
 // in the order the log writes them, which raftlog.SavePlan defines (a changed
-// term/vote first, then the entries, then the new commit) — INV-F2.
+// term/vote first, then the entries, then the new commit) — INV-F2; for an
+// interrupted Install (one record) or Compact (a rename), the state before or
+// after it.
 func (s *shadowStore) candidates() []durableState {
 	out := []durableState{s.persisted.clone()}
 	if s.pending == nil {
 		return out
 	}
 	cur := s.persisted.clone()
+	switch s.pending.kind {
+	case opInstall:
+		cur.install(s.pending.b)
+		return append(out, cur)
+	case opCompact:
+		if s.pending.b != cur.b {
+			cur.compact(s.pending.b)
+		}
+		return append(out, cur)
+	}
 	lead, trail := raftlog.SavePlan(s.persisted.hs, s.pending.hs, s.pending.entries)
 	if lead != nil {
 		cur.hs = *lead
@@ -1014,7 +1415,7 @@ func (s *shadowStore) matches(rec *raftlog.Recovered) bool {
 }
 
 func sameDurable(d durableState, rec *raftlog.Recovered) bool {
-	if len(d.entries) != len(rec.Entries) {
+	if d.b != rec.Boundary || len(d.entries) != len(rec.Entries) {
 		return false
 	}
 	for i := range d.entries {
@@ -1022,11 +1423,7 @@ func sameDurable(d durableState, rec *raftlog.Recovered) bool {
 			return false
 		}
 	}
-	commit := d.hs.Commit
-	if commit > uint64(len(d.entries)) {
-		commit = uint64(len(d.entries))
-	}
-	return d.hs.Term == rec.HardState.Term && d.hs.Vote == rec.HardState.Vote && commit == rec.HardState.Commit
+	return d.hs.Term == rec.HardState.Term && d.hs.Vote == rec.HardState.Vote && d.commit() == rec.HardState.Commit
 }
 
 func sameEntry(a, b raft.Entry) bool {
@@ -1034,10 +1431,18 @@ func sameEntry(a, b raft.Entry) bool {
 }
 
 func (s *shadowStore) describe() string {
-	p := "none"
-	if s.pending != nil {
-		p = fmt.Sprintf("%d entries, hardstate=%v", len(s.pending.entries), s.pending.hs != nil)
+	return fmt.Sprintf("persisted term=%d vote=%q boundary=%d entries=%d; interrupted: %s",
+		s.persisted.hs.Term, s.persisted.hs.Vote, s.persisted.b.Index, len(s.persisted.entries), s.pending.describe())
+}
+
+func (p *pendingOp) describe() string {
+	switch {
+	case p == nil:
+		return "none"
+	case p.kind == opInstall:
+		return fmt.Sprintf("install (%d,%d)", p.b.Index, p.b.Term)
+	case p.kind == opCompact:
+		return fmt.Sprintf("compact to (%d,%d)", p.b.Index, p.b.Term)
 	}
-	return fmt.Sprintf("persisted term=%d vote=%q entries=%d; interrupted save: %s",
-		s.persisted.hs.Term, s.persisted.hs.Vote, len(s.persisted.entries), p)
+	return fmt.Sprintf("save of %d entries, hardstate=%v", len(p.entries), p.hs != nil)
 }

@@ -80,7 +80,7 @@ func TestRandomizedFaultSchedules(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/seed=%d", p.Name, seed), func(t *testing.T) {
 				r := Run(p, seed)
 				if r.Violation != nil {
-					cfg := Config{Nodes: p.Nodes, Seed: seed}
+					cfg := p.Config(seed)
 					min := Minimize(cfg, r.Script, 300)
 					t.Fatalf("%s--- minimized script (%d of %d events; save it and replay with -raftsim.replay=FILE -raftsim.nodes=%d -raftsim.seed=%d) ---\n%s",
 						r.Report(reproCommand(p, seed)), len(min), len(r.Script), p.Nodes, seed, FormatScript(min))
@@ -108,6 +108,9 @@ func requireProgressAndFaults(t *testing.T, p Profile, s Stats) {
 		t.Fatalf("profile %s run proved nothing: commit=%d elections=%d faults injected=%d (%+v)",
 			p.Name, s.MaxCommit, s.LeaderElections, injected, s)
 	}
+	if p.SnapshotEvery > 0 && (s.Snapshots == 0 || s.MaxBoundary == 0) {
+		t.Fatalf("profile %s run never snapshotted and compacted (%+v)", p.Name, s)
+	}
 }
 
 // requireEveryFaultOccurred fails a profile whose seed set never produced one of
@@ -131,6 +134,15 @@ func requireEveryFaultOccurred(t *testing.T, p Profile, s Stats) {
 	need(p.Pause > 0, s.Pauses > 0, "a pause")
 	need(p.CrashAt > 0, s.PointCrashes > 0 && s.Restarts > 0, "a crash at a crash point and a restart")
 	need(p.CrashAt > 0 && p.PowerLossPercent > 0, s.PowerLosses > 0, "a power loss at a crash point")
+	// Phase 14: a snapshot profile must snapshot and compact, bring a lagging
+	// node back by an installed snapshot, restart from one, refuse a corrupted
+	// transfer, and crash inside snapshotting.
+	snap := p.SnapshotEvery > 0
+	need(snap, s.Snapshots > 0 && s.MaxBoundary > 0, "a snapshot and a compaction")
+	need(snap && p.Crash+p.CrashAt+p.Partition+p.Split > 0, s.Installs > 0, "a snapshot installed on a lagging node")
+	need(snap && p.Crash+p.CrashAt > 0, s.Restores > 0, "a restart from a snapshot")
+	need(p.CorruptChunk > 0, s.ChunksCorrupted > 0 && s.ChunksRefused > 0, "a corrupted snapshot chunk refused")
+	need(snap && p.CrashAt > 0, s.SnapshotPointCrashes > 0, "a crash at a snapshot crash point")
 	if len(missing) > 0 {
 		t.Fatalf("profile %s: no run in the seed set produced %s — it does not exercise what it claims (%+v)",
 			p.Name, strings.Join(missing, ", "), s)
@@ -148,6 +160,14 @@ func addStats(a, b Stats) Stats {
 	a.PersistFailures += b.PersistFailures
 	a.Pauses += b.Pauses
 	a.PointCrashes += b.PointCrashes
+	a.Snapshots += b.Snapshots
+	a.Installs += b.Installs
+	a.Restores += b.Restores
+	a.SnapshotSends += b.SnapshotSends
+	a.ChunksRefused += b.ChunksRefused
+	a.ChunksCorrupted += b.ChunksCorrupted
+	a.SnapshotPointCrashes += b.SnapshotPointCrashes
+	a.MaxBoundary = max(a.MaxBoundary, b.MaxBoundary)
 	return a
 }
 
@@ -163,7 +183,7 @@ func TestSameSeedSameTrace(t *testing.T) {
 		if FormatScript(a.Script) != FormatScript(b.Script) {
 			t.Fatalf("%s: same seed produced different scripts", p.Name)
 		}
-		re := Replay(Config{Nodes: p.Nodes, Seed: 7}, a.Script)
+		re := Replay(p.Config(7), a.Script)
 		if re.TraceHash != a.TraceHash {
 			t.Fatalf("%s: replaying the recorded script gave trace %s, the run gave %s", p.Name, re.TraceHash, a.TraceHash)
 		}
@@ -172,7 +192,7 @@ func TestSameSeedSameTrace(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: script does not parse back: %v", p.Name, err)
 		}
-		if again := Replay(Config{Nodes: p.Nodes, Seed: 7}, parsed); again.TraceHash != a.TraceHash {
+		if again := Replay(p.Config(7), parsed); again.TraceHash != a.TraceHash {
 			t.Fatalf("%s: replay from the text script diverged", p.Name)
 		}
 		if c := Run(p, 8); c.TraceHash == a.TraceHash {

@@ -255,3 +255,35 @@ func TestChunkCodec(t *testing.T) {
 		t.Errorf("trailing byte: %v", err)
 	}
 }
+
+// TestSplitSizeReassembles: any chunk size up to MaxChunk carries a snapshot
+// the receiver reassembles; sizes outside [1, MaxChunk] are clamped.
+func TestSplitSizeReassembles(t *testing.T) {
+	file := mustEncode(t, meta(9, 2), bytes.Repeat([]byte("z"), 1000))
+	for _, size := range []int{-5, 0, 1, 7, 64, 999, len(file), MaxChunk, MaxChunk + 1} {
+		chunks := SplitSize(3, meta(9, 2), file, size)
+		want := len(file)
+		if size >= 1 && size < len(file) {
+			want = (len(file) + size - 1) / size
+		} else if size < 1 {
+			want = len(file)
+		} else {
+			want = 1
+		}
+		if len(chunks) != want {
+			t.Fatalf("size %d: %d chunks, want %d", size, len(chunks), want)
+		}
+		r := NewReceiver(Files{FS: fault.NewMemFS(), Base: base})
+		var done *Received
+		for _, c := range chunks {
+			got, err := r.Accept("n1", c)
+			if err != nil {
+				t.Fatalf("size %d: %v", size, err)
+			}
+			done = got
+		}
+		if done == nil || done.Meta.Index != 9 || done.Bytes != len(file) {
+			t.Fatalf("size %d: %+v", size, done)
+		}
+	}
+}

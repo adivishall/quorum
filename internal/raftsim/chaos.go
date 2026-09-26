@@ -39,6 +39,20 @@ type Profile struct {
 	FIFOPercent                int // chance a delivery takes the oldest message (else a random one: reordering)
 	PowerLossPercent           int // chance a crash also models power loss on the node's disk
 	MaxDelay, MaxTorn          int // bounds on Delay steps and torn-tail bytes
+	// Phase 14: every node's snapshot policy (Config), the chunk size a
+	// snapshot travels in, and the weights of an explicit snapshot and of
+	// corrupting an in-flight chunk. With SnapshotEvery set, crash points
+	// include the snapshot ones and persistence faults the renames and
+	// directory fsyncs.
+	SnapshotEvery, SnapshotRetain uint64
+	ChunkSize                     int
+	SnapshotNow, CorruptChunk     int
+}
+
+// Config is the cluster configuration a run of the profile uses.
+func (p Profile) Config(seed int64) Config {
+	return Config{Nodes: p.Nodes, Seed: seed, KVLimits: p.KVLimits,
+		SnapshotEvery: p.SnapshotEvery, SnapshotRetain: p.SnapshotRetain, ChunkSize: p.ChunkSize}
 }
 
 // Profiles are the built-in chaos mixes. Every one exercises the continuous
@@ -72,17 +86,49 @@ var Profiles = []Profile{
 	{Name: "crashpoints", Nodes: 3, Steps: 3000,
 		Tick: 300, Deliver: 600, Propose: 100, CrashAt: 12, Restart: 40,
 		FIFOPercent: 80, PowerLossPercent: 50, MaxTorn: 128},
+
+	// Phase 14: snapshots and compaction under each fault family. Nodes
+	// snapshot every few entries, so logs are compacted all the time, a node
+	// that was down or cut off can only catch up by a snapshot, and every
+	// restart recovers from a snapshot plus a suffix.
+	{Name: "snapshots", Nodes: 3, Steps: 3000,
+		Tick: 300, Deliver: 600, Propose: 100, Crash: 8, Restart: 40, Drop: 15, Duplicate: 15, Delay: 15,
+		SnapshotNow: 4, CorruptChunk: 6, SnapshotEvery: 10, SnapshotRetain: 2,
+		FIFOPercent: 70, PowerLossPercent: 50, MaxDelay: 40, MaxTorn: 128},
+	{Name: "snapshot-partitions", Nodes: 5, Steps: 3000,
+		Tick: 300, Deliver: 600, Propose: 100, Partition: 10, Split: 3, Heal: 12, Crash: 4, Restart: 30,
+		SnapshotEvery: 8, SnapshotRetain: 0,
+		FIFOPercent: 80, PowerLossPercent: 40, MaxTorn: 64},
+	// Every crash lands on an exact boundary — including snapshot creation,
+	// publication, compaction and installation, and the renames and
+	// directory fsyncs inside them — half of them with a power loss.
+	{Name: "snapshot-crashpoints", Nodes: 3, Steps: 3000,
+		Tick: 300, Deliver: 600, Propose: 100, CrashAt: 14, Restart: 40, SnapshotNow: 3,
+		SnapshotEvery: 6, SnapshotRetain: 1,
+		FIFOPercent: 80, PowerLossPercent: 50, MaxTorn: 128},
+	{Name: "snapshot-disk", Nodes: 3, Steps: 3000,
+		Tick: 300, Deliver: 600, Propose: 100, Crash: 4, Restart: 40, FailPersist: 10,
+		SnapshotEvery: 8, SnapshotRetain: 2,
+		FIFOPercent: 80, PowerLossPercent: 50, MaxTorn: 128},
 }
 
-// crashPointNames are the crash points a seeded run may arm: the driver's, then
-// the durable log's I/O boundaries.
-var crashPointNames = func() []string {
+// crashPointNames are the crash points a seeded run of the profile may arm:
+// the driver's, then the I/O boundaries. A profile without snapshots arms only
+// the points it can reach — the Phase 11 set, exactly as before Phase 14.
+func crashPointNames(p Profile) []string {
 	var out []string
-	for _, p := range raftnode.Points {
-		out = append(out, p.String())
+	for _, pt := range raftnode.Points {
+		if p.SnapshotEvery == 0 && pt > raftnode.AfterAppliedTo {
+			continue
+		}
+		out = append(out, pt.String())
 	}
-	return append(out, IOPoints...)
-}()
+	out = append(out, IOPoints...)
+	if p.SnapshotEvery > 0 {
+		out = append(out, SnapshotIOPoints...)
+	}
+	return out
+}
 
 // ProfileByName returns the named built-in profile.
 func ProfileByName(name string) (Profile, bool) {
@@ -114,7 +160,7 @@ type Result struct {
 // generator seeded with seed, then stabilization (every fault healed, every node
 // restarted) and the convergence check. It is a pure function of (profile, seed).
 func Run(p Profile, seed int64) *Result {
-	c, err := New(Config{Nodes: p.Nodes, Seed: seed})
+	c, err := New(p.Config(seed))
 	if err != nil {
 		return &Result{Seed: seed, Profile: p.Name, Violation: &Violation{Invariant: "harness", Detail: err.Error()}}
 	}
@@ -378,8 +424,9 @@ func (c *Cluster) generate(rng *rand.Rand, p Profile) Event {
 	add(p.Restart, len(down) > 0, func() Event { return Event{Kind: Restart, Node: pick(down)} })
 	add(p.Pause, len(running) > 0, func() Event { return Event{Kind: Pause, Node: pick(running)} })
 	add(p.Resume, len(paused) > 0, func() Event { return Event{Kind: Resume, Node: pick(paused)} })
+	points := crashPointNames(p)
 	add(p.CrashAt, len(crashable) > 0, func() Event {
-		e := Event{Kind: CrashAt, Node: pick(crashable), Point: crashPointNames[rng.Intn(len(crashPointNames))], Nth: 1 + rng.Intn(3)}
+		e := Event{Kind: CrashAt, Node: pick(crashable), Point: points[rng.Intn(len(points))], Nth: 1 + rng.Intn(3)}
 		if rng.Intn(100) < p.PowerLossPercent {
 			e.Power = true
 			e.N = rng.Intn(p.MaxTorn + 1)
@@ -388,15 +435,34 @@ func (c *Cluster) generate(rng *rand.Rand, p Profile) Event {
 	})
 	add(p.FailPersist, len(armable) > 0, func() Event {
 		e := Event{Kind: FailPersist, Node: pick(armable)}
-		switch rng.Intn(3) {
+		ops := 3
+		if p.SnapshotEvery > 0 {
+			ops = 5
+		}
+		switch rng.Intn(ops) {
 		case 0:
 			e.Op = FailWrite
 		case 1:
 			e.Op, e.N = ShortWrite, 1+rng.Intn(24)
-		default:
+		case 2:
 			e.Op = FailSync
+		case 3:
+			e.Op = FailRename
+		default:
+			e.Op = FailSyncDir
 		}
 		return e
+	})
+	add(p.SnapshotNow, len(running) > 0, func() Event { return Event{Kind: SnapshotNow, Node: pick(running)} })
+	var chunks []*flight
+	for _, f := range c.flights {
+		if f.chunk != nil {
+			chunks = append(chunks, f)
+		}
+	}
+	add(p.CorruptChunk, len(chunks) > 0, func() Event {
+		from, to, pos := addr(chunks[rng.Intn(len(chunks))])
+		return Event{Kind: CorruptChunk, From: from, To: to, Pos: pos, N: rng.Intn(1 << 16)}
 	})
 	c.kvEvents(rng, p, add)
 

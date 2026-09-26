@@ -54,11 +54,19 @@ func UnmarshalChunk(b []byte) (Chunk, error) {
 	return c, nil
 }
 
-// Split cuts a snapshot file into the chunks that carry it, in order.
-func Split(term uint64, m Meta, file []byte) []Chunk {
+// Split cuts a snapshot file into the chunks that carry it, in order, of
+// MaxChunk bytes each (the last may be shorter).
+func Split(term uint64, m Meta, file []byte) []Chunk { return SplitSize(term, m, file, MaxChunk) }
+
+// SplitSize is Split with chunks of at most size bytes (clamped to [1,
+// MaxChunk]). The deterministic simulator uses small chunks, so that a
+// transfer is many messages its network can drop, duplicate, delay and
+// reorder; the receiver accepts any chunk size up to MaxChunk.
+func SplitSize(term uint64, m Meta, file []byte, size int) []Chunk {
+	size = max(1, min(size, MaxChunk))
 	var out []Chunk
-	for off := 0; off < len(file); off += MaxChunk {
-		end := min(off+MaxChunk, len(file))
+	for off := 0; off < len(file); off += size {
+		end := min(off+size, len(file))
 		out = append(out, Chunk{Term: term, Index: m.Index, SnapTerm: m.Term, Total: uint64(len(file)), Offset: uint64(off), Data: file[off:end]})
 	}
 	return out

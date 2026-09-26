@@ -233,3 +233,37 @@ func TestOSRenameAndRemove(t *testing.T) {
 		t.Fatalf("removed file still there: %v", err)
 	}
 }
+
+// TestCorruptFlipsBothViews: Corrupt damages a file as a crash cannot — the
+// byte is flipped in what a reader sees now and in what a power loss keeps.
+func TestCorruptFlipsBothViews(t *testing.T) {
+	m := NewMemFS()
+	f, err := m.OpenFile("/d/f", os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("abcdef")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SyncDir("/d"); err != nil {
+		t.Fatal(err)
+	}
+	if !m.Corrupt("/d/f", 8) { // 8 mod 6 = byte 2
+		t.Fatal("Corrupt reported no file")
+	}
+	c, _ := m.Cached("/d/f")
+	d, _ := m.Durable("/d/f")
+	if string(c) == "abcdef" || string(c) != string(d) || c[2] == 'c' {
+		t.Fatalf("cached %q durable %q", c, d)
+	}
+	m.CrashPowerLoss(0)
+	if after, _ := m.Cached("/d/f"); string(after) != string(c) {
+		t.Fatalf("the corruption did not survive a power loss: %q", after)
+	}
+	if m.Corrupt("/d/missing", 0) {
+		t.Fatal("Corrupt of a missing file reported success")
+	}
+}

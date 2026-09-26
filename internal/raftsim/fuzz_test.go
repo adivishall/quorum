@@ -81,13 +81,74 @@ func fuzzEvent(c *Cluster, k, a, b byte) Event {
 	case 14:
 		return Event{Kind: FailPersist, Node: id, Op: PersistOp(1 + int(b)%3), N: 1 + int(b)%20}
 	case 15:
-		return Event{Kind: CrashAt, Node: id, Point: crashPointNames[int(b)%len(crashPointNames)], Nth: 1 + int(a)%3, Power: a%2 == 1, N: int(b) % 64}
+		points := crashPointNames(Profile{})
+		return Event{Kind: CrashAt, Node: id, Point: points[int(b)%len(points)], Nth: 1 + int(a)%3, Power: a%2 == 1, N: int(b) % 64}
 	default:
 		if c.Paused(id) {
 			return Event{Kind: Resume, Node: id}
 		}
 		return Event{Kind: Pause, Node: id}
 	}
+}
+
+// FuzzSnapshotSchedule is FuzzFaultSchedule on a cluster whose nodes snapshot
+// and compact every few entries (Phase 14), with the snapshot faults added: an
+// explicit snapshot, a corrupted in-flight chunk, a failed rename or directory
+// fsync, and crashes at every snapshot crash point.
+//
+//	go test ./internal/raftsim -run '^$' -fuzz FuzzSnapshotSchedule -fuzztime 60s
+func FuzzSnapshotSchedule(f *testing.F) {
+	f.Add([]byte{})
+	f.Add([]byte{0, 0, 0, 9, 0, 0, 3, 0, 0, 9, 0, 0, 3, 0, 0, 9, 0, 0, 3, 0, 0, 17, 0, 0, 3, 0, 0})
+	f.Add([]byte{14, 1, 2, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 11, 1, 0, 1, 0, 0, 1, 0, 0, 18, 2, 1, 19, 0, 3})
+	cfg := Config{Nodes: 3, SnapshotEvery: 4, SnapshotRetain: 1, ChunkSize: 64}
+	points := crashPointNames(Profile{SnapshotEvery: 4})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		cfg := cfg
+		cfg.Seed = int64(len(data))
+		c, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i+2 < len(data) && i/3 < maxFuzzEvents && c.Violation() == nil; i += 3 {
+			k, a, b := data[i], data[i+1], data[i+2]
+			id := c.ids[int(a)%len(c.ids)]
+			var e Event
+			switch k % 21 {
+			case 17:
+				e = Event{Kind: SnapshotNow, Node: id}
+			case 18:
+				e = fuzzEvent(c, 3, a, b) // a delivery, redirected below if a chunk is in flight
+				for pos, g := 0, 0; g < len(c.flights); g++ {
+					if f := c.flights[(int(b)+g)%len(c.flights)]; f.chunk != nil {
+						for _, h := range c.flights {
+							if h == f {
+								break
+							}
+							if h.msg.From == f.msg.From && h.msg.To == f.msg.To {
+								pos++
+							}
+						}
+						e = Event{Kind: CorruptChunk, From: f.msg.From, To: f.msg.To, Pos: pos, N: int(a)}
+						break
+					}
+				}
+			case 19:
+				e = Event{Kind: FailPersist, Node: id, Op: PersistOp(4 + int(b)%2)}
+			case 20:
+				e = Event{Kind: CrashAt, Node: id, Point: points[int(b)%len(points)], Nth: 1 + int(a)%3, Power: a%2 == 1, N: int(b) % 64}
+			default:
+				e = fuzzEvent(c, k, a, b)
+			}
+			c.Apply(e)
+		}
+		if c.Violation() == nil {
+			c.Stabilize(400)
+		}
+		if v := c.Violation(); v != nil {
+			t.Fatalf("%v\n--- script ---\n%s", v, FormatScript(c.Script()))
+		}
+	})
 }
 
 func itoa(n int) string {

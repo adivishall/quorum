@@ -59,7 +59,7 @@ func TestKVSeededHistoriesAreLinearizable(t *testing.T) {
 			p, seed := p, seed
 			t.Run(fmt.Sprintf("%s/seed=%d", p.Name, seed), func(t *testing.T) {
 				r := RunKV(p, seed)
-				cfg := Config{Nodes: p.Nodes, Seed: seed, KVLimits: p.KVLimits}
+				cfg := p.Config(seed)
 				if r.Violation != nil {
 					min := Minimize(cfg, r.Script, 300)
 					t.Fatalf("%s--- minimized script (%d of %d events) ---\n%s\n--- history ---\n%s",
@@ -150,7 +150,7 @@ func TestKVSameSeedSameHistory(t *testing.T) {
 		if a.TraceHash != b.TraceHash || a.History.String() != b.History.String() {
 			t.Fatalf("%s: same seed, different runs", p.Name)
 		}
-		cfg := Config{Nodes: p.Nodes, Seed: 11, KVLimits: p.KVLimits}
+		cfg := p.Config(11)
 		parsed, err := ParseScript(FormatScript(a.Script))
 		if err != nil {
 			t.Fatalf("%s: script does not parse back: %v", p.Name, err)

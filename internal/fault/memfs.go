@@ -250,6 +250,39 @@ func (m *MemFS) Durable(name string) ([]byte, bool) {
 	return append([]byte(nil), n.durable()...), true
 }
 
+// Corrupt flips one byte of name — at offset, modulo its length — in both its
+// cached and durable views: damage a crash cannot explain (bit rot, a stray
+// write by another program), for tests of how a reader of the file refuses it.
+// It reports whether the file existed and was non-empty.
+func (m *MemFS) Corrupt(name string, offset int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	name = filepath.Clean(name)
+	flip := func(b []byte) bool {
+		if len(b) == 0 {
+			return false
+		}
+		b[offset%len(b)] ^= 0x40
+		return true
+	}
+	// The cached and the durable binding may be different files (an unsynced
+	// rename); each is flipped once. In prefix mode a file's durable view is a
+	// prefix of its data, so flipping the data flips both views.
+	done := false
+	seen := map[*memNode]bool{}
+	for _, n := range []*memNode{m.files[name], m.names[name]} {
+		if n == nil || seen[n] {
+			continue
+		}
+		seen[n] = true
+		if n.isDetached {
+			done = flip(n.detached) || done
+		}
+		done = flip(n.data) || done
+	}
+	return done
+}
+
 // DurableCopy returns a new MemFS holding exactly what a power loss (with no torn
 // tail) would leave right now — every durably created file at its durable view —
 // without disturbing m. Reading a log through it shows the state a node could
