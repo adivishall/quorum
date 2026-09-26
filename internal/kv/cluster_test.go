@@ -6,6 +6,7 @@ import (
 	"net"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,6 +97,22 @@ type cluster struct {
 	nodes map[raftnode.NodeID]*raftnode.Node
 	eps   map[raftnode.NodeID]*endpoint
 	mu    sync.Mutex
+
+	// limits are the session-table limits every node's store uses (zero:
+	// kv.DefaultLimits); they must be the same on every node.
+	limits kv.Limits
+	// hook, if set, is consulted at every driver crash point of every node: it
+	// lets a test abort one node's cycle at an exact point (Phase 11's seam).
+	hook atomic.Pointer[func(id raftnode.NodeID, p raftnode.Point, arg uint64) error]
+}
+
+// setHook installs (or with nil removes) the crash-point hook.
+func (c *cluster) setHook(h func(id raftnode.NodeID, p raftnode.Point, arg uint64) error) {
+	if h == nil {
+		c.hook.Store(nil)
+		return
+	}
+	c.hook.Store(&h)
 }
 
 func startCluster(t *testing.T, ctx context.Context, n int, faults bool) *cluster {
@@ -138,10 +155,19 @@ func (c *cluster) startNode(id raftnode.NodeID) {
 		wrapped = c.net.Wrap(tr)
 	}
 	store := kv.NewStore()
+	if c.limits != (kv.Limits{}) {
+		store = kv.NewStoreWithLimits(c.limits)
+	}
 	node, err := raftnode.Start(c.ctx, raftnode.Config{
 		ID: id, Peers: c.ids, Transport: wrapped,
 		LogPath:      filepath.Join(c.dir, string(id)+".log"),
 		StateMachine: store, TickInterval: 15 * time.Millisecond, DisableSync: true,
+		Hook: func(p raftnode.Point, arg uint64) error {
+			if h := c.hook.Load(); h != nil {
+				return (*h)(id, p, arg)
+			}
+			return nil
+		},
 	})
 	if err != nil {
 		c.t.Fatalf("node %s: %v", id, err)
