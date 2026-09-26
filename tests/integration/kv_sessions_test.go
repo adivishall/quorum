@@ -328,6 +328,19 @@ func sessionCrashWindow(t *testing.T, tc crashCase) {
 
 	l2, t2 := c.waitLeader(others(c.ids, l), tm, 20*time.Second)
 	r.event("%s leads term %d", l2, t2)
+	// A read before B: a committed original is visible though W does not know
+	// it. It also lets the checker ALONE see a second execution — A, then B,
+	// then A again cannot come from one PUT(A).
+	pre := r.session("pre-reader", patient, l2)
+	preRead, preOut := pre.Get(ctx, "k")
+	switch {
+	case preOut.Err != nil:
+		r.fail("read before B: %s %v", preRead, preOut.Err)
+	case tc.read == "new" && string(preRead.Output) != "A":
+		r.fail("the write was committed when the leader died at %s, but a later read returned %q: a committed write was lost", tc.spec, preRead.Output)
+	case tc.read == "old" && string(preRead.Output) != "old":
+		r.fail("the write never left the leader at %s, but a later read returned %q", tc.spec, preRead.Output)
+	}
 	if op, out := c2.Put(ctx, "k", []byte("B")); out.Err != nil {
 		r.fail("c2's PUT(B): %s %v", op, out.Err)
 	}
@@ -348,6 +361,7 @@ func sessionCrashWindow(t *testing.T, tc crashCase) {
 	if gotOut.Err != nil {
 		r.fail("read: %s %v", got, gotOut.Err)
 	}
+	r.check() // first: the history of logical requests alone
 	dup := out.Response.Duplicate
 	switch {
 	case tc.committed == "yes" && !dup:
@@ -359,15 +373,14 @@ func sessionCrashWindow(t *testing.T, tc crashCase) {
 	case !dup && string(got.Output) != "A":
 		r.fail("the retry executed, yet the key is %q, not A", got.Output)
 	}
-	r.check()
 	c.finish()
 	ev := c.dedupEvidence(l2, kv.DefaultLimits)
 	id := [2]uint64{w.Session().ID(), rid}
 	if _, ok := ev.executedAt[id]; !ok {
 		t.Fatalf("request (W, %d) never executed in the committed log: %+v", rid, ev)
 	}
-	t.Logf("crash at %s: W %s; the retry was %s; the key reads %q; (W, %d) has %d committed entries and executed once, at index %d",
-		tc.spec, map[bool]string{true: "knew", false: "did not know"}[firstOut.Known],
+	t.Logf("crash at %s: W %s; a read before B saw %q; the retry was %s; the key reads %q; (W, %d) has %d committed entries and executed once, at index %d",
+		tc.spec, map[bool]string{true: "knew", false: "did not know"}[firstOut.Known], preRead.Output,
 		map[bool]string{true: fmt.Sprintf("a duplicate of index %d", out.Response.Index), false: "the first execution"}[dup],
 		got.Output, rid, ev.entries[id], ev.executedAt[id])
 }
