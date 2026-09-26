@@ -1,6 +1,8 @@
 # CLIENT SEMANTICS — Phase 13
 
-Status: **Phase 13 contract.** This document is the client-visible contract for request identity,
+Status: **Phase 13 contract — implemented and verified** (on recorded histories and replayed
+logs, for one Raft group; `docs/DEDUP.md` §7, `docs/LINEARIZABILITY.md` §15). This document is the
+client-visible contract for request identity,
 retries, duplicates, conflicting reuse, forwarding and unknown outcomes. `docs/DEDUP.md` is how the
 server keeps it (the replicated session table, its bounds, its recovery); `docs/API.md` is the wire
 protocol that carries it; `docs/LINEARIZABILITY.md` is how client-visible histories are checked.
@@ -150,9 +152,10 @@ retry's entry, applied after the original, is a duplicate: `OK`, with the index 
 execution, and no state change. The response of a duplicate is the proof the client could not get
 the first time.
 
-The one way an unknown outcome stays unknown: the session is evicted before the client retries
-(`SESSION_EXPIRED`). The client then knows its session is gone, and must report every request whose
-outcome it never learned as unknown — the contract never turns an unknown into "did not happen".
+An unknown outcome stays unknown only if the client stops asking: it gives up (its attempts or
+its patience run out — `kv.Session` then reports `Known: false`), or its session is evicted before
+it retries (`SESSION_EXPIRED`). Either way the client must report every request whose outcome it
+never learned as unknown — the contract never turns an unknown into "did not happen".
 
 ## 8. Bounds
 
@@ -189,9 +192,10 @@ never reuses a RequestID for a different command) and the fault model of `docs/F
 - an identified write changes the key-value state **at most once**, however many times, to however
   many nodes, across however many crashes, restarts, reconnects and leader changes it is sent;
 - every `OK` for it — first or duplicate — reports the one execution (its log index);
-- if it executed, every later attempt that reaches the state machine while the session exists
-  receives `OK`; and the client-visible history of logical requests is linearizable
-  (`docs/LINEARIZABILITY.md` §15).
+- if it executed, every later attempt that reaches the state machine while the session exists,
+  and before the client has acknowledged the request (moved its AckedBelow past it), receives
+  `OK` with that execution's index; and the client-visible history of logical requests is
+  linearizable (`docs/LINEARIZABILITY.md` §15).
 
 This is **exactly-once execution of each identified write that executes at all, and at most once
 for every other**. It is **not**:
