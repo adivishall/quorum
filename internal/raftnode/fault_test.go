@@ -396,15 +396,36 @@ func without(ids []NodeID, x NodeID) []NodeID {
 
 // TestWedgedPeerDoesNotStallTheLeader proves the driver never blocks its Raft actor
 // on the network (FAILURE_MODEL §7 "slow node": the leader does not block on the
-// slowest follower). One follower is frozen, as a stopped process would be: every
-// send to it hangs, as a TCP write to a peer that stopped reading does, and it
+// slowest follower; INV-F5). One follower is frozen, as a stopped process would be:
+// every send to it hangs, as a TCP write to a peer that stopped reading does, and it
 // sends nothing (so its own election attempts cannot disrupt anyone — that is a
-// different fault). The leader must keep heartbeating and replicating to the other
-// follower: proposals commit on the healthy quorum and no election is triggered.
-// Once the peer thaws it catches up. With a synchronous send in the actor, the
-// first stuck write freezes the leader, the healthy follower times out, and the
-// term moves — this test fails.
+// different fault). Once the wedge has demonstrably engaged (a Send is blocked on
+// it), the leader must keep accepting proposals and committing them with the other
+// follower — twenty rounds of it. Once the peer thaws it catches up. With a
+// synchronous send in the actor, the first stuck write freezes the leader: it
+// accepts no further proposal (Propose hangs to its deadline) — this test fails.
+//
+// The assertion needs no timing assumption. An earlier version slept for a second
+// and required the term not to move, which a starved machine can break on its own:
+// the healthy follower's election timer fires, the term moves, and that says
+// nothing about the wedge (found in Phase 12 by running the race suite under
+// deliberate CPU starvation). An election voids this scenario's premise — one
+// leader throughout — without violating its property, and the leader's actor
+// proves it is alive by answering "not leader"; the scenario then starts over on
+// a fresh cluster, at most three times.
 func TestWedgedPeerDoesNotStallTheLeader(t *testing.T) {
+	for attempt := 1; attempt <= 3; attempt++ {
+		why := wedgedPeerScenario(t)
+		if why == "" {
+			return
+		}
+		t.Logf("attempt %d: premise not met (%s); starting over on a fresh cluster", attempt, why)
+	}
+	t.Fatal("the scenario's premise (one leader throughout) was not met in 3 attempts")
+}
+
+// wedgedPeerScenario is one attempt; it returns why its premise failed, or "".
+func wedgedPeerScenario(t *testing.T) string {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	fc := startFaultCluster(t, ctx, 3)
@@ -413,34 +434,39 @@ func TestWedgedPeerDoesNotStallTheLeader(t *testing.T) {
 	leader := fc.waitLeaderAmong(fc.ids, 0, 5*time.Second)
 	others := without(fc.ids, leader)
 	wedged, healthy := others[0], others[1]
-	term := fc.nodes[leader].Status().Term
 
 	rule := fc.net.AddRule(fault.Rule{From: string(leader), To: string(wedged), Action: fault.Block})
 	silenced := fc.net.AddRule(fault.Rule{From: string(wedged), Action: fault.Drop})
-	for i := 0; i < 5; i++ {
-		if err := proposeWithin(fc.nodes[leader], []byte{byte('a' + i)}); err != nil {
-			t.Fatalf("propose %d: %v", i, err)
+	var last uint64
+	for i := 0; i < 20; i++ {
+		err := proposeWithin(fc.nodes[leader], []byte{byte('a' + i)})
+		if errors.Is(err, raft.ErrNotLeader) {
+			return fmt.Sprintf("round %d: the leader answered not-leader (alive, but an election intervened)", i)
 		}
-	}
-	last := fc.nodes[leader].Status().LastIndex
-	fc.waitCommit([]NodeID{leader, healthy}, last, 3*time.Second)
-
-	// Hold the wedge for several election timeouts (15ms ticks x 10-20): a stalled
-	// leader would have lost its term by now.
-	time.Sleep(time.Second)
-	if st := fc.nodes[healthy].Status(); st.Term != term {
-		t.Fatalf("healthy follower moved from term %d to %d: the wedged peer stalled the leader's heartbeats", term, st.Term)
-	}
-	if st := fc.nodes[leader].Status(); st.Role != raft.Leader || st.Term != term {
-		t.Fatalf("leader lost leadership while one peer was wedged: %+v", st)
-	}
-	if fc.net.Stats().Blocked == 0 {
-		t.Fatal("the wedge never engaged; the test proved nothing")
+		if err != nil {
+			t.Fatalf("round %d: the leader stopped accepting proposals while one peer is wedged: %v", i, err)
+		}
+		last = fc.nodes[leader].Status().LastIndex
+		deadline := time.Now().Add(10 * time.Second)
+		for fc.nodes[leader].Status().Commit < last || fc.nodes[healthy].Status().Commit < last {
+			if st := fc.nodes[leader].Status(); st.Role != raft.Leader {
+				return fmt.Sprintf("round %d: leadership moved (%+v)", i, st)
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("round %d: index %d did not commit on the leader and the healthy follower while one peer is wedged", i, last)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		if i == 0 {
+			// Synchronize on the wedge engaging before the remaining rounds.
+			fc.waitUntil(5*time.Second, func() bool { return fc.net.Stats().Blocked > 0 }, "a send never blocked on the wedged peer")
+		}
 	}
 
 	fc.net.RemoveRule(silenced)
 	fc.net.RemoveRule(rule)
 	fc.waitCommit([]NodeID{wedged}, last, 5*time.Second)
+	return ""
 }
 
 // TestIsolatedLeaderCannotCommitAndRejoins is scenario A on the real driver: the
