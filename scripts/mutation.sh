@@ -741,6 +741,14 @@ mutant "start-reads-the-core-before-the-actor-owns-it" internal/raftnode/node.go
 	term, last := rc.Core.Term(), rc.Core.LastIndex()' \
   "-race ./internal/raftnode" 'TestStartDoesNotTouchTheCoreOnceTheActorOwnsIt'
 
+# 92. The session client backs off a fixed interval (no doubling): it spends
+#     its attempts during an ordinary election and gives up on a request that
+#     would complete moments later (what the Phase 13 gate found).
+mutant "the-session-back-off-doubles" internal/kv/session.go \
+  '		d *= 2' \
+  '		d *= 1' \
+  ./internal/kv 'TestSessionRidesOutAnElectionLongerThanItsAttemptsTimesBackoff|TestBackoffDoublesUpToItsCap'
+
 echo "== Phase 13: the checker over logical operations, and the reference model =="
 
 # 77. Request identity is not scoped by client: the same RequestID from two

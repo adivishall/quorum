@@ -32,8 +32,14 @@ type Session struct {
 type SessionOptions struct {
 	AttemptTimeout time.Duration // per attempt (default 2s)
 	MaxAttempts    int           // per request, counting redirects and retries (default 8)
-	Backoff        time.Duration // after a refusal that names no usable leader (default 20ms)
+	Backoff        time.Duration // after a refusal that names no usable leader (default 20ms), doubling per consecutive one up to maxBackoff
 }
+
+// maxBackoff caps the back-off (unless Backoff itself is larger): an election
+// under load can take far longer than MaxAttempts × Backoff, and a client that
+// burns its attempts at a fixed short interval gives up on a request that
+// would complete moments later.
+const maxBackoff = time.Second
 
 func (o *SessionOptions) defaults() {
 	if o.AttemptTimeout <= 0 {
@@ -73,6 +79,7 @@ func Register(ctx context.Context, eps []Doer, opts SessionOptions) (*Session, e
 	opts.defaults()
 	s := &Session{eps: eps, opts: opts, next: 1, inflight: map[uint64]int{}}
 	var last error
+	backoffs := 0
 	for attempt := 0; attempt < opts.MaxAttempts && ctx.Err() == nil; attempt++ {
 		ep := s.target()
 		actx, cancel := context.WithTimeout(ctx, opts.AttemptTimeout)
@@ -82,19 +89,21 @@ func Register(ctx context.Context, eps []Doer, opts SessionOptions) (*Session, e
 		case err != nil:
 			last = err
 			s.miss()
-			s.sleep(ctx)
+			s.sleep(ctx, &backoffs)
 		case resp.Status == StatusOK && resp.ClientID != 0:
 			s.id = resp.ClientID
 			return s, nil
 		case resp.Status == StatusNotLeader:
 			last = errorOf(resp)
-			if !s.redirect(resp.Leader, ep.Name()) {
-				s.sleep(ctx)
+			if s.redirect(resp.Leader, ep.Name()) {
+				backoffs = 0
+			} else {
+				s.sleep(ctx, &backoffs)
 			}
 		default:
 			last = errorOf(resp)
 			s.miss()
-			s.sleep(ctx)
+			s.sleep(ctx, &backoffs)
 		}
 	}
 	if last == nil {
@@ -193,6 +202,7 @@ func (s *Session) run(ctx context.Context, op ReqOp, key, value []byte, hook Att
 func (s *Session) Send(ctx context.Context, rid uint64, op ReqOp, key, value []byte, hook AttemptHook) Outcome {
 	out := Outcome{RequestID: rid, Known: true}
 	unknown := false
+	backoffs := 0 // consecutive back-offs: reset whenever a usable leader is named
 	for out.Attempts < s.opts.MaxAttempts && ctx.Err() == nil {
 		out.Attempts++
 		ep := s.target()
@@ -211,7 +221,7 @@ func (s *Session) Send(ctx context.Context, rid uint64, op ReqOp, key, value []b
 		switch {
 		case err != nil && errors.Is(err, ErrUnavailable):
 			s.miss() // nothing was sent: try elsewhere
-			s.sleep(ctx)
+			s.sleep(ctx, &backoffs)
 		case err != nil:
 			unknown = true // sent, no answer: retry the same request
 			s.miss()
@@ -220,12 +230,14 @@ func (s *Session) Send(ctx context.Context, rid uint64, op ReqOp, key, value []b
 			s.redirect(resp.Node, "")
 			return out
 		case resp.Status == StatusNotLeader:
-			if !s.redirect(resp.Leader, ep.Name()) {
-				s.sleep(ctx)
+			if s.redirect(resp.Leader, ep.Name()) {
+				backoffs = 0
+			} else {
+				s.sleep(ctx, &backoffs)
 			}
 		case resp.Status == StatusUnavailable:
 			s.miss()
-			s.sleep(ctx)
+			s.sleep(ctx, &backoffs)
 		case resp.Status == StatusUnknown:
 			unknown = true
 			s.miss()
@@ -233,7 +245,7 @@ func (s *Session) Send(ctx context.Context, rid uint64, op ReqOp, key, value []b
 			// This attempt's entry was overwritten: definitely no effect from
 			// it. Retrying the same identity is safe.
 		case resp.Status == StatusSessionLimit:
-			s.sleep(ctx)
+			s.sleep(ctx, &backoffs)
 		default:
 			// SESSION_EXPIRED, REQUEST_CONFLICT, REQUEST_STALE, INVALID: stop.
 			// A conflict or stale answer means THIS command did not execute
@@ -288,9 +300,24 @@ func (s *Session) miss() {
 	s.mu.Unlock()
 }
 
-func (s *Session) sleep(ctx context.Context) {
+// sleep backs off before the next attempt: Backoff the first time, doubling
+// for each consecutive back-off (*n counts them) up to maxBackoff.
+func (s *Session) sleep(ctx context.Context, n *int) {
+	d := backoffFor(s.opts.Backoff, *n)
+	*n++
 	select {
-	case <-time.After(s.opts.Backoff):
+	case <-time.After(d):
 	case <-ctx.Done():
 	}
+}
+
+// backoffFor is the n-th consecutive back-off (from 0): base·2ⁿ, capped at
+// maxBackoff — or at base, if base is larger.
+func backoffFor(base time.Duration, n int) time.Duration {
+	limit := max(base, maxBackoff)
+	d := base
+	for i := 0; i < n && d < limit; i++ {
+		d *= 2
+	}
+	return min(d, limit)
 }
