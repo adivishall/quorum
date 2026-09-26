@@ -303,9 +303,9 @@ catch).
 
 Phase 10 adds 14 mutants for its failure-handling rules and for the fault harness's own fidelity
 (`docs/FAULTS.md` §12), plus 2 for the transport's dead-connection handling; Phase 11 adds 9 for
-its crash-recovery rules (`docs/CRASH_RECOVERY.md` §11); Phase 12 adds 26 for ReadIndex, write
-completion, the client protocol and policy, the state machine and the checker
-(`docs/LINEARIZABILITY.md` §11); `make mutation` runs all 59.
+its crash-recovery rules (`docs/CRASH_RECOVERY.md` §11); Phase 12 adds 27 for ReadIndex, write
+completion, the client protocol and policy, the state machine, the codecs and the checker
+(`docs/LINEARIZABILITY.md` §11); `make mutation` runs all 60.
 
 ## 13. Multi-Raft and membership
 

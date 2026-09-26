@@ -13,7 +13,7 @@ partitions and heals; repeated leader changes; a SIGKILL at every point of a wri
 real driver in-process (message drops, duplicates, reordering), and from 1,400 seeded simulator
 runs under every fault family, is **linearizable**, as decided by a checker validated against an
 independent oracle on 20,000 arbitrary histories. The mechanisms are argued (write completion:
-LINEARIZABILITY §3; ReadIndex: §5.2) and pinned by 26 Phase 12 mutants.
+LINEARIZABILITY §3; ReadIndex: §5.2) and pinned by 27 Phase 12 mutants.
 
 That is C1 below **with its condition (d) replaced**: Phase 12 records every retry as its own
 operation (an unknown write is never silently retried), and the guarantee holds for those honest

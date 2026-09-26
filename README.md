@@ -47,7 +47,7 @@ the project, and they are being built in that order.
 > known-good/known-bad corpus and fuzzing — that checks client histories recorded from real
 > processes (concurrent clients, leader and follower SIGKILL, partitions, a minority leader that
 > still has a follower, a SIGKILL at every point of a write's life), the real driver, and 1,400
-> seeded simulator runs. 26 mutants of ReadIndex, write completion, the client and the checker
+> seeded simulator runs. 27 mutants of ReadIndex, write completion, the client and the checker
 > are killed.
 >
 > **What that claim is, exactly:** single-key PUT/GET/DELETE on **one** Raft group; every

@@ -114,7 +114,7 @@ func readBytes(b []byte, max int) ([]byte, int, error) {
 // value written in more bytes than it needs (e.g. 0 as 0x80 0x00) is refused
 // (n = 0), so every byte string these codecs accept has exactly one meaning and
 // is exactly what Encode would produce for it — byte identity is command
-// identity. Found by fuzzing (docs/LINEARIZABILITY.md §9).
+// identity. Found by fuzzing (docs/LINEARIZABILITY.md §13).
 func uvarint(b []byte) (uint64, int) {
 	v, n := binary.Uvarint(b)
 	if n > 0 && n != uvarintLen(v) {

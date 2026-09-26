@@ -507,7 +507,7 @@ misjudged by a broken checker. Each layer is argued and tested on its own.
 ## 11. Mutation testing
 
 `make mutation` applies each edit, runs its killers, requires them to fail, and reverts. Phase 12
-adds:
+adds 27:
 
 | # | Mutant | Killed by |
 |---|---|---|
@@ -537,13 +537,15 @@ adds:
 | 57 | (35 again) — simulated history alone | `TestKVNewLeaderReadWaitsForItsNoop` |
 | 58 | (40 again) — the **seeded** workloads alone | `TestKVSeededHistoriesAreLinearizable` |
 | 59 | (43 again) — real processes alone | `TestRealStaleLeaderNeverServesARead` |
+| 60 | the key-value codecs accept a non-minimal varint (one command, two encodings; §14) | `TestDecodeRejectsMalformedCommands`, `TestWireCodecsRoundTrip`, the fuzz targets' regression corpus |
 
 Mutants 34–53 list unit killers next to history-level ones, so their kill alone would not show the
 history-level tests have teeth; 54–59 prove it by using only a recorded-history test. Writing them
 exposed the one gap described in §8 (the seeded and real-process stale-leader tests did not kill
 mutant 37 until the minority-leader attack existed).
 
-MUTATION_RESULT
+**Result on the final HEAD: 60/60 mutants killed** (`make mutation`: the 33 of Phases 9–11 and
+the 27 of Phase 12).
 
 ---
 
@@ -577,7 +579,34 @@ assumption for safety.
 
 ---
 
-## 13. Reproducing
+## 13. Found and fixed during Phase 12
+
+No execution of the implementation produced a non-linearizable history. What the phase found:
+
+1. **The key-value codecs accepted non-canonical varints** (found by `make fuzz` in the validation
+   gate; `b862f1b`). `binary.Uvarint` also accepts a value written in more bytes than it needs, so
+   `PUT("0", "")` had two encodings. No consistency impact — log entries are always produced by
+   `Encode`, the server re-encodes every request, replicas decode identically — but byte identity
+   stopped being command identity. The decoders now refuse non-minimal varints; the minimized
+   inputs are regression corpus; mutant 60 pins it. The fuzz targets had only ever run on their
+   seed corpus before.
+2. **A hole in the history-level tests** (found by mutation testing). With ReadIndex's quorum rule
+   removed, the real-process stale-leader test and 1,200 seeded simulator runs still passed:
+   both only ever isolated the old leader completely, so it received no acknowledgements and even
+   a broken rule never fired. The minority-leader-with-a-follower attack (real, 5 processes; and
+   simulated) and the `kv-splits` profile close it; on real processes the broken rule then
+   **does** serve a stale value, and the test catches it (mutants 54, 55).
+3. **Test-premise bugs, each fixed at its cause, none by a longer timeout:** the first `split`
+   event accumulated partitions and fragmented the group into sides with no majority (vacuous
+   runs; now a split replaces the partition); a follower-kill test asserted clients would find the
+   dead follower, but hint-following clients never contact it (now it asserts progress during the
+   downtime and a refused read at the restarted follower); fault schedules synchronized on "N
+   operations ended", which refusals during an election satisfy instantly (now "N served", plus a
+   client back-off after a refusal naming no leader); in-process schedules and one wire test slept
+   for guessed durations (now each waits for an observable condition); a driver unit test would
+   hang, not fail, under a mutant (now it receives non-blockingly what must already be there).
+
+## 14. Reproducing
 
 ```
 go test ./internal/lincheck/ -run 'Oracle|Corpus|BruteForce' -v        # checker validation
