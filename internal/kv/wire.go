@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ import (
 // kind. It is a framed binary protocol, not the Phase 15 HTTP API.
 //
 //	request  (kind 3): op u8 | clientID | requestID | ackedBelow | timeoutMillis | key(len+bytes) | value(len+bytes, PUT only)
+//	                   (timeoutMillis at most maxMillis: a duration must fit time.Duration)
 //	response (kind 4): status u8 | flags u8 (bit 0 duplicate) | clientID | term | index |
 //	                   node | via | leader | value | message   (each len+bytes)
 //
@@ -50,7 +52,7 @@ func encodeRequest(r Request) []byte {
 	b = binary.AppendUvarint(b, r.ClientID)
 	b = binary.AppendUvarint(b, r.RequestID)
 	b = binary.AppendUvarint(b, r.AckedBelow)
-	b = binary.AppendUvarint(b, uint64(r.Timeout/time.Millisecond))
+	b = binary.AppendUvarint(b, millisOf(r.Timeout))
 	b = binary.AppendUvarint(b, uint64(len(r.Key)))
 	b = append(b, r.Key...)
 	if r.Op == ReqPut {
@@ -73,7 +75,7 @@ func decodeRequest(b []byte) (Request, error) {
 	}
 	d := decoder{b: b, i: 1}
 	r.ClientID, r.RequestID, r.AckedBelow = d.uint(), d.uint(), d.uint()
-	r.Timeout = time.Duration(d.uint()) * time.Millisecond
+	r.Timeout = d.millis()
 	r.Key = d.bytes(MaxKeyLen)
 	if r.Op == ReqPut {
 		r.Value = d.bytes(MaxValueLen)
@@ -152,6 +154,35 @@ func (d *decoder) uint() uint64 {
 	return v
 }
 
+// maxMillis is the largest millisecond count a time.Duration can hold.
+const maxMillis = math.MaxInt64 / uint64(time.Millisecond)
+
+// millis reads a duration in milliseconds. One that does not fit a
+// time.Duration is a protocol error: converting it would overflow, and the
+// frame would decode to a request that re-encodes differently (found by
+// FuzzDecodeRequestIsTotal).
+func (d *decoder) millis() time.Duration {
+	ms := d.uint()
+	if d.err == nil && ms > maxMillis {
+		d.err = fmt.Errorf("%w: duration of %d ms", ErrProtocol, ms)
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// millisOf is the wire form of a duration: whole milliseconds, a positive
+// duration below one millisecond rounded up to one (0 would mean "the server
+// default"), a negative one as 0.
+func millisOf(t time.Duration) uint64 {
+	switch {
+	case t <= 0:
+		return 0
+	case t < time.Millisecond:
+		return 1
+	}
+	return uint64(t / time.Millisecond)
+}
+
 func (d *decoder) bytes(max int) []byte {
 	if d.err != nil {
 		return nil
@@ -176,22 +207,19 @@ func (d *decoder) done() error {
 // id the forwarder chose, and for a forward the time budget left, then the
 // request or response in the client encoding.
 func encodeForward(fid uint64, budget time.Duration, r Request) []byte {
-	if budget < 0 {
-		budget = 0
-	}
 	b := binary.AppendUvarint(nil, fid)
-	b = binary.AppendUvarint(b, uint64(budget/time.Millisecond))
+	b = binary.AppendUvarint(b, millisOf(budget))
 	return append(b, encodeRequest(r)...)
 }
 
 func decodeForward(b []byte) (uint64, time.Duration, Request, error) {
 	d := decoder{b: b}
-	fid, ms := d.uint(), d.uint()
+	fid, budget := d.uint(), d.millis()
 	if d.err != nil {
 		return 0, 0, Request{}, d.err
 	}
 	r, err := decodeRequest(b[d.i:])
-	return fid, time.Duration(ms) * time.Millisecond, r, err
+	return fid, budget, r, err
 }
 
 func encodeForwardResponse(fid uint64, r Response) []byte {

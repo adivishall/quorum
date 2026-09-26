@@ -2,10 +2,12 @@ package kv
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"math"
 	"math/rand"
 	"testing"
+	"time"
 )
 
 // TestRequestValidationRejectsEveryOutOfContractField is the input-validation
@@ -134,5 +136,46 @@ func TestMalformedIdentifiersAreProtocolErrors(t *testing.T) {
 	max := Request{Op: ReqPut, ClientID: math.MaxUint64, RequestID: math.MaxUint64, AckedBelow: math.MaxUint64, Key: []byte("k")}
 	if got, err := decodeRequest(encodeRequest(max)); err != nil || got.ClientID != math.MaxUint64 || got.RequestID != math.MaxUint64 {
 		t.Fatalf("max identifiers: %+v %v", got, err)
+	}
+}
+
+// TestDurationsThatOverflowAreProtocolErrors pins the fix for a canonicality
+// bug `make fuzz` found (FuzzDecodeRequestIsTotal, seed 4acea4bd2e6f9ba9): a
+// timeoutMillis too large for a time.Duration overflowed on conversion, so the
+// frame decoded to a request that re-encoded to different bytes. A request
+// timeout or a forward budget beyond maxMillis is now refused; maxMillis itself
+// round-trips; and the encoder never writes a negative duration, nor turns a
+// positive one below a millisecond into 0 (which would mean "the default").
+func TestDurationsThatOverflowAreProtocolErrors(t *testing.T) {
+	req := func(ms uint64) []byte {
+		b := []byte{byte(ReqGet), 0, 0, 0}
+		b = binary.AppendUvarint(b, ms)
+		return append(b, 1, 'k')
+	}
+	if _, err := decodeRequest(req(maxMillis + 1)); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("a timeout past time.Duration decoded: %v", err)
+	}
+	if _, err := decodeRequest(req(math.MaxUint64)); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("the largest varint timeout decoded: %v", err)
+	}
+	r, err := decodeRequest(req(maxMillis))
+	if err != nil || !bytes.Equal(encodeRequest(r), req(maxMillis)) {
+		t.Fatalf("the largest valid timeout must round-trip: %+v %v", r, err)
+	}
+	fwd := func(ms uint64) []byte {
+		b := binary.AppendUvarint(nil, 5)
+		b = binary.AppendUvarint(b, ms)
+		return append(b, req(1)...)
+	}
+	if _, _, _, err := decodeForward(fwd(maxMillis + 1)); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("a forward budget past time.Duration decoded: %v", err)
+	}
+	if _, budget, _, err := decodeForward(fwd(maxMillis)); err != nil || budget != time.Duration(maxMillis)*time.Millisecond {
+		t.Fatalf("the largest valid budget: %v %v", budget, err)
+	}
+	for in, want := range map[time.Duration]uint64{-time.Second: 0, 0: 0, time.Microsecond: 1, time.Millisecond: 1, 1500 * time.Microsecond: 1, 2 * time.Second: 2000} {
+		if got := millisOf(in); got != want {
+			t.Errorf("millisOf(%v) = %d, want %d", in, got, want)
+		}
 	}
 }

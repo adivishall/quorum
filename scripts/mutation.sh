@@ -720,6 +720,13 @@ mutant "a-restart-rebuilds-the-session-table-by-replay" internal/raftnode/node.g
 		_ = mlog.Apply(rec.HardState.Commit)' \
   "./internal/kv ./internal/raftsim ./tests/integration" 'TestRetryAfterEveryNodeRestarts|TestKVSimSessionsSurviveARestartOfEveryNode|TestRealSessionContractSurvivesFullClusterRestart'
 
+# 90. A duration past time.Duration is decoded (it overflows, and the frame
+#     re-encodes to different bytes — the canonicality bug fuzzing found).
+mutant "durations-that-overflow-are-protocol-errors" internal/kv/wire.go \
+  '	if d.err == nil && ms > maxMillis {' \
+  '	if false && d.err == nil && ms > maxMillis {' \
+  ./internal/kv 'TestDurationsThatOverflowAreProtocolErrors|FuzzDecodeRequestIsTotal'
+
 echo "== Phase 13: the checker over logical operations, and the reference model =="
 
 # 77. Request identity is not scoped by client: the same RequestID from two
