@@ -87,7 +87,11 @@ proposed. The rules (`Request.validate`; each pinned by
 
 Anything that validates becomes a log command every replica can apply
 (`TestValidatedRequestsAlwaysApply`) — no client can get an entry proposed that replicas refuse.
-What validation cannot know is decided at apply, deterministically: a clientID that names no
+Identifiers are any 64-bit values; one that is not a canonical varint of at most 64 bits (an
+overlong encoding, more than 64 bits, truncated) is a protocol error before validation
+(`TestMalformedIdentifiersAreProtocolErrors`). There is no client-supplied hash to check — the
+state machine fingerprints the command itself. What validation cannot know is decided at apply,
+deterministically: a clientID that names no
 session is `SESSION_EXPIRED`; a reused requestID is a duplicate or `REQUEST_CONFLICT`; one below the
 session's watermark is `REQUEST_STALE` (CLIENT_SEMANTICS §4). The timeout is clamped to the server
 maximum (10 s; 0 means that maximum).

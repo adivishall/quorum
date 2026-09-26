@@ -199,6 +199,13 @@ difference shrinks further. The two linear scans (watermark, LRU) are bounded by
 cost at most ~1 µs and ~10 µs; they are the first thing to index if the limits are ever raised by
 orders of magnitude.
 
+**Unbounded growth, audited.** Everything Phase 13 added is bounded: the session table by its
+limits (§6); a forwarder's table of forwards awaiting an answer by the requests in flight (each
+entry is removed when its forward completes or times out); a session client's in-flight set by the
+caller's concurrency. The one unbounded structure on the request path is pre-existing: the Raft log
+itself, which nothing truncates until Phase 14 — and every request, including a duplicate, a
+refusal decided at apply, or a request naming an unknown session, adds an entry to it.
+
 ## 9. Mutants
 
 61 dedup lookup skipped · 62 conflict without fingerprint · 63 a refused conflict takes effect ·

@@ -103,3 +103,36 @@ func TestValidatedRequestsAlwaysApply(t *testing.T) {
 		t.Fatalf("only %d requests validated: the generator does not reach the accepted space", accepted)
 	}
 }
+
+// TestMalformedIdentifiersAreProtocolErrors: identifiers that are not
+// canonical 64-bit varints never reach validation — the frame is refused
+// (and the connection closed): an overlong encoding of a small id, an id
+// longer than 64 bits, a truncated id, trailing bytes after the request.
+func TestMalformedIdentifiersAreProtocolErrors(t *testing.T) {
+	good := encodeRequest(Request{Op: ReqPut, ClientID: 7, RequestID: 3, AckedBelow: 3, Key: []byte("k"), Value: []byte("v")})
+	if _, err := decodeRequest(good); err != nil {
+		t.Fatalf("control: %v", err)
+	}
+	withClientID := func(id []byte) []byte {
+		b := []byte{byte(ReqPut)}
+		b = append(b, id...)
+		return append(b, good[2:]...) // good[1] is ClientID 7, one byte
+	}
+	cases := map[string][]byte{
+		"overlong ClientID (7 in two bytes)": withClientID([]byte{0x87, 0x00}),
+		"ClientID over 64 bits":              withClientID([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f}),
+		"ClientID never terminated":          withClientID([]byte{0xff, 0xff, 0xff}),
+		"truncated after the op":             {byte(ReqPut)},
+		"trailing bytes":                     append(append([]byte(nil), good...), 0),
+	}
+	for name, b := range cases {
+		if _, err := decodeRequest(b); !errors.Is(err, ErrProtocol) {
+			t.Errorf("%s: decoded with %v, want ErrProtocol", name, err)
+		}
+	}
+	// The largest identifiers are ordinary values, not errors.
+	max := Request{Op: ReqPut, ClientID: math.MaxUint64, RequestID: math.MaxUint64, AckedBelow: math.MaxUint64, Key: []byte("k")}
+	if got, err := decodeRequest(encodeRequest(max)); err != nil || got.ClientID != math.MaxUint64 || got.RequestID != math.MaxUint64 {
+		t.Fatalf("max identifiers: %+v %v", got, err)
+	}
+}
