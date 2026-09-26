@@ -176,8 +176,10 @@ func (r *linRun) workload(opts workload.Options, schedule func()) workload.Stats
 	done := make(chan workload.Stats, 1)
 	go func() { done <- workload.Run(ctx, r.c.endpoints(), opts, r.rec) }()
 	if schedule != nil {
-		schedule()
-		stop.Store(true)
+		func() {
+			defer stop.Store(true) // also when a premise aborts the attempt
+			schedule()
+		}()
 	}
 	st := <-done
 	r.event("workload ended: %s", st)
@@ -235,6 +237,70 @@ func (r *linRun) fail(format string, args ...any) {
 	msg += "\n--- schedule ---\n" + strings.Join(r.notes, "\n") + "\n" + strings.Join(r.events, "\n")
 	r.mu.Unlock()
 	r.t.Fatal(msg)
+}
+
+// premiseFailed aborts one attempt of a scenario (not the test): real timing
+// violated a precondition the scenario verifies — typically, the node it armed
+// or cut off had already been deposed by a spurious election before the action,
+// which the node's own "not leader" refusal proves. Such an attempt tests
+// nothing, so the scenario starts over on a fresh cluster (withPremise). Only a
+// premise is ever retried; an assertion that fails fails the test at once.
+type premiseFailed struct{ why string }
+
+// premise aborts the attempt when cond is false.
+func (r *linRun) premise(cond bool, format string, args ...any) {
+	r.t.Helper()
+	if cond {
+		return
+	}
+	why := fmt.Sprintf(format, args...)
+	r.event("premise not met: %s", why)
+	r.c.killAll()
+	panic(premiseFailed{why})
+}
+
+// withPremise runs attempt until its premises hold, at most maxPremiseAttempts
+// times, logging every attempt whose premise real timing violated.
+func withPremise(t *testing.T, attempt func()) {
+	t.Helper()
+	if err := runWithPremise(attempt, t.Logf); err != nil {
+		t.Fatal(err)
+	}
+}
+
+const maxPremiseAttempts = 3
+
+// runWithPremise is withPremise's loop: it returns nil once an attempt
+// completes, and an error if every attempt's premise failed. Any other panic
+// propagates, and a test failure inside an attempt (t.Fatal: runtime.Goexit)
+// ends the test as it always does.
+func runWithPremise(attempt func(), logf func(string, ...any)) error {
+	for i := 1; i <= maxPremiseAttempts; i++ {
+		var failed *premiseFailed
+		func() {
+			defer func() {
+				if v := recover(); v != nil {
+					pf, ok := v.(premiseFailed)
+					if !ok {
+						panic(v)
+					}
+					failed = &pf
+				}
+			}()
+			attempt()
+		}()
+		if failed == nil {
+			return nil
+		}
+		logf("attempt %d: premise not met (%s); starting over on a fresh cluster", i, failed.why)
+	}
+	return fmt.Errorf("the scenario's premise was not met in %d attempts", maxPremiseAttempts)
+}
+
+// refusedAsNotLeader reports whether an operation's first request was refused
+// by its target as "not leader" — proof the target did not lead when it arrived.
+func refusedAsNotLeader(op lincheck.Op) bool {
+	return len(op.Attempts) > 0 && strings.HasPrefix(op.Attempts[0].Result, "not-leader")
 }
 
 // require asserts an outcome of one scripted operation.
@@ -359,46 +425,51 @@ func TestRealCompletedWriteIsSeenByEveryLaterRead(t *testing.T) {
 // after PUT(B) completed, and the checker would reject the history (the
 // Phase 12 mutant "Server.Get bypasses ReadIndex" dies here).
 func TestRealStaleLeaderNeverServesARead(t *testing.T) {
-	c := newRCluster(t, 3)
-	l1, t1 := c.waitLeader(c.ids, 0, 20*time.Second)
-	c.waitClientReady(20 * time.Second)
-	r := newLinRun(t, c)
-	ctx := context.Background()
-	w := r.client("writer", 10*time.Second, 4)
-	w.Prefer(l1)
-	r.require(w.Put(ctx, "k", []byte("A")), lincheck.OK, "")
+	withPremise(t, func() {
+		c := newRCluster(t, 3)
+		c.waitLeader(c.ids, 0, 20*time.Second)
+		c.waitClientReady(20 * time.Second)
+		r := newLinRun(t, c)
+		ctx := context.Background()
+		w := r.client("writer", 10*time.Second, 4)
+		r.require(w.Put(ctx, "k", []byte("A")), lincheck.OK, "")
+		l1, t1 := c.waitStable(c.ids, 0, 30*time.Second)
 
-	r.event("isolate %s (leader of term %d)", l1, t1)
-	c.isolate(l1)
-	l2, t2 := c.waitLeader(others(c.ids, l1), t1, 20*time.Second)
-	r.event("%s leads term %d", l2, t2)
-	w.Prefer(l2)
-	r.require(w.Put(ctx, "k", []byte("B")), lincheck.OK, "")
+		r.event("isolate %s (leader of term %d)", l1, t1)
+		c.isolate(l1)
+		l2, t2 := c.waitLeader(others(c.ids, l1), t1, 20*time.Second)
+		r.event("%s leads term %d", l2, t2)
+		w.Prefer(l2)
+		r.require(w.Put(ctx, "k", []byte("B")), lincheck.OK, "")
 
-	// The read on the stale leader: one attempt, no redirect, a short deadline.
-	stale := r.client("stale-reader", 2*time.Second, 1)
-	stale.Prefer(l1)
-	op := stale.Get(ctx, "k")
-	if op.Outcome == lincheck.OK || op.Outcome == lincheck.NotFound {
-		r.fail("the isolated leader %s SERVED a read after %s completed PUT(B) in term %d: %s", l1, l2, t2, op)
-	}
-	if op.Outcome != lincheck.Incomplete {
-		r.fail("the isolated leader %s cannot know it was deposed, so its read can only time out: %s", l1, op)
-	}
+		// The read on the stale leader: one attempt, no redirect, a short deadline.
+		stale := r.client("stale-reader", 2*time.Second, 1)
+		stale.Prefer(l1)
+		op := stale.Get(ctx, "k")
+		// Cut off, l1 can learn nothing: a "not leader" answer means it had been
+		// deposed BEFORE the cut — the attempt's premise, not a verdict.
+		r.premise(!refusedAsNotLeader(op), "%s had been deposed before it was cut off: %s", l1, op)
+		if op.Outcome == lincheck.OK || op.Outcome == lincheck.NotFound {
+			r.fail("the isolated leader %s SERVED a read after %s completed PUT(B) in term %d: %s", l1, l2, t2, op)
+		}
+		if op.Outcome != lincheck.Incomplete {
+			r.fail("the isolated leader %s cannot know it was deposed, so its read can only time out: %s", l1, op)
+		}
 
-	r.event("heal")
-	c.healAll()
-	c.waitFollows(l1, l2, t2, 20*time.Second)
-	rd := r.client("reader", 10*time.Second, 4)
-	rd.Prefer(l1)
-	op = rd.Get(ctx, "k")
-	r.require(op, lincheck.OK, "B")
-	if op.Attempts[0].Node != l1 || !strings.HasPrefix(op.Attempts[0].Result, "not-leader") {
-		r.fail("the deposed leader %s must refuse the read: %+v", l1, op.Attempts)
-	}
-	r.check()
-	c.waitStable(c.ids, 0, 30*time.Second)
-	c.finish()
+		r.event("heal")
+		c.healAll()
+		c.waitFollows(l1, l2, t2, 20*time.Second)
+		rd := r.client("reader", 10*time.Second, 4)
+		rd.Prefer(l1)
+		op = rd.Get(ctx, "k")
+		r.require(op, lincheck.OK, "B")
+		if op.Attempts[0].Node != l1 || !strings.HasPrefix(op.Attempts[0].Result, "not-leader") {
+			r.fail("the deposed leader %s must refuse the read: %+v", l1, op.Attempts)
+		}
+		r.check()
+		c.waitStable(c.ids, 0, 30*time.Second)
+		c.finish()
+	})
 }
 
 // TestRealMinorityLeaderWithAFollowerNeverServesARead is the stale-leader attack
@@ -411,48 +482,51 @@ func TestRealStaleLeaderNeverServesARead(t *testing.T) {
 // would leave it with no acknowledgements at all — a weaker attack that a
 // broken quorum rule survives; this one it does not.)
 func TestRealMinorityLeaderWithAFollowerNeverServesARead(t *testing.T) {
-	c := newRCluster(t, 5)
-	l1, t1 := c.waitLeader(c.ids, 0, 20*time.Second)
-	c.waitClientReady(20 * time.Second)
-	r := newLinRun(t, c)
-	ctx := context.Background()
-	w := r.client("writer", 10*time.Second, 6)
-	w.Prefer(l1)
-	r.require(w.Put(ctx, "k", []byte("A")), lincheck.OK, "")
-	c.waitCommit(c.ids, c.commitOf(l1), 20*time.Second)
+	withPremise(t, func() {
+		c := newRCluster(t, 5)
+		c.waitLeader(c.ids, 0, 20*time.Second)
+		c.waitClientReady(20 * time.Second)
+		r := newLinRun(t, c)
+		ctx := context.Background()
+		w := r.client("writer", 10*time.Second, 6)
+		r.require(w.Put(ctx, "k", []byte("A")), lincheck.OK, "")
+		l1, t1 := c.waitStable(c.ids, 0, 30*time.Second)
+		c.waitCommit(c.ids, c.commitOf(l1), 20*time.Second)
 
-	f := others(c.ids, l1)[0]
-	minority, majority := []string{l1, f}, others(others(c.ids, l1), f)
-	r.event("split %v | %v (leader %s of term %d)", minority, majority, l1, t1)
-	c.split(minority, majority)
-	l2, t2 := c.waitLeader(majority, t1, 20*time.Second)
-	r.event("%s leads term %d", l2, t2)
-	w.Prefer(l2)
-	r.require(w.Put(ctx, "k", []byte("B")), lincheck.OK, "")
+		f := others(c.ids, l1)[0]
+		minority, majority := []string{l1, f}, others(others(c.ids, l1), f)
+		r.event("split %v | %v (leader %s of term %d)", minority, majority, l1, t1)
+		c.split(minority, majority)
+		l2, t2 := c.waitLeader(majority, t1, 20*time.Second)
+		r.event("%s leads term %d", l2, t2)
+		w.Prefer(l2)
+		r.require(w.Put(ctx, "k", []byte("B")), lincheck.OK, "")
 
-	stale := r.client("stale-reader", 3*time.Second, 1)
-	stale.Prefer(l1)
-	op := stale.Get(ctx, "k")
-	if op.Outcome != lincheck.Incomplete {
-		r.fail("the minority leader %s (with follower %s) answered a read after %s completed PUT(B) in term %d: %s", l1, f, l2, t2, op)
-	}
-	// Premise, checked after the fact: the follower stayed with the minority
-	// leader's term throughout (it never reported a later one).
-	for _, m := range reFollower.FindAllStringSubmatch(c.procs[f].out.String(), -1) {
-		if tm, _ := strconv.ParseUint(m[2], 10, 64); tm >= t2 {
-			r.fail("premise: %s left the minority leader's term before the read (it followed %s in term %d)", f, m[3], tm)
+		stale := r.client("stale-reader", 3*time.Second, 1)
+		stale.Prefer(l1)
+		op := stale.Get(ctx, "k")
+		// Premises, checked after the fact: l1 still led when the read arrived (a
+		// "not leader" answer proves it had been deposed before the split, or by
+		// its own follower campaigning), and the follower stayed in l1's term.
+		r.premise(!refusedAsNotLeader(op), "%s did not lead when the read arrived: %s", l1, op)
+		for _, m := range reFollower.FindAllStringSubmatch(c.procs[f].out.String(), -1) {
+			tm, _ := strconv.ParseUint(m[2], 10, 64)
+			r.premise(tm < t2, "%s left the minority leader's term before the read (it followed %s in term %d)", f, m[3], tm)
 		}
-	}
+		if op.Outcome != lincheck.Incomplete {
+			r.fail("the minority leader %s (with follower %s) answered a read after %s completed PUT(B) in term %d: %s", l1, f, l2, t2, op)
+		}
 
-	r.event("heal")
-	c.healAll()
-	c.waitFollows(l1, l2, t2, 20*time.Second)
-	rd := r.client("reader", 10*time.Second, 6)
-	rd.Prefer(l1)
-	r.require(rd.Get(ctx, "k"), lincheck.OK, "B")
-	r.check()
-	c.waitStable(c.ids, 0, 30*time.Second)
-	c.finish()
+		r.event("heal")
+		c.healAll()
+		c.waitFollows(l1, l2, t2, 20*time.Second)
+		rd := r.client("reader", 10*time.Second, 6)
+		rd.Prefer(l1)
+		r.require(rd.Get(ctx, "k"), lincheck.OK, "B")
+		r.check()
+		c.waitStable(c.ids, 0, 30*time.Second)
+		c.finish()
+	})
 }
 
 // TestRealReadsAcrossLeaderChanges: GET, then a leadership change, then GET —
@@ -521,11 +595,12 @@ func faultWorkload(seed int64) workload.Options {
 // state machine rebuilt by replaying its committed prefix) and rejoins.
 func TestRealLeaderKilledDuringWorkload(t *testing.T) {
 	c := newRCluster(t, 3)
-	l, tm := c.waitLeader(c.ids, 0, 20*time.Second)
+	c.waitLeader(c.ids, 0, 20*time.Second)
 	c.waitClientReady(20 * time.Second)
 	r := newLinRun(t, c)
 	st := r.workload(faultWorkload(21), func() {
 		r.waitServed(60, 60*time.Second)
+		l, tm := c.waitStable(c.ids, 0, 30*time.Second)
 		r.event("kill leader %s (term %d)", l, tm)
 		c.kill(l)
 		l2, t2 := c.waitLeader(others(c.ids, l), tm, 20*time.Second)
@@ -551,33 +626,42 @@ func TestRealLeaderKilledDuringWorkload(t *testing.T) {
 // machine, catches up by replay, and a read sent to it afterwards is refused
 // (not leader) and redirected — it never answers from its rebuilt store.
 func TestRealFollowerKilledDuringWorkload(t *testing.T) {
-	c := newRCluster(t, 3)
-	l, _ := c.waitLeader(c.ids, 0, 20*time.Second)
-	c.waitClientReady(20 * time.Second)
-	f := others(c.ids, l)[0]
-	r := newLinRun(t, c)
-	r.workload(faultWorkload(31), func() {
-		r.waitServed(60, 60*time.Second)
-		r.event("kill follower %s", f)
-		c.kill(f)
-		r.waitServed(60, 60*time.Second) // served with f down
-		c.start(f)
-		waitForLine(t, c.procs[f], "event=client_ready", 20*time.Second)
-		r.event("restarted %s", f)
-		c.waitStable(c.ids, 0, 30*time.Second)
-		rd := r.client("follower-reader", 10*time.Second, 6)
-		rd.Prefer(f)
-		op := rd.Get(context.Background(), "k0")
-		if op.Outcome != lincheck.OK && op.Outcome != lincheck.NotFound {
-			r.fail("read redirected from the restarted follower: %s", op)
-		}
-		if first := op.Attempts[0]; first.Node != f || !strings.HasPrefix(first.Result, "not-leader") {
-			r.fail("the restarted follower %s must refuse the read: %+v", f, op.Attempts)
-		}
-		r.waitServed(40, 60*time.Second)
+	withPremise(t, func() {
+		c := newRCluster(t, 3)
+		c.waitLeader(c.ids, 0, 20*time.Second)
+		c.waitClientReady(20 * time.Second)
+		r := newLinRun(t, c)
+		r.workload(faultWorkload(31), func() {
+			r.waitServed(60, 60*time.Second)
+			l, _ := c.waitStable(c.ids, 0, 30*time.Second)
+			f := others(c.ids, l)[0]
+			r.event("kill follower %s", f)
+			c.kill(f)
+			r.waitServed(60, 60*time.Second) // served with f down
+			c.start(f)
+			waitForLine(t, c.procs[f], "event=client_ready", 20*time.Second)
+			r.event("restarted %s", f)
+			l2, _ := c.waitStable(c.ids, 0, 30*time.Second)
+			// The restarted node may legitimately win an election; the read
+			// below is about a restarted FOLLOWER.
+			r.premise(l2 != f, "the restarted %s became the leader", f)
+			rd := r.client("follower-reader", 10*time.Second, 6)
+			rd.Prefer(f)
+			op := rd.Get(context.Background(), "k0")
+			if op.Outcome != lincheck.OK && op.Outcome != lincheck.NotFound {
+				r.fail("read redirected from the restarted follower: %s", op)
+			}
+			if first := op.Attempts[0]; first.Node != f || !strings.HasPrefix(first.Result, "not-leader") {
+				// f refused, or it had become leader since waitStable (then
+				// it served: a premise, not a verdict).
+				r.premise(op.Node != f, "%s became the leader before the read arrived", f)
+				r.fail("the restarted follower %s must refuse the read: %+v", f, op.Attempts)
+			}
+			r.waitServed(40, 60*time.Second)
+		})
+		r.check()
+		c.finish()
 	})
-	r.check()
-	c.finish()
 }
 
 // TestRealLeaderPartitionedDuringWorkload: the leader's links are cut while six
@@ -588,27 +672,30 @@ func TestRealFollowerKilledDuringWorkload(t *testing.T) {
 // (their writers, if still waiting, learn they were lost), and the workload
 // continues across the heal.
 func TestRealLeaderPartitionedDuringWorkload(t *testing.T) {
-	c := newRCluster(t, 3)
-	l, tm := c.waitLeader(c.ids, 0, 20*time.Second)
-	c.waitClientReady(20 * time.Second)
-	r := newLinRun(t, c)
-	st := r.workload(faultWorkload(41), func() {
-		r.waitServed(60, 60*time.Second)
-		r.event("isolate leader %s (term %d)", l, tm)
-		c.isolate(l)
-		l2, t2 := c.waitLeader(others(c.ids, l), tm, 20*time.Second)
-		r.event("%s leads term %d", l2, t2)
-		r.waitServed(60, 60*time.Second)
-		c.healAll()
-		r.event("heal")
-		c.waitStable(c.ids, t2-1, 30*time.Second)
-		r.waitServed(60, 60*time.Second)
+	withPremise(t, func() {
+		c := newRCluster(t, 3)
+		c.waitLeader(c.ids, 0, 20*time.Second)
+		c.waitClientReady(20 * time.Second)
+		r := newLinRun(t, c)
+		st := r.workload(faultWorkload(41), func() {
+			r.waitServed(60, 60*time.Second)
+			l, tm := c.waitStable(c.ids, 0, 30*time.Second)
+			r.event("isolate leader %s (term %d)", l, tm)
+			c.isolate(l)
+			l2, t2 := c.waitLeader(others(c.ids, l), tm, 20*time.Second)
+			r.event("%s leads term %d", l2, t2)
+			r.waitServed(60, 60*time.Second)
+			c.healAll()
+			r.event("heal")
+			c.waitStable(c.ids, t2-1, 30*time.Second)
+			r.waitServed(60, 60*time.Second)
+		})
+		r.check() // every attempt's history is checked, whatever its premise
+		// Non-vacuity is this scenario's premise: if the leader had been deposed
+		// before the cut, no client waits on a stale leader and nothing was tested.
+		r.premise(st.Unknown > 0, "no client ever waited on the isolated leader: %s", st)
+		c.finish()
 	})
-	r.check()
-	if st.Unknown == 0 {
-		r.fail("no client ever waited on the isolated leader: %s", st)
-	}
-	c.finish()
 }
 
 // TestRealLeaderChangesWithoutCrashes: leadership moves repeatedly — the leader
@@ -713,12 +800,7 @@ func (c *rcluster) armCrash(id string) {
 // committed, which the explicit later-read assertion requires. The history is
 // checked too.
 func TestRealWriteCrashWindows(t *testing.T) {
-	cases := []struct {
-		spec      string
-		inLog     bool   // the entry must be on the victim's disk
-		committed string // "yes", "no", "any": the victim's durable commit covers it
-		read      string // "new", "old", "any"
-	}{
+	cases := []crashCase{
 		{"before-save:1", false, "no", "old"},
 		{"after-save:1", true, "no", "any"},
 		{"after-save:2", true, "yes", "new"},
@@ -730,76 +812,93 @@ func TestRealWriteCrashWindows(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.spec, func(t *testing.T) {
-			c := newRClusterArgs(t, 3, "-crash-at", tc.spec, "-crash-armed-by-signal")
-			l, tm := c.waitLeader(c.ids, 0, 20*time.Second)
-			c.waitClientReady(20 * time.Second)
-			r := newLinRun(t, c)
-			ctx := context.Background()
-			setup := r.client("setup", 10*time.Second, 4)
-			setup.Prefer(l)
-			r.require(setup.Put(ctx, "k", []byte("old")), lincheck.OK, "")
-			// Quiesce: every node has applied "old", so after arming the only
-			// Save, apply and reply the leader performs are the next write's.
-			c.waitCommit(c.ids, c.commitOf(l), 20*time.Second)
-
-			c.armCrash(l)
-			r.event("armed %s at %s on leader %s (term %d)", tc.spec, tc.spec, l, tm)
-			w := r.client("writer", 10*time.Second, 1) // one attempt: no retry, no redirect
-			w.Prefer(l)
-			op := w.Put(ctx, "k", []byte("new"))
-			point, nth := c.waitKilledAtPoint(l, 30*time.Second)
-			r.event("%s died at %s#%d", l, point, nth)
-			if want := strings.SplitN(tc.spec, ":", 2)[0]; point != want {
-				r.fail("died at %s, want %s", point, want)
-			}
-			switch {
-			case tc.spec == "after-reply:1" && op.Outcome == lincheck.OK:
-				t.Logf("the response left before the SIGKILL: the client knows")
-			case op.Outcome != lincheck.Incomplete:
-				r.fail("the writer must hear nothing from a leader that died at %s: %s", tc.spec, op)
-			}
-
-			// What the system did: the victim's durable log.
-			held, err := raftlog.Inspect(filepath.Join(c.dirs[l], "raft-"+l+".log"))
-			if err != nil {
-				r.fail("inspect %s: %v", l, err)
-			}
-			idx := entryHolding(held, "k", "new")
-			switch {
-			case tc.inLog && idx == 0:
-				r.fail("premise: at %s the entry must be on the leader's disk; it holds %d entries, commit %d", tc.spec, len(held.Entries), held.HardState.Commit)
-			case !tc.inLog && idx != 0:
-				r.fail("premise: at %s the entry must NOT be on the leader's disk, but index %d holds it", tc.spec, idx)
-			case tc.committed == "yes" && held.HardState.Commit < idx:
-				r.fail("premise: at %s the leader's durable commit (%d) must cover the entry (%d)", tc.spec, held.HardState.Commit, idx)
-			case tc.committed == "no" && idx != 0 && held.HardState.Commit >= idx:
-				r.fail("premise: at %s the entry (%d) must not yet be committed (durable commit %d)", tc.spec, idx, held.HardState.Commit)
-			}
-			r.event("victim's disk: entry index %d, durable commit %d", idx, held.HardState.Commit)
-
-			l2, t2 := c.waitLeader(others(c.ids, l), tm, 20*time.Second)
-			r.event("%s leads term %d", l2, t2)
-			c.start(l)
-			waitForLine(t, c.procs[l], "event=client_ready", 20*time.Second)
-			r.event("restarted %s", l)
-			c.waitStable(c.ids, 0, 30*time.Second)
-			rd := r.client("reader", 10*time.Second, 6)
-			got := rd.Get(ctx, "k")
-			if got.Outcome != lincheck.OK {
-				r.fail("read after recovery: %s", got)
-			}
-			switch saw := string(got.Output); {
-			case tc.read == "new" && saw != "new":
-				r.fail("the write was committed when the leader died at %s, but a later read returned %q: a committed write was lost", tc.spec, saw)
-			case tc.read == "old" && saw != "old":
-				r.fail("the write never left the leader at %s, but a later read returned %q", tc.spec, saw)
-			default:
-				t.Logf("crash at %s: client outcome %s; entry %d on disk (durable commit %d); later read %q", tc.spec, op.Outcome, idx, held.HardState.Commit, saw)
-			}
-			r.check()
-			c.finish()
+			withPremise(t, func() { crashWindow(t, tc) })
 		})
 	}
+}
+
+// crashCase is one row of TestRealWriteCrashWindows.
+type crashCase struct {
+	spec      string
+	inLog     bool   // the entry must be on the victim's disk
+	committed string // "yes", "no", "any": the victim's durable commit covers it
+	read      string // "new", "old", "any"
+}
+
+// crashWindow is one attempt at one row of TestRealWriteCrashWindows.
+func crashWindow(t *testing.T, tc crashCase) {
+	c := newRClusterArgs(t, 3, "-crash-at", tc.spec, "-crash-armed-by-signal")
+	c.waitLeader(c.ids, 0, 20*time.Second)
+	c.waitClientReady(20 * time.Second)
+	r := newLinRun(t, c)
+	ctx := context.Background()
+	setup := r.client("setup", 10*time.Second, 4)
+	r.require(setup.Put(ctx, "k", []byte("old")), lincheck.OK, "")
+	// Quiesce: every node has applied "old", so after arming the only
+	// Save, apply and reply the leader performs are the next write's.
+	l, tm := c.waitStable(c.ids, 0, 30*time.Second)
+	c.waitCommit(c.ids, c.commitOf(l), 20*time.Second)
+
+	c.armCrash(l)
+	r.event("armed %s at %s on leader %s (term %d)", tc.spec, tc.spec, l, tm)
+	w := r.client("writer", 10*time.Second, 1) // one attempt: no retry, no redirect
+	w.Prefer(l)
+	op := w.Put(ctx, "k", []byte("new"))
+	r.premise(!refusedAsNotLeader(op), "the armed node %s had been deposed before the write arrived: %s", l, op)
+	point, nth := c.waitKilledAtPoint(l, 30*time.Second)
+	r.event("%s died at %s#%d", l, point, nth)
+	if want := strings.SplitN(tc.spec, ":", 2)[0]; point != want {
+		r.fail("died at %s, want %s", point, want)
+	}
+	switch {
+	case tc.spec == "after-reply:1" && op.Outcome == lincheck.OK:
+		t.Logf("the response left before the SIGKILL: the client knows")
+	case op.Outcome != lincheck.Incomplete:
+		r.fail("the writer must hear nothing from a leader that died at %s: %s", tc.spec, op)
+	}
+
+	// What the system did: the victim's durable log.
+	held, err := raftlog.Inspect(filepath.Join(c.dirs[l], "raft-"+l+".log"))
+	if err != nil {
+		r.fail("inspect %s: %v", l, err)
+	}
+	// The crash point belongs to this write only if no election
+	// intervened between arming and the crash.
+	r.premise(held.HardState.Term == tm, "%s's term moved from %d to %d between arming and the crash: the point may belong to another operation", l, tm, held.HardState.Term)
+	idx := entryHolding(held, "k", "new")
+	switch {
+	case tc.inLog && idx == 0:
+		r.fail("premise: at %s the entry must be on the leader's disk; it holds %d entries, commit %d", tc.spec, len(held.Entries), held.HardState.Commit)
+	case !tc.inLog && idx != 0:
+		r.fail("premise: at %s the entry must NOT be on the leader's disk, but index %d holds it", tc.spec, idx)
+	case tc.committed == "yes" && held.HardState.Commit < idx:
+		r.fail("premise: at %s the leader's durable commit (%d) must cover the entry (%d)", tc.spec, held.HardState.Commit, idx)
+	case tc.committed == "no" && idx != 0 && held.HardState.Commit >= idx:
+		r.fail("premise: at %s the entry (%d) must not yet be committed (durable commit %d)", tc.spec, idx, held.HardState.Commit)
+	}
+	r.event("victim's disk: entry index %d, durable commit %d", idx, held.HardState.Commit)
+
+	l2, t2 := c.waitLeader(others(c.ids, l), tm, 20*time.Second)
+	r.event("%s leads term %d", l2, t2)
+	c.start(l)
+	waitForLine(t, c.procs[l], "event=client_ready", 20*time.Second)
+	r.event("restarted %s", l)
+	c.waitStable(c.ids, 0, 30*time.Second)
+	rd := r.client("reader", 10*time.Second, 6)
+	got := rd.Get(ctx, "k")
+	if got.Outcome != lincheck.OK {
+		r.fail("read after recovery: %s", got)
+	}
+	switch saw := string(got.Output); {
+	case tc.read == "new" && saw != "new":
+		r.fail("the write was committed when the leader died at %s, but a later read returned %q: a committed write was lost", tc.spec, saw)
+	case tc.read == "old" && saw != "old":
+		r.fail("the write never left the leader at %s, but a later read returned %q", tc.spec, saw)
+	default:
+		t.Logf("crash at %s: client outcome %s; entry %d on disk (durable commit %d); later read %q", tc.spec, op.Outcome, idx, held.HardState.Commit, saw)
+	}
+	r.check()
+	c.finish()
 }
 
 // --- incomplete operations and retries ---
@@ -820,55 +919,64 @@ func TestRealWriteCrashWindows(t *testing.T) {
 // retry would be recognized, not re-applied, and the single-operation view
 // would become true.
 func TestRealIncompleteWriteThenRetry(t *testing.T) {
-	c := newRClusterArgs(t, 3, "-crash-at", "after-applied-to:1", "-crash-armed-by-signal")
-	l, tm := c.waitLeader(c.ids, 0, 20*time.Second)
-	c.waitClientReady(20 * time.Second)
-	r := newLinRun(t, c)
-	ctx := context.Background()
-	c.waitCommit(c.ids, c.commitOf(l), 20*time.Second)
-	c.armCrash(l)
-	c1 := r.client("c1", 10*time.Second, 1)
-	c1.Prefer(l)
-	first := c1.Put(ctx, "k", []byte("A"))
-	c.waitKilledAtPoint(l, 30*time.Second)
-	r.event("%s died after applying c1's PUT(A), before replying", l)
-	if first.Outcome != lincheck.Incomplete {
-		r.fail("c1 must hear nothing: %s", first)
-	}
-	l2, t2 := c.waitLeader(others(c.ids, l), tm, 20*time.Second)
-	r.event("%s leads term %d", l2, t2)
-	reader := r.client("reader", 10*time.Second, 6)
-	r.require(reader.Get(ctx, "k"), lincheck.OK, "A") // committed, though c1 does not know
-	c2 := r.client("c2", 10*time.Second, 6)
-	r.require(c2.Put(ctx, "k", []byte("B")), lincheck.OK, "")
-	r.require(reader.Get(ctx, "k"), lincheck.OK, "B")
-	c1 = r.client("c1", 10*time.Second, 6) // the same client, retrying
-	retry := c1.Put(ctx, "k", []byte("A"))
-	r.require(retry, lincheck.OK, "")
-	r.require(reader.Get(ctx, "k"), lincheck.OK, "A")
-	r.check()
-
-	// The same history with c1's attempts collapsed into one operation.
-	h := r.rec.History()
-	var collapsed lincheck.History
-	for _, op := range h.Ops {
-		switch op.ID {
-		case first.ID:
-			op.Outcome, op.Complete, op.Node, op.Term, op.Index = lincheck.OK, retry.Complete, retry.Node, retry.Term, retry.Index
-		case retry.ID:
-			continue
+	withPremise(t, func() {
+		c := newRClusterArgs(t, 3, "-crash-at", "after-applied-to:1", "-crash-armed-by-signal")
+		c.waitLeader(c.ids, 0, 20*time.Second)
+		c.waitClientReady(20 * time.Second)
+		r := newLinRun(t, c)
+		ctx := context.Background()
+		l, tm := c.waitStable(c.ids, 0, 30*time.Second)
+		c.waitCommit(c.ids, c.commitOf(l), 20*time.Second)
+		c.armCrash(l)
+		c1 := r.client("c1", 10*time.Second, 1)
+		c1.Prefer(l)
+		first := c1.Put(ctx, "k", []byte("A"))
+		r.premise(!refusedAsNotLeader(first), "the armed node %s had been deposed before the write arrived: %s", l, first)
+		c.waitKilledAtPoint(l, 30*time.Second)
+		held, err := raftlog.Inspect(filepath.Join(c.dirs[l], "raft-"+l+".log"))
+		if err != nil {
+			r.fail("inspect %s: %v", l, err)
 		}
-		collapsed.Ops = append(collapsed.Ops, op)
-	}
-	if res := lincheck.Check(collapsed, lincheck.Options{Minimize: true}); res.OK {
-		r.fail("collapsing an unknown write and its retry into one operation must NOT be linearizable here:\n%s", collapsed)
-	} else {
-		t.Logf("collapsed into one PUT(A), the history is rejected, as it must be:\n%s", res.Reason)
-	}
-	c.start(l)
-	waitForLine(t, c.procs[l], "event=client_ready", 20*time.Second)
-	c.waitStable(c.ids, 0, 30*time.Second)
-	c.finish()
+		r.premise(held.HardState.Term == tm, "%s's term moved from %d to %d between arming and the crash", l, tm, held.HardState.Term)
+		r.event("%s died after applying c1's PUT(A), before replying", l)
+		if first.Outcome != lincheck.Incomplete {
+			r.fail("c1 must hear nothing: %s", first)
+		}
+		l2, t2 := c.waitLeader(others(c.ids, l), tm, 20*time.Second)
+		r.event("%s leads term %d", l2, t2)
+		reader := r.client("reader", 10*time.Second, 6)
+		r.require(reader.Get(ctx, "k"), lincheck.OK, "A") // committed, though c1 does not know
+		c2 := r.client("c2", 10*time.Second, 6)
+		r.require(c2.Put(ctx, "k", []byte("B")), lincheck.OK, "")
+		r.require(reader.Get(ctx, "k"), lincheck.OK, "B")
+		c1 = r.client("c1", 10*time.Second, 6) // the same client, retrying
+		retry := c1.Put(ctx, "k", []byte("A"))
+		r.require(retry, lincheck.OK, "")
+		r.require(reader.Get(ctx, "k"), lincheck.OK, "A")
+		r.check()
+
+		// The same history with c1's attempts collapsed into one operation.
+		h := r.rec.History()
+		var collapsed lincheck.History
+		for _, op := range h.Ops {
+			switch op.ID {
+			case first.ID:
+				op.Outcome, op.Complete, op.Node, op.Term, op.Index = lincheck.OK, retry.Complete, retry.Node, retry.Term, retry.Index
+			case retry.ID:
+				continue
+			}
+			collapsed.Ops = append(collapsed.Ops, op)
+		}
+		if res := lincheck.Check(collapsed, lincheck.Options{Minimize: true}); res.OK {
+			r.fail("collapsing an unknown write and its retry into one operation must NOT be linearizable here:\n%s", collapsed)
+		} else {
+			t.Logf("collapsed into one PUT(A), the history is rejected, as it must be:\n%s", res.Reason)
+		}
+		c.start(l)
+		waitForLine(t, c.procs[l], "event=client_ready", 20*time.Second)
+		c.waitStable(c.ids, 0, 30*time.Second)
+		c.finish()
+	})
 }
 
 // TestRealWriteToPartitionedLeaderNeverTakesEffect:
@@ -882,43 +990,48 @@ func TestRealIncompleteWriteThenRetry(t *testing.T) {
 // it to take effect later; the explicit assertion is stronger and specific to
 // this schedule: the entry never reached another node, so it never commits.
 func TestRealWriteToPartitionedLeaderNeverTakesEffect(t *testing.T) {
-	c := newRCluster(t, 3)
-	l, tm := c.waitLeader(c.ids, 0, 20*time.Second)
-	c.waitClientReady(20 * time.Second)
-	r := newLinRun(t, c)
-	ctx := context.Background()
-	setup := r.client("setup", 10*time.Second, 4)
-	r.require(setup.Put(ctx, "k", []byte("old")), lincheck.OK, "")
-	c.waitCommit(c.ids, c.commitOf(l), 20*time.Second)
+	withPremise(t, func() {
+		c := newRCluster(t, 3)
+		c.waitLeader(c.ids, 0, 20*time.Second)
+		c.waitClientReady(20 * time.Second)
+		r := newLinRun(t, c)
+		ctx := context.Background()
+		setup := r.client("setup", 10*time.Second, 4)
+		r.require(setup.Put(ctx, "k", []byte("old")), lincheck.OK, "")
+		l, tm := c.waitStable(c.ids, 0, 30*time.Second)
+		c.waitCommit(c.ids, c.commitOf(l), 20*time.Second)
 
-	r.event("isolate %s (leader of term %d)", l, tm)
-	c.isolate(l)
-	c1 := r.client("c1", 2*time.Second, 1)
-	c1.Prefer(l)
-	if op := c1.Put(ctx, "k", []byte("new")); op.Outcome != lincheck.Incomplete {
-		r.fail("a write to an isolated leader cannot complete: %s", op)
-	}
-	if entryHolding(c.liveLog(l), "k", "new") == 0 {
-		r.fail("premise: the isolated leader must have appended the write")
-	}
-	l2, t2 := c.waitLeader(others(c.ids, l), tm, 20*time.Second)
-	r.event("%s leads term %d", l2, t2)
-	c2 := r.client("c2", 10*time.Second, 6)
-	c2.Prefer(l2)
-	r.require(c2.Get(ctx, "k"), lincheck.OK, "old")
+		r.event("isolate %s (leader of term %d)", l, tm)
+		c.isolate(l)
+		c1 := r.client("c1", 2*time.Second, 1)
+		c1.Prefer(l)
+		op := c1.Put(ctx, "k", []byte("new"))
+		r.premise(!refusedAsNotLeader(op), "%s had been deposed before it was cut off: %s", l, op)
+		if op.Outcome != lincheck.Incomplete {
+			r.fail("a write to an isolated leader cannot complete: %s", op)
+		}
+		if entryHolding(c.liveLog(l), "k", "new") == 0 {
+			r.fail("premise: the isolated leader must have appended the write")
+		}
+		l2, t2 := c.waitLeader(others(c.ids, l), tm, 20*time.Second)
+		r.event("%s leads term %d", l2, t2)
+		c2 := r.client("c2", 10*time.Second, 6)
+		c2.Prefer(l2)
+		r.require(c2.Get(ctx, "k"), lincheck.OK, "old")
 
-	r.event("heal")
-	c.healAll()
-	c.waitFollows(l, l2, t2, 20*time.Second)
-	c3 := r.client("c3", 10*time.Second, 6)
-	c3.Prefer(l)
-	r.require(c3.Get(ctx, "k"), lincheck.OK, "old")
-	c.waitCommit(c.ids, c.commitOf(l2), 20*time.Second)
-	if idx := entryHolding(c.liveLog(l), "k", "new"); idx != 0 {
-		r.fail("the old leader's uncommitted entry survived the new leader's log at index %d", idx)
-	}
-	r.check()
-	c.finish()
+		r.event("heal")
+		c.healAll()
+		c.waitFollows(l, l2, t2, 20*time.Second)
+		c3 := r.client("c3", 10*time.Second, 6)
+		c3.Prefer(l)
+		r.require(c3.Get(ctx, "k"), lincheck.OK, "old")
+		c.waitCommit(c.ids, c.commitOf(l2), 20*time.Second)
+		if idx := entryHolding(c.liveLog(l), "k", "new"); idx != 0 {
+			r.fail("the old leader's uncommitted entry survived the new leader's log at index %d", idx)
+		}
+		r.check()
+		c.finish()
+	})
 }
 
 // TestRealMalformedAndAbandonedRequestsDoNotCorruptTheHistory: the wire protocol
@@ -959,4 +1072,34 @@ func TestRealMalformedAndAbandonedRequestsDoNotCorruptTheHistory(t *testing.T) {
 		r.fail("workload made no progress: %s", st)
 	}
 	c.finish()
+}
+
+// TestWithPremiseRetriesOnlyThePremise pins the harness rule the real-timing
+// scenarios rely on: an attempt whose premise fails is abandoned and started
+// over (at most three times), an attempt that completes ends the loop, a
+// premise that never holds is an error (never a pass), and any other panic is
+// not swallowed.
+func TestWithPremiseRetriesOnlyThePremise(t *testing.T) {
+	r := &linRun{t: t, c: &rcluster{t: t}, rec: lincheck.NewRecorder()}
+	attempts := 0
+	if err := runWithPremise(func() {
+		attempts++
+		r.premise(attempts >= 3, "attempt %d: the leader was deposed", attempts)
+	}, t.Logf); err != nil || attempts != 3 {
+		t.Fatalf("ran %d attempts (%v), want 3: two premise failures, then success", attempts, err)
+	}
+	attempts = 0
+	if err := runWithPremise(func() {
+		attempts++
+		r.premise(false, "never holds")
+	}, t.Logf); err == nil || attempts != maxPremiseAttempts {
+		t.Fatalf("a premise that never holds must be an error after %d attempts: %v after %d", maxPremiseAttempts, err, attempts)
+	}
+	defer func() {
+		if v := recover(); v != "boom" {
+			t.Fatalf("a panic that is not a premise must propagate, got %v", v)
+		}
+	}()
+	_ = runWithPremise(func() { panic("boom") }, t.Logf)
+	t.Fatal("unreachable: the panic must propagate")
 }
