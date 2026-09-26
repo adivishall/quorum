@@ -98,7 +98,7 @@ func Decode(b []byte) (Command, error) {
 // returning a copy and the bytes consumed. A zero length yields a non-nil empty
 // slice, so an empty value stays distinguishable from "no value".
 func readBytes(b []byte, max int) ([]byte, int, error) {
-	l, n := binary.Uvarint(b)
+	l, n := uvarint(b)
 	if n <= 0 {
 		return nil, 0, fmt.Errorf("%w: bad length", ErrMalformedCommand)
 	}
@@ -108,6 +108,28 @@ func readBytes(b []byte, max int) ([]byte, int, error) {
 	out := make([]byte, l)
 	copy(out, b[n:n+int(l)])
 	return out, n + int(l), nil
+}
+
+// uvarint is binary.Uvarint restricted to the minimal (canonical) encoding: a
+// value written in more bytes than it needs (e.g. 0 as 0x80 0x00) is refused
+// (n = 0), so every byte string these codecs accept has exactly one meaning and
+// is exactly what Encode would produce for it — byte identity is command
+// identity. Found by fuzzing (docs/LINEARIZABILITY.md §9).
+func uvarint(b []byte) (uint64, int) {
+	v, n := binary.Uvarint(b)
+	if n > 0 && n != uvarintLen(v) {
+		return 0, 0
+	}
+	return v, n
+}
+
+func uvarintLen(v uint64) int {
+	n := 1
+	for v >= 0x80 {
+		v >>= 7
+		n++
+	}
+	return n
 }
 
 // IsCommand reports whether b decodes as a Command (a cheap way for a harness to

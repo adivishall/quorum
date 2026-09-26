@@ -59,10 +59,19 @@ func TestWireCodecsRoundTrip(t *testing.T) {
 			t.Fatalf("response %+v -> %+v, %v", r, got, err)
 		}
 	}
-	bad := [][]byte{{}, {9, 1, 'k'}, {wirePut, 0}, {wireGet, 1, 'k', 0}, {wirePut, 1, 'k', 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f}}
+	bad := [][]byte{{}, {9, 1, 'k'}, {wirePut, 0}, {wireGet, 1, 'k', 0}, {wirePut, 1, 'k', 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f},
+		{wirePut, 0x00, 0x80, 0x00}, // non-minimal varints (found by FuzzDecodeRequestIsTotal)
+		{wireGet, 0x81, 0x00, 'k'}}
 	for _, b := range bad {
 		if _, err := decodeRequest(b); err == nil {
 			t.Fatalf("accepted malformed request %x", b)
+		}
+	}
+	// Responses: a non-minimal term, index or payload length is refused too
+	// (the last found by FuzzDecodeResponseIsTotal).
+	for _, b := range [][]byte{{statusOK, 0x80, 0x00, 0, 0}, {statusOK, 0, 0x81, 0x00, 0}, {'0', '0', '0', 0x80, 0x00}} {
+		if _, err := decodeResponse(b); err == nil {
+			t.Fatalf("accepted a non-canonical response %x", b)
 		}
 	}
 }

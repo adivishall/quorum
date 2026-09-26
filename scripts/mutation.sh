@@ -552,6 +552,13 @@ mutant "server-get-goes-through-readindex (real processes)" internal/kv/server.g
   '	idx, err := s.node.CommitIndex(), error(nil)' \
   ./tests/integration 'TestRealStaleLeaderNeverServesARead'
 
+# 60. The key-value codecs accept a length or term written in more bytes than it
+#     needs (found by fuzzing in the Phase 12 gate): one command, two encodings.
+mutant "codecs-accept-only-canonical-varints" internal/kv/command.go \
+  '	if n > 0 && n != uvarintLen(v) {' \
+  '	if false && n > 0 && n != uvarintLen(v) {' \
+  ./internal/kv 'TestDecodeRejectsMalformedCommands|TestWireCodecsRoundTrip|FuzzDecodeIsTotal|FuzzDecodeRequestIsTotal|FuzzDecodeResponseIsTotal'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
 if [ "$FAIL" -ne 0 ]; then

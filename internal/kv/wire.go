@@ -118,11 +118,11 @@ func decodeResponse(b []byte) (response, error) {
 	r := response{status: b[0]}
 	i := 1
 	var n int
-	if r.term, n = binary.Uvarint(b[i:]); n <= 0 {
+	if r.term, n = uvarint(b[i:]); n <= 0 {
 		return response{}, ErrProtocol
 	}
 	i += n
-	if r.index, n = binary.Uvarint(b[i:]); n <= 0 {
+	if r.index, n = uvarint(b[i:]); n <= 0 {
 		return response{}, ErrProtocol
 	}
 	i += n

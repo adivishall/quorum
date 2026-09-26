@@ -57,6 +57,11 @@ func TestDecodeRejectsMalformedCommands(t *testing.T) {
 		"trailing bytes":   append(Command{Op: OpDelete, Key: []byte("k")}.Encode(), 0),
 		"delete with data": append(Command{Op: OpDelete, Key: []byte("k")}.Encode(), 1, 'v'),
 		"bad varint":       {byte(OpPut), 0x80},
+		// Non-minimal varints (found by FuzzDecodeIsTotal): the same lengths in
+		// more bytes than they need. Accepting them would give one command two
+		// encodings.
+		"non-minimal value length": {byte(OpPut), 1, '0', 0x80, 0x00},
+		"non-minimal key length":   {byte(OpDelete), 0x81, 0x00, 'k'},
 	}
 	for name, b := range bad {
 		if _, err := Decode(b); !errors.Is(err, ErrMalformedCommand) {
