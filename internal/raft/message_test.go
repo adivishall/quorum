@@ -20,6 +20,9 @@ func TestMessageRoundTrip(t *testing.T) {
 		{Type: MsgAppendResponse, Term: 9, Success: false, ConflictTerm: 4, ConflictIndex: 2},
 		{Type: MsgAppendRequest, Term: 9, PrevLogIndex: 3, PrevLogTerm: 2, LeaderCommit: 3, Seq: 1 << 40},
 		{Type: MsgAppendResponse, Term: 9, Success: true, MatchIndex: 6, Seq: 77},
+		{Type: MsgSnapshot, Term: 9, SnapshotIndex: 1 << 33, SnapshotTerm: 8, Seq: 3},
+		{Type: MsgSnapshotResponse, Term: 9, Success: true, MatchIndex: 1 << 33, Seq: 3},
+		{Type: MsgSnapshotResponse, Term: 10, Success: false},
 	}
 	for _, m := range msgs {
 		got, err := Unmarshal(m.Marshal())
@@ -38,7 +41,8 @@ func messagesEqual(a, b Message) bool {
 		a.PrevLogIndex != b.PrevLogIndex || a.PrevLogTerm != b.PrevLogTerm ||
 		a.LeaderCommit != b.LeaderCommit || a.Success != b.Success ||
 		a.ConflictTerm != b.ConflictTerm || a.ConflictIndex != b.ConflictIndex ||
-		a.MatchIndex != b.MatchIndex || a.Seq != b.Seq || len(a.Entries) != len(b.Entries) {
+		a.MatchIndex != b.MatchIndex || a.Seq != b.Seq || len(a.Entries) != len(b.Entries) ||
+		a.SnapshotIndex != b.SnapshotIndex || a.SnapshotTerm != b.SnapshotTerm {
 		return false
 	}
 	for i := range a.Entries {
@@ -105,6 +109,8 @@ func FuzzMessageDecode(f *testing.F) {
 		{Type: MsgVoteResponse, Term: 1, VoteGranted: true},
 		{Type: MsgAppendRequest, Term: 2, Entries: []Entry{{Index: 1, Term: 2, Data: []byte("x")}}},
 		{Type: MsgAppendResponse, Term: 2, Success: false, ConflictTerm: 1, ConflictIndex: 1},
+		{Type: MsgSnapshot, Term: 2, SnapshotIndex: 9, SnapshotTerm: 1, Seq: 4},
+		{Type: MsgSnapshotResponse, Term: 2, Success: true, MatchIndex: 9, Seq: 4},
 	} {
 		f.Add(m.Marshal())
 	}

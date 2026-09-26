@@ -40,6 +40,9 @@ type network struct {
 	dropped   int
 
 	reads map[NodeID][]ReadState // confirmed ReadIndex requests drained from each node (Phase 12)
+
+	snapshotsSent      map[NodeID]int            // MsgSnapshot offers delivered to each node (Phase 14)
+	snapshotsInstalled map[NodeID][]SnapshotMeta // snapshots each node's core installed
 }
 
 // key builds the directional-link key.
@@ -99,6 +102,9 @@ func newNetwork(t *testing.T, ids []NodeID, seedBase int64) *network {
 		blocked:    map[[2]NodeID]bool{},
 		appendsTo:  map[NodeID]int{},
 		reads:      map[NodeID][]ReadState{},
+
+		snapshotsSent:      map[NodeID]int{},
+		snapshotsInstalled: map[NodeID][]SnapshotMeta{},
 	}
 	sort.Slice(nw.ids, func(i, j int) bool { return nw.ids[i] < nw.ids[j] })
 	for i, id := range nw.ids {
@@ -125,6 +131,14 @@ func (nw *network) drain(id NodeID) {
 	r := nw.nodes[id]
 	for r.HasReady() {
 		rd := r.Ready()
+		if rd.Snapshot != nil {
+			// The core reset its log to a snapshot. There is no state machine
+			// here: the snapshot's index simply becomes the node's applied point.
+			nw.snapshotsInstalled[id] = append(nw.snapshotsInstalled[id], *rd.Snapshot)
+			if rd.Snapshot.Index > nw.applyCount[id] {
+				nw.applyCount[id] = rd.Snapshot.Index
+			}
+		}
 		nw.queue = append(nw.queue, rd.Messages...)
 		nw.reads[id] = append(nw.reads[id], rd.ReadStates...)
 		r.Advance()
@@ -185,6 +199,9 @@ func (nw *network) deliver(m Message) {
 	}
 	if m.Type == MsgAppendRequest {
 		nw.appendsTo[m.To]++
+	}
+	if m.Type == MsgSnapshot {
+		nw.snapshotsSent[m.To]++
 	}
 	if err := nw.nodes[m.To].Step(m); err != nil {
 		nw.t.Fatalf("Step(%s <- %s %s): %v", m.To, m.From, m.Type, err)
@@ -301,7 +318,9 @@ func (nw *network) assertAtMostOneLeaderPerTerm() {
 }
 
 // assertLogMatching enforces INV-R3: if two logs share an entry at the same
-// (index, term), they are identical through that index.
+// (index, term), they are identical through that index — over the indexes both
+// logs still hold (Phase 14: a compacted prefix is committed, so it is covered by
+// INV-R5 instead).
 func (nw *network) assertLogMatching() {
 	for a := 0; a < len(nw.ids); a++ {
 		for b := a + 1; b < len(nw.ids); b++ {
@@ -310,7 +329,11 @@ func (nw *network) assertLogMatching() {
 			if lb.LastIndex() < hi {
 				hi = lb.LastIndex()
 			}
-			for i := hi; i >= 1; i-- {
+			lo := la.FirstIndex()
+			if lb.FirstIndex() > lo {
+				lo = lb.FirstIndex()
+			}
+			for i := hi; i >= lo && i >= 1; i-- {
 				ta, _ := la.Term(i)
 				tb, _ := lb.Term(i)
 				if ta != tb {
@@ -326,7 +349,11 @@ func (nw *network) assertLogMatching() {
 
 func (nw *network) assertPrefixEqual(a, b NodeID, through uint64) {
 	la, lb := nw.logs[a], nw.logs[b]
-	for i := uint64(1); i <= through; i++ {
+	lo := la.FirstIndex()
+	if lb.FirstIndex() > lo {
+		lo = lb.FirstIndex()
+	}
+	for i := lo; i <= through; i++ {
 		ea, _ := la.At(i)
 		eb, _ := lb.At(i)
 		if ea.Term != eb.Term || string(ea.Data) != string(eb.Data) {
@@ -339,8 +366,9 @@ func (nw *network) assertPrefixEqual(a, b NodeID, through uint64) {
 // dumpLog renders a node's log for failure messages.
 func (nw *network) dumpLog(id NodeID) string {
 	l := nw.logs[id]
-	s := fmt.Sprintf("%s[role=%s term=%d commit=%d]:", id, nw.nodes[id].Role(), nw.nodes[id].Term(), l.CommitIndex())
-	for i := uint64(1); i <= l.LastIndex(); i++ {
+	b, bt := l.Boundary()
+	s := fmt.Sprintf("%s[role=%s term=%d commit=%d boundary=%d/t%d]:", id, nw.nodes[id].Role(), nw.nodes[id].Term(), l.CommitIndex(), b, bt)
+	for i := l.FirstIndex(); i <= l.LastIndex(); i++ {
 		e, _ := l.At(i)
 		s += fmt.Sprintf(" (%d,t%d,%q)", i, e.Term, e.Data)
 	}

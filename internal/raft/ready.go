@@ -10,6 +10,12 @@ package raft
 // calls Advance, with no intervening Tick/Propose/Step. Advance drains the effects
 // the Ready reported.
 type Ready struct {
+	// Snapshot, if set, is a snapshot a leader sent that this node's log was
+	// just reset to (Phase 14, Raft §7). Before the Ready's Messages the driver
+	// must make it durable — any changed term and vote first, then the received
+	// snapshot, then its boundary in the log with the new commit — and restore the
+	// state machine from it before applying anything after it.
+	Snapshot *SnapshotMeta
 	// HardState is non-nil when currentTerm/votedFor changed, or when the commit
 	// index advanced (persisted as an optimization). Persist it before Messages.
 	HardState *HardState
@@ -27,13 +33,13 @@ type Ready struct {
 
 // empty reports whether a Ready carries nothing to do.
 func (rd Ready) empty() bool {
-	return rd.HardState == nil && len(rd.Entries) == 0 && len(rd.Messages) == 0 && len(rd.ReadStates) == 0
+	return rd.Snapshot == nil && rd.HardState == nil && len(rd.Entries) == 0 && len(rd.Messages) == 0 && len(rd.ReadStates) == 0
 }
 
 // HasReady reports whether there are pending effects to collect with Ready. It
 // does not report apply readiness — the driver checks NextApply separately.
 func (r *Raft) HasReady() bool {
-	return r.hsDirty ||
+	return r.hsDirty || r.installed != nil ||
 		r.log.CommitIndex() != r.lastPersistedCommit ||
 		r.unstable != 0 ||
 		len(r.msgs) != 0 ||
@@ -44,6 +50,10 @@ func (r *Raft) HasReady() bool {
 // acting on them). It does not mutate Raft state.
 func (r *Raft) Ready() Ready {
 	var rd Ready
+	if r.installed != nil {
+		m := *r.installed
+		rd.Snapshot = &m
+	}
 	if r.hsDirty || r.log.CommitIndex() != r.lastPersistedCommit {
 		rd.HardState = &HardState{
 			Term:   r.currentTerm,
@@ -71,4 +81,5 @@ func (r *Raft) Advance() {
 	r.lastPersistedCommit = r.log.CommitIndex()
 	r.unstable = 0
 	r.readStates = nil
+	r.installed = nil
 }

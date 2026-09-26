@@ -53,6 +53,14 @@ const (
 	MsgVoteResponse
 	MsgAppendRequest
 	MsgAppendResponse
+	// MsgSnapshot offers a follower the leader's snapshot (Phase 14, Raft §7).
+	// The core carries only its metadata — SnapshotIndex, SnapshotTerm — never
+	// its bytes: the driver streams the published file and hands the message to
+	// the follower's core only once the whole file arrived and validated.
+	MsgSnapshot
+	// MsgSnapshotResponse answers MsgSnapshot: Success with MatchIndex, the index
+	// the follower's log now matches the leader's through.
+	MsgSnapshotResponse
 )
 
 // String renders a message type.
@@ -66,6 +74,10 @@ func (t MessageType) String() string {
 		return "AppendRequest"
 	case MsgAppendResponse:
 		return "AppendResponse"
+	case MsgSnapshot:
+		return "Snapshot"
+	case MsgSnapshotResponse:
+		return "SnapshotResponse"
 	default:
 		return "MessageType(?)"
 	}
@@ -94,7 +106,11 @@ type Message struct {
 	Entries      []Entry
 	LeaderCommit uint64
 
-	// AppendResponse.
+	// Snapshot (Phase 14): the last entry the offered snapshot covers.
+	SnapshotIndex uint64
+	SnapshotTerm  uint64
+
+	// AppendResponse and SnapshotResponse.
 	Success       bool
 	ConflictTerm  uint64
 	ConflictIndex uint64
@@ -108,6 +124,11 @@ type Message struct {
 	// leadership with a quorum round after the read arrived" step of
 	// docs/DESIGN.md §8.5, without a separate heartbeat message type.
 	Seq uint64
+}
+
+// SnapshotMeta identifies a snapshot by the last entry it covers (Phase 14).
+type SnapshotMeta struct {
+	Index, Term uint64
 }
 
 // ReadState is a confirmed ReadIndex request (Phase 12, docs/DESIGN.md §8.5): once

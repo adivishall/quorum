@@ -15,8 +15,9 @@ type Raft struct {
 	log   replication.Log
 	rng   *rand.Rand
 
-	electionTicks  int
-	heartbeatTicks int
+	electionTicks      int
+	heartbeatTicks     int
+	snapshotRetryTicks int
 
 	// Persistent (durable) state.
 	role        Role
@@ -35,6 +36,14 @@ type Raft struct {
 	// Leader state.
 	nextIndex  map[NodeID]uint64
 	matchIndex map[NodeID]uint64
+	// Snapshot transfers (Phase 14, docs/SNAPSHOTS.md §8): the index of the
+	// snapshot offered to each peer still being answered, and the ticks since.
+	snapPending map[NodeID]uint64
+	snapWait    map[NodeID]int
+
+	// installed is the snapshot this follower's log was reset to since the last
+	// Advance: the driver must make it durable before the Ready's messages.
+	installed *SnapshotMeta
 
 	// Effects accumulated since the last Advance.
 	msgs                []Message
@@ -67,15 +76,16 @@ func New(cfg Config) (*Raft, error) {
 		return nil, err
 	}
 	r := &Raft{
-		id:             cfg.ID,
-		peers:          peers,
-		log:            cfg.Log,
-		rng:            cfg.Rand,
-		electionTicks:  cfg.ElectionTicks,
-		heartbeatTicks: cfg.HeartbeatTicks,
-		role:           Follower,
-		currentTerm:    cfg.Term,
-		votedFor:       cfg.Vote,
+		id:                 cfg.ID,
+		peers:              peers,
+		log:                cfg.Log,
+		rng:                cfg.Rand,
+		electionTicks:      cfg.ElectionTicks,
+		heartbeatTicks:     cfg.HeartbeatTicks,
+		snapshotRetryTicks: cfg.SnapshotRetryTicks,
+		role:               Follower,
+		currentTerm:        cfg.Term,
+		votedFor:           cfg.Vote,
 	}
 	r.lastPersistedCommit = r.log.CommitIndex()
 	r.resetElectionTimer()
@@ -92,6 +102,11 @@ func (r *Raft) LeaderID() NodeID    { return r.leaderID }
 func (r *Raft) CommitIndex() uint64 { return r.log.CommitIndex() }
 func (r *Raft) LastIndex() uint64   { return r.log.LastIndex() }
 
+// Boundary is the index and term of the last entry compacted into a snapshot
+// (0, 0 if none): the snapshot this node would offer a follower that needs an
+// entry at or below it.
+func (r *Raft) Boundary() (index, term uint64) { return r.log.Boundary() }
+
 // --- inputs ---
 
 // Tick advances the core's logical clock by one tick. A leader heartbeats every
@@ -99,6 +114,19 @@ func (r *Raft) LastIndex() uint64   { return r.log.LastIndex() }
 // election timeout.
 func (r *Raft) Tick() {
 	if r.role == Leader {
+		// A snapshot offer nobody answered in time is withdrawn: the next
+		// replication to that peer offers it again (the transfer may have been
+		// lost — a dropped chunk, a follower restart).
+		for _, p := range r.peers {
+			if r.snapPending[p] == 0 {
+				continue
+			}
+			r.snapWait[p]++
+			if r.snapWait[p] >= r.snapshotRetryTicks {
+				delete(r.snapPending, p)
+				delete(r.snapWait, p)
+			}
+		}
 		r.heartbeatElapsed++
 		if r.heartbeatElapsed >= r.heartbeatTicks {
 			r.heartbeatElapsed = 0
@@ -180,13 +208,19 @@ func (r *Raft) confirmReads() {
 	}
 }
 
+// Compact discards the log through index into a snapshot the driver has made
+// durable (Phase 14, docs/SNAPSHOTS.md §5): index must be applied. From then on a
+// follower that needs an entry at or below index is offered the snapshot.
+func (r *Raft) Compact(index uint64) error { return r.log.Compact(index) }
+
 // Step handles one inbound message. It is the only entry point for peer traffic.
 func (r *Raft) Step(m Message) error {
 	// Higher term: step down and adopt it before doing anything else. For an
-	// AppendEntries the sender is the new leader; otherwise we do not yet know one.
+	// AppendEntries or a snapshot the sender is the new leader; otherwise we do
+	// not yet know one.
 	if m.Term > r.currentTerm {
 		leader := NodeID("")
-		if m.Type == MsgAppendRequest {
+		if m.Type == MsgAppendRequest || m.Type == MsgSnapshot {
 			leader = m.From
 		}
 		r.becomeFollower(m.Term, leader)
@@ -199,6 +233,8 @@ func (r *Raft) Step(m Message) error {
 			r.send(Message{Type: MsgVoteResponse, To: m.From, Term: r.currentTerm, VoteGranted: false})
 		case MsgAppendRequest:
 			r.send(Message{Type: MsgAppendResponse, To: m.From, Term: r.currentTerm, Success: false})
+		case MsgSnapshot:
+			r.send(Message{Type: MsgSnapshotResponse, To: m.From, Term: r.currentTerm, Success: false})
 		}
 		return nil
 	}
@@ -212,6 +248,10 @@ func (r *Raft) Step(m Message) error {
 		r.handleAppendRequest(m)
 	case MsgAppendResponse:
 		r.handleAppendResponse(m)
+	case MsgSnapshot:
+		r.handleSnapshot(m)
+	case MsgSnapshotResponse:
+		r.handleSnapshotResponse(m)
 	default:
 		return ErrUnknownMessageType
 	}
@@ -271,6 +311,8 @@ func (r *Raft) becomeLeader() {
 		r.nextIndex[p] = last + 1
 		r.matchIndex[p] = 0
 	}
+	r.snapPending = map[NodeID]uint64{}
+	r.snapWait = map[NodeID]int{}
 	// The no-op entry in the current term is mandatory (docs/DESIGN.md §8.2,
 	// §5.4.2): without it a new leader cannot commit entries from prior terms —
 	// and a ReadIndex may not be served below it.
@@ -327,6 +369,22 @@ func (r *Raft) handleAppendRequest(m Message) {
 	r.becomeFollower(m.Term, m.From)
 
 	last := r.log.LastIndex()
+	// Entries at or below our boundary are compacted into our snapshot: they are
+	// committed, so they match the leader's (Leader Completeness). Skip them and
+	// check consistency at the boundary instead (Phase 14). This happens when a
+	// leader's nextIndex for us lags a snapshot we installed, or a delayed
+	// AppendEntries arrives after one.
+	if base, baseTerm := r.log.Boundary(); m.PrevLogIndex < base {
+		skip := base - m.PrevLogIndex
+		lastNew := m.PrevLogIndex + uint64(len(m.Entries))
+		if uint64(len(m.Entries)) <= skip {
+			// Nothing beyond our snapshot: what it carried we already hold.
+			r.send(Message{Type: MsgAppendResponse, To: m.From, Term: r.currentTerm, Success: true, MatchIndex: lastNew, Seq: m.Seq})
+			return
+		}
+		m.Entries = m.Entries[skip:]
+		m.PrevLogIndex, m.PrevLogTerm = base, baseTerm
+	}
 	// The entry before the new ones must exist.
 	if m.PrevLogIndex > last {
 		r.send(Message{
@@ -371,12 +429,12 @@ func (r *Raft) handleAppendResponse(m Message) {
 		r.confirmReads()
 	}
 	if m.Success {
-		// Ignore a stale success that would not advance matchIndex.
-		if m.MatchIndex > r.matchIndex[peer] {
-			r.matchIndex[peer] = m.MatchIndex
-			r.nextIndex[peer] = m.MatchIndex + 1
-			r.maybeCommit()
-		}
+		r.progress(peer, m.MatchIndex)
+		return
+	}
+	// A peer we are sending a snapshot rejects our heartbeats until it has
+	// installed it; that says nothing new (Phase 14).
+	if r.snapPending[peer] != 0 {
 		return
 	}
 	// Rejection: back up nextIndex by a whole conflicting term (§10). Only act if
@@ -385,6 +443,70 @@ func (r *Raft) handleAppendResponse(m Message) {
 	if back < r.nextIndex[peer] {
 		r.nextIndex[peer] = back
 		r.sendAppend(peer)
+	}
+}
+
+// progress records that peer's log matches ours through match — a success,
+// ignored if stale (it would not advance matchIndex). Reaching an offered
+// snapshot's index ends that offer.
+func (r *Raft) progress(peer NodeID, match uint64) {
+	if match <= r.matchIndex[peer] {
+		return
+	}
+	r.matchIndex[peer] = match
+	r.nextIndex[peer] = match + 1
+	if s := r.snapPending[peer]; s != 0 && match >= s {
+		delete(r.snapPending, peer)
+		delete(r.snapWait, peer)
+	}
+	r.maybeCommit()
+}
+
+// handleSnapshot is a follower offered the leader's snapshot (Raft §7). The
+// driver hands it over only once the whole snapshot arrived and validated.
+func (r *Raft) handleSnapshot(m Message) {
+	r.becomeFollower(m.Term, m.From)
+	commit := r.log.CommitIndex()
+	if m.SnapshotIndex <= commit {
+		// Already covered by what we have committed (a duplicate, a delayed
+		// offer, or one we installed before): nothing to install. Our committed
+		// prefix matches the leader's.
+		r.send(Message{Type: MsgSnapshotResponse, To: m.From, Term: r.currentTerm, Success: true, MatchIndex: commit, Seq: m.Seq})
+		return
+	}
+	if err := r.log.InstallSnapshot(m.SnapshotIndex, m.SnapshotTerm); err != nil {
+		// Cannot happen above the commit index; refuse rather than guess.
+		r.send(Message{Type: MsgSnapshotResponse, To: m.From, Term: r.currentTerm, Success: false, Seq: m.Seq})
+		return
+	}
+	// Entries we had not persisted yet at or below the snapshot are gone; those
+	// kept after it are still to be persisted.
+	if r.unstable != 0 && r.unstable <= m.SnapshotIndex {
+		r.unstable = 0
+		if r.log.LastIndex() > m.SnapshotIndex {
+			r.unstable = m.SnapshotIndex + 1
+		}
+	}
+	r.installed = &SnapshotMeta{Index: m.SnapshotIndex, Term: m.SnapshotTerm}
+	r.send(Message{Type: MsgSnapshotResponse, To: m.From, Term: r.currentTerm, Success: true, MatchIndex: m.SnapshotIndex, Seq: m.Seq})
+}
+
+// handleSnapshotResponse is the leader learning a follower's snapshot outcome.
+func (r *Raft) handleSnapshotResponse(m Message) {
+	if r.role != Leader {
+		return
+	}
+	peer := m.From
+	if m.Seq > r.ackSeq[peer] {
+		r.ackSeq[peer] = m.Seq
+		r.confirmReads()
+	}
+	if !m.Success {
+		return
+	}
+	r.progress(peer, m.MatchIndex)
+	if r.matchIndex[peer] < r.log.LastIndex() {
+		r.sendAppend(peer) // resume replication after the snapshot at once
 	}
 }
 
@@ -447,7 +569,7 @@ func (r *Raft) candidateUpToDate(lastIdx, lastTerm uint64) bool {
 // from upto. Terms are non-decreasing, so a term occupies a contiguous block.
 func (r *Raft) firstIndexOfTerm(term, upto uint64) uint64 {
 	ci := upto
-	for ci > 1 {
+	for ci > r.log.FirstIndex() { // never below what the log still holds
 		t, _ := r.log.Term(ci - 1)
 		if t != term {
 			break
@@ -457,16 +579,21 @@ func (r *Raft) firstIndexOfTerm(term, upto uint64) uint64 {
 	return ci
 }
 
-// lastIndexOfTerm returns the highest index whose term equals term, or 0 if none.
+// lastIndexOfTerm returns the highest index whose term equals term, or 0 if none
+// is known. The compaction boundary counts: its term is still known.
 func (r *Raft) lastIndexOfTerm(term uint64) uint64 {
-	for i := r.log.LastIndex(); i >= 1; i-- {
+	base, baseTerm := r.log.Boundary()
+	for i := r.log.LastIndex(); i > base; i-- {
 		t, _ := r.log.Term(i)
 		if t == term {
 			return i
 		}
 		if t < term {
-			break // terms are non-decreasing; no entry of this term below here
+			return 0 // terms are non-decreasing; no entry of this term below here
 		}
+	}
+	if base > 0 && baseTerm == term {
+		return base
 	}
 	return 0
 }
@@ -487,6 +614,21 @@ func (r *Raft) sendAppend(peer NodeID) {
 	next := r.nextIndex[peer]
 	if next < 1 {
 		next = 1
+	}
+	// The entries this peer needs next are compacted: only the snapshot can
+	// bring it up to date (Phase 14, Raft §7). Offer it once; until the offer is
+	// answered or withdrawn (Tick), only heartbeat the peer — at the boundary, so
+	// the heartbeat succeeds as soon as the peer has installed the snapshot.
+	if base, baseTerm := r.log.Boundary(); next <= base {
+		if r.snapPending[peer] == 0 {
+			r.snapPending[peer], r.snapWait[peer] = base, 0
+			r.send(Message{Type: MsgSnapshot, To: peer, Term: r.currentTerm,
+				SnapshotIndex: base, SnapshotTerm: baseTerm, Seq: r.hbSeq})
+			return
+		}
+		r.send(Message{Type: MsgAppendRequest, To: peer, Term: r.currentTerm,
+			PrevLogIndex: base, PrevLogTerm: baseTerm, LeaderCommit: r.log.CommitIndex(), Seq: r.hbSeq})
+		return
 	}
 	prevIndex := next - 1
 	prevTerm, _ := r.log.Term(prevIndex)

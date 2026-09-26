@@ -47,6 +47,14 @@ func (m Message) Marshal() []byte {
 		w.uvarint(m.ConflictTerm)
 		w.uvarint(m.ConflictIndex)
 		w.uvarint(m.Seq)
+	case MsgSnapshot:
+		w.uvarint(m.SnapshotIndex)
+		w.uvarint(m.SnapshotTerm)
+		w.uvarint(m.Seq)
+	case MsgSnapshotResponse:
+		w.bool(m.Success)
+		w.uvarint(m.MatchIndex)
+		w.uvarint(m.Seq)
 	}
 	return w.b
 }
@@ -122,6 +130,26 @@ func Unmarshal(payload []byte) (Message, error) {
 			return Message{}, err
 		}
 		if m.ConflictIndex, err = r.uvarint(); err != nil {
+			return Message{}, err
+		}
+		if m.Seq, err = r.uvarint(); err != nil {
+			return Message{}, err
+		}
+	case MsgSnapshot:
+		if m.SnapshotIndex, err = r.uvarint(); err != nil {
+			return Message{}, err
+		}
+		if m.SnapshotTerm, err = r.uvarint(); err != nil {
+			return Message{}, err
+		}
+		if m.Seq, err = r.uvarint(); err != nil {
+			return Message{}, err
+		}
+	case MsgSnapshotResponse:
+		if m.Success, err = r.bool(); err != nil {
+			return Message{}, err
+		}
+		if m.MatchIndex, err = r.uvarint(); err != nil {
 			return Message{}, err
 		}
 		if m.Seq, err = r.uvarint(); err != nil {

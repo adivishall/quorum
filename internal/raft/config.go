@@ -27,6 +27,10 @@ type Config struct {
 	// strictly greater than HeartbeatTicks.
 	ElectionTicks  int
 	HeartbeatTicks int
+	// SnapshotRetryTicks is how long a leader waits, in ticks, for a follower to
+	// answer a snapshot before offering it again (Phase 14, docs/SNAPSHOTS.md
+	// §8). Zero means 4 × ElectionTicks.
+	SnapshotRetryTicks int
 
 	// Rand supplies election-timeout jitter; it is injected so elections are
 	// deterministic under a seed (ADR-002). Required.
@@ -45,6 +49,9 @@ type Config struct {
 func (c *Config) withDefaults() {
 	if c.ElectionTicks == 0 {
 		c.ElectionTicks = DefaultElectionTicks
+	}
+	if c.SnapshotRetryTicks == 0 {
+		c.SnapshotRetryTicks = 4 * c.ElectionTicks
 	}
 	if c.HeartbeatTicks == 0 {
 		c.HeartbeatTicks = DefaultHeartbeatTicks
