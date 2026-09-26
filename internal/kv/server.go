@@ -106,7 +106,7 @@ func (s *Server) Delete(ctx context.Context, key []byte) (Meta, error) {
 }
 
 func (s *Server) write(ctx context.Context, c Command) (Meta, error) {
-	idx, term, err := s.node.Write(ctx, c.Encode())
+	idx, term, _, err := s.node.Write(ctx, c.Encode())
 	m := Meta{Node: s.id, Term: term, Index: idx}
 	return m, s.mapErr(err)
 }

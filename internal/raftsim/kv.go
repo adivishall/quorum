@@ -359,11 +359,11 @@ func (n *node) kvNodeDown() {
 
 // applyToStore applies a committed entry to the node's store: the election no-op
 // and the non-key-value commands of plain Propose events apply as no-ops.
-func (n *node) applyToStore(index uint64, data []byte) error {
+func (n *node) applyToStore(index uint64, data []byte) (any, error) {
 	if !kv.IsCommand(data) {
 		data = nil
 	}
-	return n.store.Apply(index, data)
+	return n.store.ApplyResult(index, data)
 }
 
 // --- seeded client workloads ---

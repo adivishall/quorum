@@ -16,7 +16,8 @@ import (
 func writeWithin(n *Node, data []byte, d time.Duration) (uint64, uint64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), d)
 	defer cancel()
-	return n.Write(ctx, data)
+	idx, term, _, err := n.Write(ctx, data)
+	return idx, term, err
 }
 
 func readWithin(n *Node, d time.Duration) (uint64, error) {

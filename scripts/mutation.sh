@@ -334,8 +334,15 @@ mutant "restart-as-follower-never-leader" internal/raft/raft.go \
 # 32. Record an entry as applied BEFORE the state machine applies it, so a crash
 #     between the two loses the application.
 mutant "applied-recorded-only-after-apply" internal/raftnode/crashpoint.go \
-  '		if sm != nil {
-			if err := sm.Apply(e.Index, e.Data); err != nil {
+  '		var result any
+		if sm != nil {
+			var err error
+			if rsm != nil {
+				result, err = rsm.ApplyResult(e.Index, e.Data)
+			} else {
+				err = sm.Apply(e.Index, e.Data)
+			}
+			if err != nil {
 				return fmt.Errorf("%w: index %d: %w", ErrApply, e.Index, err)
 			}
 		}
@@ -348,8 +355,15 @@ mutant "applied-recorded-only-after-apply" internal/raftnode/crashpoint.go \
   '		if err := core.AppliedTo(e.Index); err != nil {
 			return fmt.Errorf("%w: AppliedTo(%d): %w", ErrApply, e.Index, err)
 		}
+		var result any
 		if sm != nil {
-			if err := sm.Apply(e.Index, e.Data); err != nil {
+			var err error
+			if rsm != nil {
+				result, err = rsm.ApplyResult(e.Index, e.Data)
+			} else {
+				err = sm.Apply(e.Index, e.Data)
+			}
+			if err != nil {
 				return fmt.Errorf("%w: index %d: %w", ErrApply, e.Index, err)
 			}
 		}
@@ -414,9 +428,10 @@ mutant "write-completes-only-when-committed-and-applied" internal/raftnode/waite
   '	if index <= applied || term != 0 {' \
   "./internal/raftnode ./internal/raftsim" 'TestWaitersCompleteWritesOnlyInTheirTerm|TestKVWriteIsNotAcknowledgedBeforeCommit'
 
-# 41. A write whose index was taken by a DIFFERENT committed entry reports success.
+# 41. A write whose index was taken by a DIFFERENT committed entry reports success
+#     (and receives that other entry's result).
 mutant "lost-write-is-not-success" internal/raftnode/waiters.go \
-  '		case wt.term == 0 || wt.term == term:' \
+  '		case wt.term == term:' \
   '		case true:' \
   "./internal/raftnode ./internal/raftsim" 'TestWaitersCompleteWritesOnlyInTheirTerm|TestKVWriteIsNotAcknowledgedBeforeCommit'
 

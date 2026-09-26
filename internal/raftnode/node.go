@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adivishall/quorum/internal/raft"
@@ -181,6 +182,33 @@ type Node struct {
 	mu     sync.Mutex
 	status Status
 	err    error // the fail-stop cause; nil if running or cleanly closed
+
+	app atomic.Pointer[AppHandler] // Phase 13: application messages (forwarding)
+}
+
+// AppHandler receives the application messages this node's peers send it —
+// every frame kind the Raft driver does not own (Phase 13: request forwarding,
+// transport.MsgForward and MsgForwardResponse). It runs on the node's receive
+// goroutine, so it must not block: hand the work to another goroutine.
+type AppHandler func(peer NodeID, kind transport.MsgKind, payload []byte)
+
+// SetAppHandler installs the application-message handler (nil removes it).
+// Messages that arrive with no handler installed are dropped, as they were
+// before Phase 13.
+func (n *Node) SetAppHandler(h AppHandler) {
+	if h == nil {
+		n.app.Store(nil)
+		return
+	}
+	n.app.Store(&h)
+}
+
+// SendApp sends an application message to a peer over the node's transport —
+// the same connections, framing and fault injection as Raft traffic. An error
+// means the message was not handed to the connection (e.g. the peer is not
+// connected): nothing was sent.
+func (n *Node) SendApp(ctx context.Context, peer NodeID, kind transport.MsgKind, payload []byte) error {
+	return n.tr.Send(ctx, transport.NodeID(peer), kind, payload)
 }
 
 type proposal struct {
@@ -301,7 +329,10 @@ func (n *Node) Propose(ctx context.Context, data []byte) error {
 // COMMITTED and APPLIED on this node in the term it was proposed in — the Phase
 // 12 write-completion rule (docs/LINEARIZABILITY.md §3, docs/ARCHITECTURE.md §8
 // step 8): success means every later linearizable read, from any client, sees
-// the write. It returns the entry's index and term. Errors:
+// the write. It returns the entry's index and term, and the state machine's
+// result for that entry (Phase 13: for the key-value store, whether the entry
+// executed its request or was a duplicate or a conflict — nil for a state
+// machine without results). Errors:
 //
 //   - raft.ErrNotLeader: this node did not accept the proposal; nothing was
 //     appended. The client should retry at the leader (LeaderID). Definite.
@@ -311,31 +342,31 @@ func (n *Node) Propose(ctx context.Context, data []byte) error {
 //     A client must treat it exactly as a timeout (docs/CONSISTENCY.md C4).
 //   - raft.ErrStopped, or a persistence failure: the node stopped. If the
 //     proposal had been accepted the outcome is likewise unknown.
-func (n *Node) Write(ctx context.Context, data []byte) (index, term uint64, err error) {
+func (n *Node) Write(ctx context.Context, data []byte) (index, term uint64, result any, err error) {
 	req := writeReq{data: append([]byte(nil), data...), result: make(chan writeAccepted, 1)}
 	select {
 	case n.writeCh <- req:
 	case <-n.ctx.Done():
-		return 0, 0, raft.ErrStopped
+		return 0, 0, nil, raft.ErrStopped
 	case <-ctx.Done():
-		return 0, 0, ctx.Err()
+		return 0, 0, nil, ctx.Err()
 	}
 	var acc writeAccepted
 	select {
 	case acc = <-req.result:
 	case <-n.ctx.Done():
-		return 0, 0, raft.ErrStopped
+		return 0, 0, nil, raft.ErrStopped
 	case <-ctx.Done():
-		return 0, 0, ctx.Err()
+		return 0, 0, nil, ctx.Err()
 	}
 	if acc.err != nil {
-		return 0, 0, acc.err
+		return 0, 0, nil, acc.err
 	}
 	select {
 	case out := <-acc.done:
-		return acc.index, acc.term, out.Err
+		return acc.index, acc.term, out.Result, out.Err
 	case <-ctx.Done():
-		return acc.index, acc.term, ctx.Err()
+		return acc.index, acc.term, nil, ctx.Err()
 	}
 }
 
@@ -490,9 +521,10 @@ func (n *Node) confirmRead(rs raft.ReadState) {
 }
 
 // applied is ApplyCommitted's hand-off after an entry is applied and recorded:
-// the write that proposed it (or a read barrier at its index) completes now.
-func (n *Node) applied(e raft.Entry) {
-	n.waiters.Applied(e.Index, e.Term)
+// the write that proposed it (or a read barrier at its index) completes now,
+// with the state machine's result.
+func (n *Node) applied(e raft.Entry, result any) {
+	n.waiters.Applied(e.Index, e.Term, result)
 }
 
 // fail records a persistence failure and stops every goroutine of the node. The
@@ -570,7 +602,13 @@ func (n *Node) receiveLoop() {
 			}
 			mt, ok := typeForKind(env.Kind)
 			if !ok {
-				continue // not a Raft message (e.g. a Probe); ignore
+				// Not a Raft message: an application message (Phase 13
+				// forwarding) if a handler is installed; otherwise (e.g. a
+				// Probe) ignored.
+				if h := n.app.Load(); h != nil {
+					(*h)(NodeID(env.Peer), env.Kind, env.Payload)
+				}
+				continue
 			}
 			m, err := raft.Unmarshal(env.Payload)
 			if err != nil {

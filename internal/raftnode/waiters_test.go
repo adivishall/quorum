@@ -22,8 +22,8 @@ func TestWaitersCompleteWritesOnlyInTheirTerm(t *testing.T) {
 		t.Fatal("a write completed before its index was applied")
 	default:
 	}
-	w.Applied(5, 2)
-	w.Applied(6, 3) // a different term's entry at 6: the term-2 proposal was overwritten
+	w.Applied(5, 2, nil)
+	w.Applied(6, 3, nil) // a different term's entry at 6: the term-2 proposal was overwritten
 	if out := <-ok; out.Err != nil || out.Index != 5 || out.Term != 2 {
 		t.Fatalf("matching term: %+v", out)
 	}
@@ -44,14 +44,14 @@ func TestWaitersBarrierIsImmediateWhenAlreadyApplied(t *testing.T) {
 		t.Fatalf("immediate barrier: %+v", out)
 	}
 	later := w.Add(7, 0, 4)
-	w.Applied(5, 1)
-	w.Applied(6, 1)
+	w.Applied(5, 1, nil)
+	w.Applied(6, 1, nil)
 	select {
 	case <-later:
 		t.Fatal("barrier at 7 completed at index 6")
 	default:
 	}
-	w.Applied(7, 9)
+	w.Applied(7, 9, nil)
 	if out := <-later; out.Err != nil || out.Index != 7 {
 		t.Fatalf("barrier: %+v", out)
 	}
@@ -97,7 +97,7 @@ func TestReadsConfirmAndDropStale(t *testing.T) {
 		t.Fatal("read at 15 served at applied 12")
 	default:
 	}
-	w.Applied(15, 3)
+	w.Applied(15, 3, nil)
 	if out := recvNow(t, c2); out.Err != nil || out.Index != 15 {
 		t.Fatalf("barrier read: %+v", out)
 	}

@@ -137,22 +137,43 @@ func DrainReadyAt(core *raft.Raft, st Storage, send func(raft.Message), reads fu
 	return nil
 }
 
+// ResultStateMachine is a StateMachine whose applications produce a result for
+// the client whose command it was (Phase 13): the key-value store's decision —
+// executed, duplicate of an earlier execution, conflict, … — which only the
+// state machine, applying entries in log order, can make. ApplyCommitted uses
+// ApplyResult instead of Apply when the state machine has it, and hands the
+// result to the waiting Write with the entry.
+type ResultStateMachine interface {
+	StateMachine
+	ApplyResult(index uint64, command []byte) (any, error)
+}
+
 // ApplyCommitted feeds the committed-but-unapplied entries to sm in index order,
 // recording each through AppliedTo only after its Apply returned nil (so an apply
 // failure never advances appliedIndex — INV-R7's driver half). A nil sm applies
 // nothing but still advances. applied, if non-nil, is told of each entry AFTER it
-// has been applied and recorded (Phase 12: this is where a client's write or read
-// barrier completes — never before the application it reports). It returns a
-// state-machine failure wrapped in ErrApply (the remaining entries are left
-// unapplied for the next cycle), or a hook's abort as-is. It is shared by the
-// node's actor loop and the simulator.
-func ApplyCommitted(core *raft.Raft, sm StateMachine, at Hook, applied func(raft.Entry)) error {
+// has been applied and recorded, with the state machine's result for it (nil
+// unless sm is a ResultStateMachine) — Phase 12: this is where a client's write
+// or read barrier completes, never before the application it reports; Phase 13:
+// and with what the application decided. It returns a state-machine failure
+// wrapped in ErrApply (the remaining entries are left unapplied for the next
+// cycle), or a hook's abort as-is. It is shared by the node's actor loop and the
+// simulator.
+func ApplyCommitted(core *raft.Raft, sm StateMachine, at Hook, applied func(raft.Entry, any)) error {
+	rsm, _ := sm.(ResultStateMachine)
 	for _, e := range core.NextApply() {
 		if err := at.hit(BeforeApply, e.Index); err != nil {
 			return err
 		}
+		var result any
 		if sm != nil {
-			if err := sm.Apply(e.Index, e.Data); err != nil {
+			var err error
+			if rsm != nil {
+				result, err = rsm.ApplyResult(e.Index, e.Data)
+			} else {
+				err = sm.Apply(e.Index, e.Data)
+			}
+			if err != nil {
 				return fmt.Errorf("%w: index %d: %w", ErrApply, e.Index, err)
 			}
 		}
@@ -166,7 +187,7 @@ func ApplyCommitted(core *raft.Raft, sm StateMachine, at Hook, applied func(raft
 			return err
 		}
 		if applied != nil {
-			applied(e)
+			applied(e, result)
 		}
 	}
 	return nil

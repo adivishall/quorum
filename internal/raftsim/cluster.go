@@ -694,7 +694,7 @@ func (c *Cluster) send(n *node, m raft.Message) {
 // points in effect.
 func (c *Cluster) apply(n *node) {
 	sm := &simSM{c: c, n: n}
-	err := raftnode.ApplyCommitted(n.core, sm, c.hook(n), func(e raft.Entry) { n.waiters.Applied(e.Index, e.Term) })
+	err := raftnode.ApplyCommitted(n.core, sm, c.hook(n), func(e raft.Entry, result any) { n.waiters.Applied(e.Index, e.Term, result) })
 	if sm.last > 0 {
 		c.trace.add(c.step, "apply %s %d..%d", n.id, sm.first, sm.last)
 	}
@@ -717,14 +717,22 @@ type simSM struct {
 	first, last uint64
 }
 
-func (s *simSM) Apply(index uint64, _ []byte) error {
+func (s *simSM) Apply(index uint64, data []byte) error {
+	_, err := s.ApplyResult(index, data)
+	return err
+}
+
+// ApplyResult makes simSM a raftnode.ResultStateMachine, so the driver hands
+// every client's Write the key-value store's decision for its entry.
+func (s *simSM) ApplyResult(index uint64, _ []byte) (any, error) {
 	e, err := s.n.mem.At(index)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	s.c.checkApply(s.n, e)
-	if err := s.n.applyToStore(index, e.Data); err != nil {
-		return err
+	result, err := s.n.applyToStore(index, e.Data)
+	if err != nil {
+		return nil, err
 	}
 	s.n.applied = index
 	s.n.hist = append(s.n.hist, applied{inc: s.n.inc, e: e})
@@ -732,7 +740,7 @@ func (s *simSM) Apply(index uint64, _ []byte) error {
 		s.first = index
 	}
 	s.last = index
-	return nil
+	return result, nil
 }
 
 // --- crash points (Phase 11) ---
