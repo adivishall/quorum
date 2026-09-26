@@ -43,8 +43,18 @@ func FuzzDecodeForwardIsTotal(f *testing.F) {
 	f.Add(encodeForward(77, 2*time.Second, Request{Op: ReqPut, Key: []byte("k"), Value: []byte("v"), ClientID: 3, RequestID: 1, AckedBelow: 1}))
 	f.Add(encodeForwardResponse(77, Response{Status: StatusOK, Node: "n1"}))
 	f.Fuzz(func(t *testing.T, b []byte) {
-		_, _, _, _ = decodeForward(b) // total: never panics
-		_, _, _ = decodeForwardResponse(b)
+		// Total (never panics) and canonical: whatever decodes re-encodes to
+		// the same bytes — the property the forward budget once broke.
+		if fid, budget, r, err := decodeForward(b); err == nil {
+			if again := encodeForward(fid, budget, r); !bytes.Equal(again, b) {
+				t.Fatalf("forward not canonical: %x -> %x", b, again)
+			}
+		}
+		if fid, r, err := decodeForwardResponse(b); err == nil {
+			if again := encodeForwardResponse(fid, r); !bytes.Equal(again, b) {
+				t.Fatalf("forward response not canonical: %x -> %x", b, again)
+			}
+		}
 	})
 }
 
