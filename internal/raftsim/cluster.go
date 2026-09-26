@@ -36,6 +36,9 @@ type Config struct {
 	// ElectionTicks and HeartbeatTicks default to the core's defaults.
 	ElectionTicks  int
 	HeartbeatTicks int
+	// KVLimits are every node's session-table limits (zero: kv.DefaultLimits);
+	// the reference model uses the same (Phase 13).
+	KVLimits kv.Limits
 }
 
 // Violation is a broken invariant, with the logical step at which it was seen.
@@ -327,7 +330,7 @@ func (c *Cluster) boot(n *node) error {
 	n.shadow.rebase(rc.Log, rc.State)
 	n.core, n.mem, n.up, n.paused = rc.Core, rc.Mem, true, false
 	n.applied, n.verified, n.lv = 0, 0, nil
-	n.kvNodeUp()
+	n.kvNodeUp(c.kvLimits())
 	n.role, n.term, n.commit = n.core.Role(), n.core.Term(), n.core.CommitIndex()
 	n.refresh()
 	c.trace.add(c.step, "up %s inc=%d term=%d vote=%q last=%d commit=%d", n.id, n.inc, n.term, n.core.VotedFor(), n.core.LastIndex(), n.commit)
@@ -578,6 +581,12 @@ func (c *Cluster) Apply(e Event) {
 		touched = c.kvStart(e)
 	case KVTimeout:
 		c.kvTimeout(e)
+	case KVRegister:
+		touched = c.kvRegister(e)
+	case KVRetry:
+		touched = c.kvRetry(e)
+	case KVDup:
+		touched = c.kvDup(e)
 	default:
 		c.skip(e)
 		return
@@ -734,6 +743,7 @@ func (s *simSM) ApplyResult(index uint64, _ []byte) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.c.checkDecision(s.n, e, result)
 	s.n.applied = index
 	s.n.hist = append(s.n.hist, applied{inc: s.n.inc, e: e})
 	if s.first == 0 {

@@ -59,7 +59,7 @@ func TestKVSeededHistoriesAreLinearizable(t *testing.T) {
 			p, seed := p, seed
 			t.Run(fmt.Sprintf("%s/seed=%d", p.Name, seed), func(t *testing.T) {
 				r := RunKV(p, seed)
-				cfg := Config{Nodes: p.Nodes, Seed: seed}
+				cfg := Config{Nodes: p.Nodes, Seed: seed, KVLimits: p.KVLimits}
 				if r.Violation != nil {
 					min := Minimize(cfg, r.Script, 300)
 					t.Fatalf("%s--- minimized script (%d of %d events) ---\n%s\n--- history ---\n%s",
@@ -94,11 +94,25 @@ func TestKVSeededHistoriesAreLinearizable(t *testing.T) {
 		if len(selectedSeeds()) >= 5 {
 			requireEveryFaultOccurred(t, p, tally)
 			// The client-visible outcomes the profile's faults must produce.
-			if kvTally.Incomplete == 0 && (p.Crash > 0 || p.CrashAt > 0 || p.KVTimeout > 0) {
+			// An anonymous client's unanswered write ends Incomplete; a session
+			// client's is retried until it is answered — and some of those
+			// answers must be duplicates of an unanswered send that executed.
+			faulty := p.Crash > 0 || p.CrashAt > 0 || p.KVTimeout > 0
+			if faulty && !p.KVSessions && kvTally.Incomplete == 0 {
 				t.Fatalf("profile %s: no operation ever ended incomplete: %+v", p.Name, kvTally)
+			}
+			if faulty && p.KVSessions && (kvTally.Resolved == 0 || kvTally.ResolvedDup == 0) {
+				t.Fatalf("profile %s: no unanswered session write was ever resolved by a deduplicated retry: %+v", p.Name, kvTally)
 			}
 			if kvTally.Redirects == 0 && p.Name != "kv-steady" {
 				t.Fatalf("profile %s: no request ever met a non-leader: %+v", p.Name, kvTally)
+			}
+			// Session profiles must actually retry, duplicate and deduplicate.
+			if p.KVSessions && (kvTally.Registered == 0 || kvTally.Retries == 0 || kvTally.DupSends == 0 || kvTally.Duplicates == 0) {
+				t.Fatalf("profile %s: sessions were not exercised: %+v", p.Name, kvTally)
+			}
+			if p.KVLimits.MaxSessions > 0 && kvTally.Expired == 0 {
+				t.Fatalf("profile %s: no retry ever met an evicted session: %+v", p.Name, kvTally)
 			}
 		}
 		t.Logf("%s: %d ops over %d seeds %+v; %d checker states", p.Name, ops, len(selectedSeeds()), kvTally, checked)
@@ -117,6 +131,13 @@ func addKV(a, b KVStats) KVStats {
 	a.Stalled += b.Stalled
 	a.ReadsServed += b.ReadsServed
 	a.WritesAcked += b.WritesAcked
+	a.Registered += b.Registered
+	a.Retries += b.Retries
+	a.DupSends += b.DupSends
+	a.Duplicates += b.Duplicates
+	a.Expired += b.Expired
+	a.Resolved += b.Resolved
+	a.ResolvedDup += b.ResolvedDup
 	return a
 }
 
@@ -129,7 +150,7 @@ func TestKVSameSeedSameHistory(t *testing.T) {
 		if a.TraceHash != b.TraceHash || a.History.String() != b.History.String() {
 			t.Fatalf("%s: same seed, different runs", p.Name)
 		}
-		cfg := Config{Nodes: p.Nodes, Seed: 11}
+		cfg := Config{Nodes: p.Nodes, Seed: 11, KVLimits: p.KVLimits}
 		parsed, err := ParseScript(FormatScript(a.Script))
 		if err != nil {
 			t.Fatalf("%s: script does not parse back: %v", p.Name, err)
@@ -579,5 +600,188 @@ func TestKVHistoryOfAScriptIsReplayable(t *testing.T) {
 	}
 	if !strings.Contains(FormatScript(s.Script()), `kvget n2 c2 "k"`) {
 		t.Fatalf("client events must appear in the script:\n%s", FormatScript(s.Script()))
+	}
+}
+
+// --- Phase 13: request identity in the deterministic tier ---
+
+// register makes a client register a session at node and waits for it.
+func (s *kvSim) register(node NodeID, client string) uint64 {
+	s.t.Helper()
+	s.Apply(Event{Kind: KVRegister, Node: node, Client: client})
+	for i := 0; i < 20 && s.Busy(client); i++ {
+		s.DeliverAll()
+		s.heartbeat(node)
+	}
+	id := s.Session(client)
+	if id == 0 {
+		s.t.Fatalf("%s did not register at %s", client, node)
+	}
+	return id
+}
+
+// TestKVSimCommittedRequestRetriedAfterLeaderCrash is the hardest case, exact
+// and replayable: a session's PUT(A) is committed and applied on the leader,
+// which dies (at after-applied-to) before the reply; a new leader is elected;
+// another client writes B; the first client's retry of the SAME request is a
+// duplicate — no second execution, the key keeps B — and the history of logical
+// requests is linearizable. Every replica's decision for every entry matches
+// the reference model at the instant it applies it (INV-X11), including the
+// replays of the restarted node.
+func TestKVSimCommittedRequestRetriedAfterLeaderCrash(t *testing.T) {
+	s := newKVSim(t, 3)
+	s.electLeader("n1")
+	s.register("n1", "c1")
+	s.register("n1", "c2")
+	s.heartbeat("n1")
+	s.do(Event{Kind: CrashAt, Node: "n1", Point: "after-applied-to", Nth: 1})
+	s.put("n1", "c1", "k", "A")
+	s.DeliverAll()
+	s.heartbeat("n1")
+	if s.Up("n1") {
+		t.Fatal("premise: n1 must have died after applying the write")
+	}
+	if !s.Busy("c1") {
+		t.Fatalf("the client of a dead leader must not have an answer: %s", s.last("c1"))
+	}
+	s.do(Event{Kind: KVTimeout, Client: "c1"}) // gives up on that send; the request stays open
+	s.electLeader("n2")
+	s.do(Event{Kind: Restart, Node: "n1"})
+	s.heartbeat("n2")
+	s.put("n2", "c2", "k", "B")
+	s.DeliverAll()
+	s.heartbeat("n2")
+	if op := s.last("c2"); op.Outcome != lincheck.OK {
+		t.Fatalf("put(B): %s", op)
+	}
+	s.Apply(Event{Kind: KVRetry, Node: "n2", Client: "c1"})
+	s.DeliverAll()
+	s.heartbeat("n2")
+	op := s.last("c1")
+	if op.Outcome != lincheck.OK || len(op.Attempts) != 2 || !strings.HasPrefix(op.Attempts[1].Result, "duplicate of index") {
+		t.Fatalf("the retry must be answered as a duplicate of the original: %s %+v", op, op.Attempts)
+	}
+	s.get("n2", "c3", "k")
+	s.DeliverAll()
+	s.heartbeat("n2")
+	if op := s.last("c3"); op.Outcome != lincheck.OK || string(op.Output) != "B" {
+		t.Fatalf("the retry executed again: %s", op)
+	}
+	s.requireLinearizable()
+	if st := s.KVStats(); st.Duplicates != 1 {
+		t.Fatalf("stats: %+v", st)
+	}
+}
+
+// TestKVSimConcurrentDuplicateExecutesOnce: while a session write is in flight
+// at the leader, a duplicate is sent to a follower, redirected to the leader,
+// and appended as a second entry: the first applied executes, the second is its
+// duplicate; the client's request completes once.
+func TestKVSimConcurrentDuplicateExecutesOnce(t *testing.T) {
+	s := newKVSim(t, 3)
+	s.electLeader("n1")
+	s.register("n1", "c1")
+	s.heartbeat("n1")
+	s.put("n1", "c1", "k", "A")
+	s.Apply(Event{Kind: KVDup, Node: "n2", Client: "c1"})
+	s.DeliverAll()
+	s.heartbeat("n1")
+	s.heartbeat("n1")
+	op := s.last("c1")
+	if op.Outcome != lincheck.OK {
+		t.Fatalf("%s", op)
+	}
+	st := s.Store("n1").Stats()
+	if st.Executed != 1 || st.Duplicate != 1 {
+		t.Fatalf("want one execution and one duplicate on the leader: %+v", st)
+	}
+	s.requireLinearizable()
+}
+
+// TestKVSimSessionsSurviveARestartOfEveryNode: after every node crashes and
+// restarts, the session table is rebuilt by replay — every replayed decision
+// is checked against the model as it is made — and a retry of an executed
+// request is still a duplicate.
+func TestKVSimSessionsSurviveARestartOfEveryNode(t *testing.T) {
+	s := newKVSim(t, 3)
+	s.electLeader("n1")
+	s.register("n1", "c1")
+	s.heartbeat("n1")
+	s.do(Event{Kind: CrashAt, Node: "n1", Point: "after-applied-to", Nth: 1})
+	s.put("n1", "c1", "k", "A")
+	s.DeliverAll()
+	s.heartbeat("n1")
+	s.do(Event{Kind: KVTimeout, Client: "c1"})
+	for _, id := range []NodeID{"n2", "n3"} {
+		s.do(Event{Kind: Crash, Node: id, Power: true})
+	}
+	for _, id := range []NodeID{"n1", "n2", "n3"} {
+		s.do(Event{Kind: Restart, Node: id})
+	}
+	s.electLeader("n3")
+	s.heartbeat("n3")
+	s.Apply(Event{Kind: KVRetry, Node: "n3", Client: "c1"})
+	s.DeliverAll()
+	s.heartbeat("n3")
+	op := s.last("c1")
+	if op.Outcome != lincheck.OK || !strings.HasPrefix(op.Attempts[len(op.Attempts)-1].Result, "duplicate of index") {
+		t.Fatalf("after every node restarted, the retry must still be a duplicate: %s %+v", op, op.Attempts)
+	}
+	s.requireLinearizable()
+}
+
+// TestKVTierCatchesRetriesThatAreNotDeduplicated proves the session tier has
+// teeth at the history level: with a deliberately broken client that retries
+// under a fresh request id — so an unanswered send that executed is executed
+// again by its retry — the store, every replica and the session model all
+// agree (every id is new, INV-X11 and INV-X2 are silent), yet seeded runs
+// produce histories of logical requests the checker rejects: a write that took
+// effect twice. If this ever stops failing, the tier cannot see a lost
+// deduplication.
+func TestKVTierCatchesRetriesThatAreNotDeduplicated(t *testing.T) {
+	p, _ := KVProfileByName("kv-sessions-crashpoints")
+	p.Keys = 1 // every write and read on one key: a second execution is observable
+	caught := 0
+	for seed := int64(1); seed <= 12; seed++ {
+		cfg := Config{Nodes: p.Nodes, Seed: seed, KVLimits: p.KVLimits}
+		c, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.UnsafeFreshRetryIDs()
+		rng := newRand(seed)
+		for i := 0; i < p.Steps && c.Violation() == nil; i++ {
+			c.Apply(c.generate(rng, p))
+		}
+		if c.Violation() != nil {
+			t.Fatalf("seed %d: the broken client must be invisible to the invariants: %v", seed, c.Violation())
+		}
+		if ok, r := linearizable(c.History()); !ok {
+			caught++
+			if caught == 1 {
+				replay := func(s []Event) lincheck.History {
+					rc, _ := New(cfg)
+					rc.UnsafeFreshRetryIDs()
+					for _, e := range s {
+						rc.Apply(e)
+					}
+					return rc.History()
+				}
+				min := MinimizeFunc(cfg, c.Script(), 600, func(s []Event) bool {
+					good, _ := linearizable(replay(s))
+					return !good
+				})
+				good, mr := linearizable(replay(min))
+				if good {
+					t.Fatal("the minimized script no longer reproduces the double execution")
+				}
+				t.Logf("seed %d: retry without deduplication caught: %s\nminimized to %d of %d events:\n%s\n--- counterexample ---\n%s",
+					seed, r.Reason, len(min), len(c.Script()), FormatScript(min), lincheck.Format(mr.Counterexample))
+			}
+		}
+	}
+	t.Logf("%d of 12 runs caught", caught)
+	if caught == 0 {
+		t.Fatal("no run with fresh-id retries was caught: the tier cannot see a lost deduplication")
 	}
 }

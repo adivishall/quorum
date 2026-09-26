@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/adivishall/quorum/internal/kv"
 	"github.com/adivishall/quorum/internal/lincheck"
 	"github.com/adivishall/quorum/internal/raftnode"
 )
@@ -28,9 +29,16 @@ type Profile struct {
 	// client giving up, over Clients clients and Keys keys (k0..).
 	KVPut, KVGet, KVDelete, KVTimeout int
 	Clients, Keys                     int
-	FIFOPercent                       int // chance a delivery takes the oldest message (else a random one: reordering)
-	PowerLossPercent                  int // chance a crash also models power loss on the node's disk
-	MaxDelay, MaxTorn                 int // bounds on Delay steps and torn-tail bytes
+	// Phase 13: KVSessions makes every client register a session (weight
+	// KVRegister) before its requests, retry an open request under the same
+	// identity (KVRetry) and send concurrent duplicates of writes (KVDup);
+	// KVLimits are the session-table limits (zero: kv.DefaultLimits).
+	KVSessions                 bool
+	KVRegister, KVRetry, KVDup int
+	KVLimits                   kv.Limits
+	FIFOPercent                int // chance a delivery takes the oldest message (else a random one: reordering)
+	PowerLossPercent           int // chance a crash also models power loss on the node's disk
+	MaxDelay, MaxTorn          int // bounds on Delay steps and torn-tail bytes
 }
 
 // Profiles are the built-in chaos mixes. Every one exercises the continuous

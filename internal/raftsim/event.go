@@ -71,6 +71,13 @@ const (
 	// KVTimeout makes Client give up on its outstanding operation: the
 	// operation is Incomplete (a write may still take effect).
 	KVTimeout
+	// KVRegister makes Client register a session at Node (Phase 13): from then
+	// on its requests carry an identity and survive retries.
+	KVRegister
+	// KVRetry re-sends Client's open request — the same identity — to Node.
+	KVRetry
+	// KVDup sends a concurrent duplicate of Client's open write to Node.
+	KVDup
 	// Split replaces any partition with a two-sided one, Data = "a,b|c,d,e":
 	// every link between the sides is cut both ways, every link within a side
 	// works (Phase 12 — a minority side that keeps a leader AND a follower
@@ -85,6 +92,7 @@ var kindNames = map[Kind]string{
 	FailPersist: "failpersist", Disarm: "disarm", Release: "release", Propose: "propose",
 	CheckConverged: "check-converged", CrashAt: "crashat",
 	KVPut: "kvput", KVGet: "kvget", KVDelete: "kvdel", KVTimeout: "kvtimeout", Split: "split",
+	KVRegister: "kvregister", KVRetry: "kvretry", KVDup: "kvdup",
 }
 
 func (k Kind) String() string {
@@ -123,6 +131,7 @@ func (o PersistOp) String() string { return persistNames[o] }
 //	KVPut                                     Node, Client, Key, Data (the value)
 //	KVGet, KVDelete                           Node, Client, Key
 //	KVTimeout                                 Client
+//	KVRegister, KVRetry, KVDup                Node, Client
 //	Split                                     Data ("a,b|c,d,e")
 //
 // A message is addressed by its link and its position among the messages
@@ -200,6 +209,8 @@ func (e Event) String() string {
 		return fmt.Sprintf("%s %s %s %s", e.Kind, e.Node, e.Client, strconv.Quote(e.Key))
 	case KVTimeout:
 		return fmt.Sprintf("kvtimeout %s", e.Client)
+	case KVRegister, KVRetry, KVDup:
+		return fmt.Sprintf("%s %s %s", e.Kind, e.Node, e.Client)
 	case Split:
 		return fmt.Sprintf("split %s", e.Data)
 	default:
@@ -312,6 +323,10 @@ func ParseEvent(line string) (Event, error) {
 	case KVTimeout:
 		if err = need(2); err == nil {
 			e.Client = f[1]
+		}
+	case KVRegister, KVRetry, KVDup:
+		if err = need(3); err == nil {
+			e.Node, e.Client = NodeID(f[1]), f[2]
 		}
 	case Split:
 		if err = need(2); err == nil {

@@ -39,7 +39,10 @@ mutation:
 ## `go test` runs a small seed set), the Phase 11 crash matrix (a crash at every
 ## driver and I/O boundary a scenario reaches, in every crash mode), and the
 ## Phase 12 client workloads (every KV profile's history checked for
-## linearizability, plus INV-X5..X8). Every run is replayable: a failure prints
+## linearizability, plus INV-X5..X8), including the Phase 13 session profiles
+## (retries and concurrent duplicates under one request identity; every
+## replica's apply-time decision checked against the session model, INV-X11,
+## and no identity executed twice, INV-X2). Every run is replayable: a failure prints
 ## the exact command and a minimized script (or, for the matrix, the exact
 ## crashat event). See docs/FAULTS.md, docs/CRASH_RECOVERY.md and
 ## docs/LINEARIZABILITY.md.
