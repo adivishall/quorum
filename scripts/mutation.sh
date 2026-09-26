@@ -727,6 +727,20 @@ mutant "durations-that-overflow-are-protocol-errors" internal/kv/wire.go \
   '	if false && d.err == nil && ms > maxMillis {' \
   ./internal/kv 'TestDurationsThatOverflowAreProtocolErrors|FuzzDecodeRequestIsTotal'
 
+# 91. raftnode.Start reads the core after the actor goroutine owns it (the data
+#     race the Phase 13 gate's race suite found). Killed only under the race
+#     detector, so "-race" rides in the package list.
+mutant "start-reads-the-core-before-the-actor-owns-it" internal/raftnode/node.go \
+  '	term, last := rc.Core.Term(), rc.Core.LastIndex()
+	n.wg.Add(2)
+	go n.receiveLoop()
+	go n.actorLoop()' \
+  '	n.wg.Add(2)
+	go n.receiveLoop()
+	go n.actorLoop()
+	term, last := rc.Core.Term(), rc.Core.LastIndex()' \
+  "-race ./internal/raftnode" 'TestStartDoesNotTouchTheCoreOnceTheActorOwnsIt'
+
 echo "== Phase 13: the checker over logical operations, and the reference model =="
 
 # 77. Request identity is not scoped by client: the same RequestID from two

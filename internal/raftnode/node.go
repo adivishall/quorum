@@ -289,10 +289,14 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		n.wg.Add(1)
 		go n.senderLoop(ch)
 	}
+	// Read what the start line reports while this goroutine still owns the
+	// core: once the actor runs, only it may touch the core (it may be
+	// stepping a message already).
+	term, last := rc.Core.Term(), rc.Core.LastIndex()
 	n.wg.Add(2)
 	go n.receiveLoop()
 	go n.actorLoop()
-	n.logf("event=raft_started node=%s peers=%d term=%d lastIndex=%d", cfg.ID, len(cfg.Peers), rc.Core.Term(), rc.Core.LastIndex())
+	n.logf("event=raft_started node=%s peers=%d term=%d lastIndex=%d", cfg.ID, len(cfg.Peers), term, last)
 	return n, nil
 }
 

@@ -8,8 +8,9 @@ import (
 // kindForType maps a Raft message type to the transport's reserved frame kind
 // (ADR-013). This mapping is the only place the two vocabularies meet: the core
 // never imports the transport, and the transport never learns what a term means
-// (docs/RAFT.md §25). Only the four Phase 9 Raft kinds are activated; snapshot and
-// forward kinds stay reserved.
+// (docs/RAFT.md §25). Only the four Phase 9 Raft kinds are Raft messages; the
+// Phase 13 forward kinds are application messages (SetAppHandler, SendApp), and
+// the snapshot kinds stay reserved.
 func kindForType(t raft.MessageType) (transport.MsgKind, bool) {
 	switch t {
 	case raft.MsgVoteRequest:
