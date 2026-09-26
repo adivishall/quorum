@@ -406,7 +406,10 @@ more operations **served** (OK/NotFound — refusals are not progress), a crash 
 follower reporting the new leader. Timing is real, so a run cannot be replayed from a seed — its
 **evidence** can: each run records the workload seed and options (each client's operation
 sequence is a function of them), every fault and node event at a position in the history's own
-clock, and the history. A failure writes those and every node's output to a directory it names;
+clock, and the history. A scenario that depends on real timing leaving something unchanged — "the
+node we armed or cut off still leads" — verifies that premise from what the system itself says (a
+*not leader* refusal, the durable term) and, if real timing voided it, starts over on a fresh
+cluster, at most three times; a premise is never assumed, and an assertion is never retried. A failure writes those and every node's output to a directory it names;
 `go run ./cmd/lincheck DIR/history.txt` re-checks, minimizes and explains the saved history
 offline. (Exact replay of a *schedule* is the simulator's job, §8.)
 
@@ -605,6 +608,19 @@ No execution of the implementation produced a non-linearizable history. What the
    client back-off after a refusal naming no leader); in-process schedules and one wire test slept
    for guessed durations (now each waits for an observable condition); a driver unit test would
    hang, not fail, under a mutant (now it receives non-blockingly what must already be there).
+4. **Real-process tests assumed the leader they found stays leader** (found by CI, `check` job:
+   every package's race tests at once on a small runner). Three scripted tests sent a request to
+   "the leader" and got a definite *not leader*: a spurious election under load had deposed it
+   between the test finding it and acting. No history was wrong — the premise was. Each such test
+   now verifies its premise (the node's own *not leader* refusal proves it did not lead; the
+   victim's durable term must not move between arming and the crash) and, when real timing voids
+   it, starts over on a fresh cluster, at most three times (`withPremise`, itself unit-tested).
+   Only a premise is ever retried; an assertion that fails fails the test.
+5. **A Phase 10 test carried the same kind of timing assumption** (found by running the whole
+   race suite under deliberate CPU starvation): `TestWedgedPeerDoesNotStallTheLeader` required no
+   term change during a one-second sleep. It now asserts INV-F5 without timing — after the wedge
+   engages, twenty rounds of proposals are accepted and committed with the healthy follower —
+   with the same premise rule; its mutant (a synchronous send) is still killed.
 
 ## 14. Reproducing
 
