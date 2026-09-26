@@ -80,6 +80,9 @@ func FuzzDecodeIsTotal(f *testing.F) {
 	f.Add(Command{Op: OpPut, Key: []byte("k"), Value: []byte("v")}.Encode())
 	f.Add(Command{Op: OpDelete, Key: []byte("k")}.Encode())
 	f.Add([]byte{1, 200})
+	f.Add(Command{Op: OpRegister}.Encode())
+	f.Add(Command{Op: OpPut, Key: []byte("k"), Value: []byte("v"), ClientID: 5, RequestID: 9, AckedBelow: 4}.Encode())
+	f.Add(Command{Op: OpDelete, Key: []byte("k"), ClientID: 5, RequestID: 9, AckedBelow: 9}.Encode())
 	f.Fuzz(func(t *testing.T, b []byte) {
 		c, err := Decode(b) // must never panic
 		if err != nil {
