@@ -424,8 +424,10 @@ func TestRealForwarderDiesBeforeRelaying(t *testing.T) {
 
 // TestRealConcurrentDuplicatesThroughEveryNode: the same request is sent at
 // once to all three nodes — the leader executes one copy, each follower
-// forwards its copy — round after round. Exactly one copy executes; every
-// other is answered as its duplicate, with the same index.
+// forwards its copy — round after round: 20 PUT rounds, 5 GET rounds, 5 DELETE
+// rounds. For a write exactly one copy executes and every other is answered as
+// its duplicate, with the same index; a read is never deduplicated — every copy
+// really reads, and all see the same value.
 func TestRealConcurrentDuplicatesThroughEveryNode(t *testing.T) {
 	c := newRCluster(t, 3)
 	c.waitLeader(c.ids, 0, 20*time.Second)
@@ -436,9 +438,8 @@ func TestRealConcurrentDuplicatesThroughEveryNode(t *testing.T) {
 	opts := kv.SessionOptions{AttemptTimeout: 5 * time.Second, MaxAttempts: 20, Backoff: 50 * time.Millisecond}
 	base := r.session("W", opts)
 	sess := base.Session()
-	for round := 0; round < 20; round++ {
+	round := func(n int, kind lincheck.Kind, value []byte) []kv.Outcome {
 		rid := sess.Reserve()
-		value := []byte(fmt.Sprintf("v%d", round))
 		outs := make([]kv.Outcome, len(c.ids))
 		var wg sync.WaitGroup
 		for i, id := range c.ids {
@@ -449,34 +450,103 @@ func TestRealConcurrentDuplicatesThroughEveryNode(t *testing.T) {
 			go func(i int) {
 				defer wg.Done()
 				defer sess.Release(rid)
-				_, outs[i] = cl.Send(ctx, rid, lincheck.Put, "k", value)
+				_, outs[i] = cl.Send(ctx, rid, kind, "k", value)
 			}(i)
 		}
 		wg.Wait()
 		sess.Release(rid)
-		executed := 0
 		for i, o := range outs {
 			if o.Err != nil {
-				r.fail("round %d: the copy sent to %s: %+v", round, c.ids[i], o)
+				r.fail("%s round %d: the copy sent to %s: %+v", kind, n, c.ids[i], o)
 			}
+		}
+		return outs
+	}
+	writes := func(n int, kind lincheck.Kind, value []byte) {
+		outs := round(n, kind, value)
+		executed := 0
+		for _, o := range outs {
 			if !o.Response.Duplicate {
 				executed++
 			}
 			if o.Response.Index != outs[0].Response.Index {
-				r.fail("round %d: copies answered from different indexes: %+v", round, outs)
+				r.fail("%s round %d: copies answered from different indexes: %+v", kind, n, outs)
 			}
 		}
 		if executed != 1 {
-			r.fail("round %d: %d copies executed, want exactly 1: %+v", round, executed, outs)
+			r.fail("%s round %d: %d copies executed, want exactly 1: %+v", kind, n, executed, outs)
+		}
+	}
+	for n := 0; n < 20; n++ {
+		writes(n, lincheck.Put, []byte(fmt.Sprintf("v%d", n)))
+	}
+	for n := 0; n < 5; n++ {
+		for _, o := range round(n, lincheck.Get, nil) {
+			if o.Response.Duplicate || o.Response.Status != kv.StatusOK || string(o.Response.Value) != "v19" {
+				r.fail("GET round %d: every copy must really read v19: %+v", n, o.Response)
+			}
+		}
+	}
+	for n := 0; n < 5; n++ {
+		writes(n, lincheck.Delete, nil)
+	}
+	r.check()
+	c.finish()
+	ev := c.requireDedupEvidence(kv.DefaultLimits)
+	if len(ev.executedAt) != 25 || ev.duplicates < 50 {
+		t.Fatalf("want 25 write identities executed once and at least 50 duplicate entries: %+v", ev)
+	}
+	t.Logf("committed log: %d identified entries, %d duplicates, %d identities executed once each", ev.identified, ev.duplicates, len(ev.executedAt))
+}
+
+// TestRealConcurrentRequestsFromOneSession: eight goroutines share one session
+// and send distinct requests at once (through the session's endpoints — its
+// first requests to any node, then following the leader hint). Every request
+// executes once — none is refused stale or answered as a duplicate: each
+// carries the lowest id still in flight as its watermark, so no request's
+// result is forgotten while it is outstanding — and the history is
+// linearizable.
+func TestRealConcurrentRequestsFromOneSession(t *testing.T) {
+	c := newRCluster(t, 3)
+	c.waitLeader(c.ids, 0, 20*time.Second)
+	c.waitClientReady(20 * time.Second)
+	c.waitStable(c.ids, 0, 30*time.Second)
+	r := newLinRun(t, c)
+	ctx := context.Background()
+	opts := kv.SessionOptions{AttemptTimeout: 5 * time.Second, MaxAttempts: 20, Backoff: 50 * time.Millisecond}
+	sess := r.session("S", opts).Session()
+	var wg sync.WaitGroup
+	errs := make(chan string, 80)
+	for g := 0; g < 8; g++ {
+		cl := workload.NewSessionClient(fmt.Sprintf("S-g%d", g), sess, r.rec)
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				op, out := cl.Put(ctx, fmt.Sprintf("k%d", g), []byte(fmt.Sprint(i)))
+				if out.Err != nil || out.Response.Duplicate {
+					errs <- fmt.Sprintf("goroutine %d request %d: %s %+v", g, i, op, out)
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		r.fail("%s", e)
+	}
+	rd := r.session("reader", opts)
+	for g := 0; g < 8; g++ {
+		if got, out := rd.Get(ctx, fmt.Sprintf("k%d", g)); out.Err != nil || string(got.Output) != "9" {
+			r.fail("k%d = %q (%v)", g, got.Output, out.Err)
 		}
 	}
 	r.check()
 	c.finish()
 	ev := c.requireDedupEvidence(kv.DefaultLimits)
-	if len(ev.executedAt) != 20 || ev.duplicates < 40 {
-		t.Fatalf("want 20 identities executed once and at least 40 duplicate entries: %+v", ev)
+	if len(ev.executedAt) != 80 {
+		t.Fatalf("want 80 requests executed once each: %+v", ev)
 	}
-	t.Logf("committed log: %d identified entries, %d duplicates, %d identities executed once each", ev.identified, ev.duplicates, len(ev.executedAt))
 }
 
 // TestRealRedirectOnlyModeWithSessions: with -client-forwarding=false, a

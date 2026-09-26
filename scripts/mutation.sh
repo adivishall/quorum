@@ -702,6 +702,24 @@ mutant "requests-are-validated-before-they-are-proposed" internal/kv/api.go \
   '	if r.RequestID == 0 || r.AckedBelow == 0 {' \
   ./internal/kv 'TestRequestValidationRejectsEveryOutOfContractField|TestValidatedRequestsAlwaysApply'
 
+# 88. A duplicate is answered with its OWN entry's index instead of the
+#     original execution's (a result that belongs to a different entry).
+mutant "a-duplicate-reports-the-original-execution" internal/kv/store.go \
+  '			return Result{Decision: Duplicate, Index: rec.index}' \
+  '			return Result{Decision: Duplicate, Index: index}' \
+  "./internal/kv ./tests/integration" 'TestStoreAgreesWithTheSessionModel|TestConcurrentDuplicatesAtTwoNodes|TestRealConcurrentDuplicatesThroughEveryNode'
+
+# 89. A restart marks the recovered commit applied instead of replaying it into
+#     the fresh state machine: the session table (with the rest of the state)
+#     is lost, and a retry after the restart is refused or re-executed.
+mutant "a-restart-rebuilds-the-session-table-by-replay" internal/raftnode/node.go \
+  '			return nil, fmt.Errorf("raftnode: recovered commit invalid: %w", err)
+		}' \
+  '			return nil, fmt.Errorf("raftnode: recovered commit invalid: %w", err)
+		}
+		_ = mlog.Apply(rec.HardState.Commit)' \
+  "./internal/kv ./internal/raftsim ./tests/integration" 'TestRetryAfterEveryNodeRestarts|TestKVSimSessionsSurviveARestartOfEveryNode|TestRealSessionContractSurvivesFullClusterRestart'
+
 echo "== Phase 13: the checker over logical operations, and the reference model =="
 
 # 77. Request identity is not scoped by client: the same RequestID from two
