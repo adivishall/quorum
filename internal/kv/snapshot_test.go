@@ -361,7 +361,11 @@ func TestSnapshotStateCorpus(t *testing.T) {
 			t.Fatalf("%s: snapshot format: %v", name, err)
 		}
 		s := NewStoreWithLimits(corpusLimits)
+		verr := s.ValidateSnapshot(m.Index, state)
 		err = s.RestoreSnapshot(m.Index, state)
+		if (verr == nil) != (err == nil) {
+			t.Errorf("%s: ValidateSnapshot says %v, RestoreSnapshot %v", name, verr, err)
+		}
 		switch {
 		case strings.HasPrefix(name, "good/") && err != nil:
 			t.Errorf("%s: known-good refused: %v", name, err)

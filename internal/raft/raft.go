@@ -102,10 +102,15 @@ func (r *Raft) LeaderID() NodeID    { return r.leaderID }
 func (r *Raft) CommitIndex() uint64 { return r.log.CommitIndex() }
 func (r *Raft) LastIndex() uint64   { return r.log.LastIndex() }
 
-// Boundary is the index and term of the last entry compacted into a snapshot
-// (0, 0 if none): the snapshot this node would offer a follower that needs an
-// entry at or below it.
+// Boundary is the index and term of the last entry compacted away (0, 0 if
+// none). A follower that needs an entry at or below it can only be brought up
+// to date by a snapshot at or beyond it; the driver sends its latest published
+// snapshot, which a compaction never passes (docs/SNAPSHOTS.md §5).
 func (r *Raft) Boundary() (index, term uint64) { return r.log.Boundary() }
+
+// TermAt returns the term of the entry at index, which must be in the log or
+// be its boundary (Phase 14: the driver names a snapshot by (index, term)).
+func (r *Raft) TermAt(index uint64) (uint64, error) { return r.log.Term(index) }
 
 // --- inputs ---
 

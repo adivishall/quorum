@@ -90,17 +90,35 @@ func appendBytes(b, p []byte) []byte {
 // guarantees — and the store is unchanged if any fails. The decision counters
 // restart at zero.
 func (s *Store) RestoreSnapshot(index uint64, data []byte) error {
-	st, err := decodeState(data, s.limits)
+	st, err := s.checkSnapshot(index, data)
 	if err != nil {
 		return err
-	}
-	if st.applied != index {
-		return fmt.Errorf("%w: state at index %d, snapshot at %d", ErrSnapshotState, st.applied, index)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.m, s.sessions, s.applied, s.stats = st.m, st.sessions, st.applied, ApplyStats{}
 	return nil
+}
+
+// ValidateSnapshot reports whether RestoreSnapshot would accept data as the
+// state at index, without changing the store. The driver checks a snapshot a
+// leader sent before the Raft core ever sees it (docs/SNAPSHOTS.md §7): once
+// installed, a snapshot is durable, and one the store then refused would leave
+// the node unable to start.
+func (s *Store) ValidateSnapshot(index uint64, data []byte) error {
+	_, err := s.checkSnapshot(index, data)
+	return err
+}
+
+func (s *Store) checkSnapshot(index uint64, data []byte) (*state, error) {
+	st, err := decodeState(data, s.limits)
+	if err != nil {
+		return nil, err
+	}
+	if st.applied != index {
+		return nil, fmt.Errorf("%w: state at index %d, snapshot at %d", ErrSnapshotState, st.applied, index)
+	}
+	return st, nil
 }
 
 type state struct {
