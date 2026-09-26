@@ -26,7 +26,7 @@ func execProgram(t *testing.T, l *MemoryLog, data []byte) {
 	i := 0
 	for ops := 0; i < len(data) && ops < 200; ops++ {
 		op := nextByte(data, &i)
-		switch op % 4 {
+		switch op % 6 {
 		case 0: // append at the end (structurally contiguous; term may regress)
 			n := 1 + int(nextByte(data, &i))%3
 			term := uint64(nextByte(data, &i)) % 6
@@ -43,6 +43,13 @@ func execProgram(t *testing.T, l *MemoryLog, data []byte) {
 		case 3: // apply, target possibly illegal
 			target := uint64(nextByte(data, &i)) % (l.LastIndex() + 2)
 			_ = l.Apply(target)
+		case 4: // compact (Phase 14), target possibly illegal
+			target := uint64(nextByte(data, &i)) % (l.LastIndex() + 2)
+			_ = l.Compact(target)
+		case 5: // install a snapshot (Phase 14): index and term arbitrary
+			idx := uint64(nextByte(data, &i)) % (l.LastIndex() + 4)
+			term := uint64(nextByte(data, &i)) % 6
+			_ = l.InstallSnapshot(idx, term)
 		}
 		assertInvariants(t, ops, l)
 	}
@@ -70,7 +77,12 @@ func FuzzLogOperations(f *testing.F) {
 				l1.LastIndex(), l1.CommitIndex(), l1.AppliedIndex(),
 				l2.LastIndex(), l2.CommitIndex(), l2.AppliedIndex())
 		}
-		for i := uint64(1); i <= l1.LastIndex(); i++ {
+		if b1, t1 := l1.Boundary(); true {
+			if b2, t2 := l2.Boundary(); b1 != b2 || t1 != t2 {
+				t.Fatalf("non-deterministic boundary: (%d,%d) vs (%d,%d)", b1, t1, b2, t2)
+			}
+		}
+		for i := l1.FirstIndex(); i <= l1.LastIndex(); i++ {
 			a, _ := l1.At(i)
 			b, _ := l2.At(i)
 			if a.Index != b.Index || a.Term != b.Term || !bytes.Equal(a.Data, b.Data) {
@@ -79,13 +91,13 @@ func FuzzLogOperations(f *testing.F) {
 		}
 
 		// Aliasing: mutating a read cannot change stored bytes.
-		if l1.LastIndex() >= 1 {
-			e, _ := l1.At(1)
+		if l1.LastIndex() >= l1.FirstIndex() {
+			e, _ := l1.At(l1.FirstIndex())
 			orig := append([]byte(nil), e.Data...)
 			for j := range e.Data {
 				e.Data[j] ^= 0xff
 			}
-			again, _ := l1.At(1)
+			again, _ := l1.At(l1.FirstIndex())
 			if !bytes.Equal(again.Data, orig) {
 				t.Fatalf("read exposed internal storage at index 1: %q became %q", orig, again.Data)
 			}

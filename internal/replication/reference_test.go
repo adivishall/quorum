@@ -2,6 +2,7 @@ package replication
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math/rand"
 	"testing"
@@ -12,19 +13,52 @@ import (
 // same operation sequence through it and through MemoryLog and asserts they never
 // diverge — a cross-check that the real implementation matches the specified
 // contract rather than only its own idea of it.
+//
+// Phase 14: the model keeps a slot for every index — slots at or below the
+// boundary are dead placeholders — and a separate boundary (index, term), so its
+// notion of compaction is independent of MemoryLog's re-based slice.
 type refLog struct {
-	entries []Entry // slot i-1 holds index i
-	commit  uint64
-	applied uint64
+	entries  []Entry // slot i-1 holds index i; slots <= base are dead
+	commit   uint64
+	applied  uint64
+	base     uint64
+	baseTerm uint64
 }
 
 func (r *refLog) last() uint64 { return uint64(len(r.entries)) }
 
 func (r *refLog) term(i uint64) uint64 {
-	if i == 0 {
-		return 0
+	if i == r.base {
+		return r.baseTerm
 	}
 	return r.entries[i-1].Term
+}
+
+// compact moves the boundary up to i: legal iff base <= i <= applied.
+func (r *refLog) compact(i uint64) bool {
+	if i < r.base || i > r.applied {
+		return false
+	}
+	if i > r.base {
+		r.base, r.baseTerm = i, r.term(i)
+	}
+	return true
+}
+
+// installSnapshot resets the log to a snapshot ending at (i, t) (Raft §7): legal
+// iff i is above the commit; the suffix after i survives only if the log held i
+// with term t.
+func (r *refLog) installSnapshot(i, t uint64) bool {
+	if i <= r.commit {
+		return false
+	}
+	matched := i <= r.last() && r.term(i) == t
+	if !matched {
+		r.entries = make([]Entry, i) // dead placeholders through i
+	}
+	r.base, r.baseTerm = i, t
+	r.commit, r.applied = i, i
+	return true
 }
 
 // contiguousNonDecreasing reports whether a batch starting at f is contiguous and
@@ -53,7 +87,7 @@ func (r *refLog) truncateAndAppend(es []Entry) bool {
 		return false
 	}
 	f := es[0].Index
-	if f < 1 || f > r.last()+1 || f <= r.commit || !r.contiguousNonDecreasing(f, es) {
+	if f < 1 || f > r.last()+1 || f <= r.commit || f <= r.base || !r.contiguousNonDecreasing(f, es) {
 		return false
 	}
 	r.install(f, es)
@@ -98,7 +132,7 @@ func TestAgainstReferenceModel(t *testing.T) {
 			term := uint64(1)
 
 			for step := 0; step < 400; step++ {
-				switch rng.Intn(5) {
+				switch rng.Intn(7) {
 				case 0, 1: // append at the end (mostly valid)
 					if rng.Intn(6) == 0 {
 						term++ // occasionally bump the term
@@ -131,6 +165,21 @@ func TestAgainstReferenceModel(t *testing.T) {
 					target := uint64(rng.Intn(int(impl.LastIndex()) + 2))
 					assertSameOutcome(t, step, "apply",
 						impl.Apply(target), ref.doApply(target), impl, ref)
+				case 5: // compact (Phase 14), target possibly beyond applied or below the boundary
+					target := uint64(rng.Intn(int(impl.LastIndex()) + 2))
+					assertSameOutcome(t, step, "compact",
+						impl.Compact(target), ref.compact(target), impl, ref)
+				case 6: // install a snapshot (Phase 14): matching, conflicting, beyond the log or stale
+					idx := uint64(rng.Intn(int(impl.LastIndex()) + 4))
+					st := term
+					if last := impl.LastIndex(); idx >= impl.FirstIndex() && idx <= last && rng.Intn(2) == 0 {
+						st, _ = impl.Term(idx) // a snapshot the log agrees with: its suffix survives
+					} else if rng.Intn(3) == 0 {
+						st = term + 1
+						term = st
+					}
+					assertSameOutcome(t, step, "install",
+						impl.InstallSnapshot(idx, st), ref.installSnapshot(idx, st), impl, ref)
 				}
 				assertInvariants(t, step, impl)
 			}
@@ -163,7 +212,18 @@ func assertSameOutcome(t *testing.T, step int, op string, implErr error, refOK b
 	if impl.AppliedIndex() != ref.applied {
 		t.Fatalf("step %d %s: applied impl=%d ref=%d", step, op, impl.AppliedIndex(), ref.applied)
 	}
-	for i := uint64(1); i <= impl.LastIndex(); i++ {
+	if bi, bt := impl.Boundary(); bi != ref.base || bt != ref.baseTerm {
+		t.Fatalf("step %d %s: boundary impl=(%d,%d) ref=(%d,%d)", step, op, bi, bt, ref.base, ref.baseTerm)
+	}
+	if impl.FirstIndex() > 1 {
+		if _, err := impl.At(impl.FirstIndex() - 1); !errors.Is(err, ErrCompacted) {
+			t.Fatalf("step %d %s: At below FirstIndex = %v, want ErrCompacted", step, op, err)
+		}
+	}
+	if tm, err := impl.Term(ref.base); err != nil || tm != ref.baseTerm {
+		t.Fatalf("step %d %s: Term(boundary) = %d, %v; want %d", step, op, tm, err, ref.baseTerm)
+	}
+	for i := impl.FirstIndex(); i <= impl.LastIndex(); i++ {
 		got, err := impl.At(i)
 		if err != nil {
 			t.Fatalf("step %d %s: At(%d): %v", step, op, i, err)
@@ -184,9 +244,13 @@ func assertInvariants(t *testing.T, step int, l *MemoryLog) {
 	if l.AppliedIndex() > l.CommitIndex() {
 		t.Fatalf("step %d: applied %d > commit %d (INV-P8)", step, l.AppliedIndex(), l.CommitIndex())
 	}
-	// Contiguity and non-decreasing terms (INV-P2).
-	var prevTerm uint64
-	for i := uint64(1); i <= l.LastIndex(); i++ {
+	base, baseTerm := l.Boundary()
+	if base > l.AppliedIndex() {
+		t.Fatalf("step %d: boundary %d above applied %d (Phase 14: only applied state is compacted)", step, base, l.AppliedIndex())
+	}
+	// Contiguity and non-decreasing terms (INV-P2), from the boundary on.
+	prevTerm := baseTerm
+	for i := l.FirstIndex(); i <= l.LastIndex(); i++ {
 		e, err := l.At(i)
 		if err != nil {
 			t.Fatalf("step %d: At(%d): %v", step, i, err)

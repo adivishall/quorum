@@ -69,4 +69,17 @@ var (
 	// ErrApplyBeyondCommit means Apply was asked to advance appliedIndex past
 	// commitIndex — applying an uncommitted entry (INV-P8, INV-P9).
 	ErrApplyBeyondCommit = errors.New("applied index beyond commit index")
+
+	// ErrCompacted means an index at or below the log's compaction boundary was
+	// asked for (its entry was discarded into a snapshot, Phase 14), or a
+	// compaction would move the boundary backward.
+	ErrCompacted = errors.New("index compacted into a snapshot")
+
+	// ErrCompactBeyondApplied means a compaction would discard an entry the
+	// state machine has not applied — the snapshot could not contain it.
+	ErrCompactBeyondApplied = errors.New("compaction beyond the applied index")
+
+	// ErrStaleSnapshot means a snapshot at or below the commit index was offered
+	// for installation: the log already covers it.
+	ErrStaleSnapshot = errors.New("snapshot at or below the commit index")
 )

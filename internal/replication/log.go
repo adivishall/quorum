@@ -6,6 +6,8 @@ package replication
 //
 // Indexes are 1-based and contiguous; index 0 is the empty sentinel with term 0
 // (docs/REPLICATION.md §3.2). Terms are a non-decreasing logical clock (§3.3).
+// Since Phase 14 a log may begin after a compaction boundary: the entries at
+// and below it were discarded into a snapshot (docs/SNAPSHOTS.md).
 type Entry struct {
 	Index uint64
 	Term  uint64
@@ -19,23 +21,35 @@ type Entry struct {
 // committed. Commit records that an index IS committed; it does not decide that a
 // distributed group is ALLOWED to (docs/REPLICATION.md §4).
 //
-// Ranges are half-open [lo,hi); a valid range satisfies 1 <= lo <= hi <=
-// LastIndex()+1. Implementations copy Entry.Data in and out (INV-P4) and are
-// deterministic (INV-P2, §9).
+// Ranges are half-open [lo,hi); a valid range satisfies FirstIndex() <= lo <=
+// hi <= LastIndex()+1. Implementations copy Entry.Data in and out (INV-P4) and
+// are deterministic (INV-P2, §9).
+//
+// Phase 14 adds a compaction boundary (Boundary): the index and term of the last
+// entry discarded into a snapshot. Entries at or below it are gone — asking for
+// one is ErrCompacted — but the boundary's own term stays answerable, because
+// Raft's consistency check needs the term of the entry just before the first
+// one it sends. boundary <= applied <= commit <= LastIndex always holds.
 type Log interface {
-	// FirstIndex is the index of the first entry the log could hold. It is 1 in
-	// Phase 8 (nothing truncates the front; snapshots are Phase 14).
+	// FirstIndex is the index of the first entry the log could hold:
+	// Boundary()+1 (1 when nothing was compacted).
 	FirstIndex() uint64
+	// Boundary is the index and term of the last compacted entry, (0, 0) when
+	// the log was never compacted.
+	Boundary() (index, term uint64)
 	// LastIndex is the highest live index, or 0 when the log is empty.
 	LastIndex() uint64
 
-	// Term returns the term at index. Term(0) == 0; an index past LastIndex is
-	// ErrOutOfRange.
+	// Term returns the term at index. Term(Boundary index) is the boundary term
+	// (Term(0) == 0 on an uncompacted log); below the boundary is ErrCompacted,
+	// past LastIndex ErrOutOfRange.
 	Term(index uint64) (uint64, error)
-	// At returns a copy of the entry at index; out of range is ErrOutOfRange.
+	// At returns a copy of the entry at index; at or below the boundary is
+	// ErrCompacted, past LastIndex ErrOutOfRange.
 	At(index uint64) (Entry, error)
-	// Slice returns copies of the entries with indexes in [lo,hi). An invalid
-	// range is ErrOutOfRange, never clamped.
+	// Slice returns copies of the entries with indexes in [lo,hi). A range
+	// reaching at or below the boundary is ErrCompacted; any other invalid range
+	// is ErrOutOfRange, never clamped.
 	Slice(lo, hi uint64) ([]Entry, error)
 
 	// Append extends the log at the end only. Entries must be contiguous starting
@@ -63,6 +77,21 @@ type Log interface {
 	// ErrAppliedRegression) and never exceeds CommitIndex (ErrApplyBeyondCommit),
 	// so an entry is applied at most once through this interface.
 	Apply(through uint64) error
+
+	// Compact discards the entries at or below index into a snapshot the caller
+	// already made durable (Phase 14). index must be applied
+	// (ErrCompactBeyondApplied otherwise) — a snapshot contains only applied
+	// state — and not below the current boundary (ErrCompacted); compacting to
+	// the boundary itself changes nothing. The term of the entry at index becomes
+	// the boundary term.
+	Compact(index uint64) error
+	// InstallSnapshot resets the log to a snapshot whose last entry is (index,
+	// term), received from a leader (Raft §7). index must be above the commit
+	// index (ErrStaleSnapshot otherwise). If the log holds index with that term,
+	// the entries after it are kept; otherwise every entry is discarded. The
+	// boundary becomes (index, term) and commit and applied become index: the
+	// caller replaces the state machine's state with the snapshot's.
+	InstallSnapshot(index, term uint64) error
 }
 
 // MemoryLog is the Phase 8 in-memory reference implementation of Log. It exists
@@ -75,9 +104,11 @@ type Log interface {
 // or randomness: it is a pure object a single goroutine drives, exactly like the
 // coming raft.Raft. It is therefore NOT safe for concurrent use.
 type MemoryLog struct {
-	entries []Entry // index i is stored at slot i-1
-	commit  uint64
-	applied uint64
+	entries  []Entry // index i is stored at slot i-base-1
+	base     uint64  // compaction boundary: the last discarded index (0: none)
+	baseTerm uint64  // the term of the entry at base
+	commit   uint64
+	applied  uint64
 }
 
 // NewMemoryLog returns an empty log: LastIndex 0, commitIndex 0, appliedIndex 0.
@@ -86,11 +117,15 @@ func NewMemoryLog() *MemoryLog { return &MemoryLog{} }
 // compile-time assertion that MemoryLog satisfies Log.
 var _ Log = (*MemoryLog)(nil)
 
-// FirstIndex is always 1 in Phase 8 (docs/REPLICATION.md §3.2).
-func (l *MemoryLog) FirstIndex() uint64 { return 1 }
+// FirstIndex is the first index the log can hold: the boundary plus one.
+func (l *MemoryLog) FirstIndex() uint64 { return l.base + 1 }
 
-// LastIndex returns the highest live index, or 0 when empty.
-func (l *MemoryLog) LastIndex() uint64 { return uint64(len(l.entries)) }
+// Boundary returns the index and term of the last compacted entry.
+func (l *MemoryLog) Boundary() (uint64, uint64) { return l.base, l.baseTerm }
+
+// LastIndex returns the highest live index: the boundary when nothing follows
+// it, 0 for an empty, never-compacted log.
+func (l *MemoryLog) LastIndex() uint64 { return l.base + uint64(len(l.entries)) }
 
 // CommitIndex returns the highest committed index.
 func (l *MemoryLog) CommitIndex() uint64 { return l.commit }
@@ -98,35 +133,45 @@ func (l *MemoryLog) CommitIndex() uint64 { return l.commit }
 // AppliedIndex returns the highest applied index.
 func (l *MemoryLog) AppliedIndex() uint64 { return l.applied }
 
-// Term returns the term at index. Term(0) is 0; index > LastIndex is out of range.
+// Term returns the term at index: the boundary term at the boundary (0 at index
+// 0 of a never-compacted log), ErrCompacted below it, ErrOutOfRange past the end.
 func (l *MemoryLog) Term(index uint64) (uint64, error) {
-	if index == 0 {
-		return 0, nil
-	}
-	if index > l.LastIndex() {
+	switch {
+	case index < l.base:
+		return 0, ErrCompacted
+	case index == l.base:
+		return l.baseTerm, nil
+	case index > l.LastIndex():
 		return 0, ErrOutOfRange
 	}
-	return l.entries[index-1].Term, nil
+	return l.entries[index-l.base-1].Term, nil
 }
 
-// At returns a copy of the entry at index (1 <= index <= LastIndex).
+// At returns a copy of the entry at index (FirstIndex <= index <= LastIndex).
 func (l *MemoryLog) At(index uint64) (Entry, error) {
-	if index < 1 || index > l.LastIndex() {
+	switch {
+	case index <= l.base && l.base > 0:
+		return Entry{}, ErrCompacted
+	case index < 1 || index > l.LastIndex():
 		return Entry{}, ErrOutOfRange
 	}
-	return copyEntry(l.entries[index-1]), nil
+	return copyEntry(l.entries[index-l.base-1]), nil
 }
 
 // Slice returns copies of the entries with indexes in the half-open range
-// [lo,hi). A valid range satisfies 1 <= lo <= hi <= LastIndex()+1; anything else
+// [lo,hi). A valid range satisfies FirstIndex <= lo <= hi <= LastIndex()+1; a
+// range starting at or below the boundary is ErrCompacted, anything else invalid
 // is ErrOutOfRange. Slice(lo,lo) is empty.
 func (l *MemoryLog) Slice(lo, hi uint64) ([]Entry, error) {
+	if lo <= l.base && l.base > 0 {
+		return nil, ErrCompacted
+	}
 	if lo < 1 || hi < lo || hi > l.LastIndex()+1 {
 		return nil, ErrOutOfRange
 	}
 	out := make([]Entry, 0, hi-lo)
 	for i := lo; i < hi; i++ {
-		out = append(out, copyEntry(l.entries[i-1]))
+		out = append(out, copyEntry(l.entries[i-l.base-1]))
 	}
 	return out, nil
 }
@@ -154,6 +199,7 @@ func (l *MemoryLog) TruncateAndAppend(entries ...Entry) error {
 		return ErrNonContiguous
 	}
 	if f <= l.commit {
+		// Also covers f <= base: compacted entries are committed.
 		return ErrTruncateCommitted
 	}
 	return l.appendFrom(f, entries)
@@ -179,7 +225,7 @@ func (l *MemoryLog) appendFrom(f uint64, entries []Entry) error {
 		prevTerm = e.Term
 	}
 	// All checks passed; install.
-	l.entries = l.entries[:f-1]
+	l.entries = l.entries[:f-l.base-1]
 	for _, e := range entries {
 		l.entries = append(l.entries, copyEntry(e))
 	}
@@ -215,6 +261,42 @@ func (l *MemoryLog) Apply(through uint64) error {
 		return ErrApplyBeyondCommit
 	}
 	l.applied = through
+	return nil
+}
+
+// Compact discards the entries at or below index (see the Log interface).
+func (l *MemoryLog) Compact(index uint64) error {
+	switch {
+	case index < l.base:
+		return ErrCompacted
+	case index == l.base:
+		return nil
+	case index > l.applied:
+		return ErrCompactBeyondApplied
+	}
+	term, err := l.Term(index)
+	if err != nil {
+		return err
+	}
+	keep := l.entries[index-l.base:]
+	l.entries = append([]Entry(nil), keep...) // release the discarded prefix
+	l.base, l.baseTerm = index, term
+	return nil
+}
+
+// InstallSnapshot resets the log to a snapshot ending at (index, term) (see the
+// Log interface).
+func (l *MemoryLog) InstallSnapshot(index, term uint64) error {
+	if index <= l.commit {
+		return ErrStaleSnapshot
+	}
+	var keep []Entry
+	if t, err := l.Term(index); err == nil && t == term && index <= l.LastIndex() {
+		keep = append([]Entry(nil), l.entries[index-l.base:]...)
+	}
+	l.entries = keep
+	l.base, l.baseTerm = index, term
+	l.commit, l.applied = index, index
 	return nil
 }
 
