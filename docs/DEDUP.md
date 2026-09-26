@@ -175,7 +175,7 @@ does not — an evicted session's requests are refused, not re-executed (mutant 
   one execution per identity (`dedupEvidence`).
 - **Through client histories.** Retries and duplicates are recorded as sends of one logical
   operation and checked for linearizability (LINEARIZABILITY §15).
-- **Mutants 61–86** (`scripts/mutation.sh`): each rule above broken on purpose, each killed.
+- **Mutants 61–89** (`scripts/mutation.sh`): each rule above broken on purpose, each killed.
 
 ## 8. Cost (measured)
 
@@ -209,7 +209,9 @@ strips identity · 73 a new request id per attempt · 74 an unanswered request r
 75 a watermark that passes requests in flight · 76 dkvd ignores the configured limits · 77–81 the
 checker's logical merge (identity scope, accepted conflicts, invocation, completion, foreign
 commands) · 82 the model without deduplication · 83–86 the same rules killed by client-visible
-histories of real processes alone. `LINEARIZABILITY.md` §15.6 has the killers.
+histories of real processes alone · 87 validation before proposal · 88 a duplicate reports the
+original's index · 89 a restart rebuilds the table by replay. `LINEARIZABILITY.md` §15.6 has the
+killers.
 
 ## 10. Limitations
 

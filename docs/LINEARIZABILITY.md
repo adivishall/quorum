@@ -759,7 +759,8 @@ committed logs against the session model (`dedupEvidence`):
 | `TestRealSessionWorkloadsUnderFaults` (leader SIGKILL, leader partition, rolling restart) | six session clients, 15% concurrent duplicates: linearizable; writes retried after unanswered attempts; duplicate entries in the log answered from their originals |
 | `TestRealSessionRetryAcrossCrashWindows` (8 points: before-save … after-reply) | the hardest case at every window; the victim's disk decides which case; a read between the crash and B lets the checker alone see a second execution |
 | `TestRealForwarderDiesBeforeRelaying` | a follower SIGKILLed before relaying the leader's answer; the retry is a duplicate |
-| `TestRealConcurrentDuplicatesThroughEveryNode` | one request sent at once to all three nodes, 20 rounds: one execution each, every other copy its duplicate at the same index |
+| `TestRealConcurrentDuplicatesThroughEveryNode` | one request sent at once to all three nodes — 20 PUT, 5 GET, 5 DELETE rounds: each write executes once, every other copy its duplicate at the same index; every GET copy really reads (reads are never deduplicated) |
+| `TestRealConcurrentRequestsFromOneSession` | eight goroutines on one session: every request executes once, none stale or duplicate |
 | `TestRealRedirectOnlyModeWithSessions` | `-client-forwarding=false`: NOT_LEADER with the leader, followed; nothing forwarded |
 | `TestRealSessionContractSurvivesFullClusterRestart` | conflict, stale, SESSION_LIMIT, LRU expiry with small limits; every process SIGKILLed and restarted; the evicted session stays expired, a live session's retry is still a duplicate, no refused request took effect |
 
@@ -794,6 +795,8 @@ committed logs against the session model (`dedupEvidence`):
 | 85 | a retry after a dead connection keeps its RequestID | `TestRealForwarderDiesBeforeRelaying` | killed |
 | 86 | 65 on real processes, through a full restart | `TestRealSessionContractSurvivesFullClusterRestart` | killed |
 | 87 | requests are validated before they are proposed | `TestRequestValidationRejectsEveryOutOfContractField`, `TestValidatedRequestsAlwaysApply` | killed |
+| 88 | a duplicate reports the ORIGINAL execution's index | `TestStoreAgreesWithTheSessionModel`, `TestConcurrentDuplicatesAtTwoNodes`, `TestRealConcurrentDuplicatesThroughEveryNode` | killed |
+| 89 | a restart rebuilds the session table by replay (not: mark the recovered commit applied) | `TestRetryAfterEveryNodeRestarts`, `TestKVSimSessionsSurviveARestartOfEveryNode`, `TestRealSessionContractSurvivesFullClusterRestart` | killed |
 
 ### 15.7 Found and fixed during Phase 13
 
