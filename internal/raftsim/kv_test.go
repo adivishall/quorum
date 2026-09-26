@@ -785,3 +785,87 @@ func TestKVTierCatchesRetriesThatAreNotDeduplicated(t *testing.T) {
 		t.Fatal("no run with fresh-id retries was caught: the tier cannot see a lost deduplication")
 	}
 }
+
+// TestKVSessionRetryAfterCrashAtEveryPoint is the crash matrix of a session
+// write retried under its identity: the leader dies at every driver crash point
+// of the cycles that carry the write — before its Save, after it, after sending,
+// before and after applying, after recording the apply (the response not yet
+// sent) — the client hears nothing, a new leader is elected, the old one
+// restarts and replays its log, and the client retries the SAME request at the
+// new leader. Whatever the point, the request has exactly one effect: the retry
+// is answered as a duplicate of the original when the original was committed,
+// and executes as the original when it was not; every replica — including the
+// restarted one, which re-decides every entry during replay under INV-X11 —
+// holds the same number of duplicates; and a later read returns the value.
+func TestKVSessionRetryAfterCrashAtEveryPoint(t *testing.T) {
+	cases := []struct {
+		point     string
+		committed string // "yes", "no", or "either" (depends on who wins next)
+	}{
+		{"before-save", "no"},
+		{"after-save", "either"},
+		{"after-send", "either"},
+		{"before-advance", "either"},
+		{"before-apply", "yes"},
+		{"after-apply", "yes"},
+		{"after-applied-to", "yes"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.point, func(t *testing.T) {
+			s := newKVSim(t, 3)
+			s.electLeader("n1")
+			s.register("n1", "c2")
+			s.put("n1", "c1", "k", "old")
+			s.DeliverAll()
+			s.heartbeat("n1")
+			s.do(Event{Kind: CrashAt, Node: "n1", Point: tc.point, Nth: 1})
+			s.put("n1", "c2", "k", "new")
+			s.DeliverAll()
+			if s.Up("n1") {
+				s.heartbeat("n1")
+			}
+			if s.Up("n1") {
+				t.Fatalf("n1 never reached %s", tc.point)
+			}
+			if !s.Busy("c2") {
+				t.Fatalf("the session request must stay open after its leader died at %s: %s", tc.point, s.last("c2"))
+			}
+			s.do(Event{Kind: KVTimeout, Client: "c2"})
+			s.electLeader("n2")
+			s.do(Event{Kind: Restart, Node: "n1"})
+			s.heartbeat("n2")
+			s.Apply(Event{Kind: KVRetry, Node: "n2", Client: "c2"})
+			s.DeliverAll()
+			s.heartbeat("n2")
+			s.heartbeat("n2")
+			op := s.last("c2")
+			if op.Outcome != lincheck.OK {
+				t.Fatalf("the retry must reach a definite answer: %s %+v", op, op.Attempts)
+			}
+			dup := strings.HasPrefix(op.Attempts[len(op.Attempts)-1].Result, "duplicate of index")
+			switch {
+			case tc.committed == "yes" && !dup:
+				t.Fatalf("the write was committed before the leader died at %s, but its retry executed again: %+v", tc.point, op.Attempts)
+			case tc.committed == "no" && dup:
+				t.Fatalf("the write never left the leader at %s, but its retry was answered as a duplicate: %+v", tc.point, op.Attempts)
+			}
+			want := 0
+			if dup {
+				want = 1
+			}
+			for _, id := range []NodeID{"n1", "n2", "n3"} {
+				if st := s.Store(id).Stats(); st.Duplicate != want {
+					t.Fatalf("%s: %d duplicates, want %d: %+v", id, st.Duplicate, want, st)
+				}
+			}
+			s.get("n2", "c3", "k")
+			s.DeliverAll()
+			s.heartbeat("n2")
+			if r := s.last("c3"); r.Outcome != lincheck.OK || string(r.Output) != "new" {
+				t.Fatalf("read after the retry: %s", r)
+			}
+			t.Logf("crash at %s: the retry was %s", tc.point, map[bool]string{true: "a duplicate of the committed original", false: "the first execution"}[dup])
+			s.requireLinearizable()
+		})
+	}
+}
