@@ -3,7 +3,6 @@ package kv_test
 import (
 	"context"
 	"fmt"
-	"net"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -16,6 +15,7 @@ import (
 	"github.com/adivishall/quorum/internal/lincheck"
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftnode"
+	"github.com/adivishall/quorum/internal/testport"
 	"github.com/adivishall/quorum/internal/transport"
 )
 
@@ -26,14 +26,10 @@ import (
 // seed-replayable; what they assert must hold under any timing: every recorded
 // history is linearizable.
 
+// freeAddr is an address a node's transport will bind (internal/testport).
 func freeAddr(t testing.TB) string {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-	return l.Addr().String()
+	return testport.Addr(t, testport.KV)
 }
 
 // endpoint routes to a node's current Server, and reports the node unavailable

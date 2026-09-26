@@ -3,7 +3,7 @@ package integration
 import (
 	"bytes"
 	"fmt"
-	"net"
+	"github.com/adivishall/quorum/internal/testport"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -40,15 +40,11 @@ func (s *safeBuf) String() string {
 // between closing the probe listener and the child re-binding it, but on
 // localhost in a test that window is negligible; a bind failure would surface as
 // the child failing to start, which the test detects.
+// freeTCPAddr is an address a dkvd process will bind (docs: internal/testport —
+// never a port the kernel can hand to another connection meanwhile).
 func freeTCPAddr(t *testing.T) string {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
-	}
-	addr := l.Addr().String()
-	_ = l.Close()
-	return addr
+	return testport.Addr(t, testport.Integration)
 }
 
 type dkvNode struct {

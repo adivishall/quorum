@@ -3,13 +3,13 @@ package raftnode
 import (
 	"context"
 	"fmt"
-	"net"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/adivishall/quorum/internal/raft"
+	"github.com/adivishall/quorum/internal/testport"
 	"github.com/adivishall/quorum/internal/transport"
 )
 
@@ -48,15 +48,10 @@ func TestDefaultConfigIsDurable(t *testing.T) {
 	}
 }
 
+// freeAddr is an address a node's transport will bind (internal/testport).
 func freeAddr(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	a := ln.Addr().String()
-	_ = ln.Close()
-	return a
+	return testport.Addr(t, testport.RaftNode)
 }
 
 type harness struct {
