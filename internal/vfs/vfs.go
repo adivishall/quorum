@@ -44,8 +44,16 @@ type FS interface {
 	// errors.Is(err, fs.ErrNotExist).
 	Stat(name string) (fs.FileInfo, error)
 	// SyncDir fsyncs the directory dir, making the creation of the files in it
-	// durable.
+	// durable — and every rename and removal of a name in it (Phase 14).
 	SyncDir(dir string) error
+	// Rename renames oldname to newname, atomically replacing newname if it
+	// exists (POSIX rename(2)): an observer sees the old binding or the new, never
+	// neither. Like a creation, the change survives a power loss only once
+	// SyncDir has been called on the directory.
+	Rename(oldname, newname string) error
+	// Remove deletes name. The deletion survives a power loss only once SyncDir
+	// has been called on the directory.
+	Remove(name string) error
 }
 
 // OS is the real filesystem, and the production default: every method is a
@@ -78,6 +86,12 @@ func (OS) SyncDir(dir string) error {
 	}
 	return d.Close()
 }
+
+// Rename calls os.Rename.
+func (OS) Rename(oldname, newname string) error { return os.Rename(oldname, newname) }
+
+// Remove calls os.Remove.
+func (OS) Remove(name string) error { return os.Remove(name) }
 
 // Or returns fsys, or OS when fsys is nil — so a zero-valued option means the
 // real filesystem.

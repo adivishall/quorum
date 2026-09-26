@@ -24,6 +24,8 @@ const (
 	OpSync
 	OpTruncate
 	OpSyncDir
+	OpRename // Phase 14: an injection's Path matches the rename's DESTINATION
+	OpRemove
 )
 
 func (o Op) String() string {
@@ -38,6 +40,10 @@ func (o Op) String() string {
 		return "truncate"
 	case OpSyncDir:
 		return "syncdir"
+	case OpRename:
+		return "rename"
+	case OpRemove:
+		return "remove"
 	default:
 		return "op(?)"
 	}
@@ -227,6 +233,45 @@ func (f *InjectFS) SyncDir(dir string) error {
 	err := f.base.SyncDir(dir)
 	f.mu.Lock()
 	f.record(OpRecord{Op: OpSyncDir, Path: dir, Err: err})
+	f.mu.Unlock()
+	return err
+}
+
+// Rename forwards to the base filesystem unless an OpRename fault fires. An
+// injection's Path is matched against the DESTINATION: "the rename that
+// publishes this file". A failed rename changes nothing.
+func (f *InjectFS) Rename(oldname, newname string) error {
+	oldname, newname = filepath.Clean(oldname), filepath.Clean(newname)
+	return f.dirOp(OpRename, newname, func() error { return f.base.Rename(oldname, newname) })
+}
+
+// Remove forwards to the base filesystem unless an OpRemove fault fires.
+func (f *InjectFS) Remove(name string) error {
+	name = filepath.Clean(name)
+	return f.dirOp(OpRemove, name, func() error { return f.base.Remove(name) })
+}
+
+// dirOp is the common path of an operation that has no file handle: an armed
+// observation point runs first and the operation then proceeds; an armed fault
+// fails it without forwarding; either way the op log records it.
+func (f *InjectFS) dirOp(op Op, path string, do func() error) error {
+	f.mu.Lock()
+	inj, fire := f.take(op, path)
+	f.mu.Unlock()
+	if fire && inj.At != nil {
+		inj.At()
+		fire = false
+	}
+	if fire {
+		err := injectedErr(op, path, inj)
+		f.mu.Lock()
+		f.record(OpRecord{Op: op, Path: path, Err: err, Injected: true})
+		f.mu.Unlock()
+		return err
+	}
+	err := do()
+	f.mu.Lock()
+	f.record(OpRecord{Op: op, Path: path, Err: err})
 	f.mu.Unlock()
 	return err
 }

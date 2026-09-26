@@ -29,8 +29,12 @@ var ErrCrashed = errors.New("fault: file handle belongs to a crashed process")
 //     and only this, survives a modeled POWER LOSS (CrashPowerLoss), optionally
 //     with a torn prefix of the bytes written after that Sync.
 //
-// A newly created file's existence is itself durable only once SyncDir has been
-// called on its directory; a power loss before that removes it.
+// Names are a third, directory-level view: which name refers to which file.
+// Every creation, rename (Phase 14) and removal changes the cached binding at
+// once — a process crash keeps it, the kernel has it — but a directory's binding
+// is durable only as of the last SyncDir of that directory: a power loss reverts
+// every name in it to that binding, so an unsynced creation disappears, an
+// unsynced rename is undone, and an unsynced removal comes back.
 //
 // This is a software model used to check that code issues its writes and fsyncs
 // in the right order. It is NOT evidence about hardware: it assumes an fsync that
@@ -42,8 +46,9 @@ var ErrCrashed = errors.New("fault: file handle belongs to a crashed process")
 // against it is exactly reproducible.
 type MemFS struct {
 	mu    sync.Mutex
-	files map[string]*memNode
-	epoch uint64 // bumped by every crash; handles from an older epoch are dead
+	files map[string]*memNode // the cached directory: what every lookup sees now
+	names map[string]*memNode // the durable directory: bindings as of each dir's last SyncDir
+	epoch uint64              // bumped by every crash; handles from an older epoch are dead
 }
 
 // memNode is one file. The durable view is data[:syncedLen] while the file has
@@ -51,11 +56,10 @@ type MemFS struct {
 // truncation below syncedLen first detaches a private copy of the durable bytes,
 // so appends — the common case for a log — never copy.
 type memNode struct {
-	data        []byte
-	syncedLen   int
-	detached    []byte
-	isDetached  bool
-	nameDurable bool
+	data       []byte
+	syncedLen  int
+	detached   []byte
+	isDetached bool
 }
 
 func (n *memNode) durable() []byte {
@@ -74,7 +78,9 @@ func (n *memNode) detach() {
 }
 
 // NewMemFS returns an empty filesystem.
-func NewMemFS() *MemFS { return &MemFS{files: map[string]*memNode{}} }
+func NewMemFS() *MemFS {
+	return &MemFS{files: map[string]*memNode{}, names: map[string]*memNode{}}
+}
 
 var _ vfs.FS = (*MemFS)(nil)
 
@@ -121,16 +127,55 @@ func (m *MemFS) Stat(name string) (fs.FileInfo, error) {
 	return memInfo{name: filepath.Base(name), size: int64(len(n.data))}, nil
 }
 
-// SyncDir makes the creation of every file directly inside dir durable.
+// SyncDir makes dir's current bindings durable: every creation, rename and
+// removal of a name directly inside it survives a power loss from now on.
 func (m *MemFS) SyncDir(dir string) error {
 	dir = filepath.Clean(dir)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for name, n := range m.files {
+	for name := range m.names {
 		if filepath.Dir(name) == dir {
-			n.nameDurable = true
+			if _, ok := m.files[name]; !ok {
+				delete(m.names, name)
+			}
 		}
 	}
+	for name, n := range m.files {
+		if filepath.Dir(name) == dir {
+			m.names[name] = n
+		}
+	}
+	return nil
+}
+
+// Rename binds newname to oldname's file and unbinds oldname, replacing any
+// file newname referred to — atomically, as rename(2). Open handles keep
+// referring to the file they opened. The change is durable only after SyncDir.
+func (m *MemFS) Rename(oldname, newname string) error {
+	oldname, newname = filepath.Clean(oldname), filepath.Clean(newname)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n, ok := m.files[oldname]
+	if !ok {
+		return &fs.PathError{Op: "rename", Path: oldname, Err: fs.ErrNotExist}
+	}
+	if oldname == newname {
+		return nil
+	}
+	m.files[newname] = n
+	delete(m.files, oldname)
+	return nil
+}
+
+// Remove unbinds name. The removal is durable only after SyncDir.
+func (m *MemFS) Remove(name string) error {
+	name = filepath.Clean(name)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.files[name]; !ok {
+		return &fs.PathError{Op: "remove", Path: name, Err: fs.ErrNotExist}
+	}
+	delete(m.files, name)
 	return nil
 }
 
@@ -142,28 +187,26 @@ func (m *MemFS) CrashProcess() {
 	m.epoch++
 }
 
-// CrashPowerLoss models losing power: every open handle dies, a file whose
-// creation was never made durable disappears, and every other file reverts to its
-// durable view plus the first tornTail bytes (at most) of what was written after
-// its last Sync — a torn, partially flushed append. Bytes that were overwritten or
-// truncated inside the durable region since the last Sync are simply lost (the
-// durable view wins). Files are processed in name order, so the outcome is
-// deterministic.
+// CrashPowerLoss models losing power: every open handle dies, every directory
+// reverts to its durable bindings (an unsynced creation disappears, an unsynced
+// rename is undone, an unsynced removal comes back), and every file that remains
+// reverts to its durable view plus the first tornTail bytes (at most) of what was
+// written after its last Sync — a torn, partially flushed append. Bytes that were
+// overwritten or truncated inside the durable region since the last Sync are
+// simply lost (the durable view wins). Files are processed in name order, so the
+// outcome is deterministic.
 func (m *MemFS) CrashPowerLoss(tornTail int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.epoch++
-	names := make([]string, 0, len(m.files))
-	for name := range m.files {
+	names := make([]string, 0, len(m.names))
+	for name := range m.names {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	files := make(map[string]*memNode, len(names))
 	for _, name := range names {
-		n := m.files[name]
-		if !n.nameDurable {
-			delete(m.files, name)
-			continue
-		}
+		n := m.names[name]
 		kept := append([]byte(nil), n.durable()...)
 		if !n.isDetached && tornTail > 0 {
 			tail := n.data[n.syncedLen:]
@@ -173,7 +216,12 @@ func (m *MemFS) CrashPowerLoss(tornTail int) {
 			kept = append(kept, tail...)
 		}
 		// After the power cycle, what is on the device is simply the file.
-		m.files[name] = &memNode{data: kept, syncedLen: len(kept), nameDurable: true}
+		files[name] = &memNode{data: kept, syncedLen: len(kept)}
+	}
+	m.files = files
+	m.names = make(map[string]*memNode, len(files))
+	for name, n := range files {
+		m.names[name] = n
 	}
 }
 
@@ -195,8 +243,8 @@ func (m *MemFS) Cached(name string) ([]byte, bool) {
 func (m *MemFS) Durable(name string) ([]byte, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	n, ok := m.files[filepath.Clean(name)]
-	if !ok || !n.nameDurable {
+	n, ok := m.names[filepath.Clean(name)]
+	if !ok {
 		return nil, false
 	}
 	return append([]byte(nil), n.durable()...), true
@@ -210,24 +258,24 @@ func (m *MemFS) DurableCopy() *MemFS {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := NewMemFS()
-	for name, n := range m.files {
-		if !n.nameDurable {
-			continue
-		}
+	for name, n := range m.names {
 		d := append([]byte(nil), n.durable()...)
-		out.files[name] = &memNode{data: d, syncedLen: len(d), nameDurable: true}
+		c := &memNode{data: d, syncedLen: len(d)}
+		out.files[name], out.names[name] = c, c
 	}
 	return out
 }
 
-// FullySynced reports whether name exists, its creation is durable, and its
-// cached view equals its durable view — i.e. a power loss right now would lose
-// nothing. It is how a test asserts "everything written has been fsynced".
+// FullySynced reports whether name exists, its binding is durable (a power loss
+// would not unbind or rebind it), and its cached view equals its durable view —
+// i.e. a power loss right now would lose nothing. It is how a test asserts
+// "everything written has been fsynced".
 func (m *MemFS) FullySynced(name string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	n, ok := m.files[filepath.Clean(name)]
-	return ok && n.nameDurable && !n.isDetached && n.syncedLen == len(n.data)
+	name = filepath.Clean(name)
+	n, ok := m.files[name]
+	return ok && m.names[name] == n && !n.isDetached && n.syncedLen == len(n.data)
 }
 
 // memFile is an open handle.
