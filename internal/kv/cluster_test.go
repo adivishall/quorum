@@ -66,6 +66,17 @@ func (e *endpoint) Get(ctx context.Context, key []byte) ([]byte, kv.Meta, error)
 	}
 	return s.Get(ctx, key)
 }
+
+// Do is the Phase 13 API (kv.Doer): a node that is down is unreachable before
+// anything was sent — a definite ErrUnavailable.
+func (e *endpoint) Do(ctx context.Context, req kv.Request) (kv.Response, error) {
+	s, err := e.current()
+	if err != nil {
+		return kv.Response{}, err
+	}
+	return s.Do(ctx, req)
+}
+
 func (e *endpoint) Delete(ctx context.Context, key []byte) (kv.Meta, error) {
 	s, err := e.current()
 	if err != nil {

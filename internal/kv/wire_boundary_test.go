@@ -34,17 +34,17 @@ func TestWireClientNeverMatchesALateResponseToANewRequest(t *testing.T) {
 			go func(conn net.Conn, first bool) {
 				defer conn.Close()
 				for {
-					if _, err := readFrame(conn, kindRequest); err != nil {
+					if _, err := readFrame(conn, kindRequest, MaxRequestFrame); err != nil {
 						return
 					}
 					if first {
 						first = false
 						<-gaveUp // answer only after the client abandoned the request
-						_ = writeFrame(conn, kindResponse, response{status: statusOK, payload: []byte("stale")}.encode())
+						_ = writeFrame(conn, kindResponse, encodeResponse(Response{Status: StatusOK, Value: []byte("stale")}))
 						close(lateSent)
 						continue
 					}
-					if err := writeFrame(conn, kindResponse, response{status: statusOK, payload: []byte("fresh")}.encode()); err != nil {
+					if err := writeFrame(conn, kindResponse, encodeResponse(Response{Status: StatusOK, Value: []byte("fresh")})); err != nil {
 						return
 					}
 				}

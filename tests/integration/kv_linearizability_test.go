@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -297,6 +298,20 @@ func runWithPremise(attempt func(), logf func(string, ...any)) error {
 	return fmt.Errorf("the scenario's premise was not met in %d attempts", maxPremiseAttempts)
 }
 
+// leftTerm reports whether a node's current process has reported following, or
+// leading, a term above t — i.e. it stopped believing it leads term t.
+func (c *rcluster) leftTerm(id string, t uint64) bool {
+	out := c.procs[id].out.String()
+	for _, re := range []*regexp.Regexp{reFollower, reLeader} {
+		for _, m := range re.FindAllStringSubmatch(out, -1) {
+			if tm, _ := strconv.ParseUint(m[2], 10, 64); m[1] == id && tm > t {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // refusedAsNotLeader reports whether an operation's first request was refused
 // by its target as "not leader" — proof the target did not lead when it arrived.
 func refusedAsNotLeader(op lincheck.Op) bool {
@@ -373,8 +388,8 @@ func TestRealSameKeyWritesReadsAndDeletes(t *testing.T) {
 // later-read rule asserted directly, not only through the checker: after
 // PUT(k, v) returns OK, a GET invoked afterwards — by another client, sent
 // first to EACH node in turn, followers included — returns v. A follower
-// never answers with its own state: its attempt is a not-leader redirect,
-// recorded, and the read is served by the leader through ReadIndex.
+// never answers with its own state: it forwards the read to the leader
+// (Phase 13), which serves it through ReadIndex, and the answer records both.
 func TestRealCompletedWriteIsSeenByEveryLaterRead(t *testing.T) {
 	c := newRCluster(t, 3)
 	l, _ := c.waitLeader(c.ids, 0, 20*time.Second)
@@ -392,19 +407,19 @@ func TestRealCompletedWriteIsSeenByEveryLaterRead(t *testing.T) {
 			rd.Prefer(id)
 			op := rd.Get(ctx, "k")
 			r.require(op, lincheck.OK, v)
-			// Whoever first received the read either served it (it led) or
-			// refused it — a node that did not serve never answers with its
-			// own state.
+			// Whoever first received the read either served it (it led),
+			// forwarded it to the leader that did, or refused it — a node that
+			// did not serve never answers with its own state.
 			if first := op.Attempts[0]; first.Node != op.Node {
-				if !strings.HasPrefix(first.Result, "not-leader") {
-					r.fail("%s did not serve the read yet did not refuse it: %+v", first.Node, op.Attempts)
+				if !strings.HasPrefix(first.Result, "not-leader") && !strings.HasSuffix(first.Result, "via "+first.Node) {
+					r.fail("%s did not serve the read yet neither forwarded nor refused it: %+v", first.Node, op.Attempts)
 				}
 				redirected++
 			}
 		}
 	}
 	if redirected < 5 {
-		r.fail("only %d of 15 reads were sent to a follower and redirected; the scenario did not exercise followers", redirected)
+		r.fail("only %d of 15 reads were sent to a follower and served by the leader; the scenario did not exercise followers", redirected)
 	}
 	r.check()
 	c.finish()
@@ -449,6 +464,10 @@ func TestRealStaleLeaderNeverServesARead(t *testing.T) {
 		// Cut off, l1 can learn nothing: a "not leader" answer means it had been
 		// deposed BEFORE the cut — the attempt's premise, not a verdict.
 		r.premise(!refusedAsNotLeader(op), "%s had been deposed before it was cut off: %s", l1, op)
+		// With forwarding, a node deposed before the cut would forward the read
+		// rather than refuse it; its own output settles whether it still
+		// believed it led term t1 (a node cut off learns no higher term).
+		r.premise(!c.leftTerm(l1, t1), "%s had left term %d before the read: %s", l1, t1, op)
 		if op.Outcome == lincheck.OK || op.Outcome == lincheck.NotFound {
 			r.fail("the isolated leader %s SERVED a read after %s completed PUT(B) in term %d: %s", l1, l2, t2, op)
 		}
@@ -463,8 +482,11 @@ func TestRealStaleLeaderNeverServesARead(t *testing.T) {
 		rd.Prefer(l1)
 		op = rd.Get(ctx, "k")
 		r.require(op, lincheck.OK, "B")
-		if op.Attempts[0].Node != l1 || !strings.HasPrefix(op.Attempts[0].Result, "not-leader") {
-			r.fail("the deposed leader %s must refuse the read: %+v", l1, op.Attempts)
+		// The deposed leader never serves the read itself: it forwards it to
+		// the leader (Phase 13) — or, in redirect-only mode, refuses it.
+		if op.Attempts[0].Node != l1 || op.Node == l1 ||
+			!(strings.HasPrefix(op.Attempts[0].Result, "not-leader") || strings.HasSuffix(op.Attempts[0].Result, "via "+l1)) {
+			r.fail("the deposed leader %s must not serve the read itself: %+v, served by %s", l1, op.Attempts, op.Node)
 		}
 		r.check()
 		c.waitStable(c.ids, 0, 30*time.Second)
@@ -509,6 +531,7 @@ func TestRealMinorityLeaderWithAFollowerNeverServesARead(t *testing.T) {
 		// "not leader" answer proves it had been deposed before the split, or by
 		// its own follower campaigning), and the follower stayed in l1's term.
 		r.premise(!refusedAsNotLeader(op), "%s did not lead when the read arrived: %s", l1, op)
+		r.premise(!c.leftTerm(l1, t1), "%s had left term %d before the read: %s", l1, t1, op)
 		for _, m := range reFollower.FindAllStringSubmatch(c.procs[f].out.String(), -1) {
 			tm, _ := strconv.ParseUint(m[2], 10, 64)
 			r.premise(tm < t2, "%s left the minority leader's term before the read (it followed %s in term %d)", f, m[3], tm)
@@ -651,11 +674,12 @@ func TestRealFollowerKilledDuringWorkload(t *testing.T) {
 			if op.Outcome != lincheck.OK && op.Outcome != lincheck.NotFound {
 				r.fail("read redirected from the restarted follower: %s", op)
 			}
-			if first := op.Attempts[0]; first.Node != f || !strings.HasPrefix(first.Result, "not-leader") {
-				// f refused, or it had become leader since waitStable (then
-				// it served: a premise, not a verdict).
+			if first := op.Attempts[0]; first.Node != f || op.Node == f ||
+				!(strings.HasPrefix(first.Result, "not-leader") || strings.HasSuffix(first.Result, "via "+f)) {
+				// f served it itself only if it had become leader since
+				// waitStable: a premise, not a verdict.
 				r.premise(op.Node != f, "%s became the leader before the read arrived", f)
-				r.fail("the restarted follower %s must refuse the read: %+v", f, op.Attempts)
+				r.fail("the restarted follower %s must not serve the read itself (refuse, or forward to the leader): %+v", f, op.Attempts)
 			}
 			r.waitServed(40, 60*time.Second)
 		})
@@ -719,7 +743,9 @@ func TestRealLeaderChangesWithoutCrashes(t *testing.T) {
 		}
 	})
 	r.check()
-	if st.Redirects == 0 {
+	// A client meets a deposed leader as a redirect, a forwarded answer (a
+	// deposed leader forwards to the new one, Phase 13) or a lost write.
+	if st.Redirects+st.Forwarded+st.Lost == 0 {
 		r.fail("no client ever met a deposed leader: %s", st)
 	}
 	c.finish()

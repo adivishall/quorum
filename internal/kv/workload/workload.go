@@ -59,6 +59,17 @@ type Options struct {
 	// Stop, if non-nil, ends every client's loop early once it returns true
 	// (checked before each operation).
 	Stop func() bool
+	// Sessions switches the clients to the Phase 13 policy
+	// (docs/CLIENT_SEMANTICS.md): each registers a session and sends every
+	// request with its identity, and a request whose outcome is unknown is
+	// RETRIED under the same identity — one logical operation in the history,
+	// its sends recorded as attempts. The endpoints must be kv.Doers.
+	Sessions bool
+	// DupPct, in session mode, is the percentage of writes also sent
+	// concurrently as a deliberate duplicate — the same request, a second
+	// connection, another node — recorded as a separate operation with the
+	// same identity (the checker merges them: one logical request).
+	DupPct int
 	// Backoff, if > 0, is how long a client waits before its next attempt after
 	// a definite refusal that names no usable leader (node unavailable, or not
 	// leader with no hint) — as a real client would, instead of spinning
@@ -73,11 +84,14 @@ type Stats struct {
 	Attempts, Redirects, Unavailable        int
 	ReadRetries, Unknown                    int
 	Lost, Invalid                           int
+	// Session mode (Phase 13).
+	Sessions, WriteRetries, Duplicates, DupSends, Forwarded int
 }
 
 func (s Stats) String() string {
-	return fmt.Sprintf("ops=%d ok=%d notfound=%d rejected=%d incomplete=%d attempts=%d redirects=%d unavailable=%d readretries=%d unknown=%d lost=%d invalid=%d",
-		s.Ops, s.OK, s.NotFound, s.Rejected, s.Incomplete, s.Attempts, s.Redirects, s.Unavailable, s.ReadRetries, s.Unknown, s.Lost, s.Invalid)
+	return fmt.Sprintf("ops=%d ok=%d notfound=%d rejected=%d incomplete=%d attempts=%d redirects=%d unavailable=%d readretries=%d unknown=%d lost=%d invalid=%d sessions=%d writeretries=%d duplicates=%d dupsends=%d forwarded=%d",
+		s.Ops, s.OK, s.NotFound, s.Rejected, s.Incomplete, s.Attempts, s.Redirects, s.Unavailable, s.ReadRetries, s.Unknown, s.Lost, s.Invalid,
+		s.Sessions, s.WriteRetries, s.Duplicates, s.DupSends, s.Forwarded)
 }
 
 // Run executes the workload and returns its statistics; the history is in rec.
@@ -102,7 +116,12 @@ func Run(ctx context.Context, eps []Endpoint, opts Options, rec *lincheck.Record
 				name: fmt.Sprintf("c%d", c+1), eps: eps, opts: opts, rec: rec,
 				rng: rand.New(rand.NewSource(opts.Seed*7919 + int64(c))), next: c % len(eps),
 			}
-			st := cl.run(ctx)
+			var st Stats
+			if opts.Sessions {
+				st = cl.runSession(ctx)
+			} else {
+				st = cl.run(ctx)
+			}
 			mu.Lock()
 			stats.add(st)
 			mu.Unlock()
@@ -125,6 +144,11 @@ func (s *Stats) add(o Stats) {
 	s.Unknown += o.Unknown
 	s.Lost += o.Lost
 	s.Invalid += o.Invalid
+	s.Sessions += o.Sessions
+	s.WriteRetries += o.WriteRetries
+	s.Duplicates += o.Duplicates
+	s.DupSends += o.DupSends
+	s.Forwarded += o.Forwarded
 }
 
 type client struct {
@@ -166,6 +190,23 @@ func (c *client) run(ctx context.Context) Stats {
 		}
 	}
 	return c.st
+}
+
+// via renders a forwarded answer's path for the attempt record.
+func via(m kv.Meta) string {
+	if m.Via == "" {
+		return ""
+	}
+	return " via " + m.Via
+}
+
+// served is the node that served a completed request: the one the response
+// names (the leader, when a follower forwarded it), else the endpoint.
+func served(m kv.Meta, ep Endpoint) string {
+	if m.Node != "" {
+		return m.Node
+	}
+	return ep.Name()
 }
 
 // target picks the endpoint for the next attempt: the leader hint if it names a
@@ -263,14 +304,20 @@ func (c *client) op(ctx context.Context, kind lincheck.Kind, key string, value [
 		var nl *kv.NotLeaderError
 		switch {
 		case err == nil:
-			c.rec.AttemptDone(id, a, true, "ok", m.Term)
-			c.rec.End(id, lincheck.OK, out, ep.Name(), m.Term, m.Index)
+			c.rec.AttemptDone(id, a, true, "ok"+via(m), m.Term)
+			if m.Via != "" {
+				c.st.Forwarded++
+			}
+			c.rec.End(id, lincheck.OK, out, served(m, ep), m.Term, m.Index)
 			c.hint = ep.Name()
 			c.st.OK++
 			return id
 		case errors.Is(err, kv.ErrNotFound):
-			c.rec.AttemptDone(id, a, true, "notfound", m.Term)
-			c.rec.End(id, lincheck.NotFound, nil, ep.Name(), m.Term, m.Index)
+			c.rec.AttemptDone(id, a, true, "notfound"+via(m), m.Term)
+			if m.Via != "" {
+				c.st.Forwarded++
+			}
+			c.rec.End(id, lincheck.NotFound, nil, served(m, ep), m.Term, m.Index)
 			c.hint = ep.Name()
 			c.st.NotFound++
 			return id

@@ -74,18 +74,37 @@ func TestWireClientAgainstRealNodes(t *testing.T) {
 	if _, err := lc.Put(ctx, nil, []byte("v")); !errors.Is(err, kv.ErrInvalid) {
 		t.Fatalf("empty key: %v, want ErrInvalid", err)
 	}
+	// A follower forwards to the leader (Phase 13): the answer is the
+	// leader's, and says so — never the follower's own state.
 	for _, id := range c.ids {
 		if id == l {
 			continue
 		}
+		resp, err := clients[id].Do(ctx, kv.Request{Op: kv.ReqPut, Key: []byte("k"), Value: []byte("x")})
+		if err != nil || resp.Status != kv.StatusOK || resp.Node != string(l) || resp.Via != string(id) {
+			t.Fatalf("follower %s: %+v %v, want OK served by %s via %s", id, resp, err, l, id)
+		}
+		resp, err = clients[id].Do(ctx, kv.Request{Op: kv.ReqGet, Key: []byte("k")})
+		if err != nil || resp.Status != kv.StatusOK || string(resp.Value) != "x" || resp.Node != string(l) || resp.Via != string(id) {
+			t.Fatalf("follower read: %+v %v", resp, err)
+		}
+	}
+	// In redirect-only mode a follower refuses instead, naming the leader.
+	for _, id := range c.ids {
+		if id == l {
+			continue
+		}
+		srv, _ := c.eps[id].current()
+		srv.SetForwarding(false)
 		var nl *kv.NotLeaderError
-		_, err := clients[id].Put(ctx, []byte("k"), []byte("x"))
+		_, err := clients[id].Put(ctx, []byte("k"), []byte("y"))
 		if !errors.As(err, &nl) || nl.Leader != string(l) || nl.Node != string(id) {
-			t.Fatalf("follower %s: %v, want not-leader with hint %s", id, err, l)
+			t.Fatalf("redirect-only follower %s: %v, want not-leader with hint %s", id, err, l)
 		}
 		if _, _, err := clients[id].Get(ctx, []byte("k")); !errors.As(err, &nl) {
-			t.Fatalf("follower read: %v", err)
+			t.Fatalf("redirect-only follower read: %v", err)
 		}
+		srv.SetForwarding(true)
 	}
 }
 

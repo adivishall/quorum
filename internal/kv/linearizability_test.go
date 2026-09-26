@@ -330,9 +330,18 @@ func TestFollowerLocalReadIsCaughtAsNonLinearizable(t *testing.T) {
 		t.Fatalf("a stale follower read was accepted as linearizable:\n%s", h)
 	}
 	t.Logf("caught, as it must be:\n%s", r.Reason)
-	// And the same read through ReadIndex on the follower is refused, not served.
+	// And the same read sent to the follower through the API is never served
+	// from the follower's state: in redirect-only mode it is refused; with
+	// forwarding (Phase 13) the leader serves it — through ReadIndex — and the
+	// answer is the fresh value, labelled with the leader that served it.
+	srvF.SetForwarding(false)
 	if _, _, err := srvF.Get(ctx, []byte("k")); err == nil {
 		t.Fatal("a follower served a linearizable read")
+	}
+	srvF.SetForwarding(true)
+	resp, _ := srvF.Do(ctx, kv.Request{Op: kv.ReqGet, Key: []byte("k")})
+	if resp.Status != kv.StatusOK || string(resp.Value) != "new" || resp.Node != string(l) || resp.Via != follower.Name() {
+		t.Fatalf("a forwarded read must be the leader's fresh answer: %+v", resp)
 	}
 }
 
