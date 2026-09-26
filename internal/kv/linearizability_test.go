@@ -287,7 +287,7 @@ func TestSessionClientsUnderFaultsRetryAndStayLinearizable(t *testing.T) {
 		defer cancel()
 		c := startCluster(t, ctx, 3, true)
 		c.waitLeader(0, 10*time.Second)
-		c.net.AddRule(fault.Rule{Action: fault.Duplicate, Copies: 1})
+		dup := c.net.AddRule(fault.Rule{Action: fault.Duplicate, Copies: 1})
 		rec, st := runFaults(t, c, opts, func(rec *lincheck.Recorder) {
 			waitServed(t, rec, 20, 30*time.Second)
 			for i := 0; i < 5; i++ {
@@ -304,10 +304,16 @@ func TestSessionClientsUnderFaultsRetryAndStayLinearizable(t *testing.T) {
 				// request, the forwarder never hears — UNKNOWN — and the
 				// client must retry the same request. (Drops that Raft heals
 				// by retransmission alone do not guarantee an unknown outcome.)
+				// The duplicate rule is suspended meanwhile: it applies first,
+				// so a response would travel as two copies and dropping one
+				// would lose nothing (fault.Rule: duplication, then the
+				// terminal rules, per copy).
+				c.net.RemoveRule(dup)
 				dropped = c.net.Stats().Dropped
 				lost := c.net.AddRule(fault.Rule{Kinds: []transport.MsgKind{transport.MsgForwardResponse}, Action: fault.Drop, Count: 1})
 				waitFor(t, "dropping a forward response", 10*time.Second, func() bool { return c.net.Stats().Dropped > dropped })
 				c.net.RemoveRule(lost)
+				dup = c.net.AddRule(fault.Rule{Action: fault.Duplicate, Copies: 1})
 				waitServed(t, rec, 10, 30*time.Second)
 			}
 		})
@@ -315,6 +321,9 @@ func TestSessionClientsUnderFaultsRetryAndStayLinearizable(t *testing.T) {
 		c.net.Release(false)
 		check(t, rec, st)
 		requireSessionEffects(t, st)
+		if st.Unknown == 0 {
+			t.Fatalf("five forward responses were lost, yet no attempt was unknown: %s", st)
+		}
 	})
 	t.Run("leader-crash", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
