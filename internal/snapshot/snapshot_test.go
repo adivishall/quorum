@@ -154,10 +154,14 @@ func corpus(t *testing.T) map[string]struct {
 		"bad/truncated-in-data":   {good[:len(good)-15], ErrCorrupt},
 		"bad/missing-footer":      {cat(rec(t, kindHeader, header(magic, 1, members3, 10, 2, uint64(len(data)), sum)), rec(t, kindData, data)), ErrCorrupt},
 		"bad/bytes-after-footer":  {cat(good, rec(t, kindData, []byte("x"))), ErrCorrupt},
-		"bad/two-headers":         {cat(rec(t, kindHeader, header(magic, 1, members3, 10, 2, uint64(len(data)), sum)), good), ErrCorrupt},
-		"bad/data-first":          {cat(rec(t, kindData, data), good), ErrCorrupt},
-		"bad/unknown-kind":        {cat(rec(t, kindHeader, header(magic, 1, members3, 10, 2, 0, empty)), rec(t, 9, []byte("?")), rec(t, kindFooter, footer(10, 2))), ErrCorrupt},
-		"bad/empty-data-record":   {cat(rec(t, kindHeader, header(magic, 1, members3, 10, 2, 0, empty)), rec(t, kindData, nil), rec(t, kindFooter, footer(10, 2))), ErrCorrupt},
+		// Found by FuzzDecode: a remainder shorter than a record header looked
+		// like a clean end of file to the framing's reader.
+		"bad/one-stray-byte-after-footer":    {cat(good, []byte("0")), ErrCorrupt},
+		"bad/eight-stray-bytes-after-footer": {cat(good, []byte("01234567")), ErrCorrupt},
+		"bad/two-headers":                    {cat(rec(t, kindHeader, header(magic, 1, members3, 10, 2, uint64(len(data)), sum)), good), ErrCorrupt},
+		"bad/data-first":                     {cat(rec(t, kindData, data), good), ErrCorrupt},
+		"bad/unknown-kind":                   {cat(rec(t, kindHeader, header(magic, 1, members3, 10, 2, 0, empty)), rec(t, 9, []byte("?")), rec(t, kindFooter, footer(10, 2))), ErrCorrupt},
+		"bad/empty-data-record":              {cat(rec(t, kindHeader, header(magic, 1, members3, 10, 2, 0, empty)), rec(t, kindData, nil), rec(t, kindFooter, footer(10, 2))), ErrCorrupt},
 
 		// Known bad: checksums and lengths.
 		"bad/corrupted-crc":         {func() []byte { b := append([]byte(nil), good...); b[len(b)-1] ^= 0x40; return b }(), ErrCorrupt},

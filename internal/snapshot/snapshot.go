@@ -210,8 +210,12 @@ func Decode(b []byte) (Meta, []byte, error) {
 		}
 		break
 	}
-	if _, _, err := rd.Next(); err != io.EOF {
-		return Meta{}, nil, fmt.Errorf("%w: bytes after the footer", ErrCorrupt)
+	// Nothing may follow the footer. The framing's reader reports a remainder
+	// shorter than a record header as a clean end of file (the logs' policy for
+	// a torn header); a snapshot is never torn, so compare offsets instead (found
+	// by FuzzDecode: one stray byte after the footer was accepted).
+	if rd.NextOffset() != int64(len(b)) {
+		return Meta{}, nil, fmt.Errorf("%w: %d bytes after the footer", ErrCorrupt, int64(len(b))-rd.NextOffset())
 	}
 	if uint64(len(data)) != dataLen {
 		return Meta{}, nil, fmt.Errorf("%w: %d state bytes, header says %d", ErrCorrupt, len(data), dataLen)
