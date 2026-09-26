@@ -142,6 +142,10 @@ func get(t testing.TB, c *cluster, key string) (string, bool) {
 // index of the ORIGINAL execution, with no second state transition — the key
 // keeps the other client's value.
 func TestUnknownWriteRetriedAfterLeaderCrashIsOneRequest(t *testing.T) {
+	withPremise(t, func() { unknownWriteRetriedAfterLeaderCrash(t) })
+}
+
+func unknownWriteRetriedAfterLeaderCrash(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := startClusterWith(t, ctx, 3, false, kv.Limits{})
@@ -149,10 +153,15 @@ func TestUnknownWriteRetriedAfterLeaderCrashIsOneRequest(t *testing.T) {
 	t1 := c.node(l).Status().Term
 	s := register(t, c, kv.SessionOptions{AttemptTimeout: 3 * time.Second, MaxAttempts: 1}, l)
 	idx := c.quiesce(l) + 1
+	c.premise(c.ledThroughout(l, t1), "%s was deposed during setup", l)
 	fired := c.armCrash(l, raftnode.AfterAppliedTo, idx)
 	rid := s.Reserve()
 	first := s.Send(ctx, rid, kv.ReqPut, []byte("k"), []byte("A"), nil)
-	fired.Wait()
+	// The write must have reached l as the leader (CI once saw it forwarded
+	// to a new leader: a spurious election had deposed l first), and l must
+	// have reached the crash point applying it.
+	c.premise(servedBy(first, l), "%s no longer led when the write arrived: %+v", l, first)
+	c.premise(waitFired(fired, 10*time.Second), "%s never applied the write at %d", l, idx)
 	c.setHook(nil)
 	if first.Known || !errors.Is(first.Err, kv.ErrUnknown) {
 		t.Fatalf("the client of a leader that died before replying must not know the outcome: %+v", first)
@@ -195,59 +204,85 @@ func TestRetryAtEveryCrashPointOfAWrite(t *testing.T) {
 		{raftnode.AfterAppliedTo, true, "yes"},
 	} {
 		t.Run(tc.point.String(), func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			c := startClusterWith(t, ctx, 3, false, kv.Limits{})
-			l := c.waitLeader(0, 10*time.Second)
-			s := register(t, c, kv.SessionOptions{AttemptTimeout: 2 * time.Second, MaxAttempts: 20, Backoff: 20 * time.Millisecond})
-			if o := s.Put(ctx, []byte("k"), []byte("old"), nil); o.Err != nil {
-				t.Fatal(o.Err)
-			}
-			l = c.waitLeader(0, 10*time.Second)
-			idx := c.quiesce(l) + 1
-			var at uint64
-			if tc.atIndex {
-				at = idx
-			}
-			fired := c.armCrash(l, tc.point, at)
-			restarted := make(chan struct{})
-			go func() {
-				fired.Wait()
-				c.setHook(nil)
-				c.restart(l) // the crashed node comes back while the client retries
-				close(restarted)
-			}()
-			out := s.Put(ctx, []byte("k"), []byte("new"), nil)
-			<-restarted
-			if out.Err != nil {
-				t.Fatalf("the retried write did not complete: %+v", out)
-			}
-			if out.Attempts < 2 {
-				t.Fatalf("the first attempt should have died with the leader: %+v", out)
-			}
-			switch {
-			case tc.duplicate == "yes" && !out.Response.Duplicate:
-				t.Fatalf("committed before the crash at %s, yet the retry executed it again: %+v", tc.point, out.Response)
-			case tc.duplicate == "yes" && out.Response.Index != idx:
-				t.Fatalf("the duplicate must report the original execution at %d: %+v", idx, out.Response)
-			case tc.duplicate == "no" && out.Response.Duplicate:
-				t.Fatalf("the write never left the leader at %s, yet the retry was answered as a duplicate: %+v", tc.point, out.Response)
-			}
-			if v, _ := get(t, c, "k"); v != "new" {
-				t.Fatalf("k = %q", v)
-			}
-			// Exactly one execution anywhere: every replica — restarted ones
-			// rebuilt theirs by replaying the log — executed exactly two
-			// writes, the setup "old" and the one logical request "new";
-			// every other entry carrying the request was a duplicate.
-			commit := c.node(c.waitLeader(0, 10*time.Second)).Status().Commit
-			for _, id := range c.ids {
-				c.waitApplied(id, commit)
-				if st := c.server(id).Store().Stats(); st.Executed != 2 {
-					t.Fatalf("%s executed %d writes (%+v): the request took effect more than once, or never", id, st.Executed, st)
+			withPremise(t, func() {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				c := startClusterWith(t, ctx, 3, false, kv.Limits{})
+				l := c.waitLeader(0, 10*time.Second)
+				s := register(t, c, kv.SessionOptions{AttemptTimeout: 2 * time.Second, MaxAttempts: 20, Backoff: 20 * time.Millisecond})
+				if o := s.Put(ctx, []byte("k"), []byte("old"), nil); o.Err != nil {
+					t.Fatal(o.Err)
 				}
-			}
-			t.Logf("crash at %s: %d attempts; duplicate=%v, executed at index %d", tc.point, out.Attempts, out.Response.Duplicate, out.Response.Index)
+				l = c.waitLeader(0, 10*time.Second)
+				t1 := c.node(l).Status().Term
+				idx := c.quiesce(l) + 1
+				c.premise(c.ledThroughout(l, t1), "%s was deposed during setup", l)
+				var at uint64
+				if tc.atIndex {
+					at = idx
+				}
+				fired := c.armCrash(l, tc.point, at)
+				restarted := make(chan bool, 1)
+				go func() {
+					ok := waitFired(fired, 20*time.Second)
+					if ok {
+						c.setHook(nil)
+						c.restart(l) // the crashed node comes back while the client retries
+					}
+					restarted <- ok
+				}()
+				// The first attempt must reach l as the leader: one forwarded or
+				// refused shows a spurious election deposed l first.
+				var first kv.Response
+				var firstErr error
+				var firstNode string
+				attempts := 0
+				hook := func(node string) func(kv.Response, error) {
+					attempts++
+					n := attempts
+					if n == 1 {
+						firstNode = node
+					}
+					return func(r kv.Response, err error) {
+						if n == 1 {
+							first, firstErr = r, err
+						}
+					}
+				}
+				out := s.Put(ctx, []byte("k"), []byte("new"), hook)
+				c.premise(<-restarted, "%s never reached %s", l, tc.point)
+				c.premise(firstNode == string(l) && servedBy(kv.Outcome{Response: first}, l),
+					"the first attempt did not reach %s as the leader (sent to %s: %+v, %v)", l, firstNode, first, firstErr)
+				if out.Err != nil {
+					t.Fatalf("the retried write did not complete: %+v", out)
+				}
+				if out.Attempts < 2 {
+					t.Fatalf("the first attempt should have died with the leader: %+v", out)
+				}
+				switch {
+				case tc.duplicate == "yes" && !out.Response.Duplicate:
+					t.Fatalf("committed before the crash at %s, yet the retry executed it again: %+v", tc.point, out.Response)
+				case tc.duplicate == "yes" && out.Response.Index != idx:
+					t.Fatalf("the duplicate must report the original execution at %d: %+v", idx, out.Response)
+				case tc.duplicate == "no" && out.Response.Duplicate:
+					t.Fatalf("the write never left the leader at %s, yet the retry was answered as a duplicate: %+v", tc.point, out.Response)
+				}
+				if v, _ := get(t, c, "k"); v != "new" {
+					t.Fatalf("k = %q", v)
+				}
+				// Exactly one execution anywhere: every replica — restarted ones
+				// rebuilt theirs by replaying the log — executed exactly two
+				// writes, the setup "old" and the one logical request "new";
+				// every other entry carrying the request was a duplicate.
+				commit := c.node(c.waitLeader(0, 10*time.Second)).Status().Commit
+				for _, id := range c.ids {
+					c.waitApplied(id, commit)
+					if st := c.server(id).Store().Stats(); st.Executed != 2 {
+						t.Fatalf("%s executed %d writes (%+v): the request took effect more than once, or never", id, st.Executed, st)
+					}
+				}
+				t.Logf("crash at %s: %d attempts; duplicate=%v, executed at index %d", tc.point, out.Attempts, out.Response.Duplicate, out.Response.Index)
+			})
 		})
 	}
 }
@@ -266,10 +301,15 @@ func (c *cluster) waitApplied(id raftnode.NodeID, idx uint64) {
 // the OTHER follower, which forwards it again. The second forward is a
 // duplicate: one execution.
 func TestForwardedRequestWhoseAnswerIsLostIsRetriedSafely(t *testing.T) {
+	withPremise(t, func() { forwardedRequestWhoseAnswerIsLost(t) })
+}
+
+func forwardedRequestWhoseAnswerIsLost(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := startClusterWith(t, ctx, 3, true, kv.Limits{})
 	l := c.waitLeader(0, 10*time.Second)
+	t1 := c.node(l).Status().Term
 	var fs []raftnode.NodeID
 	for _, id := range c.ids {
 		if id != l {
@@ -280,6 +320,7 @@ func TestForwardedRequestWhoseAnswerIsLostIsRetriedSafely(t *testing.T) {
 	drop := c.net.AddRule(fault.Rule{Kinds: []transport.MsgKind{transport.MsgForwardResponse}, Action: fault.Drop, Count: 1})
 	out := s.Put(ctx, []byte("k"), []byte("A"), nil)
 	c.net.RemoveRule(drop)
+	c.premise(c.ledThroughout(l, t1), "%s did not lead throughout: the followers were not followers", l)
 	if out.Err != nil || !out.Response.Duplicate || out.Response.Via == "" || out.Attempts < 2 {
 		t.Fatalf("want OK as a forwarded duplicate after a lost forward response: %+v", out)
 	}
@@ -354,16 +395,23 @@ func TestConcurrentDuplicatesAtTwoNodes(t *testing.T) {
 // would silence the heartbeats too, and a follower that hears none campaigns
 // and deposes the leader the test is about.)
 func TestDuplicateSentBeforeTheOriginalCommits(t *testing.T) {
+	withPremise(t, func() { duplicateSentBeforeTheOriginalCommits(t) })
+}
+
+func duplicateSentBeforeTheOriginalCommits(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := startClusterWith(t, ctx, 3, true, kv.Limits{})
 	l := c.waitLeader(0, 10*time.Second)
+	t1 := c.node(l).Status().Term
 	s := register(t, c, kv.SessionOptions{AttemptTimeout: 300 * time.Millisecond, MaxAttempts: 1}, l)
 	c.quiesce(l)
+	c.premise(c.ledThroughout(l, t1), "%s was deposed during setup", l)
 	held := c.net.Stats().Held
 	hold := c.net.AddRule(fault.Rule{Kinds: []transport.MsgKind{transport.MsgAppendEntriesResponse}, Action: fault.Hold})
 	rid := s.Reserve()
 	first := s.Send(ctx, rid, kv.ReqPut, []byte("k"), []byte("A"), nil)
+	c.premise(servedBy(first, l), "%s no longer led when the write arrived: %+v", l, first)
 	if first.Known {
 		t.Fatalf("a write that cannot commit was answered: %+v", first)
 	}
@@ -372,17 +420,19 @@ func TestDuplicateSentBeforeTheOriginalCommits(t *testing.T) {
 	dup.Hold(rid)
 	done := make(chan kv.Outcome, 1)
 	go func() { done <- dup.Send(ctx, rid, kv.ReqPut, []byte("k"), []byte("A"), nil) }()
-	waitFor(t, "the duplicate to be appended behind the original", 5*time.Second, func() bool {
-		return c.node(l).Status().LastIndex >= c.node(l).Status().Commit+2
-	})
+	appended := false
+	for deadline := time.Now().Add(5 * time.Second); !appended && time.Now().Before(deadline); time.Sleep(2 * time.Millisecond) {
+		st := c.node(l).Status()
+		appended = st.LastIndex >= st.Commit+2
+	}
 	c.net.RemoveRule(hold)
 	c.net.Release(false)
 	out := <-done
+	// Everything below rests on l having led throughout (else the duplicate
+	// was never appended behind the original, or went elsewhere).
+	c.premise(appended && c.ledThroughout(l, t1), "%s did not lead throughout (appended=%v): %+v", l, appended, c.node(l).Status())
 	if out.Err != nil || !out.Response.Duplicate {
 		t.Fatalf("the duplicate must be answered from the original's execution: %+v", out)
-	}
-	if st := c.node(l).Status(); st.Role != raft.Leader {
-		t.Fatalf("premise: %s must have led throughout, it is now %s in term %d", l, st.Role, st.Term)
 	}
 }
 
@@ -390,19 +440,27 @@ func TestDuplicateSentBeforeTheOriginalCommits(t *testing.T) {
 // then EVERY node restarts — every store is rebuilt from the log, session table
 // included. The retry is still a duplicate.
 func TestRetryAfterEveryNodeRestarts(t *testing.T) {
+	withPremise(t, func() { retryAfterEveryNodeRestarts(t) })
+}
+
+func retryAfterEveryNodeRestarts(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := startClusterWith(t, ctx, 3, false, kv.Limits{})
 	l := c.waitLeader(0, 10*time.Second)
+	t1 := c.node(l).Status().Term
 	s := register(t, c, kv.SessionOptions{MaxAttempts: 1, AttemptTimeout: 3 * time.Second}, l)
 	idx := c.quiesce(l) + 1
+	c.premise(c.ledThroughout(l, t1), "%s was deposed during setup", l)
 	fired := c.armCrash(l, raftnode.AfterAppliedTo, idx)
 	rid := s.Reserve()
-	if o := s.Send(ctx, rid, kv.ReqDelete, []byte("k"), nil, nil); o.Known {
+	o := s.Send(ctx, rid, kv.ReqDelete, []byte("k"), nil, nil)
+	c.premise(servedBy(o, l), "%s no longer led when the delete arrived: %+v", l, o)
+	c.premise(waitFired(fired, 10*time.Second), "%s never applied the delete at %d", l, idx)
+	c.setHook(nil)
+	if o.Known {
 		t.Fatalf("want an unknown outcome: %+v", o)
 	}
-	fired.Wait()
-	c.setHook(nil)
 	for _, id := range c.ids {
 		c.restart(id)
 	}
@@ -503,6 +561,7 @@ func TestEvictedSessionIsRefusedNotReexecuted(t *testing.T) {
 	if v, _ := get(t, c, "k"); v != "B" {
 		t.Fatalf("an evicted session's retry executed again: k = %q", v)
 	}
+	c.waitApplied(l, c.node(c.waitLeader(0, 10*time.Second)).Status().Commit)
 	if st := c.server(l).Store().Stats(); st.Evicted != 1 {
 		t.Fatalf("stats: %+v", st)
 	}
@@ -513,31 +572,42 @@ func TestEvictedSessionIsRefusedNotReexecuted(t *testing.T) {
 // no effect) — the server never forgets a result a retry might still need —
 // and succeeds once it acknowledges.
 func TestSessionLimitRefusesRatherThanForgets(t *testing.T) {
+	withPremise(t, func() { sessionLimitRefusesRatherThanForgets(t) })
+}
+
+func sessionLimitRefusesRatherThanForgets(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := startClusterWith(t, ctx, 3, false, kv.Limits{MaxSessions: 8, MaxUnacked: 2})
 	l := c.waitLeader(0, 10*time.Second)
+	t1 := c.node(l).Status().Term
 	s := register(t, c, kv.SessionOptions{MaxAttempts: 1}, l)
+	// Single attempts: each must reach l as the leader.
+	send := func(rid uint64, value string) kv.Outcome {
+		o := s.Send(ctx, rid, kv.ReqPut, []byte("k"), []byte(value), nil)
+		c.premise(servedBy(o, l) && c.ledThroughout(l, t1), "%s no longer led: %+v", l, o)
+		return o
+	}
 	a, b := s.Reserve(), s.Reserve() // both stay in flight: the watermark stays at a
 	for _, rid := range []uint64{a, b} {
-		if o := s.Send(ctx, rid, kv.ReqPut, []byte("k"), []byte(fmt.Sprint(rid)), nil); o.Err != nil {
+		if o := send(rid, fmt.Sprint(rid)); o.Err != nil {
 			t.Fatal(o)
 		}
 	}
 	third := s.Reserve()
-	if o := s.Send(ctx, third, kv.ReqPut, []byte("k"), []byte("3"), nil); !errors.Is(o.Err, kv.ErrSessionLimit) {
+	if o := send(third, "3"); !errors.Is(o.Err, kv.ErrSessionLimit) {
 		t.Fatalf("want SESSION_LIMIT: %+v", o)
 	}
 	if v, _ := get(t, c, "k"); v != fmt.Sprint(b) {
 		t.Fatalf("a refused request changed the state: %q", v)
 	}
 	// Retries of the remembered requests are still answered.
-	if o := s.Send(ctx, a, kv.ReqPut, []byte("k"), []byte(fmt.Sprint(a)), nil); o.Err != nil || !o.Response.Duplicate {
+	if o := send(a, fmt.Sprint(a)); o.Err != nil || !o.Response.Duplicate {
 		t.Fatalf("a remembered request: %+v", o)
 	}
 	s.Release(a)
 	s.Release(b)
-	if o := s.Send(ctx, third, kv.ReqPut, []byte("k"), []byte("3"), nil); o.Err != nil || o.Response.Duplicate {
+	if o := send(third, "3"); o.Err != nil || o.Response.Duplicate {
 		t.Fatalf("after acknowledging, the request executes: %+v", o)
 	}
 }
@@ -546,10 +616,15 @@ func TestSessionLimitRefusesRatherThanForgets(t *testing.T) {
 // is not the leader is answered NOT_LEADER by it — never forwarded onwards —
 // so forwarding cannot loop, whatever the nodes believe.
 func TestForwardedRequestIsNeverForwardedAgain(t *testing.T) {
+	withPremise(t, func() { forwardedRequestIsNeverForwardedAgain(t) })
+}
+
+func forwardedRequestIsNeverForwardedAgain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := startClusterWith(t, ctx, 3, false, kv.Limits{})
 	l := c.waitLeader(0, 10*time.Second)
+	t1 := c.node(l).Status().Term
 	var fs []raftnode.NodeID
 	for _, id := range c.ids {
 		if id != l {
@@ -558,6 +633,7 @@ func TestForwardedRequestIsNeverForwardedAgain(t *testing.T) {
 	}
 	c.quiesce(l)
 	resp := c.server(fs[0]).ForwardTo(ctx, string(fs[1]), kv.Request{Op: kv.ReqPut, Key: []byte("k"), Value: []byte("A")})
+	c.premise(c.ledThroughout(l, t1), "%s did not lead throughout: %s may not have been a follower", l, fs[1])
 	if resp.Status != kv.StatusNotLeader || resp.Node != string(fs[1]) || resp.Leader != string(l) {
 		t.Fatalf("a follower receiving a forward must refuse it, naming the leader: %+v", resp)
 	}
@@ -609,5 +685,114 @@ func TestConcurrentRequestsFromOneSession(t *testing.T) {
 		if st := c.server(id).Store().Stats(); st.Executed != 160 {
 			t.Fatalf("%s executed %d writes for 160 requests: %+v", id, st.Executed, st)
 		}
+	}
+}
+
+// --- premises (the in-process analogue of tests/integration's withPremise) ---
+
+// premiseFailed aborts one attempt of a scenario whose premise real timing
+// voided: typically, a spurious election — which the CI race job, running every
+// package at once on a small runner, does produce — deposed the leader the
+// scenario armed or aimed at, as the system's own answers show. The scenario
+// starts over on a fresh cluster (the attempt's context is cancelled as it
+// unwinds), at most three times. Only a premise is ever retried; an assertion
+// that fails fails the test at once.
+type premiseFailed struct{ why string }
+
+func (c *cluster) premise(cond bool, format string, args ...any) {
+	c.t.Helper()
+	if cond {
+		return
+	}
+	why := fmt.Sprintf(format, args...)
+	c.t.Logf("premise not met: %s", why)
+	panic(premiseFailed{why})
+}
+
+func withPremise(t *testing.T, attempt func()) {
+	t.Helper()
+	if err := runWithPremise(attempt, t.Logf); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// runWithPremise is withPremise's loop: nil once an attempt completes, an
+// error if every attempt's premise failed; any other panic propagates.
+func runWithPremise(attempt func(), logf func(string, ...any)) error {
+	for i := 1; i <= 3; i++ {
+		var failed *premiseFailed
+		func() {
+			defer func() {
+				if v := recover(); v != nil {
+					pf, ok := v.(premiseFailed)
+					if !ok {
+						panic(v)
+					}
+					failed = &pf
+				}
+			}()
+			attempt()
+		}()
+		if failed == nil {
+			return nil
+		}
+		logf("attempt %d: premise not met (%s); starting over on a fresh cluster", i, failed.why)
+	}
+	return errors.New("the scenario's premise was not met in 3 attempts")
+}
+
+// TestWithPremiseRetriesOnlyThePremise pins the rule the premise-checked
+// scenarios rely on: a failed premise starts the attempt over (at most three
+// times), a premise that never holds is an error (never a pass), and any other
+// panic is not swallowed.
+func TestWithPremiseRetriesOnlyThePremise(t *testing.T) {
+	c := &cluster{t: t}
+	n := 0
+	if err := runWithPremise(func() { n++; c.premise(n >= 3, "attempt %d", n) }, t.Logf); err != nil || n != 3 {
+		t.Fatalf("ran %d attempts (%v), want 3", n, err)
+	}
+	n = 0
+	if err := runWithPremise(func() { n++; c.premise(false, "never") }, t.Logf); err == nil || n != 3 {
+		t.Fatalf("a premise that never holds must be an error after 3 attempts: %v after %d", err, n)
+	}
+	defer func() {
+		if v := recover(); v != "boom" {
+			t.Fatalf("a panic that is not a premise must propagate, got %v", v)
+		}
+	}()
+	_ = runWithPremise(func() { panic("boom") }, t.Logf)
+	t.Fatal("unreachable")
+}
+
+// ledThroughout reports whether id still leads in term: it never stopped
+// leading since it was found leading in that term (losing leadership raises
+// the term).
+func (c *cluster) ledThroughout(id raftnode.NodeID, term uint64) bool {
+	n := c.node(id)
+	if n == nil {
+		return false
+	}
+	st := n.Status()
+	return st.Role == raft.Leader && st.Term == term
+}
+
+// servedBy reports whether a single attempt reached id as the leader: not
+// forwarded elsewhere, not refused, not overwritten. An attempt that fails
+// this was aimed at a node that no longer led.
+func servedBy(o kv.Outcome, id raftnode.NodeID) bool {
+	r := o.Response
+	return r.Via == "" && (r.Node == "" || r.Node == string(id)) &&
+		r.Status != kv.StatusNotLeader && r.Status != kv.StatusUnavailable && r.Status != kv.StatusLost
+}
+
+// waitFired waits at most d for an armed crash to fire.
+func waitFired(fired *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() { fired.Wait(); close(done) }()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
 	}
 }
