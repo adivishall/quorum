@@ -59,6 +59,9 @@ func TestRunRejectsBadClientAndCrashSeamFlags(t *testing.T) {
 		{"-raft", "-crash-at", "after-reply:0", "-client-listen", "127.0.0.1:0"},              // occurrence must be positive
 		{"-raft", "-crash-at", "during-reply:1", "-client-listen", "127.0.0.1:0"},             // unknown point
 		{"-raft", "-crash-at", "before-reply:x", "-client-listen", "127.0.0.1:0", "-id", "b"}, // bad occurrence
+		{"-raft", "-client-listen", "127.0.0.1:0", "-session-max", "0"},                       // no session could exist
+		{"-raft", "-client-listen", "127.0.0.1:0", "-session-max-unacked", "-1"},              // no request could complete
+		{"-raft", "-session-max", "x"},                                                        // not a number
 	} {
 		var out, errb bytes.Buffer
 		if code := run(context.Background(), append(append([]string(nil), base...), extra...), &out, &errb); code != 2 {

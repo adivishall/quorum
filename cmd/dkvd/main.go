@@ -76,7 +76,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		tickIvl  = fs.Duration("tick-interval", 50*time.Millisecond, "raft logical tick duration")
 		crashAt  = fs.String("crash-at", "", "TEST SEAM (raft mode): kill this process with SIGKILL at a crash point, e.g. after-save:2 (the 2nd time it is reached), fsync:3 (before the 3rd fsync of the durable log) or before-reply:1 (before the 1st client response is written); see docs/CRASH_RECOVERY.md")
 		crashArm = fs.Bool("crash-armed-by-signal", false, "TEST SEAM: count -crash-at occurrences only after this process receives SIGUSR1 (it logs event=crash_armed), so a test can crash at the Nth occurrence after a point of its choosing; driver and reply points only")
-		clientAt = fs.String("client-listen", "", "raft mode: serve the Phase 12 key-value operation protocol (PUT/GET/DELETE, internal/kv) on this host:port; a test boundary, not the client API (docs/LINEARIZABILITY.md)")
+		clientAt = fs.String("client-listen", "", "raft mode: serve the key-value client protocol (internal/kv, docs/API.md: PUT/GET/DELETE, REGISTER, request identity) on this host:port")
+		sessMax  = fs.Int("session-max", kv.DefaultLimits.MaxSessions, "raft mode: the most client sessions the state machine keeps; the least recently used is evicted beyond it (docs/DEDUP.md). Part of the replicated state machine: every node of a group MUST use the same value")
+		sessUnk  = fs.Int("session-max-unacked", kv.DefaultLimits.MaxUnacked, "raft mode: the most unacknowledged results one session may hold (docs/DEDUP.md). Every node of a group MUST use the same value")
+		forward  = fs.Bool("client-forwarding", true, "raft mode: a node that is not the leader forwards a client request one hop to the leader; false is redirect-only (NOT_LEADER with a leader hint)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -137,8 +140,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		_ = tr.Close()
 		return 2
 	}
+	limits := kv.Limits{MaxSessions: *sessMax, MaxUnacked: *sessUnk}
+	if limits.MaxSessions < 1 || limits.MaxUnacked < 1 {
+		fmt.Fprintf(stderr, "dkvd: -session-max and -session-max-unacked must be at least 1, got %d and %d\n", limits.MaxSessions, limits.MaxUnacked)
+		_ = tr.Close()
+		return 2
+	}
 	if *raftMode {
-		r := raftRun{id: *id, peers: peers, tr: tr, dataDir: *dataDir, tick: *tickIvl, lg: lg, stderr: stderr, clientAddr: *clientAt, crash: crash}
+		r := raftRun{id: *id, peers: peers, tr: tr, dataDir: *dataDir, tick: *tickIvl, lg: lg, stderr: stderr, clientAddr: *clientAt, crash: crash,
+			limits: limits, redirectOnly: !*forward}
 		if crash != nil {
 			r.hook, r.fs = crash.install(ctx, lg, *id, *crashArm)
 		}
@@ -285,8 +295,10 @@ type raftRun struct {
 	// clientAddr, if set, serves the Phase 12 key-value protocol (internal/kv)
 	// on that address: PUT/DELETE complete when committed and applied here,
 	// GET goes through ReadIndex. The node's state machine is a kv.Store.
-	clientAddr string
-	crash      *crashPoint // -crash-at; nil in normal operation
+	clientAddr   string
+	crash        *crashPoint // -crash-at; nil in normal operation
+	limits       kv.Limits   // the session table's bounds, identical on every node (zero: kv.DefaultLimits)
+	redirectOnly bool        // -client-forwarding=false
 }
 
 // runRaft runs a single Raft group (Phase 9) over the already-built transport
@@ -316,7 +328,11 @@ func runRaft(ctx context.Context, r raftRun) int {
 		return 2
 	}
 
-	store := kv.NewStore()
+	limits := r.limits
+	if limits == (kv.Limits{}) {
+		limits = kv.DefaultLimits
+	}
+	store := kv.NewStoreWithLimits(limits)
 	n, err := raftnode.Start(ctx, raftnode.Config{
 		ID: raftnode.NodeID(id), Peers: group, Transport: r.tr,
 		LogPath:      filepath.Join(dataDir, "raft-"+id+".log"),
@@ -339,8 +355,10 @@ func runRaft(ctx context.Context, r raftRun) int {
 		if r.crash != nil && r.crash.reply != 0 {
 			clientLn = &crashListener{Listener: clientLn, cp: r.crash}
 		}
-		go kv.Serve(ctx, clientLn, kv.NewServer(id, n, store), lg.logf)
-		lg.logf("event=client_ready node=%s addr=%s", id, clientLn.Addr())
+		srv := kv.NewServer(id, n, store)
+		srv.SetForwarding(!r.redirectOnly)
+		go kv.Serve(ctx, clientLn, srv, lg.logf)
+		lg.logf("event=client_ready node=%s addr=%s forwarding=%t sessions=%d unacked=%d", id, clientLn.Addr(), !r.redirectOnly, limits.MaxSessions, limits.MaxUnacked)
 	}
 
 	var wg sync.WaitGroup
