@@ -476,7 +476,9 @@ func TestRealConcurrentDuplicatesThroughEveryNode(t *testing.T) {
 		var wg sync.WaitGroup
 		for i, id := range c.ids {
 			sess.Hold(rid)
-			cl := r.resume(fmt.Sprintf("W@%s", id), sess, kv.SessionOptions{AttemptTimeout: 5 * time.Second, MaxAttempts: 1}, id)
+			// Each copy retries like any session request (a spurious election
+			// may refuse one); what may not happen is a second execution.
+			cl := r.resume(fmt.Sprintf("W@%s", id), sess, opts, id)
 			cl.Session().Hold(rid)
 			wg.Add(1)
 			go func(i int) {
@@ -494,19 +496,25 @@ func TestRealConcurrentDuplicatesThroughEveryNode(t *testing.T) {
 		}
 		return outs
 	}
+	// Every answer reports the one execution. When every copy was answered on
+	// its first attempt, exactly one of them is that execution; a copy retried
+	// after an unanswered attempt may find its own earlier attempt executed.
+	// That the request executed once is established from the committed log
+	// (dedupEvidence) either way.
 	writes := func(n int, kind lincheck.Kind, value []byte) {
 		outs := round(n, kind, value)
-		executed := 0
+		executed, firstTry := 0, true
 		for _, o := range outs {
 			if !o.Response.Duplicate {
 				executed++
 			}
+			firstTry = firstTry && o.Attempts == 1
 			if o.Response.Index != outs[0].Response.Index {
 				r.fail("%s round %d: copies answered from different indexes: %+v", kind, n, outs)
 			}
 		}
-		if executed != 1 {
-			r.fail("%s round %d: %d copies executed, want exactly 1: %+v", kind, n, executed, outs)
+		if executed > 1 || (firstTry && executed != 1) {
+			r.fail("%s round %d: %d answers report an execution, want exactly 1: %+v", kind, n, executed, outs)
 		}
 	}
 	for n := 0; n < 20; n++ {
@@ -534,10 +542,10 @@ func TestRealConcurrentDuplicatesThroughEveryNode(t *testing.T) {
 // TestRealConcurrentRequestsFromOneSession: eight goroutines share one session
 // and send distinct requests at once (through the session's endpoints — its
 // first requests to any node, then following the leader hint). Every request
-// executes once — none is refused stale or answered as a duplicate: each
-// carries the lowest id still in flight as its watermark, so no request's
-// result is forgotten while it is outstanding — and the history is
-// linearizable.
+// executes once (the committed log shows it) — none is refused stale, none is
+// answered on its first attempt as the duplicate of another: each carries the
+// lowest id still in flight as its watermark, so no request's result is
+// forgotten while it is outstanding — and the history is linearizable.
 func TestRealConcurrentRequestsFromOneSession(t *testing.T) {
 	c := newRCluster(t, 3)
 	c.waitLeader(c.ids, 0, 20*time.Second)
@@ -556,7 +564,9 @@ func TestRealConcurrentRequestsFromOneSession(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < 10; i++ {
 				op, out := cl.Put(ctx, fmt.Sprintf("k%d", g), []byte(fmt.Sprint(i)))
-				if out.Err != nil || out.Response.Duplicate {
+				// A duplicate answer is legitimate only after an unanswered
+				// attempt of the same request.
+				if out.Err != nil || (out.Response.Duplicate && out.Attempts == 1) {
 					errs <- fmt.Sprintf("goroutine %d request %d: %s %+v", g, i, op, out)
 				}
 			}

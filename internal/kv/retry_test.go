@@ -313,7 +313,9 @@ func TestConcurrentDuplicatesAtTwoNodes(t *testing.T) {
 		outs := make([]kv.Outcome, 2)
 		var wg sync.WaitGroup
 		for i, f := range fs {
-			s2 := kv.ResumeSession(c.doers(f), kv.SessionOptions{MaxAttempts: 1}, s.ID(), rid+1)
+			// Each copy retries like any session request (a spurious election
+			// may refuse one); what may not happen is a second execution.
+			s2 := kv.ResumeSession(c.doers(f), kv.SessionOptions{MaxAttempts: 20, Backoff: 20 * time.Millisecond}, s.ID(), rid+1)
 			s2.Hold(rid)
 			wg.Add(1)
 			go func(i int) {
@@ -326,8 +328,21 @@ func TestConcurrentDuplicatesAtTwoNodes(t *testing.T) {
 		if outs[0].Err != nil || outs[1].Err != nil {
 			t.Fatalf("round %d: %+v / %+v", round, outs[0], outs[1])
 		}
-		if outs[0].Response.Duplicate == outs[1].Response.Duplicate || outs[0].Response.Index != outs[1].Response.Index {
-			t.Fatalf("round %d: want exactly one execution and one duplicate of it: %+v / %+v", round, outs[0].Response, outs[1].Response)
+		// Both answers report the one execution. When both copies were
+		// answered on their first attempt, exactly one of them is that
+		// execution; a copy retried after an unanswered attempt may find its
+		// own earlier attempt executed, so both may be duplicates.
+		if outs[0].Response.Index != outs[1].Response.Index || (!outs[0].Response.Duplicate && !outs[1].Response.Duplicate) ||
+			(outs[0].Attempts == 1 && outs[1].Attempts == 1 && outs[0].Response.Duplicate == outs[1].Response.Duplicate) {
+			t.Fatalf("round %d: want one execution, every other answer its duplicate: %+v / %+v", round, outs[0], outs[1])
+		}
+	}
+	// Exactly one execution per round, on every replica.
+	commit := c.node(c.waitLeader(0, 10*time.Second)).Status().Commit
+	for _, id := range c.ids {
+		c.waitApplied(id, commit)
+		if st := c.server(id).Store().Stats(); st.Executed != 30 {
+			t.Fatalf("%s executed %d writes for 30 requests: %+v", id, st.Executed, st)
 		}
 	}
 }
@@ -569,7 +584,10 @@ func TestConcurrentRequestsFromOneSession(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < 10; i++ {
 				o := s.Put(ctx, []byte(fmt.Sprintf("k%d", g)), []byte(fmt.Sprint(i)), nil)
-				if o.Err != nil || o.Response.Duplicate {
+				// A duplicate answer is legitimate only after an unanswered
+				// attempt of the same request; on a first attempt it would
+				// mean two requests shared an id.
+				if o.Err != nil || (o.Response.Duplicate && o.Attempts == 1) {
 					errs <- fmt.Errorf("goroutine %d op %d: %+v", g, i, o)
 				}
 			}
@@ -583,6 +601,13 @@ func TestConcurrentRequestsFromOneSession(t *testing.T) {
 	for g := 0; g < 16; g++ {
 		if v, _ := get(t, c, fmt.Sprintf("k%d", g)); v != "9" {
 			t.Fatalf("k%d = %q", g, v)
+		}
+	}
+	commit := c.node(c.waitLeader(0, 10*time.Second)).Status().Commit
+	for _, id := range c.ids {
+		c.waitApplied(id, commit)
+		if st := c.server(id).Store().Stats(); st.Executed != 160 {
+			t.Fatalf("%s executed %d writes for 160 requests: %+v", id, st.Executed, st)
 		}
 	}
 }
