@@ -863,6 +863,18 @@ history. What the phase found:
    duplicate answer, though one is legitimate after an unanswered attempt. Copies now retry like
    any request; the assertions are the contract's (one execution per request — checked from the
    stores and the committed log — and no duplicate answer on a first attempt).
+11. **CI found what the local gate did not** (run 36244993180, both on a small runner): an
+   in-process retry test aimed its write at the leader it had found, but a spurious election had
+   deposed that node, which forwarded the write — the in-process tier had no premise discipline, so
+   it now has the real-process tier's (`withPremise`, itself tested: verify from the system's
+   answers that the aimed-at node led, bound every wait on an armed crash, start over on a fresh
+   cluster at most three times, never retry an assertion); and a `dkvd` process could not bind its
+   port because the harness reserved ports by binding `:0` and closing — an ephemeral port the
+   kernel may hand to any outgoing connection before the child binds it (a race in the harness
+   since Phase 7), now replaced by `internal/testport`, which allocates from ranges below every
+   common ephemeral range. Running the race suite under 16 CPU hogs then found the same premise
+   bug in a Phase 10 test (`TestIsolatedLeaderCannotCommitAndRejoins`), fixed the way its sibling
+   already was. No history and no log was wrong in any of them.
 
 ### 15.8 What is and is not claimed
 
