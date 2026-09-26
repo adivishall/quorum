@@ -47,6 +47,7 @@ type rcluster struct {
 	proxies map[[2]string]*tcpProxy // keyed by (dialer, accepter), dialer < accepter
 	procs   map[string]*dkvNode     // the current process of each node (nil = not running)
 	history []*dkvNode              // every process ever started, for election-safety checks
+	every   []string                // dkvd flags for EVERY start of every node (e.g. session limits)
 }
 
 func newRCluster(t *testing.T, n int) *rcluster {
@@ -58,9 +59,17 @@ func newRCluster(t *testing.T, n int) *rcluster {
 // start (restarts through start use the plain flags).
 func newRClusterArgs(t *testing.T, n int, extra ...string) *rcluster {
 	t.Helper()
+	return newRClusterEvery(t, n, nil, extra...)
+}
+
+// newRClusterEvery is newRClusterArgs with flags every start of every node
+// uses — configuration that must be identical on every process of the group,
+// restarts included (the session limits are part of the state machine).
+func newRClusterEvery(t *testing.T, n int, every []string, extra ...string) *rcluster {
+	t.Helper()
 	c := &rcluster{
 		t: t, bin: buildDkvd(t), addrs: map[string]string{}, kvAddrs: map[string]string{}, dirs: map[string]string{},
-		proxies: map[[2]string]*tcpProxy{}, procs: map[string]*dkvNode{},
+		proxies: map[[2]string]*tcpProxy{}, procs: map[string]*dkvNode{}, every: every,
 	}
 	root := t.TempDir()
 	for i := 1; i <= n; i++ {

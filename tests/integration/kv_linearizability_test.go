@@ -86,6 +86,17 @@ func (e *procEndpoint) Delete(ctx context.Context, key []byte) (kv.Meta, error) 
 	return c.Delete(ctx, key)
 }
 
+// Do sends one request of the Phase 13 protocol (kv.Doer) on its own
+// connection.
+func (e *procEndpoint) Do(ctx context.Context, req kv.Request) (kv.Response, error) {
+	c, err := e.dial()
+	if err != nil {
+		return kv.Response{Node: e.node}, err
+	}
+	defer c.Close()
+	return c.Do(ctx, req)
+}
+
 func (c *rcluster) endpoints() []workload.Endpoint {
 	var out []workload.Endpoint
 	for _, id := range c.ids {

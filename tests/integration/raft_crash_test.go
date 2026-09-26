@@ -52,7 +52,7 @@ func (c *rcluster) startWith(id string, extra ...string) {
 	}
 	buf := &safeBuf{}
 	args := append([]string{"-id", id, "-listen", c.addrs[id], "-peers", strings.Join(peers, ","),
-		"-raft", "-data-dir", c.dirs[id], "-tick-interval", "25ms", "-client-listen", c.kvAddrs[id]}, extra...)
+		"-raft", "-data-dir", c.dirs[id], "-tick-interval", "25ms", "-client-listen", c.kvAddrs[id]}, append(append([]string(nil), c.every...), extra...)...)
 	cmd := exec.Command(c.bin, args...)
 	cmd.Stdout, cmd.Stderr = buf, buf
 	if err := cmd.Start(); err != nil {
