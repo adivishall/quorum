@@ -43,36 +43,49 @@ func serveAll(t *testing.T, c *cluster) (map[raftnode.NodeID]*kv.Client, []workl
 // nodes: ok, notfound, notleader with a hint, invalid; values round-trip
 // including the empty value; one connection serves many requests.
 func TestWireClientAgainstRealNodes(t *testing.T) {
+	withPremise(t, func() { wireClientAgainstRealNodes(t) })
+}
+
+func wireClientAgainstRealNodes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := startCluster(t, ctx, 3, false)
 	l := c.waitLeader(0, 10*time.Second)
+	t1 := c.node(l).Status().Term
 	clients, _ := serveAll(t, c)
+	// Every assertion below names l as the leader: a failure is a verdict
+	// only if l still leads in the term it was found leading in; otherwise a
+	// spurious election voided the premise and the scenario starts over.
+	fatalf := func(format string, args ...any) {
+		t.Helper()
+		c.premise(c.ledThroughout(l, t1), "%s did not lead throughout (then: "+format+")", append([]any{l}, args...)...)
+		t.Fatalf(format, args...)
+	}
 	lc := clients[l]
 	if _, err := lc.Put(ctx, []byte("k"), []byte("v1")); err != nil {
-		t.Fatalf("put: %v", err)
+		fatalf("put: %v", err)
 	}
 	v, m, err := lc.Get(ctx, []byte("k"))
 	if err != nil || string(v) != "v1" || m.Node != string(l) || m.Index == 0 || m.Term == 0 {
-		t.Fatalf("get: %q %+v %v", v, m, err)
+		fatalf("get: %q %+v %v", v, m, err)
 	}
 	if _, err := lc.Put(ctx, []byte("k"), []byte{}); err != nil {
-		t.Fatal(err)
+		fatalf("%v", err)
 	}
 	if v, _, err := lc.Get(ctx, []byte("k")); err != nil || v == nil || len(v) != 0 {
-		t.Fatalf("empty value must be present and empty: %q %v (nil=%v)", v, err, v == nil)
+		fatalf("empty value must be present and empty: %q %v (nil=%v)", v, err, v == nil)
 	}
 	if _, err := lc.Delete(ctx, []byte("k")); err != nil {
-		t.Fatal(err)
+		fatalf("%v", err)
 	}
 	if _, _, err := lc.Get(ctx, []byte("k")); !errors.Is(err, kv.ErrNotFound) {
-		t.Fatalf("get after delete: %v, want ErrNotFound", err)
+		fatalf("get after delete: %v, want ErrNotFound", err)
 	}
 	if _, err := lc.Delete(ctx, []byte("k")); err != nil {
-		t.Fatalf("second delete must succeed: %v", err)
+		fatalf("second delete must succeed: %v", err)
 	}
 	if _, err := lc.Put(ctx, nil, []byte("v")); !errors.Is(err, kv.ErrInvalid) {
-		t.Fatalf("empty key: %v, want ErrInvalid", err)
+		fatalf("empty key: %v, want ErrInvalid", err)
 	}
 	// A follower forwards to the leader (Phase 13): the answer is the
 	// leader's, and says so — never the follower's own state.
@@ -82,11 +95,11 @@ func TestWireClientAgainstRealNodes(t *testing.T) {
 		}
 		resp, err := clients[id].Do(ctx, kv.Request{Op: kv.ReqPut, Key: []byte("k"), Value: []byte("x")})
 		if err != nil || resp.Status != kv.StatusOK || resp.Node != string(l) || resp.Via != string(id) {
-			t.Fatalf("follower %s: %+v %v, want OK served by %s via %s", id, resp, err, l, id)
+			fatalf("follower %s: %+v %v, want OK served by %s via %s", id, resp, err, l, id)
 		}
 		resp, err = clients[id].Do(ctx, kv.Request{Op: kv.ReqGet, Key: []byte("k")})
 		if err != nil || resp.Status != kv.StatusOK || string(resp.Value) != "x" || resp.Node != string(l) || resp.Via != string(id) {
-			t.Fatalf("follower read: %+v %v", resp, err)
+			fatalf("follower read: %+v %v", resp, err)
 		}
 	}
 	// In redirect-only mode a follower refuses instead, naming the leader.
@@ -99,10 +112,10 @@ func TestWireClientAgainstRealNodes(t *testing.T) {
 		var nl *kv.NotLeaderError
 		_, err := clients[id].Put(ctx, []byte("k"), []byte("y"))
 		if !errors.As(err, &nl) || nl.Leader != string(l) || nl.Node != string(id) {
-			t.Fatalf("redirect-only follower %s: %v, want not-leader with hint %s", id, err, l)
+			fatalf("redirect-only follower %s: %v, want not-leader with hint %s", id, err, l)
 		}
 		if _, _, err := clients[id].Get(ctx, []byte("k")); !errors.As(err, &nl) {
-			t.Fatalf("redirect-only follower read: %v", err)
+			fatalf("redirect-only follower read: %v", err)
 		}
 		srv.SetForwarding(true)
 	}
