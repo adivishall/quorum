@@ -6,7 +6,7 @@ Quorum is currently implementing its durable storage engine. No Raft library, no
 database, no consensus service — the storage engine and the consensus implementation are
 the project, and they are being built in that order.
 
-> **Status: Phase 12 of 25 — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, a working Raft consensus core, deterministic fault injection, a proven crash-recovery model for the Raft node, and client-visible linearizability of single-key operations on one Raft group, checked on real client histories.**
+> **Status: Phase 13 of 25 — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, a working Raft consensus core, deterministic fault injection, a proven crash-recovery model for the Raft node, client-visible linearizability of single-key operations on one Raft group, and safe client retries: request identity, deduplication at apply and request forwarding, checked on real client histories.**
 >
 > **Implemented:** a write-ahead log, an ordered memtable, immutable on-disk SSTables, Bloom
 > filters, size-tiered compaction, crash-safe MANIFEST-based file publication, and restart
@@ -49,13 +49,24 @@ the project, and they are being built in that order.
 > still has a follower, a SIGKILL at every point of a write's life), the real driver, and 1,400
 > seeded simulator runs. 27 mutants of ReadIndex, write completion, the client and the checker
 > are killed.
+> Phase 13 makes **retries safe** (`docs/CLIENT_SEMANTICS.md`, `docs/DEDUP.md`, `docs/API.md`): a
+> client registers a session (its ClientID is the log index of the REGISTER entry) and numbers its
+> requests; the replicated state machine decides at apply — identically on every replica, from a
+> bounded session table rebuilt by replay — whether an entry executes or is a duplicate of an earlier
+> one (answered with the original's index), a conflicting reuse, or from an expired session; a
+> non-leader forwards a request one hop to the leader; a session client retries every unknown
+> outcome under the same identity. A request's sends are checked as ONE logical operation: the
+> hardest case (committed, reply lost, new leader, another write, retry) at all eight crash windows
+> of a real process, forwarders killed before relaying, concurrent copies through every node, a
+> full-cluster restart, and 1,200 more seeded simulator runs in which every replica's every
+> apply-time decision matches an independent model. 27 more mutants are killed.
 >
 > **What that claim is, exactly:** single-key PUT/GET/DELETE on **one** Raft group; every
 > recorded finite history linearizable, plus an argument with named assumptions — not a proof
-> over every execution; and only for histories that record each retry as its own operation
-> (hidden retries need Phase 13's dedup). **Not implemented:** request forwarding, the client/HTTP
-> API, dedup / exactly-once client semantics, multi-group routing, snapshots, dynamic membership,
-> a dashboard, the LSM engine as the replicated state machine. See
+> over every execution; retries are inside the claim for identified writes (at most one execution
+> per request — exactly one if it executes; not exactly-once delivery), and anonymous writes keep
+> Phase 12's semantics. **Not implemented:** the HTTP API, multi-group routing, snapshots, dynamic
+> membership, a dashboard, the LSM engine as the replicated state machine. See
 > [docs/ROADMAP.md](docs/ROADMAP.md) for exactly what is done and what is not.
 >
 > The binary is still called `dkv`; that is the command name, not the project name.
@@ -119,13 +130,19 @@ crash point ───────▶│  named points in persist·send·advance�
 
                     ┌───────── implemented, Phase 12 (linearizability) ──┐
 client history ────▶│  ReadIndex · completion at commit+apply in term    │
-                    │  kv state machine · -client-listen test protocol   │
+                    │  kv state machine · -client-listen protocol        │
                     │  validated checker over real/driver/sim histories  │
                     └────────────────────────────────────────────────────┘
 
+                    ┌───────── implemented, Phase 13 (client semantics) ─┐
+retry ─────────────▶│  sessions · request ids · dedup at apply           │
+                    │  one-hop forwarding · wire v2 · session client     │
+                    │  logical-operation checking · session model        │
+                    └────────────────────────────────────────────────────┘
+
                     ┌──────────────── not implemented ───────────────────┐
-                    │  forwarding · request ids · dedup                  │ Phase 13
-                    │  HTTP API · dashboard · snapshots                  │ Phases 14+
+                    │  snapshots                                         │ Phase 14
+                    │  HTTP API · dashboard                              │ Phases 15+
                     └────────────────────────────────────────────────────┘
 ```
 
@@ -371,7 +388,10 @@ it is being answered out of memory.
 | [RAFT.md](docs/RAFT.md) | The deterministic core, persistent state and election timing, RequestVote/AppendEntries, the conflict hint, the commit rule and no-op, the apply path, persistence ordering and recovery, the simulated network, the INV-R invariants, and what Phase 9 does and does not prove |
 | [FAULTS.md](docs/FAULTS.md) | The fault model and its three tiers, the deterministic simulator, crash/power-loss/persistence-failure semantics, seeds/replay/minimization, the INV-F invariants, the bugs Phase 10 found, and what remains untested |
 | [CRASH_RECOVERY.md](docs/CRASH_RECOVERY.md) | The node's crash points, what each crash window leaves on disk and what recovery makes of it, the exhaustive crash matrix, the INV-CR invariants, and the Save record order Phase 11 fixed |
-| [LINEARIZABILITY.md](docs/LINEARIZABILITY.md) | The client-visible contract: the object model, write completion, ReadIndex and its safety argument, incomplete operations and retries, the checker and how it was validated, every real-process and simulator scenario, the mutants, and exactly what is and is not verified |
+| [LINEARIZABILITY.md](docs/LINEARIZABILITY.md) | The client-visible contract: the object model, write completion, ReadIndex and its safety argument, incomplete operations and retries, the checker and how it was validated, every real-process and simulator scenario, the mutants, and exactly what is and is not verified; §15: logical operations under retries and deduplication |
+| [CLIENT_SEMANTICS.md](docs/CLIENT_SEMANTICS.md) | The Phase 13 contract: logical requests, ClientID and RequestID, what happens to an identified write, reads, the eleven statuses, unknown outcomes, bounds, forwarding, and what the guarantee is and is not |
+| [DEDUP.md](docs/DEDUP.md) | How the server keeps it: the session table inside the replicated state machine, the decision at apply, recovery by replay and every crash window, concurrency, bounds and eviction, verification, measured cost, mutants, limitations |
+| [API.md](docs/API.md) | The client wire protocol v2: framing, messages, operations, validation, status codes, forwarding and redirect-only mode, the session client library |
 
 ## Development
 

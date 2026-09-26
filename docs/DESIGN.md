@@ -445,9 +445,12 @@ frame. Exact grammar, sizes, and timeouts: `docs/TRANSPORT.md` §3.
 Message types: `Probe` and `ProbeResponse` (liveness) are implemented in Phase 7. `RequestVote`,
 `AppendEntries` and their responses are **implemented in Phase 9** — the codec lives in
 `internal/raft` and `internal/raftnode` maps message types to these frame kinds (ADR-016), so the
-transport still carries them as opaque bytes. `InstallSnapshot` and `Forward` (client request
-proxied to a leader) and their responses remain **reserved kind identifiers** for Phases 14/13 with
-no codec or semantics yet.
+transport still carries them as opaque bytes. `Forward` and `ForwardResponse` (a client request
+proxied one hop to the leader, and its answer) are **implemented in Phase 13** — the payload is a
+forward id, the remaining time budget and the client request (or response) in the client
+encoding, codec in `internal/kv`, carried by `raftnode.SendApp` and dispatched to the
+application's handler (`docs/API.md` §6, ADR-020). `InstallSnapshot` and its response remain a
+**reserved kind identifier** for Phase 14 with no codec or semantics yet.
 
 Payloads use a hand-written binary codec (explicit `Marshal`/`Unmarshal`, varints, no
 reflection). Not gob, not JSON, not protobuf. Reasons, in order of weight:

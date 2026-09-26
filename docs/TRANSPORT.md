@@ -127,7 +127,7 @@ after the handshake both ends run a reader loop and share a mutex-guarded writer
 ## 5. Message kinds
 
 The 1-byte frame `kind` is the message type. Phase 7 implemented the probe kinds; Phase 9 activated
-the four Raft kinds; the rest remain reserved:
+the four Raft kinds; Phase 13 activated the forwarding kinds; the snapshot kinds remain reserved:
 
 | kind | name | status |
 |---|---|---|
@@ -139,13 +139,16 @@ the four Raft kinds; the rest remain reserved:
 | 19 | `AppendEntriesResponse` | implemented (Phase 9) |
 | 20 | `InstallSnapshot` | reserved for Phase 14 |
 | 21 | `InstallSnapshotResponse` | reserved for Phase 14 |
-| 32 | `Forward` | reserved for Phase 13 |
-| 33 | `ForwardResponse` | reserved for Phase 13 |
+| 32 | `Forward` | implemented (Phase 13) — codec in `internal/kv`, sent with `raftnode.SendApp` |
+| 33 | `ForwardResponse` | implemented (Phase 13) |
 
 The Raft kinds carry a hand-written bounded codec that lives in `internal/raft` (not here — the
 transport stays ignorant of what a term means, ADR-013/ADR-016); `internal/raftnode` maps message
-types to these kinds. The still-reserved kinds (`InstallSnapshot`, `Forward`) are **identifiers
-only**: their payloads depend on types that do not exist yet, and inventing fields for them now
+types to these kinds. The forwarding kinds carry a client request or response wrapped with a
+forward id (`docs/API.md` §6); `raftnode` hands every non-Raft kind it receives to the
+application's handler (`SetAppHandler`) and sends them for it (`SendApp`), so the transport and
+the Raft driver stay ignorant of client semantics. The still-reserved kinds (`InstallSnapshot`
+and its response) are **identifiers only**: their payloads depend on types that do not exist yet, and inventing fields for them now
 would be inventing later-phase behaviour. A frame with a reserved-but-unimplemented kind is accepted
 at the frame layer and ignored by a node that has no handler for it; an entirely unknown kind is
 `ErrUnknownKind` at the frame layer.
@@ -244,10 +247,10 @@ test-owned TCP proxies on the node-to-node links (`docs/FAULTS.md`). Since Phase
 sends from one goroutine per peer (bounded outboxes), so a peer whose writes block delays only its
 own messages (INV-F5); per-connection frame order is unaffected.
 
-**Still not built (on top of the transport):** request forwarding, shard/client serving, an HTTP
-API, a dashboard, dynamic membership, snapshots, and end-to-end cross-node consistency
-verification. The `InstallSnapshot`/`Forward` kinds remain reserved. `Probe`
-is a liveness probe, not a Raft heartbeat.
+**Built on top of the transport since:** Raft (Phase 9), client request forwarding (Phase 13,
+kinds 32/33). **Still not built:** shard serving, an HTTP API, a dashboard, dynamic membership and
+snapshots. The `InstallSnapshot` kinds remain reserved. `Probe` is a liveness probe, not a Raft
+heartbeat.
 
 ## 12. Invariants
 

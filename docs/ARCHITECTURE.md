@@ -1,15 +1,17 @@
 # ARCHITECTURE
 
 Status: **specification.** Every claim here is a *design intent* for the finished system,
-not a description of what exists. As of Phase 12 these parts are real: the storage engine (WAL,
+not a description of what exists. As of Phase 13 these parts are real: the storage engine (WAL,
 memtable, SSTables, Bloom filters, compaction, MANIFEST — Phases 1–5), routing as a library
 (Phase 6), node processes and the TCP transport (Phase 7), the local replicated-log model (Phase
 8), a single Raft group with a durable log and node driver (Phase 9), fault injection (Phase 10),
 crash-window recovery (Phase 11), and — Phase 12 — a replicated key-value state machine
 (`internal/kv`, in memory), linearizable reads through ReadIndex, write completion at
-commit-and-apply, and a minimal test-facing operation protocol on each node's `-client-listen`
-port. The client API, request forwarding and deduplication, one Raft group per hosted shard, the
-LSM engine as the state machine, snapshots and the dashboard are still design.
+commit-and-apply, and — Phase 13 — request identity (cluster-assigned sessions), deduplication at
+apply from a replicated session table, one-hop request forwarding and a retrying session client,
+over a framed client protocol (wire v2) on each node's `-client-listen` port. The HTTP client API,
+one Raft group per hosted shard, the LSM engine as the state machine, snapshots and the dashboard
+are still design.
 `docs/LIMITATIONS.md` and the per-phase reports record what is actually true of the code at any
 point in time.
 
@@ -152,9 +154,17 @@ the proposal's term; `GET` through `raftnode.Node.ReadIndex`, which completes on
 confirmed this leader after the read was registered and the store has applied through the read
 index). The pure core gained ReadIndex (a heartbeat sequence echoed by every AppendEntries
 response) and stays pure. The histories clients observe — from real processes, the in-process
-driver and the simulator — are checked by `internal/lincheck`. The protocol that carries them
-(`kv.Serve`/`kv.Client`, framed TCP on `-client-listen`) is a test boundary, not the client API:
-no HTTP, no request ids, no forwarding, no deduplication.
+driver and the simulator — are checked by `internal/lincheck`.
+
+As of Phase 13 (`docs/CLIENT_SEMANTICS.md`, `docs/DEDUP.md`, `docs/API.md`, ADR-020) a write may
+carry a **request identity**: a session's ClientID (the index of its committed `REGISTER` entry) and
+a RequestID. `kv.Store` keeps a bounded session table as part of the replicated state and decides
+each identified entry at apply — executed, duplicate (answered with the original index), conflict,
+stale, expired, limit — identically on every replica; the table is rebuilt by replay like the rest
+of the store. A non-leader **forwards** a request one hop to the leader over the internal transport
+(kinds 32/33, through `raftnode`'s application-message seam) and relays the answer; `kv.Session`
+retries unknown outcomes under the same identity. The protocol (`kv.Serve`/`kv.Client`, wire v2 on
+`-client-listen`) is framed binary TCP — not the HTTP API.
 
 As of Phase 11 (`docs/CRASH_RECOVERY.md`, ADR-018) the node's **crash windows** are characterised
 and proven: the driver's persist → send → advance → apply cycle exposes named crash points
@@ -280,10 +290,13 @@ as the multi-node demo.
 Step 8 is what lets us talk about linearizability. Answering at step 6 would be faster and
 would be a lie about read-your-writes.
 
-**Phase 12 — what is implemented of this path.** Steps 4–8 are real for one group, with the
+**Phases 12–13 — what is implemented of this path.** Steps 3–8 are real for one group, with the
 in-memory `kv.Store` in place of the engine (step 7) and the `-client-listen` protocol in place of
-HTTP (steps 1–3: a non-leader answers "not leader" with a hint and the client redirects; there is
-no forwarding and no `clientID/seqNo` — Phase 13). Step 8 is precise: the reply is sent only after
+HTTP (steps 1–2: one group, no routing). Step 3 (Phase 13): a non-leader forwards the request one
+hop to the leader it believes in and relays the answer — or, in redirect-only mode, answers "not
+leader" with a hint. Step 4 carries `clientID/requestID/ackedBelow` for identified writes, and the
+state machine decides at step 7 whether the entry executes or is a duplicate of an earlier one
+(`docs/DEDUP.md`). Step 8 is precise: the reply is sent only after
 the entry at the proposal's index is applied **with the proposal's term**; a different entry
 applied there means the write was lost (a definite no-effect); a deadline or a dead node means the
 outcome is unknown (`docs/LINEARIZABILITY.md` §3–§4). Reads do not enter the log: the leader
