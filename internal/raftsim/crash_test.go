@@ -629,6 +629,9 @@ func TestCrashMatrix(t *testing.T) {
 	}
 	byPoint, byMode := rep.Coverage()
 	for _, p := range raftnode.Points {
+		if p > raftnode.AfterAppliedTo {
+			continue // the snapshot points: TestSnapshotCrashMatrix covers them (this scenario never snapshots)
+		}
 		if byPoint[p.String()] == 0 {
 			t.Errorf("the scenario never reached driver point %s; the matrix does not cover it", p)
 		}

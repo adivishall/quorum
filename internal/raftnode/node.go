@@ -42,6 +42,7 @@ import (
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftlog"
 	"github.com/adivishall/quorum/internal/replication"
+	"github.com/adivishall/quorum/internal/snapshot"
 	"github.com/adivishall/quorum/internal/transport"
 	"github.com/adivishall/quorum/internal/vfs"
 )
@@ -92,6 +93,30 @@ type Config struct {
 	// at one of them (see Point and Hook; Phase 11, docs/CRASH_RECOVERY.md). It
 	// is a test seam: production leaves it nil, and a nil Hook costs nothing.
 	Hook Hook
+
+	// SnapshotEvery makes the node snapshot its state machine every
+	// SnapshotEvery applied entries and compact its log behind the snapshot
+	// (Phase 14, docs/SNAPSHOTS.md §4); 0 never does. Independently of it, a
+	// node whose StateMachine is a SnapshotStateMachine installs the snapshots
+	// its leader sends, and restores the published one at startup.
+	SnapshotEvery uint64
+	// SnapshotRetain is how many entries below a new snapshot's index the
+	// compaction keeps, so a follower slightly behind catches up by entries.
+	SnapshotRetain uint64
+}
+
+// snapshotFiles are the node's snapshot files, beside its log.
+func (c Config) snapshotFiles() snapshot.Files {
+	return snapshot.Files{FS: c.FS, Base: c.LogPath}
+}
+
+// members is the group identity a snapshot records: the peer ids, sorted.
+func (c Config) members() []string {
+	ids := make([]string, len(c.Peers))
+	for i, p := range c.Peers {
+		ids[i] = string(p)
+	}
+	return snapshot.Group(ids)
 }
 
 // raftlogOptions returns the durable-log options this config implies. The default
@@ -111,40 +136,116 @@ type Storage interface {
 	Save(hs *raftlog.HardState, entries []raftlog.Entry) error
 }
 
-// Recovered is a core rebuilt from its durable log, together with the open log.
+// Recovered is a core rebuilt from its durable log and snapshot, together with
+// the open log.
 type Recovered struct {
 	Core  *raft.Raft
 	Log   *raftlog.Log
 	Mem   *replication.MemoryLog // the core's in-memory log
-	State *raftlog.Recovered     // exactly what was read from disk
+	State *raftlog.Recovered     // exactly what was read from the log (after any repair)
+	// Snapshot is the published snapshot the state machine was restored from
+	// (nil: none); Repaired says recovery completed an interrupted install.
+	Snapshot *snapshot.Meta
+	Repaired bool
+	// Durable is the log and snapshots, for the Ready cycle.
+	Durable *Durable
 }
 
-// Recover opens the durable log at cfg.LogPath (on cfg.FS) and rebuilds the core
-// from it: the in-memory log from the durable entries, the commit index from the
-// persisted (clamped) value, and the core at the recovered term and vote, as a
-// Follower. It is the exact startup path of Start, exported so the deterministic
-// simulator restarts nodes through the same code. It uses ID, Peers, LogPath,
-// FS, DisableSync, Rand (required here), ElectionTicks and HeartbeatTicks.
+// Recover rebuilds a node from its durable state (docs/SNAPSHOTS.md §6): it
+// removes orphaned temporary files, loads and fully validates the published
+// snapshot (if any), opens the durable log at cfg.LogPath (on cfg.FS), and
+// reconciles the two — completing an install that crashed after publishing
+// its snapshot, and refusing any contradiction. The in-memory log starts at
+// the log's boundary; the commit index is the persisted (clamped) value, at
+// least the snapshot's index; the state machine is restored from the snapshot
+// and the applied index set to it; the core starts at the recovered term and
+// vote, as a Follower. It is the exact startup path of Start, exported so the
+// deterministic simulator restarts nodes through the same code. It uses ID,
+// Peers, LogPath, FS, DisableSync, Rand (required here), ElectionTicks,
+// HeartbeatTicks, StateMachine, SnapshotEvery and SnapshotRetain.
 func Recover(cfg Config) (*Recovered, error) {
 	if cfg.Rand == nil {
 		return nil, raft.ErrNoRand
+	}
+	files := cfg.snapshotFiles()
+	if err := files.RemoveOrphans(); err != nil {
+		return nil, err
+	}
+	meta, data, _, found, err := files.Load()
+	if err != nil {
+		return nil, fmt.Errorf("%w: the published snapshot: %w", ErrSnapshot, err)
+	}
+	if found && !snapshot.SameGroup(meta.Members, cfg.members()) {
+		return nil, fmt.Errorf("%w: the published snapshot is of group %v, this node's is %v", snapshot.ErrWrongGroup, meta.Members, cfg.members())
+	}
+	ssm, _ := cfg.StateMachine.(SnapshotStateMachine)
+	if found && ssm == nil {
+		return nil, fmt.Errorf("%w: a snapshot is published and the state machine cannot restore it", ErrSnapshot)
 	}
 	lg, rec, err := raftlog.Open(cfg.LogPath, cfg.raftlogOptions())
 	if err != nil {
 		return nil, err
 	}
+	fail := func(err error) (*Recovered, error) {
+		_ = lg.Close()
+		return nil, err
+	}
+	repaired := false
+	switch {
+	case found:
+		repair, err := reconcile(meta, rec)
+		if err != nil {
+			return fail(err)
+		}
+		if repair {
+			// The log does not record the snapshot yet: write the boundary record
+			// the interrupted install would have, then read the log back.
+			if err := lg.Install(meta.Index, meta.Term); err != nil {
+				return fail(fmt.Errorf("%w: completing the install of (%d,%d): %w", ErrSnapshot, meta.Index, meta.Term, err))
+			}
+			if err := lg.Close(); err != nil {
+				return nil, err
+			}
+			if lg, rec, err = raftlog.Open(cfg.LogPath, cfg.raftlogOptions()); err != nil {
+				return nil, err
+			}
+			if again, err := reconcile(meta, rec); err != nil || again {
+				return fail(fmt.Errorf("%w: the repaired log still disagrees with the snapshot (%v)", ErrSnapshot, err))
+			}
+			repaired = true
+		}
+	case rec.Boundary.Index > 0:
+		return fail(fmt.Errorf("%w: the log is compacted through %d and no snapshot is published", ErrSnapshot, rec.Boundary.Index))
+	}
 	mlog := replication.NewMemoryLog()
-	if len(rec.Entries) > 0 {
-		if err := mlog.Append(rec.Entries...); err != nil {
-			_ = lg.Close()
-			return nil, fmt.Errorf("raftnode: recovered log is inconsistent: %w", err)
+	if b := rec.Boundary; b.Index > 0 {
+		if err := mlog.InstallSnapshot(b.Index, b.Term); err != nil {
+			return fail(fmt.Errorf("raftnode: recovered boundary invalid: %w", err))
 		}
 	}
-	if rec.HardState.Commit > 0 {
-		if err := mlog.Commit(rec.HardState.Commit); err != nil {
-			_ = lg.Close()
-			return nil, fmt.Errorf("raftnode: recovered commit invalid: %w", err)
+	if len(rec.Entries) > 0 {
+		if err := mlog.Append(rec.Entries...); err != nil {
+			return fail(fmt.Errorf("raftnode: recovered log is inconsistent: %w", err))
 		}
+	}
+	commit := rec.HardState.Commit
+	if found {
+		commit = max(commit, meta.Index)
+	}
+	if commit > mlog.CommitIndex() {
+		if err := mlog.Commit(commit); err != nil {
+			return fail(fmt.Errorf("raftnode: recovered commit invalid: %w", err))
+		}
+	}
+	var restored *snapshot.Meta
+	if found {
+		if err := ssm.RestoreSnapshot(meta.Index, data); err != nil {
+			return fail(fmt.Errorf("%w: restoring the published snapshot: %w", ErrSnapshot, err))
+		}
+		if err := mlog.Apply(meta.Index); err != nil {
+			return fail(fmt.Errorf("raftnode: applied index of the snapshot: %w", err))
+		}
+		restored = &meta
 	}
 	core, err := raft.New(raft.Config{
 		ID: cfg.ID, Peers: cfg.Peers, Rand: cfg.Rand, Log: mlog,
@@ -152,10 +253,14 @@ func Recover(cfg Config) (*Recovered, error) {
 		Term: rec.HardState.Term, Vote: rec.HardState.Vote,
 	})
 	if err != nil {
-		_ = lg.Close()
-		return nil, err
+		return fail(err)
 	}
-	return &Recovered{Core: core, Log: lg, Mem: mlog, State: rec}, nil
+	snaps := &Snapshots{Files: files, SM: ssm, Members: cfg.members(), Every: cfg.SnapshotEvery, Retain: cfg.SnapshotRetain}
+	if found {
+		snaps.meta = meta
+	}
+	return &Recovered{Core: core, Log: lg, Mem: mlog, State: rec, Snapshot: restored, Repaired: repaired,
+		Durable: &Durable{Log: lg, Snap: snaps}}, nil
 }
 
 // Node is a running Raft group driver.
@@ -163,6 +268,7 @@ type Node struct {
 	cfg  Config
 	core *raft.Raft
 	log  *raftlog.Log
+	dur  *Durable // the log and the snapshots (Phase 14; actor-owned)
 	tr   transport.Transport
 	sm   StateMachine
 
@@ -172,6 +278,7 @@ type Node struct {
 	done   chan struct{} // closed when the actor loop exits, for any reason
 
 	recvCh    chan raft.Message
+	chunkCh   chan inChunk // snapshot chunks from peers (Phase 14)
 	proposeCh chan proposal
 	writeCh   chan writeReq
 	readCh    chan readReq
@@ -179,9 +286,10 @@ type Node struct {
 	waiters   *Waiters // requests waiting for an apply (actor-owned)
 	reads     *Reads   // unconfirmed ReadIndex requests (actor-owned)
 
-	mu     sync.Mutex
-	status Status
-	err    error // the fail-stop cause; nil if running or cleanly closed
+	mu      sync.Mutex
+	status  Status
+	err     error           // the fail-stop cause; nil if running or cleanly closed
+	sending map[NodeID]bool // peers a snapshot is being streamed to (Phase 14)
 
 	app atomic.Pointer[AppHandler] // Phase 13: application messages (forwarding)
 }
@@ -214,6 +322,12 @@ func (n *Node) SendApp(ctx context.Context, peer NodeID, kind transport.MsgKind,
 type proposal struct {
 	data   []byte
 	result chan error
+}
+
+// inChunk is one snapshot chunk a peer sent (transport kind InstallSnapshot).
+type inChunk struct {
+	from    NodeID
+	payload []byte
 }
 
 // writeReq is a Write: the actor answers with the entry's index and term and the
@@ -249,6 +363,10 @@ type Status struct {
 	Commit    uint64
 	LastIndex uint64
 	Applied   uint64
+	// Phase 14: the log's compaction boundary (entries at or below it are
+	// discarded) and the published snapshot's index (0: none).
+	Boundary uint64
+	Snapshot uint64
 }
 
 // Start recovers durable state, constructs the core, and launches the actor,
@@ -268,9 +386,11 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 
 	nctx, cancel := context.WithCancel(ctx)
 	n := &Node{
-		cfg: cfg, core: rc.Core, log: rc.Log, tr: cfg.Transport, sm: cfg.StateMachine,
+		cfg: cfg, core: rc.Core, log: rc.Log, dur: rc.Durable, tr: cfg.Transport, sm: cfg.StateMachine,
 		ctx: nctx, cancel: cancel, done: make(chan struct{}),
 		recvCh:    make(chan raft.Message, 256),
+		chunkCh:   make(chan inChunk, 16),
+		sending:   map[NodeID]bool{},
 		proposeCh: make(chan proposal),
 		writeCh:   make(chan writeReq),
 		readCh:    make(chan readReq),
@@ -278,7 +398,11 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		waiters:   NewWaiters(),
 		reads:     NewReads(),
 	}
+	n.dur.Snap.Installed = n.waiters.Installed
 	n.snapshotStatus()
+	if rc.Snapshot != nil {
+		n.logf("event=raft_snapshot_restored node=%s index=%d term=%d repaired=%v", cfg.ID, rc.Snapshot.Index, rc.Snapshot.Term, rc.Repaired)
+	}
 
 	for _, p := range cfg.Peers {
 		if p == cfg.ID {
@@ -459,6 +583,8 @@ func (n *Node) actorLoop() {
 			n.core.Tick()
 		case m := <-n.recvCh:
 			_ = n.core.Step(m)
+		case c := <-n.chunkCh:
+			n.receiveChunk(c)
 		case p := <-n.proposeCh:
 			if err := n.core.Propose(p.data); err != nil {
 				p.result <- err
@@ -502,7 +628,8 @@ func (n *Node) actorLoop() {
 // crash-point abort (Config.Hook). A state-machine failure is logged and left for
 // the next cycle: appliedIndex does not advance past it, and the node keeps running.
 func (n *Node) processReady() error {
-	if err := DrainReadyAt(n.core, n.log, n.enqueue, n.confirmRead, n.cfg.Hook); err != nil {
+	defer n.dur.Snap.Unstage() // a staged snapshot lives for one cycle at most
+	if err := DrainReadyAt(n.core, n.dur, n.enqueue, n.confirmRead, n.cfg.Hook); err != nil {
 		return err
 	}
 	if err := ApplyCommitted(n.core, n.sm, n.cfg.Hook, n.applied); err != nil {
@@ -510,6 +637,20 @@ func (n *Node) processReady() error {
 			return err // a crash point fired
 		}
 		n.logf("event=raft_apply_failed node=%s err=%v", n.cfg.ID, err)
+	}
+	// Phase 14: snapshot and compact when the trigger says so. A state too
+	// large to snapshot is reported and skipped; any other failure is a
+	// durability failure and stops the node, as a failed Save does.
+	before := n.dur.Snap.Published().Index
+	if err := n.dur.MaybeSnapshot(n.core, n.cfg.Hook); err != nil {
+		if !errors.Is(err, snapshot.ErrTooLarge) {
+			return err
+		}
+		n.logf("event=raft_snapshot_skipped node=%s applied=%d err=%v", n.cfg.ID, n.core.AppliedIndex(), err)
+	}
+	if after := n.dur.Snap.Published(); after.Index != before {
+		b, _ := n.core.Boundary()
+		n.logf("event=raft_snapshot node=%s index=%d term=%d boundary=%d", n.cfg.ID, after.Index, after.Term, b)
 	}
 	// A read registered in a term this node no longer leads will never be
 	// confirmed (the core dropped it): tell its client to go elsewhere.
@@ -550,6 +691,10 @@ func (n *Node) fail(err error) {
 // peer's outbox without ever blocking the actor. A full outbox drops the message;
 // Raft's heartbeats retransmit whatever it carried.
 func (n *Node) enqueue(m raft.Message) {
+	if m.Type == raft.MsgSnapshot {
+		n.startTransfer(m)
+		return
+	}
 	ch, ok := n.outboxes[m.To]
 	if !ok {
 		n.logf("event=raft_send_dropped node=%s to=%s type=%s reason=unknown_peer", n.cfg.ID, m.To, m.Type)
@@ -604,6 +749,14 @@ func (n *Node) receiveLoop() {
 			if !ok {
 				return // transport closed
 			}
+			if env.Kind == transport.MsgInstallSnapshot {
+				select {
+				case n.chunkCh <- inChunk{from: NodeID(env.Peer), payload: env.Payload}:
+				case <-n.ctx.Done():
+					return
+				}
+				continue
+			}
 			mt, ok := typeForKind(env.Kind)
 			if !ok {
 				// Not a Raft message: an application message (Phase 13
@@ -633,11 +786,75 @@ func (n *Node) receiveLoop() {
 
 func (n *Node) snapshotStatus() {
 	n.mu.Lock()
+	b, _ := n.core.Boundary()
 	n.status = Status{
 		Role: n.core.Role(), Term: n.core.Term(), Leader: n.core.LeaderID(),
 		Commit: n.core.CommitIndex(), LastIndex: n.core.LastIndex(), Applied: n.core.AppliedIndex(),
+		Boundary: b, Snapshot: n.dur.Snap.Published().Index,
 	}
 	n.mu.Unlock()
+}
+
+// startTransfer answers the core's offer of a snapshot to a follower (Phase
+// 14, docs/SNAPSHOTS.md §8) by streaming the published snapshot — at or beyond
+// the core's boundary, which a compaction never passes — in chunks on its own
+// goroutine, so the peer's heartbeats keep flowing meanwhile (a chunk does not
+// reset a follower's election timer; a heartbeat does). At most one transfer
+// runs per peer; an offer while one runs is ignored. A failed send abandons
+// the transfer, and the core offers again when its offer goes unanswered.
+func (n *Node) startTransfer(m raft.Message) {
+	meta, file, err := n.dur.Snap.SendFile()
+	if err == nil && meta.Index < m.SnapshotIndex {
+		err = fmt.Errorf("%w: published snapshot %d is below the log's boundary %d", ErrSnapshot, meta.Index, m.SnapshotIndex)
+	}
+	if err != nil {
+		n.logf("event=raft_snapshot_send_failed node=%s to=%s err=%v", n.cfg.ID, m.To, err)
+		return
+	}
+	n.mu.Lock()
+	busy := n.sending[m.To]
+	n.sending[m.To] = true
+	n.mu.Unlock()
+	if busy {
+		return
+	}
+	n.wg.Add(1)
+	go n.transfer(m.To, m.Term, meta, file)
+}
+
+// transfer streams one snapshot to one peer.
+func (n *Node) transfer(peer NodeID, term uint64, meta snapshot.Meta, file []byte) {
+	defer n.wg.Done()
+	defer func() {
+		n.mu.Lock()
+		delete(n.sending, peer)
+		n.mu.Unlock()
+	}()
+	chunks := snapshot.Split(term, meta, file)
+	for _, c := range chunks {
+		if err := n.tr.Send(n.ctx, transport.NodeID(peer), transport.MsgInstallSnapshot, c.Marshal()); err != nil {
+			n.logf("event=raft_snapshot_send_failed node=%s to=%s index=%d offset=%d err=%v", n.cfg.ID, peer, meta.Index, c.Offset, err)
+			return
+		}
+	}
+	n.logf("event=raft_snapshot_sent node=%s to=%s index=%d term=%d bytes=%d chunks=%d", n.cfg.ID, peer, meta.Index, meta.Term, len(file), len(chunks))
+}
+
+// receiveChunk takes one chunk of a snapshot a peer is sending. A complete,
+// valid snapshot is stepped into the core as its MsgSnapshot; the Ready cycle
+// that follows installs it (or the core ignores it as already covered).
+func (n *Node) receiveChunk(c inChunk) {
+	m, err := n.dur.Snap.Receive(c.from, c.payload)
+	if err != nil {
+		n.logf("event=raft_snapshot_refused node=%s from=%s err=%v", n.cfg.ID, c.from, err)
+		return
+	}
+	if m == nil {
+		return
+	}
+	m.To = n.cfg.ID
+	n.logf("event=raft_snapshot_received node=%s from=%s index=%d term=%d", n.cfg.ID, c.from, m.SnapshotIndex, m.SnapshotTerm)
+	_ = n.core.Step(*m)
 }
 
 func (n *Node) logf(format string, args ...any) {

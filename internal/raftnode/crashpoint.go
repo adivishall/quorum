@@ -41,16 +41,45 @@ const (
 	AfterApply
 	// AfterAppliedTo: AppliedTo recorded the entry (Arg = its index).
 	AfterAppliedTo
+
+	// Phase 14 — creating a snapshot (docs/SNAPSHOTS.md §5; Arg = its index).
+
+	// BeforeSnapshotPublish: the state is encoded; nothing of the snapshot is
+	// on disk.
+	BeforeSnapshotPublish
+	// AfterSnapshotPublish: the snapshot is published (renamed, directory
+	// fsynced); the log still holds the prefix it covers.
+	AfterSnapshotPublish
+	// AfterLogCompact: the durable log is rewritten without the prefix (Arg =
+	// the compaction index, the snapshot's less Retain); the core still holds it.
+	AfterLogCompact
+
+	// Phase 14 — installing a leader's snapshot (§8; Arg = its index).
+
+	// BeforeInstallPublish: the core installed the snapshot and a changed term
+	// is durable; the received file is not yet published.
+	BeforeInstallPublish
+	// AfterInstallPublish: the received snapshot is published; the log has no
+	// boundary record for it yet (recovery completes the install).
+	AfterInstallPublish
+	// AfterInstallBoundary: the log's boundary record is durable; the state
+	// machine is not yet restored, the new commit not yet saved, and the
+	// response not yet sent.
+	AfterInstallBoundary
 )
 
 var pointNames = map[Point]string{
 	BeforeSave: "before-save", AfterSave: "after-save", AfterSend: "after-send",
 	BeforeAdvance: "before-advance", AfterAdvance: "after-advance",
 	BeforeApply: "before-apply", AfterApply: "after-apply", AfterAppliedTo: "after-applied-to",
+	BeforeSnapshotPublish: "before-snapshot-publish", AfterSnapshotPublish: "after-snapshot-publish",
+	AfterLogCompact: "after-log-compact", BeforeInstallPublish: "before-install-publish",
+	AfterInstallPublish: "after-install-publish", AfterInstallBoundary: "after-install-boundary",
 }
 
 // Points lists every crash point, in cycle order.
-var Points = []Point{BeforeSave, AfterSave, AfterSend, BeforeAdvance, AfterAdvance, BeforeApply, AfterApply, AfterAppliedTo}
+var Points = []Point{BeforeSave, AfterSave, AfterSend, BeforeAdvance, AfterAdvance, BeforeApply, AfterApply, AfterAppliedTo,
+	BeforeSnapshotPublish, AfterSnapshotPublish, AfterLogCompact, BeforeInstallPublish, AfterInstallPublish, AfterInstallBoundary}
 
 // String renders a point in the syntax ParsePoint reads back.
 func (p Point) String() string {
@@ -88,6 +117,11 @@ var ErrApply = errors.New("raftnode: state machine apply failed")
 // Ready's messages and without advancing; the caller must then treat the node as
 // failed and never drive core again (INV-F1). This is the single implementation of
 // the ordering, shared by the node's actor loop and the deterministic simulator.
+//
+// A Ready that carries a snapshot the core installed (Phase 14) has it made
+// durable and active first — through st, which must be an Installer — and only
+// then its HardState and entries saved and its messages sent: the response
+// that tells the leader the snapshot is installed never precedes it.
 func DrainReady(core *raft.Raft, st Storage, send func(raft.Message)) error {
 	return DrainReadyAt(core, st, send, nil, nil)
 }
@@ -103,6 +137,15 @@ func DrainReadyAt(core *raft.Raft, st Storage, send func(raft.Message), reads fu
 		var hs *raftlog.HardState
 		if rd.HardState != nil {
 			hs = &raftlog.HardState{Term: rd.HardState.Term, Vote: rd.HardState.Vote, Commit: rd.HardState.Commit}
+		}
+		if rd.Snapshot != nil {
+			in, ok := st.(Installer)
+			if !ok {
+				return fmt.Errorf("%w: the core installed a snapshot and the storage cannot", ErrSnapshot)
+			}
+			if err := in.InstallSnapshot(*rd.Snapshot, hs, at); err != nil {
+				return err
+			}
 		}
 		if hs != nil || len(rd.Entries) > 0 {
 			if err := at.hit(BeforeSave, 0); err != nil {

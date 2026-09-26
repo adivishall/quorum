@@ -8,9 +8,12 @@ import (
 // kindForType maps a Raft message type to the transport's reserved frame kind
 // (ADR-013). This mapping is the only place the two vocabularies meet: the core
 // never imports the transport, and the transport never learns what a term means
-// (docs/RAFT.md §25). Only the four Phase 9 Raft kinds are Raft messages; the
-// Phase 13 forward kinds are application messages (SetAppHandler, SendApp), and
-// the snapshot kinds stay reserved.
+// (docs/RAFT.md §25). The four Phase 9 Raft kinds and, since Phase 14,
+// InstallSnapshotResponse are Raft messages; the Phase 13 forward kinds are
+// application messages (SetAppHandler, SendApp). InstallSnapshot carries a
+// snapshot's chunks, not a Raft message: the core's MsgSnapshot is realized as
+// a transfer of the published file (Node.startTransfer), and a complete one
+// becomes a MsgSnapshot on the receiving side (Snapshots.Receive).
 func kindForType(t raft.MessageType) (transport.MsgKind, bool) {
 	switch t {
 	case raft.MsgVoteRequest:
@@ -21,6 +24,8 @@ func kindForType(t raft.MessageType) (transport.MsgKind, bool) {
 		return transport.MsgAppendEntries, true
 	case raft.MsgAppendResponse:
 		return transport.MsgAppendEntriesResponse, true
+	case raft.MsgSnapshotResponse:
+		return transport.MsgInstallSnapshotResponse, true
 	default:
 		return 0, false
 	}
@@ -38,6 +43,8 @@ func typeForKind(k transport.MsgKind) (raft.MessageType, bool) {
 		return raft.MsgAppendRequest, true
 	case transport.MsgAppendEntriesResponse:
 		return raft.MsgAppendResponse, true
+	case transport.MsgInstallSnapshotResponse:
+		return raft.MsgSnapshotResponse, true
 	default:
 		return 0, false
 	}

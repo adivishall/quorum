@@ -97,6 +97,28 @@ func (w *Waiters) FailAll(err error) {
 	w.n = 0
 }
 
+// Installed reports that a snapshot from the leader replaced the log through
+// index before this node applied it (Phase 14): every waiter at or below index
+// completes now — a barrier successfully (the state machine is at index), a
+// write with ErrSuperseded (its entry's effect, if it was its entry, is in the
+// snapshot, but which entry it was is not: the outcome is unknown).
+func (w *Waiters) Installed(index uint64) {
+	for idx, ws := range w.byIndex {
+		if idx > index {
+			continue
+		}
+		delete(w.byIndex, idx)
+		w.n -= len(ws)
+		for _, wt := range ws {
+			if wt.term == 0 {
+				wt.ch <- Outcome{Index: idx}
+			} else {
+				wt.ch <- Outcome{Index: idx, Err: ErrSuperseded}
+			}
+		}
+	}
+}
+
 // Len is the number of waiters registered and not yet completed.
 func (w *Waiters) Len() int { return w.n }
 
