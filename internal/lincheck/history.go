@@ -82,6 +82,13 @@ type Op struct {
 	Key    string
 	Value  []byte // Put: the value written
 
+	// ClientID and RequestID are the operation's request identity (Phase 13,
+	// docs/CLIENT_SEMANTICS.md): ClientID 0 is anonymous. Several ops with the
+	// same non-zero identity are sends of ONE logical request — History.Logical
+	// merges the writes among them before checking.
+	ClientID  uint64
+	RequestID uint64
+
 	// Invoke and Complete are positions in the history's event order; Complete is
 	// 0 for an Incomplete operation. Positions are strictly increasing in real
 	// time within one history (a sequence counter), so "A completed before B was
@@ -111,7 +118,7 @@ func (o Op) Optional() bool { return o.Outcome == Incomplete }
 
 // String renders an op in the one-line form Parse reads back:
 //
-//	id client kind key inv complete outcome [value=<v>] [output=<v>] [node=n term=t index=i]
+//	id client kind key inv complete outcome [value=<v>] [output=<v>] [cid=c rid=r] [node=n term=t index=i]
 func (o Op) String() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%d %s %s %s %d %d %s", o.ID, o.Client, o.Kind, quote(o.Key), o.Invoke, o.Complete, o.Outcome)
@@ -120,6 +127,9 @@ func (o Op) String() string {
 	}
 	if o.Kind == Get && o.Outcome == OK {
 		fmt.Fprintf(&b, " output=%s", quote(string(o.Output)))
+	}
+	if o.ClientID != 0 {
+		fmt.Fprintf(&b, " cid=%d rid=%d", o.ClientID, o.RequestID)
 	}
 	if o.Node != "" {
 		fmt.Fprintf(&b, " node=%s term=%d index=%d", o.Node, o.Term, o.Index)
@@ -227,6 +237,14 @@ func Parse(line string) (Op, error) {
 				return Op{}, fmt.Errorf("lincheck: bad output in %q", line)
 			}
 			op.Output = []byte(s)
+		case "cid":
+			if op.ClientID, err = strconv.ParseUint(v, 10, 64); err != nil {
+				return Op{}, fmt.Errorf("lincheck: bad cid in %q", line)
+			}
+		case "rid":
+			if op.RequestID, err = strconv.ParseUint(v, 10, 64); err != nil {
+				return Op{}, fmt.Errorf("lincheck: bad rid in %q", line)
+			}
 		case "node":
 			op.Node = v
 		case "term":
@@ -383,6 +401,11 @@ func (h History) Validate() error {
 			return fmt.Errorf("lincheck: op %d has an output but is not a successful get", op.ID)
 		}
 	}
+	for _, op := range h.Ops {
+		if (op.ClientID == 0) != (op.RequestID == 0) {
+			return fmt.Errorf("lincheck: op %d has cid=%d rid=%d: an identity needs both", op.ID, op.ClientID, op.RequestID)
+		}
+	}
 	return nil
 }
 
@@ -411,6 +434,18 @@ func (r *Recorder) Begin(client string, kind Kind, key string, value []byte) int
 	op := &Op{ID: r.next, Client: client, Kind: kind, Key: key, Value: append([]byte(nil), value...), Invoke: r.seq}
 	r.ops[op.ID] = op
 	return op.ID
+}
+
+// BeginRequest is Begin for an identified request (Phase 13): the op carries
+// its (ClientID, RequestID). Record every send of one logical request under ONE
+// op, as attempts; a client that deliberately re-issues an identity as a new op
+// (e.g. after a restart) gets separate ops, which History.Logical merges.
+func (r *Recorder) BeginRequest(client string, kind Kind, key string, value []byte, clientID, requestID uint64) int {
+	id := r.Begin(client, kind, key, value)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ops[id].ClientID, r.ops[id].RequestID = clientID, requestID
+	return id
 }
 
 // Attempt records that the op is now trying node. It returns the attempt's index.

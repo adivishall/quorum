@@ -1,6 +1,7 @@
 package lincheck
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -46,7 +47,11 @@ type Result struct {
 
 // Check decides whether h is linearizable under the register model. It
 // validates the history first (a malformed history is an error in the harness,
-// reported as a non-OK result with a reason, not silently "linearizable").
+// reported as a non-OK result with a reason, not silently "linearizable"), then
+// checks its LOGICAL operations (History.Logical): the sends of one identified
+// write are one operation. A history in which the server acknowledged two
+// different commands under one request identity is not linearizable under the
+// request-identity contract, and is reported as such.
 func Check(h History, opts Options) Result {
 	start := time.Now()
 	res := Result{OK: true}
@@ -55,6 +60,20 @@ func Check(h History, opts Options) Result {
 		res.Reason = "invalid history: " + err.Error()
 		return res
 	}
+	lh, err := h.Logical()
+	if err != nil {
+		res.OK = false
+		res.Reason = "request identity violated: " + err.Error()
+		var ie *IdentityError
+		if errors.As(err, &ie) {
+			res.Counterexample = ie.Ops
+			if len(ie.Ops) > 0 {
+				res.Key = ie.Ops[0].Key
+			}
+		}
+		return res
+	}
+	h = lh
 	max := opts.MaxStates
 	if max <= 0 {
 		max = DefaultMaxStates

@@ -47,6 +47,10 @@ type oracleOp struct {
 // oracleLinearizable decides h by the definition above.
 func oracleLinearizable(h History) bool {
 	var required, pending []oracleOp
+	h, ok := oracleRequests(h)
+	if !ok {
+		return false
+	}
 	for _, op := range h.Ops {
 		o := oracleOp{key: op.Key, inv: op.Invoke, res: op.Complete}
 		switch op.Kind {
@@ -85,6 +89,84 @@ func oracleLinearizable(h History) bool {
 		}
 	}
 	return false
+}
+
+// oracleRequests is the oracle's own reading of the request-identity contract
+// (docs/CLIENT_SEMANTICS.md §4), written from the contract rather than from
+// History.Logical: an identified write request takes effect at most once, at a
+// point after the first send carrying its command and before the first
+// acknowledgement of that command — so it behaves as ONE write whose interval
+// runs from that first send to that first acknowledgement, required if some send
+// was acknowledged, optional if some send went unanswered, absent otherwise. A
+// send carrying a different command than an acknowledged one could not have
+// taken effect. Two different commands both acknowledged under one identity
+// break the contract: the history is not acceptable (false). The generator
+// below never produces the case the contract leaves undecided (two unanswered
+// sends with different commands and no acknowledgement).
+func oracleRequests(h History) (History, bool) {
+	type key struct{ c, r uint64 }
+	var out History
+	bySend := map[key][]Op{}
+	var order []key
+	for _, op := range h.Ops {
+		if op.ClientID == 0 || op.Kind == Get {
+			out.Ops = append(out.Ops, op)
+			continue
+		}
+		k := key{op.ClientID, op.RequestID}
+		if _, seen := bySend[k]; !seen {
+			order = append(order, k)
+		}
+		bySend[k] = append(bySend[k], op)
+	}
+	same := func(a, b Op) bool { return a.Kind == b.Kind && a.Key == b.Key && string(a.Value) == string(b.Value) }
+	for _, k := range order {
+		sends := bySend[k]
+		var acked []Op
+		for _, s := range sends {
+			if s.Outcome == OK {
+				acked = append(acked, s)
+			}
+		}
+		for i := range acked {
+			if !same(acked[i], acked[0]) {
+				return History{}, false
+			}
+		}
+		var cmd *Op
+		switch {
+		case len(acked) > 0:
+			cmd = &acked[0]
+		default:
+			for i := range sends {
+				if sends[i].Outcome == Incomplete {
+					cmd = &sends[i]
+					break
+				}
+			}
+		}
+		if cmd == nil {
+			continue // every send refused: the request never happened
+		}
+		req := *cmd
+		req.Invoke, req.Complete, req.Outcome = math.MaxInt64, math.MaxInt64, Incomplete
+		for _, s := range sends {
+			if !same(s, *cmd) {
+				continue
+			}
+			if s.Invoke < req.Invoke {
+				req.Invoke = s.Invoke
+			}
+			if s.Outcome == OK && s.Complete < req.Complete {
+				req.Complete, req.Outcome = s.Complete, OK
+			}
+		}
+		if req.Outcome == Incomplete {
+			req.Complete = 0
+		}
+		out.Ops = append(out.Ops, req)
+	}
+	return out, true
 }
 
 // oracleOrder extends the partial order `placed` one op at a time, checking
@@ -371,6 +453,185 @@ func TestKnownGoodAndKnownBadCorpus(t *testing.T) {
 	}
 }
 
+// randomRequestHistory builds an arbitrary small history of IDENTIFIED requests
+// (Phase 13): 1–5 logical requests, each sent 1–3 times with the same identity
+// and command — each send with its own interval and its own outcome (ok,
+// unanswered, refused) — so retries, duplicate deliveries and resends to other
+// nodes all occur; sometimes a send under the same identity carries a
+// DIFFERENT command (refused, as the contract requires — or, rarely,
+// acknowledged, which breaks the contract); identities repeat across two
+// clients; and reads (never merged) and anonymous writes are mixed in.
+func randomRequestHistory(rng *rand.Rand) History {
+	values := []string{"", "a", "b"}
+	var sends []Op
+	nreq := 1 + rng.Intn(5)
+	for r := 0; r < nreq; r++ {
+		op := Op{Client: "c", Key: fmt.Sprintf("k%d", rng.Intn(2)), ClientID: uint64(1 + rng.Intn(2)), RequestID: uint64(1 + rng.Intn(3))}
+		switch rng.Intn(4) {
+		case 0:
+			op.Kind = Get
+		case 1:
+			op.Kind = Delete
+		default:
+			op.Kind, op.Value = Put, []byte(values[rng.Intn(len(values))])
+		}
+		if rng.Intn(6) == 0 {
+			op.ClientID, op.RequestID = 0, 0 // anonymous
+		}
+		n := 1 + rng.Intn(3)
+		for i := 0; i < n; i++ {
+			s := op
+			if i > 0 && op.Kind != Get && rng.Intn(5) == 0 {
+				s.Value = []byte(values[rng.Intn(len(values))] + "x") // a conflicting reuse
+				s.Kind = Put
+			}
+			sends = append(sends, s)
+		}
+	}
+	if len(sends) > 8 {
+		sends = sends[:8]
+	}
+	slots := rng.Perm(2 * len(sends))
+	var h History
+	reserved := make([]int64, len(sends)) // each send's own completion slot
+	for i, op := range sends {
+		x, y := int64(slots[2*i]+1), int64(slots[2*i+1]+1)
+		if x > y {
+			x, y = y, x
+		}
+		reserved[i] = y
+		op.ID, op.Invoke, op.Complete = i+1, x, y
+		switch r := rng.Intn(100); {
+		case r < 25:
+			op.Outcome, op.Complete = Incomplete, 0
+		case r < 40:
+			op.Outcome = Rejected
+		case op.Kind == Get && r < 65:
+			op.Outcome = NotFound
+		case op.Kind == Get:
+			op.Outcome, op.Output = OK, []byte(values[rng.Intn(len(values))])
+		default:
+			op.Outcome = OK
+		}
+		h.Ops = append(h.Ops, op)
+	}
+	// Keep to what the contract decides: a conflicting send (a command other
+	// than the group's) is refused, unless it is acknowledged (a contract
+	// violation both judges must reject); never two different unanswered
+	// commands with nothing acknowledged.
+	type key struct{ c, r uint64 }
+	first := map[key]Op{}
+	for i, op := range h.Ops {
+		if op.ClientID == 0 || op.Kind == Get {
+			continue
+		}
+		k := key{op.ClientID, op.RequestID}
+		f, seen := first[k]
+		if !seen {
+			first[k] = op
+			continue
+		}
+		if f.Kind != op.Kind || f.Key != op.Key || string(f.Value) != string(op.Value) {
+			if op.Outcome == Incomplete || (op.Outcome == OK && rng.Intn(4) != 0) {
+				h.Ops[i].Outcome, h.Ops[i].Complete = Rejected, reserved[i]
+			}
+		}
+	}
+	return h
+}
+
+// TestCheckerAgreesWithOracleOnRequestIdentity is the Phase 13 cross-validation
+// of the checker: thousands of arbitrary histories of identified requests —
+// retries, duplicate sends, resends, conflicting reuse, identities repeated
+// across clients, reads that reuse an identity, anonymous writes — decided by
+// the checker (History.Logical, then the search) and by the oracle (its own
+// reading of the contract, the definitional enumeration). Every verdict must
+// agree, and both verdicts and every feature must be well represented.
+func TestCheckerAgreesWithOracleOnRequestIdentity(t *testing.T) {
+	rng := rand.New(rand.NewSource(20261001))
+	var good, bad, violations int
+	features := map[string]int{}
+	for i := 0; i < 20000; i++ {
+		h := randomRequestHistory(rng)
+		if err := h.Validate(); err != nil {
+			t.Fatalf("generator produced an invalid history: %v\n%s", err, h)
+		}
+		want := oracleLinearizable(h)
+		got := Check(h, Options{})
+		if got.Unchecked {
+			t.Fatalf("budget exceeded:\n%s", h)
+		}
+		if got.OK != want {
+			t.Fatalf("checker=%v oracle=%v on:\n%s\nchecker: %s", got.OK, want, h, got.Reason)
+		}
+		if want {
+			good++
+		} else {
+			bad++
+		}
+		if strings.HasPrefix(got.Reason, "request identity violated") {
+			violations++
+		}
+		countRequestFeatures(h, features)
+	}
+	t.Logf("%d linearizable, %d not (%d of them identity violations); features: %v", good, bad, violations, features)
+	if good < 5000 || bad < 5000 || violations < 200 {
+		t.Fatalf("corpus not balanced: %d good, %d bad, %d identity violations", good, bad, violations)
+	}
+	for _, f := range []string{"retried request", "retry acknowledged after an unanswered send", "conflicting reuse refused", "same id, two clients", "read reusing an id", "anonymous write"} {
+		if features[f] < 500 {
+			t.Fatalf("feature %q appears in only %d histories", f, features[f])
+		}
+	}
+}
+
+func countRequestFeatures(h History, f map[string]int) {
+	type key struct{ c, r uint64 }
+	groups := map[key][]Op{}
+	seen := map[string]bool{}
+	for _, op := range h.Ops {
+		switch {
+		case op.ClientID == 0 && op.Kind != Get:
+			seen["anonymous write"] = true
+		case op.ClientID != 0 && op.Kind == Get:
+			seen["read reusing an id"] = true
+		case op.ClientID != 0:
+			groups[key{op.ClientID, op.RequestID}] = append(groups[key{op.ClientID, op.RequestID}], op)
+		}
+	}
+	rids := map[uint64]map[uint64]bool{}
+	for k, g := range groups {
+		if rids[k.r] == nil {
+			rids[k.r] = map[uint64]bool{}
+		}
+		rids[k.r][k.c] = true
+		if len(g) > 1 {
+			seen["retried request"] = true
+		}
+		var unanswered, acked bool
+		for _, op := range g {
+			unanswered = unanswered || op.Outcome == Incomplete
+			acked = acked || op.Outcome == OK
+			if op.Kind != g[0].Kind || op.Key != g[0].Key || string(op.Value) != string(g[0].Value) {
+				if op.Outcome == Rejected {
+					seen["conflicting reuse refused"] = true
+				}
+			}
+		}
+		if unanswered && acked {
+			seen["retry acknowledged after an unanswered send"] = true
+		}
+	}
+	for _, cs := range rids {
+		if len(cs) > 1 {
+			seen["same id, two clients"] = true
+		}
+	}
+	for k := range seen {
+		f[k]++
+	}
+}
+
 // FuzzCheckerMatchesOracle feeds arbitrary bytes, decoded into a small history,
 // to the checker and the oracle; any disagreement is a checker (or oracle) bug.
 func FuzzCheckerMatchesOracle(f *testing.F) {
@@ -382,6 +643,15 @@ func FuzzCheckerMatchesOracle(f *testing.F) {
 		}
 		n := 1 + int(data[0])%7
 		rng := rand.New(rand.NewSource(int64(data[1]) | int64(len(data))<<8))
+		if data[0]&0x80 != 0 {
+			// Phase 13: histories of identified requests (retries,
+			// duplicates, conflicting reuse).
+			h := randomRequestHistory(rng)
+			if got := Check(h, Options{}); !got.Unchecked && got.OK != oracleLinearizable(h) {
+				t.Fatalf("checker=%v oracle=%v:\n%s", got.OK, !got.OK, h)
+			}
+			return
+		}
 		h := randomHistory(rng, n, 1+int(data[0]/7)%2)
 		// Let the input steer outcomes and outputs directly, too.
 		for i := range h.Ops {

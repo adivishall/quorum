@@ -1,0 +1,10 @@
+# The same history as good/deduplicated-retry-after-another-write.hist, but the
+# final read sees A: the retry of (cid=1, rid=1) wrote A AGAIN, after B. One
+# logical PUT(A) cannot both precede op 2 and follow op 3 — the double
+# application is visible, and the checker must reject it.
+1 c1 put "k" 1 0 incomplete value="A" cid=1 rid=1
+2 c3 get "k" 2 3 ok output="A"
+3 c2 put "k" 4 5 ok value="B" cid=2 rid=1
+4 c3 get "k" 6 7 ok output="B"
+5 c1 put "k" 8 9 ok value="A" cid=1 rid=1
+6 c3 get "k" 10 11 ok output="A"

@@ -1,0 +1,9 @@
+# The DELETE retry of (cid=1, rid=4) removed the key AGAIN after c2's PUT(B):
+# one logical DELETE cannot precede op 3 and follow op 4.
+1 c2 put "k" 1 2 ok value="X"
+2 c1 delete "k" 3 0 incomplete cid=1 rid=4
+3 c3 get "k" 4 5 notfound
+4 c2 put "k" 6 7 ok value="B"
+5 c3 get "k" 8 9 ok output="B"
+6 c1 delete "k" 10 11 ok cid=1 rid=4
+7 c3 get "k" 12 13 notfound

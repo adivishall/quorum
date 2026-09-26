@@ -1,0 +1,11 @@
+# The Phase 12 collapsed-retry shape, now with request identity and a server
+# that deduplicates: (cid=1, rid=1) PUT(A) takes effect (op 2 reads it), c2's
+# PUT(B) follows, and the retry of rid=1 is answered from the session table —
+# OK, no second write — so the final read sees B. Linearizable: the one logical
+# PUT(A) lies before op 2.
+1 c1 put "k" 1 0 incomplete value="A" cid=1 rid=1
+2 c3 get "k" 2 3 ok output="A"
+3 c2 put "k" 4 5 ok value="B" cid=2 rid=1
+4 c3 get "k" 6 7 ok output="B"
+5 c1 put "k" 8 9 ok value="A" cid=1 rid=1
+6 c3 get "k" 10 11 ok output="B"

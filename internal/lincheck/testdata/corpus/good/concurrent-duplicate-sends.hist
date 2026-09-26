@@ -1,0 +1,6 @@
+# One request sent to two nodes at once (two connections): both are
+# acknowledged — one executed it, the other answered as a duplicate — and it
+# took effect once.
+1 c1 put "k" 1 5 ok value="A" cid=1 rid=3
+2 c1 put "k" 2 4 ok value="A" cid=1 rid=3
+3 c2 get "k" 6 7 ok output="A"

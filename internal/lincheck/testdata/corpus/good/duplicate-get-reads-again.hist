@@ -1,0 +1,5 @@
+# Reads are not deduplicated: a GET re-sent under the same identity reads
+# again, and may see a newer value. Each read is its own operation.
+1 c1 get "k" 1 2 notfound cid=1 rid=2
+2 c2 put "k" 3 4 ok value="A"
+3 c1 get "k" 5 6 ok output="A" cid=1 rid=2

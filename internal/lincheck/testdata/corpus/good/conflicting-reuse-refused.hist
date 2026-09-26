@@ -1,0 +1,5 @@
+# The same request id with a different command is refused (REQUEST_CONFLICT)
+# and has no effect; the first command's result stands.
+1 c1 put "k" 1 2 ok value="A" cid=1 rid=7
+2 c1 put "k" 3 4 rejected value="B" cid=1 rid=7
+3 c2 get "k" 5 6 ok output="A"

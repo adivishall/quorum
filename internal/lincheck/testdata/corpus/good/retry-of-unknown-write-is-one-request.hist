@@ -1,0 +1,6 @@
+# Phase 13: PUT(A) as request (cid=1, rid=1) gets no answer; the client retries
+# the SAME request and gets OK. One logical request: it took effect once,
+# somewhere after the first send and before the acknowledgement.
+1 c1 put "k" 1 0 incomplete value="A" cid=1 rid=1
+2 c1 put "k" 2 3 ok value="A" cid=1 rid=1
+3 c2 get "k" 4 5 ok output="A"
