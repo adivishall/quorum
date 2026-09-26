@@ -113,11 +113,14 @@ it is not a defect we can engineer away, and any system claiming otherwise is wr
 - A client may crash between sending a request and receiving a response. The request may or may
   not have committed. See `docs/CONSISTENCY.md` C4.
 - A client may retry any request any number of times, including after a partition heals, so a
-  very old duplicate can arrive much later. The dedup table (Phase 13) must therefore be
-  bounded and its eviction policy must be stated — an evicted session's retry degrades back to
-  at-least-once, and that boundary is documented rather than hidden.
+  very old duplicate can arrive much later. The dedup table (Phase 13, `docs/DEDUP.md`) is
+  therefore bounded and its eviction policy stated: an evicted session's retry is refused
+  (`SESSION_EXPIRED`) — never re-executed, so it does **not** degrade to at-least-once — and the
+  outcome of its earlier attempts stays unknown; a duplicate older than the client's
+  acknowledgement watermark is refused (`REQUEST_STALE`).
 - A client may send malformed input, oversized keys or values, or many concurrent requests.
-  Handled by validation and limits (Phase 21), not by trust.
+  Every request is validated before anything is proposed (Phase 13, `docs/API.md` §4); admission
+  control and rate limits are Phase 21 — not trust.
 
 ---
 

@@ -1,6 +1,7 @@
-# LINEARIZABILITY — Phase 12
+# LINEARIZABILITY — Phases 12 and 13
 
-Status: **Phase 12 complete.** This document states exactly what the running system guarantees
+Status: **Phase 13 complete** (Phase 12: §1–§14; Phase 13, logical operations under retries and
+deduplication: §15). This document states exactly what the running system guarantees
 to a client, what mechanism provides it, how it is checked, and — just as precisely — what it
 does not guarantee and what was not tested. It is the reference the code comments point at
 (`docs/LINEARIZABILITY.md §N`). ADR-019 records the decisions; `docs/CONSISTENCY.md` is the
@@ -17,7 +18,9 @@ The one-sentence claim, with every qualifier attached:
 > make it so are argued in §3 and §5 and pinned by mutants (§11). It is **not** a proof that every
 > possible history is linearizable, it assumes the fault model of `docs/FAILURE_MODEL.md`, and it
 > holds for honestly recorded histories only — a client that retries an unknown write and reports
-> the two attempts as one operation is outside it until Phase 13 (§4.3).
+> the two attempts as one operation is outside it **unless** the write carries a request identity
+> (Phase 13, §15): then its sends are one logical operation, and the history of logical operations
+> is what is checked — and is linearizable.
 
 ---
 
@@ -142,8 +145,11 @@ rejection cannot hide.
 
 ### 4.2 The client policy (part of what a history means)
 
-`internal/kv/workload` (and its scripted `workload.Client`) is the only client, and its policy is
-fixed and pinned by `TestClientPolicy`:
+`internal/kv/workload` has two policies. The **session** policy (Phase 13, `Options.Sessions`,
+`workload.SessionClient`) registers a session and retries every unknown write under the same
+request identity, recording one operation per logical request with every send an attempt (§15).
+The **anonymous** policy — the Phase 12 one, kept so the Phase 12 contract and its tests remain
+meaningful — is fixed and pinned by `TestClientPolicy`:
 
 - a not-leader answer is followed to the named leader (or the next node); every attempt is
   recorded with the node contacted and what came back — nothing is hidden;
@@ -168,7 +174,10 @@ So in Phase 12 the guarantee holds for histories that record every attempt as an
 **not** for "at-most-once from the caller's point of view". Phase 13 adds request ids and a
 deduplication table so a retry is recognized at apply time and answered with the original result
 without re-applying; then the collapsed view becomes true (INV-X2), and C1 of
-`docs/CONSISTENCY.md` holds under retries. Phase 12 deliberately does **not** add deduplication.
+`docs/CONSISTENCY.md` holds under retries — **for identified writes**. An anonymous write is exactly
+as in Phase 12. The same interleaving with an identified write, on real processes, is
+`TestRealSessionRetryAcrossCrashWindows` (§15.5): the retry is a duplicate, the key keeps B, and
+the collapsed history is linearizable.
 
 ---
 
@@ -576,7 +585,9 @@ assumption for safety.
 - more than one Raft group, or keys routed across groups (Phase 6 routing is not wired to Raft);
 - real power loss on real hardware (the simulator's power-loss model only);
 - Byzantine faults, clock-based anything (none is used);
-- exactly-once / at-most-once semantics under hidden retries (§4.3, Phase 13);
+- at-most-once semantics for **anonymous** writes under hidden retries (§4.3) — identified
+  writes have them (§15); requests from a session that was evicted, or from a client that reuses
+  another client's ClientID (§15.8);
 - snapshots and membership changes (Phase 14+) — the argument assumes fixed membership;
 - the Phase 15 API and stale-mode reads (none exist yet).
 
@@ -631,4 +642,197 @@ go test ./internal/raftsim -run 'TestKVSeededHistoriesAreLinearizable/kv-mixed/s
 go test -race -count=1 -run 'TestReal' -v ./tests/integration/          # real processes
 go run ./cmd/lincheck internal/lincheck/testdata/corpus/bad/stale-leader-read.hist
 make mutation
+# Phase 13
+go test ./internal/lincheck -run 'RequestIdentity|Logical|SessionModel|Corpus' -v
+go test ./internal/raftsim -run 'TestKVSeededHistoriesAreLinearizable/kv-sessions' -raftsim.seeds=200
+go test ./internal/raftsim -run 'TestKVSim|TestKVSessionRetry|TestKVTierCatchesRetries' -v
+go test ./internal/kv -run 'Retry|Duplicate|Session|Conflict|Evicted|Forward|Validat' -v
+go test -race -count=1 -run 'TestRealSession|TestRealForwarder|TestRealConcurrentDuplicates|TestRealRedirectOnly' -v ./tests/integration/
 ```
+
+---
+
+## 15. Logical operations: retries and deduplication (Phase 13)
+
+`docs/CLIENT_SEMANTICS.md` is the contract, `docs/DEDUP.md` the mechanism; this section is how
+histories with request identity are recorded and checked, and what was verified.
+
+### 15.1 What a history records
+
+A session client records **one operation per logical request**, carrying its identity
+`(ClientID, RequestID)` (`cid=`/`rid=` in the text format), with **every send an attempt**: the node
+contacted and what came back — `ok`, `ok (duplicate of index N)`, `not_leader(n2)`,
+`ok via n3`, `unknown: …`. A deliberate concurrent duplicate — the same request sent at once on
+another connection — is recorded as a second operation with the same identity. Reads may carry an
+identity too (tracing only).
+
+### 15.2 The logical history the checker judges
+
+`History.Logical()` (`internal/lincheck/logical.go`) turns every group of identified writes with
+the same identity into ONE operation, then the Phase 12 checker runs unchanged:
+
+- the group's **command** is the command of its acknowledged ops; two *different* commands both
+  acknowledged under one identity means the server accepted a conflicting reuse — reported as a
+  violation (`request identity violated`), with the offending sends as the counterexample, never
+  checked around;
+- with no acknowledgement, the command of its unanswered sends; if those disagree, which one may
+  have taken effect is ambiguous and the history is **refused as unsupported** — an error, not a
+  verdict (the contract leaves it open, so the checker does not guess);
+- sends of any other command are excluded: they were refused, or could not have taken effect
+  (the acknowledged command owns the identity);
+- the merged operation is **invoked at the first send** of its command and **completes at the first
+  acknowledgement** of it; OK if any send was acknowledged, Incomplete (optional) if any was
+  unanswered, Rejected (excluded) if every send was refused; all attempts are kept.
+
+**Why that interval is right.** Under the contract the request changes state at most once — when
+the first entry carrying its identity and command is applied (DEDUP §3). That entry was proposed
+after the server received some send of the command, so after the first send's invocation. Every
+acknowledgement of the command — the original's or a duplicate's — is sent after an entry carrying
+it was applied, and a duplicate's entry is applied after the original's, so after the execution:
+the execution precedes the first acknowledgement. An unanswered request may have executed or not:
+optional, exactly like Phase 12's Incomplete. **Reads are never merged**: each read really
+executes; a read retried inside one operation spans all its attempts, as in §4.2.
+
+Phase 12's `TestRealIncompleteWriteThenRetry` shape — `PUT(A)` unknown, read A, `PUT(B)`, read B,
+retry of `PUT(A)` — is linearizable as one logical operation **iff the retry did not execute
+again** (the reads after it see B). If it did, the reads see A, then B, then A again, which one
+`PUT(A)` cannot produce: the checker alone rejects a lost deduplication whenever a read observes the
+intermediate state (§15.6, mutant 83).
+
+### 15.3 How the checker's new half was validated
+
+- **An independent reading of the contract.** `oracleRequests` (in the test file, no shared code
+  with `Logical`) rewrites identity groups from the contract's text, then the brute-force oracle
+  decides. `TestCheckerAgreesWithOracleOnRequestIdentity`: 20,000 random histories with retries,
+  duplicates, conflicting reuse, cross-client id reuse and unanswered sends — required balanced
+  (≥ 5,000 linearizable, ≥ 5,000 not, ≥ 200 identity violations) and agreeing on every one; the
+  fuzz target `FuzzCheckerMatchesOracle` generates identity histories on half its inputs.
+- **Corpus** (`testdata/corpus`, now 24 good / 24 bad): known-good — a retry of an unknown write
+  is one request; a deduplicated retry after another write; a refused conflicting reuse; the same
+  RequestID from different clients; a duplicate DELETE; concurrent duplicate sends; a duplicate GET
+  reads again. Known-bad — a failed deduplication applied twice; a duplicate DELETE applied twice;
+  an accepted conflicting reuse; a refused conflict that took effect; RequestIDs confused across
+  clients; a retry acknowledged before the first send.
+- `TestLogicalMergesTheSendsOfOneRequest`, `TestLogicalRefusesWhatTheContractForbidsOrLeavesOpen`.
+- Mutants 77–81 (§15.6).
+
+### 15.4 Simulator tier
+
+The simulator's clients (`internal/raftsim/kv.go`) gained sessions: `kvregister` creates one (the
+REGISTER is a replicated command), `kvretry` re-sends a session's open request with its identity to
+any node after its previous sends are over, `kvdup` sends a concurrent copy (following redirects)
+while one is outstanding; a session's request stays open across timeouts, crashes and lost entries
+until a definite answer. At every apply, on every replica — first application and every replay
+after a crash or power loss — the decision must equal the reference session model's for that index
+of the committed log (**INV-X11**), and an identity may execute at one index only (**INV-X2**);
+INV-X8 compares the key-value map and the session table with the model after convergence.
+
+Six session profiles run 200 seeds each in `make faults` (1,200 runs; with the Phase 12 profiles,
+2,600 KV runs): `kv-sessions-crashes`, `-crashpoints`, `-partitions`, `-messages`, `-mixed`, and
+`-evict` (MaxSessions 3, MaxUnacked 2). Each must register, retry, send duplicates, answer
+duplicates, resolve unanswered writes with deduplicated retries, and (`-evict`) meet expired
+sessions — or it fails as vacuous. All pass; the golden trace is unchanged.
+
+Scripted: `TestKVSimCommittedRequestRetriedAfterLeaderCrash` (the hardest case, exact),
+`TestKVSimConcurrentDuplicateExecutesOnce`, `TestKVSimSessionsSurviveARestartOfEveryNode`,
+`TestKVSessionRetryAfterCrashAtEveryPoint` (every driver crash point; both outcomes of the
+undetermined points occur). **Teeth:** `TestKVTierCatchesRetriesThatAreNotDeduplicated` runs a
+deliberately broken client that retries under a fresh RequestID — invisible to INV-X11/X2 (every id
+is new) — and the logical checker rejects 5 of 12 seeded runs, minimizing one to a short script.
+
+### 15.5 Real-driver and real-process tiers
+
+In-process (`internal/kv/retry_test.go`, `session_test.go`, `linearizability_test.go`): the hardest
+case (UNKNOWN; new leader; B written; the retry answered as a duplicate of the original index; the
+key keeps B); a crash at every driver point with the session retrying (one execution on every
+replica); a lost forward response retried through the other follower; concurrent duplicates at two
+nodes (30 rounds); a duplicate sent before the original commits; every node restarted, then the
+retry; conflict, stale and per-client scope; eviction and SESSION_LIMIT; forward loop prevention;
+16 goroutines on one session; session workloads under message faults, a leader crash and a
+partition — linearizable.
+
+Real `dkvd` processes (`tests/integration/kv_sessions_test.go`), each also replaying the durable
+committed logs against the session model (`dedupEvidence`):
+
+| Test | What it establishes |
+|---|---|
+| `TestRealSessionWorkloadsUnderFaults` (leader SIGKILL, leader partition, rolling restart) | six session clients, 15% concurrent duplicates: linearizable; writes retried after unanswered attempts; duplicate entries in the log answered from their originals |
+| `TestRealSessionRetryAcrossCrashWindows` (8 points: before-save … after-reply) | the hardest case at every window; the victim's disk decides which case; a read between the crash and B lets the checker alone see a second execution |
+| `TestRealForwarderDiesBeforeRelaying` | a follower SIGKILLed before relaying the leader's answer; the retry is a duplicate |
+| `TestRealConcurrentDuplicatesThroughEveryNode` | one request sent at once to all three nodes, 20 rounds: one execution each, every other copy its duplicate at the same index |
+| `TestRealRedirectOnlyModeWithSessions` | `-client-forwarding=false`: NOT_LEADER with the leader, followed; nothing forwarded |
+| `TestRealSessionContractSurvivesFullClusterRestart` | conflict, stale, SESSION_LIMIT, LRU expiry with small limits; every process SIGKILLed and restarted; the evicted session stays expired, a live session's retry is still a duplicate, no refused request took effect |
+
+### 15.6 Mutants (Phase 13)
+
+| # | Rule broken | Killed by | Result |
+|---|---|---|---|
+| 61 | the dedup lookup (a retry executes again) | `TestStoreAgreesWithTheSessionModel`, `TestUnknownWriteRetriedAfterLeaderCrashIsOneRequest`, `TestKVSimCommittedRequestRetriedAfterLeaderCrash` | killed |
+| 62 | conflict detection by fingerprint | `TestStoreAgreesWithTheSessionModel`, `TestConflictingReuseAndIdentityScope` | killed |
+| 63 | a refused conflict has no effect | same | killed |
+| 64 | the fingerprint covers the value | `TestConflictingReuseAndIdentityScope` | killed |
+| 65 | an evicted session is never revived | model diff, `TestEvictedSessionIsRefusedNotReexecuted`, `kv-sessions-evict` | killed |
+| 66 | the watermark forgets only results below it | model diff, `TestReplayRebuildsTheSessionTable`, session profiles | killed |
+| 67 | stale requests are refused | model diff, `TestConflictingReuseAndIdentityScope` | killed |
+| 68 | at most MaxUnacked results | model diff, `TestSessionLimitRefusesRatherThanForgets` | killed |
+| 69 | LRU evicts the least recently used | model diff, `TestEvictedSessionIsRefusedNotReexecuted`, `kv-sessions-evict` | killed |
+| 70 | a forwarded request is never forwarded again | `TestForwardedRequestIsNeverForwardedAgain` | killed |
+| 71 | an unanswered forward is UNKNOWN, not OK | `TestForwardedRequestWhoseAnswerIsLostIsRetriedSafely` | killed |
+| 72 | the forwarder keeps the identity | `TestConcurrentDuplicatesAtTwoNodes`, the lost-forward test | killed |
+| 73 | a retry keeps its RequestID | `TestUnknownWriteRetriedAfterLeaderCrashIsOneRequest`, the lost-forward test | killed (first formulation survived — see §15.7) |
+| 74 | an unanswered request is reported unknown | `TestDuplicateSentBeforeTheOriginalCommits` | killed |
+| 75 | the watermark waits for requests in flight | `TestConcurrentRequestsFromOneSession` | killed |
+| 76 | dkvd applies the configured limits | `TestRealSessionContractSurvivesFullClusterRestart` | killed |
+| 77 | checker: identity is scoped by client | corpus, identity oracle | killed |
+| 78 | checker: an accepted conflict is reported | corpus, `TestLogicalRefusesWhatTheContractForbidsOrLeavesOpen` | killed |
+| 79 | checker: invoked at the first send | corpus, identity oracle | killed |
+| 80 | checker: completes at the first acknowledgement | corpus, identity oracle | killed |
+| 81 | checker: sends of another command excluded | corpus, identity oracle | killed |
+| 82 | the reference model deduplicates | `TestSessionModelFollowsTheContract`, `TestStoreAgreesWithTheSessionModel` | killed |
+| 83 | 61 on real processes, history only | `TestRealSessionRetryAcrossCrashWindows` — the checker rejects `A, B, A` before any explicit assertion | killed |
+| 84 | 72 on real processes | `TestRealConcurrentDuplicatesThroughEveryNode` | killed |
+| 85 | a retry after a dead connection keeps its RequestID | `TestRealForwarderDiesBeforeRelaying` | killed |
+| 86 | 65 on real processes, through a full restart | `TestRealSessionContractSurvivesFullClusterRestart` | killed |
+| 87 | requests are validated before they are proposed | `TestRequestValidationRejectsEveryOutOfContractField`, `TestValidatedRequestsAlwaysApply` | killed |
+
+### 15.7 Found and fixed during Phase 13
+
+No execution of the implementation violated the contract or produced a non-linearizable logical
+history. What the phase found:
+
+1. **The Phase 12 differential was wrong under deduplication** (the simulator's INV-X8 folded every
+   committed command into the model; with dedup a duplicate or conflict changes nothing). It now
+   folds through the session model and compares the session tables too.
+2. **Identity violations came without a counterexample**: the checker now returns the offending
+   sends (`IdentityError`).
+3. **The workload's duplicate sender sent AckedBelow 0** for a session view with nothing in flight
+   (INVALID_REQUEST, not a safety issue): it now resumes at `rid+1` and holds `rid`.
+4. **Phase 12 tests asserted that a follower refuses** — the Phase 12 contract. Forwarding changed
+   it; the tests now assert the Phase 13 contract (served by the leader, via the follower), and
+   redirect-only mode keeps the redirect path tested.
+5. **Mutation found an untested branch**: a retry after a *transport* failure (the connection died
+   mid-request) is reached only over a real connection — in-process servers never fail there — so
+   the first retry-id mutant survived every in-process test. It is now two mutants: every attempt
+   after the first (killed in-process) and the transport branch alone (killed by real processes).
+6. **Test-premise bugs, each fixed at its cause:** a session fault schedule meant to force an
+   unknown outcome by dropping one forward response lost nothing — under a global duplicate rule
+   the response travels as two copies and the drop takes one (found by looping the suite and
+   capturing the one failing run; the rule is now suspended for the drop, and the test asserts an
+   unknown occurred); a duplicate-before-commit test held every AppendEntries, which silenced the
+   heartbeats until a follower campaigned and deposed the leader (it now holds the
+   acknowledgements, and asserts the leader led throughout); the workload counted the unanswered
+   attempt itself as a retry.
+
+### 15.8 What is and is not claimed
+
+**Verified on finite recorded histories and replayed logs, one Raft group:** for identified writes,
+at most one execution per identity (INV-X2) and linearizability of the logical history, under
+crashes and SIGKILL at every point of a write's life, restarts of every node, partitions, message
+loss/duplication/reordering, leader changes, concurrent duplicates and forwarding; deterministic,
+replica-identical decisions (INV-X11); bounded memory (DEDUP §6).
+
+**Not claimed:** exactly-once *delivery*; anything for anonymous writes beyond Phase 12; a
+retry's answer after its session was evicted (`SESSION_EXPIRED`: the outcome of earlier attempts
+stays unknown); protection against a client that presents another client's ClientID or reuses a
+RequestID for another command (it is refused, not protected); snapshots (the session table is
+rebuilt by full replay; Phase 14 must carry it); more than one Raft group.

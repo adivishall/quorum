@@ -1,7 +1,9 @@
 # CONSISTENCY MODEL
 
-Status: **Phase 12 — client-visible linearizability of single-key operations is verified on
-recorded histories, for one Raft group, with the conditions below.** `docs/LINEARIZABILITY.md` is
+Status: **Phase 13 — client-visible linearizability of single-key operations is verified on
+recorded histories, for one Raft group, including under retries of identified writes (C4 stage
+two), with the conditions below.** `docs/CLIENT_SEMANTICS.md` is the Phase 13 contract (request
+identity, retries, duplicates, statuses); `docs/DEDUP.md` how the server keeps it. `docs/LINEARIZABILITY.md` is
 the full statement (object model, write completion, ReadIndex and its safety argument,
 incomplete operations, the checker and how it was validated, every scenario, every mutant).
 
@@ -17,16 +19,25 @@ LINEARIZABILITY §3; ReadIndex: §5.2) and pinned by 27 Phase 12 mutants.
 
 That is C1 below **with its condition (d) replaced**: Phase 12 records every retry as its own
 operation (an unknown write is never silently retried), and the guarantee holds for those honest
-histories. It does not hold for a caller that hides a retry of an unknown write inside one
-operation — that is C4 stage two, Phase 13 (LINEARIZABILITY §4.3 shows the exact history).
+histories. It did not hold for a caller that hides a retry of an unknown write inside one
+operation (LINEARIZABILITY §4.3 shows the exact history).
+
+**What Phase 13 adds (C4 stage two).** A write that carries a request identity — a session's
+`(ClientID, RequestID)` — is executed at most once however many times it is sent, to however many
+nodes, across crashes, restarts, leader changes and forwarding; every retry of it is answered with
+the one execution's index. Its sends are therefore one **logical operation**, and the histories of
+logical operations — from real processes (the hardest case at every crash window, forwarders
+killed before relaying, concurrent copies through every node, a full-cluster restart with small
+limits), the real driver, and 1,200 more seeded simulator runs in which every replica's every
+apply-time decision is checked against an independent model — are linearizable (LINEARIZABILITY
+§15; INV-X2, X11–X14; 27 more mutants). Anonymous writes keep Phase 12's semantics.
 
 **Still verified from earlier phases.** Raft's safety properties (INV-R1..R10; Phase 9), under
 injected faults (Phase 10, `docs/FAULTS.md`), and across crashes at every boundary of the node's
 cycle (Phase 11, `docs/CRASH_RECOVERY.md`: application is at-least-once across restarts, exactly-once
 within an incarnation — the applied index is volatile and a restart replays the committed prefix).
 
-**Not yet verified.** Dedup / exactly-once application under retries (C4 stage two, Phase 13);
-more than one Raft group and routed keys (the routing layer is not wired to Raft); the Phase 15 API
+**Not yet verified.** More than one Raft group and routed keys (the routing layer is not wired to Raft); the Phase 15 API
 and `stale` reads (C5 — no such mode exists yet); snapshots and membership change (Phase 14+);
 the storage engine hosted by a node; real power-loss durability.
 
@@ -86,7 +97,7 @@ committed. This is unavoidable; it is not a bug. Two stages:
 | Stage | Guarantee | Consequence |
 |---|---|---|
 | Phases 9–12 | **at-least-once** application (verified in Phase 11: a restart re-applies the whole recovered committed prefix; exactly-once holds only within one incarnation) | A retried `PUT` may be applied twice. For `PUT`/`DELETE` (idempotent given the same value) the final state is the same, but a retry that lands *after* a newer write from another client will clobber it. C1 does **not** hold under *hidden* retries in this stage. Phase 12 made this concrete on real processes: an unacknowledged-but-committed `PUT(A)`, a `PUT(B)` by another client, then the retry of `PUT(A)` — linearizable as two operations, rejected by the checker as one (`TestRealIncompleteWriteThenRetry`). The Phase 12 test client therefore never retries an unknown write. |
-| Phase 13 onward | **exactly-once application** per `(clientID, seqNo)` | The state machine keeps a dedup table. A duplicate proposal is recognized at apply time and returns the original result without re-applying. C1 holds under retries. |
+| Phase 13 onward | **at most one execution per `(ClientID, RequestID)`** for identified writes — exactly one if it executes at all (verified: INV-X2, INV-X11; LINEARIZABILITY §15) | The replicated state machine keeps a bounded session table (`docs/DEDUP.md`). A duplicate entry is recognized at apply time and answered with the original execution's index without re-applying; a different command under a used id is refused (`REQUEST_CONFLICT`). C1 holds under retries of identified writes. Limits: a retry after its session was evicted learns only `SESSION_EXPIRED`; anonymous writes are as in Phases 9–12. |
 
 Note the phrase: exactly-once **application**, not exactly-once delivery. Messages are still
 delivered any number of times. What is guaranteed is that the state machine transition
@@ -140,8 +151,9 @@ The failure modes we are specifically defending against and testing:
 5. **Losing a committed entry on restart.** Prevented by fsync of log + HardState before the
    AppendEntries reply. This is the one most likely to be silently broken by an optimization,
    which is why the crash tests kill with SIGKILL rather than a graceful shutdown.
-6. **Duplicate application under retry.** C4 / Phase 13. *Phase 12:* made visible, not fixed
-   (LINEARIZABILITY §4.3).
+6. **Duplicate application under retry.** C4. *Phase 12:* made visible (LINEARIZABILITY §4.3).
+   *Phase 13:* prevented for identified writes by deciding at apply, from the replicated session
+   table, identically on every replica (`docs/DEDUP.md`); anonymous writes are still exposed.
 7. **Divergent replicas after compaction.** Different replicas compacting at different times
    must still expose identical logical state. Tested by comparing full key-space dumps across
    replicas after chaos.
