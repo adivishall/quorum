@@ -57,15 +57,16 @@ func (c *client) runSession(ctx context.Context) Stats {
 			go func() {
 				defer wg.Done()
 				defer dup.Release(rid)
-				st := c.sessionOp(ctx, dup, rid, kind, key, value, c.name+"-dup")
+				st, _, _ := c.sessionOp(ctx, dup, rid, kind, key, value, c.name+"-dup")
 				c.merge(st)
 			}()
-			st := c.sessionOp(ctx, sess, rid, kind, key, value, c.name)
+			st, _, _ := c.sessionOp(ctx, sess, rid, kind, key, value, c.name)
 			wg.Wait()
 			c.merge(st)
 			sess.Release(rid)
 		} else {
-			c.merge(c.sessionOp(ctx, sess, rid, kind, key, value, c.name))
+			st, _, _ := c.sessionOp(ctx, sess, rid, kind, key, value, c.name)
+			c.merge(st)
 		}
 		sess.Release(rid)
 		if c.opts.Pace > 0 {
@@ -90,8 +91,9 @@ func (c *client) merge(st Stats) {
 	statsMu.Unlock()
 }
 
-// sessionOp runs one send stream of logical request rid and records it.
-func (c *client) sessionOp(ctx context.Context, sess *kv.Session, rid uint64, kind lincheck.Kind, key string, value []byte, name string) Stats {
+// sessionOp runs one send stream of logical request rid and records it; it
+// returns what it saw, the recorded operation's id and the session's outcome.
+func (c *client) sessionOp(ctx context.Context, sess *kv.Session, rid uint64, kind lincheck.Kind, key string, value []byte, name string) (Stats, int, kv.Outcome) {
 	var st Stats
 	st.Ops++
 	id := c.rec.BeginRequest(name, kind, key, value, sess.ID(), rid)
@@ -100,6 +102,9 @@ func (c *client) sessionOp(ctx context.Context, sess *kv.Session, rid uint64, ki
 	hook := func(node string) func(kv.Response, error) {
 		a := c.rec.Attempt(id, node)
 		st.Attempts++
+		if unknownSeen && kind != lincheck.Get {
+			st.WriteRetries++ // a retry of a write whose earlier attempt went unanswered
+		}
 		return func(resp kv.Response, err error) {
 			switch {
 			case err != nil && errors.Is(err, kv.ErrUnavailable):
@@ -130,9 +135,6 @@ func (c *client) sessionOp(ctx context.Context, sess *kv.Session, rid uint64, ki
 				}
 				c.rec.AttemptDone(id, a, complete, result, resp.Term)
 			}
-			if unknownSeen && kind != lincheck.Get {
-				st.WriteRetries++ // the next attempt, if any, is a retry of an unknown write
-			}
 		}
 	}
 	out := sess.Send(ctx, rid, op, []byte(key), value, hook)
@@ -158,7 +160,55 @@ func (c *client) sessionOp(ctx context.Context, sess *kv.Session, rid uint64, ki
 			st.Lost++
 		}
 	}
-	return st
+	return st, id, out
+}
+
+// SessionClient is a scripted, history-recording session client (Phase 13):
+// each call is one logical request, recorded as Run's session clients record
+// it — one operation carrying the identity, every send an attempt — and
+// returns the operation as recorded together with the session's outcome. It
+// is not safe for concurrent use; two SessionClients may share one Session.
+type SessionClient struct {
+	c    *client
+	sess *kv.Session
+}
+
+// NewSessionClient records the requests of sess under the client name name.
+func NewSessionClient(name string, sess *kv.Session, rec *lincheck.Recorder) *SessionClient {
+	return &SessionClient{c: &client{name: name, rec: rec}, sess: sess}
+}
+
+// Session is the session the client sends through.
+func (s *SessionClient) Session() *kv.Session { return s.sess }
+
+// Stats returns what this client saw.
+func (s *SessionClient) Stats() Stats { return s.c.st }
+
+// Put, Get and Delete run one logical request each, with a fresh RequestID.
+func (s *SessionClient) Put(ctx context.Context, key string, value []byte) (lincheck.Op, kv.Outcome) {
+	return s.fresh(ctx, lincheck.Put, key, value)
+}
+func (s *SessionClient) Get(ctx context.Context, key string) (lincheck.Op, kv.Outcome) {
+	return s.fresh(ctx, lincheck.Get, key, nil)
+}
+func (s *SessionClient) Delete(ctx context.Context, key string) (lincheck.Op, kv.Outcome) {
+	return s.fresh(ctx, lincheck.Delete, key, nil)
+}
+
+func (s *SessionClient) fresh(ctx context.Context, kind lincheck.Kind, key string, value []byte) (lincheck.Op, kv.Outcome) {
+	rid := s.sess.Reserve()
+	defer s.sess.Release(rid)
+	return s.Send(ctx, rid, kind, key, value)
+}
+
+// Send runs logical request rid, which the caller holds (Reserve or Hold) —
+// or an id already used, to exercise the contract: a retry after an answer,
+// a conflicting reuse.
+func (s *SessionClient) Send(ctx context.Context, rid uint64, kind lincheck.Kind, key string, value []byte) (lincheck.Op, kv.Outcome) {
+	st, id, out := s.c.sessionOp(ctx, s.sess, rid, kind, key, value, s.c.name)
+	s.c.st.add(st)
+	op, _ := s.c.rec.Op(id)
+	return op, out
 }
 
 // nextOp draws the next operation exactly as run does.
