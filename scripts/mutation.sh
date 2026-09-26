@@ -478,10 +478,10 @@ mutant "store-empty-value-is-present" internal/kv/store.go \
 # 47. The client keeps a connection whose request timed out: the late response
 #     is read as the answer to the NEXT request.
 mutant "wire-client-abandons-a-timed-out-connection" internal/kv/wire.go \
-  '	payload, err := readFrame(c.conn, kindResponse)
+  '	payload, err := readFrame(c.conn, kindResponse, maxResponseFrame)
 	if err != nil {
 		c.dropConn()' \
-  '	payload, err := readFrame(c.conn, kindResponse)
+  '	payload, err := readFrame(c.conn, kindResponse, maxResponseFrame)
 	if err != nil {' \
   ./internal/kv 'TestWireClientNeverMatchesALateResponseToANewRequest'
 
