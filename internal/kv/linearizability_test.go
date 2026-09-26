@@ -271,6 +271,90 @@ func TestLinearizableAcrossPartitionAndHeal(t *testing.T) {
 	}
 }
 
+// TestSessionClientsUnderFaultsRetryAndStayLinearizable is Phase 13 under
+// Phase 10's faults: session clients that RETRY every unknown write under its
+// identity, with deliberate concurrent duplicates, through held-and-reversed,
+// dropped and duplicated traffic (forwards included), a leader crash and
+// restart, and a leader partition and heal. The checker judges LOGICAL
+// operations — a retried request is one operation, its sends attempts — and
+// the history must be linearizable; the clients must actually have retried
+// unknown writes and met duplicates, or the run proved nothing.
+func TestSessionClientsUnderFaultsRetryAndStayLinearizable(t *testing.T) {
+	opts := workload.Options{Clients: 6, OpsPerClient: 1 << 20, Keys: 2, Timeout: 1 * time.Second, Seed: 13,
+		GetPct: 35, DeletePct: 15, MaxAttempts: 30, Backoff: 5 * time.Millisecond, Sessions: true, DupPct: 20}
+	t.Run("messages", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		c := startCluster(t, ctx, 3, true)
+		c.waitLeader(0, 10*time.Second)
+		c.net.AddRule(fault.Rule{Action: fault.Duplicate, Copies: 1})
+		rec, st := runFaults(t, c, opts, func(rec *lincheck.Recorder) {
+			waitServed(t, rec, 20, 30*time.Second)
+			for i := 0; i < 5; i++ {
+				held := c.net.Stats().Held
+				hold := c.net.AddRule(fault.Rule{Kinds: []transport.MsgKind{transport.MsgAppendEntries, transport.MsgForwardResponse}, Action: fault.Hold})
+				waitFor(t, "holding replication and forward responses", 10*time.Second, func() bool { return c.net.Stats().Held >= held+4 })
+				c.net.RemoveRule(hold)
+				c.net.Release(true)
+				dropped := c.net.Stats().Dropped
+				drop := c.net.AddRule(fault.Rule{Kinds: []transport.MsgKind{transport.MsgForward, transport.MsgForwardResponse, transport.MsgAppendEntries}, Action: fault.Drop, Count: 6})
+				waitFor(t, "dropping six messages", 10*time.Second, func() bool { return c.net.Stats().Dropped >= dropped+6 })
+				c.net.RemoveRule(drop)
+				waitServed(t, rec, 10, 30*time.Second)
+			}
+		})
+		c.net.ClearRules()
+		c.net.Release(false)
+		check(t, rec, st)
+		requireSessionEffects(t, st)
+	})
+	t.Run("leader-crash", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		c := startCluster(t, ctx, 3, false)
+		l := c.waitLeader(0, 10*time.Second)
+		t1 := c.node(l).Status().Term
+		rec, st := runFaults(t, c, opts, func(rec *lincheck.Recorder) {
+			waitServed(t, rec, 30, 30*time.Second)
+			c.crash(l)
+			c.waitLeader(t1, 10*time.Second)
+			waitServed(t, rec, 30, 30*time.Second)
+			c.startNode(l)
+			waitServed(t, rec, 30, 30*time.Second)
+		})
+		check(t, rec, st)
+		requireSessionEffects(t, st)
+	})
+	t.Run("leader-partition", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		c := startCluster(t, ctx, 3, true)
+		l := c.waitLeader(0, 10*time.Second)
+		t1 := c.node(l).Status().Term
+		rec, st := runFaults(t, c, opts, func(rec *lincheck.Recorder) {
+			waitServed(t, rec, 30, 30*time.Second)
+			c.net.Isolate(string(l), c.members())
+			c.waitLeader(t1, 10*time.Second)
+			waitServed(t, rec, 30, 30*time.Second)
+			c.net.HealAll()
+			waitFor(t, "the old leader stepping down", 10*time.Second, func() bool { return c.node(l).Status().Term > t1 })
+			waitServed(t, rec, 30, 30*time.Second)
+		})
+		check(t, rec, st)
+		requireSessionEffects(t, st)
+	})
+}
+
+// requireSessionEffects fails a session run that never retried an unknown
+// write or never saw a duplicate answered — it would have tested nothing new.
+func requireSessionEffects(t *testing.T, st workload.Stats) {
+	t.Helper()
+	if st.Sessions == 0 || st.DupSends == 0 || st.Duplicates == 0 || st.WriteRetries+st.Unknown == 0 {
+		t.Fatalf("the run did not exercise retries and duplicates: %s", st)
+	}
+	t.Logf("sessions: %s", st)
+}
+
 // TestFollowerLocalReadIsCaughtAsNonLinearizable is the bug hunt made concrete:
 // a read served from a follower's local store, WITHOUT ReadIndex, while a write
 // completed on the leader that the follower has not yet applied. The checker must
