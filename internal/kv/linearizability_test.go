@@ -144,7 +144,7 @@ func waitServed(t *testing.T, rec *lincheck.Recorder, n int, d time.Duration) {
 
 // waitFor polls a condition (a fault engaging, a leader appearing) — a
 // synchronization point, bounded by d.
-func waitFor(t *testing.T, what string, d time.Duration, cond func() bool) {
+func waitFor(t testing.TB, what string, d time.Duration, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(d)
 	for !cond() {

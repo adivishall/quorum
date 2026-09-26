@@ -23,7 +23,7 @@ import (
 
 var errCrash = errors.New("test: crash point")
 
-func startClusterWith(t *testing.T, ctx context.Context, n int, faults bool, limits kv.Limits) *cluster {
+func startClusterWith(t testing.TB, ctx context.Context, n int, faults bool, limits kv.Limits) *cluster {
 	t.Helper()
 	c := &cluster{t: t, ctx: ctx, dir: t.TempDir(), addrs: map[raftnode.NodeID]string{}, limits: limits,
 		trs: map[raftnode.NodeID]*transport.TCPTransport{}, nodes: map[raftnode.NodeID]*raftnode.Node{}, eps: map[raftnode.NodeID]*endpoint{}}
@@ -62,7 +62,7 @@ func (c *cluster) server(id raftnode.NodeID) *kv.Server {
 	return s
 }
 
-func register(t *testing.T, c *cluster, opts kv.SessionOptions, order ...raftnode.NodeID) *kv.Session {
+func register(t testing.TB, c *cluster, opts kv.SessionOptions, order ...raftnode.NodeID) *kv.Session {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(c.ctx, 20*time.Second)
 	defer cancel()
@@ -118,7 +118,7 @@ func (c *cluster) restart(id raftnode.NodeID) {
 	c.startNode(id)
 }
 
-func get(t *testing.T, c *cluster, key string) (string, bool) {
+func get(t testing.TB, c *cluster, key string) (string, bool) {
 	t.Helper()
 	l := c.waitLeader(0, 10*time.Second)
 	ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)

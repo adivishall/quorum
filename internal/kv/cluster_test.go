@@ -26,7 +26,7 @@ import (
 // seed-replayable; what they assert must hold under any timing: every recorded
 // history is linearizable.
 
-func freeAddr(t *testing.T) string {
+func freeAddr(t testing.TB) string {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -87,7 +87,7 @@ func (e *endpoint) Delete(ctx context.Context, key []byte) (kv.Meta, error) {
 }
 
 type cluster struct {
-	t     *testing.T
+	t     testing.TB
 	ctx   context.Context
 	dir   string
 	ids   []raftnode.NodeID
@@ -115,7 +115,7 @@ func (c *cluster) setHook(h func(id raftnode.NodeID, p raftnode.Point, arg uint6
 	c.hook.Store(&h)
 }
 
-func startCluster(t *testing.T, ctx context.Context, n int, faults bool) *cluster {
+func startCluster(t testing.TB, ctx context.Context, n int, faults bool) *cluster {
 	t.Helper()
 	c := &cluster{t: t, ctx: ctx, dir: t.TempDir(), addrs: map[raftnode.NodeID]string{},
 		trs: map[raftnode.NodeID]*transport.TCPTransport{}, nodes: map[raftnode.NodeID]*raftnode.Node{}, eps: map[raftnode.NodeID]*endpoint{}}
