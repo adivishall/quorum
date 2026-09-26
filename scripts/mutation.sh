@@ -694,6 +694,14 @@ mutant "dkvd-applies-the-configured-session-limits" cmd/dkvd/main.go \
   '	store := kv.NewStore()' \
   ./tests/integration 'TestRealSessionContractSurvivesFullClusterRestart'
 
+# 87. Request validation drops the watermark bound: a request with AckedBelow
+#     above its RequestID is proposed, and every replica refuses the entry at
+#     apply as malformed.
+mutant "requests-are-validated-before-they-are-proposed" internal/kv/api.go \
+  '	if r.RequestID == 0 || r.AckedBelow == 0 || r.AckedBelow > r.RequestID {' \
+  '	if r.RequestID == 0 || r.AckedBelow == 0 {' \
+  ./internal/kv 'TestRequestValidationRejectsEveryOutOfContractField|TestValidatedRequestsAlwaysApply'
+
 echo "== Phase 13: the checker over logical operations, and the reference model =="
 
 # 77. Request identity is not scoped by client: the same RequestID from two
