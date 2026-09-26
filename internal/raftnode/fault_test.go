@@ -474,7 +474,26 @@ func wedgedPeerScenario(t *testing.T) string {
 // commit; the majority elects a new leader in a higher term and commits; after
 // healing, the old leader steps down and every durable log converges, with the
 // old leader's uncommitted entry replaced.
+//
+// Its premise is that the node found leading still leads when it is isolated.
+// A spurious election before the isolation (the race suite under CPU
+// starvation produces one — found in the Phase 13 gate) voids that without
+// violating anything; the isolated node then proves it by answering "not
+// leader" — once isolated it cannot learn of a higher term any other way — and
+// the scenario starts over on a fresh cluster, at most three times.
 func TestIsolatedLeaderCannotCommitAndRejoins(t *testing.T) {
+	for attempt := 1; attempt <= 3; attempt++ {
+		why := isolatedLeaderScenario(t)
+		if why == "" {
+			return
+		}
+		t.Logf("attempt %d: premise not met (%s); starting over on a fresh cluster", attempt, why)
+	}
+	t.Fatal("the scenario's premise (the isolated node still led) was not met in 3 attempts")
+}
+
+// isolatedLeaderScenario is one attempt; it returns why its premise failed, or "".
+func isolatedLeaderScenario(t *testing.T) string {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	fc := startFaultCluster(t, ctx, 3)
@@ -486,6 +505,9 @@ func TestIsolatedLeaderCannotCommitAndRejoins(t *testing.T) {
 
 	fc.net.Isolate(string(old), fc.memberID)
 	if err := proposeWithin(fc.nodes[old], []byte("stranded")); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) {
+			return fmt.Sprintf("%s was deposed before it was isolated", old)
+		}
 		t.Fatalf("propose on isolated leader: %v", err)
 	}
 	stranded := fc.nodes[old].Status().LastIndex
@@ -525,6 +547,7 @@ func TestIsolatedLeaderCannotCommitAndRejoins(t *testing.T) {
 	if string(logs[next].Entries[fresh-1].Data) != "fresh" {
 		t.Fatalf("index %d = %q, want fresh", fresh, logs[next].Entries[fresh-1].Data)
 	}
+	return ""
 }
 
 // assertLogsIdenticalThrough requires every durable log to hold the same entries
