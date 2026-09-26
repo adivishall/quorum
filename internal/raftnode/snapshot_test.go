@@ -854,3 +854,46 @@ func TestSnapshotCreationUnderAFailedDisk(t *testing.T) {
 		t.Fatalf("the restarted node never snapshotted: %+v", st)
 	}
 }
+
+// TestReceiveRefusesWhatCannotBeInstalled: a complete, well-formed transfer
+// that is another group's snapshot, or whose state the state machine refuses,
+// is refused before the core ever sees it — nothing is staged, so nothing can
+// be installed — while a valid one is accepted. An install of a refused
+// snapshot would be durable, and a node whose published snapshot its state
+// machine refuses cannot start (docs/SNAPSHOTS.md §7).
+func TestReceiveRefusesWhatCannotBeInstalled(t *testing.T) {
+	members := []string{"n0", "n1", "n2"}
+	snaps := &Snapshots{Files: snapshot.Files{FS: fault.NewMemFS(), Base: "/n/raft.log"}, SM: &snapSM{}, Members: members}
+	src := &snapSM{}
+	for i := 1; i <= 3; i++ {
+		_ = src.Apply(uint64(i), []byte("c"))
+	}
+	_, state, _ := src.EncodeSnapshot()
+	send := func(meta snapshot.Meta) (*raft.Message, error) {
+		t.Helper()
+		file, err := snapshot.Encode(meta, state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m *raft.Message
+		for _, c := range snapshot.Split(2, meta, file) {
+			if m, err = snaps.Receive("n1", c.Marshal()); err != nil {
+				return m, err
+			}
+		}
+		return m, nil
+	}
+	if m, err := send(snapshot.Meta{Members: []string{"a", "b", "c"}, Index: 3, Term: 1}); m != nil || !errors.Is(err, snapshot.ErrWrongGroup) {
+		t.Fatalf("another group's snapshot: %v %v", m, err)
+	}
+	if m, err := send(snapshot.Meta{Members: members, Index: 4, Term: 1}); m != nil || err == nil {
+		t.Fatalf("a state the state machine refuses (state at 3, snapshot at 4): %v %v", m, err)
+	}
+	d := &Durable{Snap: snaps}
+	if err := d.InstallSnapshot(raft.SnapshotMeta{Index: 4, Term: 1}, nil, nil); !errors.Is(err, ErrSnapshot) {
+		t.Fatalf("a refused snapshot was left installable: %v", err)
+	}
+	if m, err := send(snapshot.Meta{Members: members, Index: 3, Term: 1}); m == nil || err != nil {
+		t.Fatalf("the valid snapshot: %v %v", m, err)
+	}
+}

@@ -6,10 +6,13 @@
 # (docs/CRASH_RECOVERY.md §10), the Phase 12 client-visible consistency
 # rules — ReadIndex, write completion, the client protocol and policy, the
 # state machine, and the linearizability checker itself
-# (docs/LINEARIZABILITY.md §11) — and the Phase 13 request-identity rules:
+# (docs/LINEARIZABILITY.md §11) — the Phase 13 request-identity rules:
 # deduplication, conflicts, the watermark, bounds and eviction, forwarding, the
 # session client, the checker over logical operations and the session model
-# (docs/DEDUP.md §9).
+# (docs/DEDUP.md §9) — and the Phase 14 snapshot and compaction rules: the
+# orderings of creation, publication, compaction and installation, the format's
+# validation, recovery's reconciliation, the protocol, and the session table's
+# place in the snapshot (docs/SNAPSHOTS.md §10).
 #
 # For each mutant it applies a real source edit that violates a specific Raft rule,
 # runs the test(s) that should catch that violation, and requires them to FAIL (the
@@ -19,7 +22,12 @@
 # a permanent runtime flag or a source-string inspection: it exercises altered
 # behaviour and proves the existing correctness suite detects it.
 #
-# Usage: scripts/mutation.sh   (from anywhere; requires a clean git working tree)
+# Usage: scripts/mutation.sh          (from anywhere; requires a clean git working tree)
+#        DRY=1 scripts/mutation.sh    (apply and revert every mutant without running
+#                                      tests: checks every pattern still matches)
+#
+# A mutant whose edit does not compile is NOT killed: the runner reports it as a
+# failure of the runner, never as a kill.
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -62,9 +70,19 @@ mutant() {
     return
   fi
 
+  if [ -n "${DRY:-}" ]; then
+    echo "· $name: pattern applies"
+    git checkout -- "$file" 2>/dev/null
+    return
+  fi
+
   # shellcheck disable=SC2086 # $pkg is a deliberate word-split package list
-  if go test $pkg -run "$tests" -count=1 -timeout 180s >/tmp/mutation.$$.log 2>&1; then
+  if go test $pkg -run "$tests" -count=1 -timeout 300s >/tmp/mutation.$$.log 2>&1; then
     echo "✗ $name: SURVIVED — killer tests [$tests] still PASSED with the rule broken."
+    FAIL=$((FAIL + 1))
+  elif grep -qE '\[build failed\]|\[setup failed\]' /tmp/mutation.$$.log; then
+    echo "✗ $name: the mutant does not compile — that is not a kill."
+    grep -m 3 -E '\.go:[0-9]+' /tmp/mutation.$$.log
     FAIL=$((FAIL + 1))
   else
     echo "✓ $name: killed by [$tests]."
@@ -205,8 +223,14 @@ mutant "duplicate-votes-idempotent" internal/raft/raft.go \
   ./internal/raftsim 'TestDuplicatedVoteDoesNotCountTwice'
 
 # 17. A reordered, older AppendEntries success moves a follower's progress backward.
+#     (Phase 14: the rule lives in progress(), shared with snapshot responses.)
 mutant "stale-success-ignored" internal/raft/raft.go \
-  'if m.MatchIndex > r.matchIndex[peer] {' 'if true {' \
+  '	if match <= r.matchIndex[peer] {
+		return
+	}' \
+  '	if false && match <= r.matchIndex[peer] {
+		return
+	}' \
   ./internal/raftsim 'TestStaleSuccessDoesNotRegressReplication'
 
 echo "== Phase 10: fault-model fidelity (the harness must do what it claims) =="
@@ -294,8 +318,8 @@ mutant "commit-not-durable-before-its-entries" internal/raftlog/raftlog.go \
 
 # 27. Trust a persisted commit beyond the entries actually recovered.
 mutant "recovered-commit-clamped-to-log" internal/raftlog/raftlog.go \
-  '	if rec.HardState.Commit > uint64(len(rec.Entries)) {' \
-  '	if false && rec.HardState.Commit > uint64(len(rec.Entries)) {' \
+  '	rec.HardState.Commit = min(rec.HardState.Commit, rec.LastIndex())' \
+  '	_ = rec.LastIndex()' \
   ./internal/raftlog 'TestCommitBeyondRecoveredLogIsClamped'
 
 # 28. Do not truncate a torn tail on recovery, so the next append lands behind
@@ -330,8 +354,8 @@ mutant "recover-refuses-term-below-log" internal/raft/config.go \
 # 31. Restore volatile leader state on restart: a recovered node believes it
 #     still leads its recovered term.
 mutant "restart-as-follower-never-leader" internal/raft/raft.go \
-  '		role:           Follower,' \
-  '		role:           Leader,' \
+  '		role:               Follower,' \
+  '		role:               Leader,' \
   ./internal/raftsim 'TestCrashMatrix|TestCrashDuringSuffixReplacement'
 
 # 32. Record an entry as applied BEFORE the state machine applies it, so a crash
@@ -713,11 +737,13 @@ mutant "a-duplicate-reports-the-original-execution" internal/kv/store.go \
 #     the fresh state machine: the session table (with the rest of the state)
 #     is lost, and a retry after the restart is refused or re-executed.
 mutant "a-restart-rebuilds-the-session-table-by-replay" internal/raftnode/node.go \
-  '			return nil, fmt.Errorf("raftnode: recovered commit invalid: %w", err)
-		}' \
-  '			return nil, fmt.Errorf("raftnode: recovered commit invalid: %w", err)
+  '			return fail(fmt.Errorf("raftnode: recovered commit invalid: %w", err))
 		}
-		_ = mlog.Apply(rec.HardState.Commit)' \
+	}' \
+  '			return fail(fmt.Errorf("raftnode: recovered commit invalid: %w", err))
+		}
+	}
+	_ = mlog.Apply(commit)' \
   "./internal/kv ./internal/raftsim ./tests/integration" 'TestRetryAfterEveryNodeRestarts|TestKVSimSessionsSurviveARestartOfEveryNode|TestRealSessionContractSurvivesFullClusterRestart'
 
 # 90. A duration past time.Duration is decoded (it overflows, and the frame
@@ -834,6 +860,277 @@ mutant "an-evicted-session-is-never-revived (real processes)" internal/kv/store.
 		s.sessions[c.ClientID] = ss
 	}' \
   ./tests/integration 'TestRealSessionContractSurvivesFullClusterRestart'
+
+echo "== Phase 14: snapshots and log compaction (docs/SNAPSHOTS.md §10) =="
+
+# 93. Compact before the snapshot is durable: the log is rewritten without the
+#     prefix before the snapshot covering it is published, so a crash between
+#     leaves the only record of the prefix nowhere.
+mutant "the-snapshot-is-durable-before-the-log-is-compacted" internal/raftnode/snapshot.go \
+  '	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
+		return err
+	}
+	if err := s.Files.Publish(file); err != nil {' \
+  '	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
+		return err
+	}
+	s.meta = meta
+	if err := d.compact(core, at); err != nil {
+		return err
+	}
+	if err := s.Files.Publish(file); err != nil {' \
+  "./internal/raftnode ./internal/raftsim" 'TestSnapshotCrashPointsRecover|TestSnapshotCrashMatrix'
+
+# 94. Compact beyond the applied index, in memory.
+mutant "compaction-never-passes-the-applied-index" internal/replication/log.go \
+  '	case index > l.applied:
+		return ErrCompactBeyondApplied' \
+  '	case false && index > l.applied:
+		return ErrCompactBeyondApplied' \
+  ./internal/replication 'TestCompactDiscardsOnlyTheAppliedPrefix|TestAgainstReferenceModel'
+
+# 95. Compact beyond the durable commit, on disk: an uncommitted entry — one a
+#     new leader may replace — is discarded into a snapshot.
+mutant "durable-compaction-never-passes-the-commit" internal/raftlog/raftlog.go \
+  '	case index > rec.HardState.Commit:' \
+  '	case false && index > rec.HardState.Commit:' \
+  ./internal/raftlog 'TestCompactAndInstallRefuseImpossibleBoundaries'
+
+# 96. A restart resumes the in-memory log at the wrong boundary.
+mutant "recovery-resumes-at-the-log-boundary" internal/raftnode/node.go \
+  '		if err := mlog.InstallSnapshot(b.Index, b.Term); err != nil {' \
+  '		if err := mlog.InstallSnapshot(b.Index+1, b.Term); err != nil {' \
+  ./internal/raftnode 'TestRecoverFromSnapshotAndSuffix|TestLaggingFollowerCatchesUpBySnapshot'
+
+# 97. A restart recovers the boundary with the wrong term.
+mutant "recovery-keeps-the-boundary-term" internal/raftnode/node.go \
+  '		if err := mlog.InstallSnapshot(b.Index, b.Term); err != nil {' \
+  '		if err := mlog.InstallSnapshot(b.Index, b.Term+1); err != nil {' \
+  ./internal/raftsim 'TestSimRestartFromSnapshotAfterPowerLoss|TestSnapshotCrashMatrix'
+
+# 98. A corrupt published snapshot is silently ignored instead of refused.
+mutant "a-corrupt-snapshot-is-refused-not-ignored" internal/snapshot/files.go \
+  '		return Meta{}, nil, nil, true, fmt.Errorf("%s: %w", f.Path(), err)' \
+  '		return Meta{}, nil, nil, false, nil' \
+  "./internal/snapshot ./internal/raftsim" 'TestLoadRefusesACorruptPublishedSnapshot|TestSimCorruptPublishedSnapshotRefusesToStart'
+
+# 99. The state's SHA-256 is not checked (the records' CRCs alone pass).
+mutant "the-snapshot-checksum-is-verified" internal/snapshot/snapshot.go \
+  '	if sha256.Sum256(data) != sum {' \
+  '	if false && sha256.Sum256(data) != sum {' \
+  ./internal/snapshot 'TestCorpus'
+
+# 100. Bytes after the footer are accepted (what FuzzDecode found).
+mutant "nothing-may-follow-the-footer" internal/snapshot/snapshot.go \
+  '	if rd.NextOffset() != int64(len(b)) {' \
+  '	if false && rd.NextOffset() != int64(len(b)) {' \
+  ./internal/snapshot 'TestCorpus'
+
+# 101. The snapshot drops the session table: after a restore, a retry of an
+#      executed request is no longer recognized.
+mutant "the-snapshot-carries-the-session-table" internal/kv/snapshot.go \
+  '	b = binary.AppendUvarint(b, uint64(len(ids)))
+	for _, id := range ids {' \
+  '	ids = nil
+	b = binary.AppendUvarint(b, uint64(len(ids)))
+	for _, id := range ids {' \
+  "./internal/kv ./internal/raftsim" 'TestSnapshotPlusSuffixEqualsFullReplay|TestSimDedupSurvivesSnapshotCompactionAndRestart'
+
+# 102. A follower refuses a snapshot its commit already covers instead of
+#      answering it covered (the leader then never ends its offer).
+mutant "a-follower-answers-a-covered-snapshot" internal/raft/raft.go \
+  '	if m.SnapshotIndex <= commit {' \
+  '	if false && m.SnapshotIndex <= commit {' \
+  ./internal/raft 'TestFollowerIgnoresASnapshotItAlreadyCovers'
+
+# 103. A stale snapshot resets the log: an install at or below the commit
+#      index is accepted, and entries not yet applied are skipped.
+mutant "a-stale-snapshot-never-resets-the-log" internal/replication/log.go \
+  '	if index <= l.commit {
+		return ErrStaleSnapshot' \
+  '	if false && index <= l.commit {
+		return ErrStaleSnapshot' \
+  ./internal/replication 'TestInstallSnapshotKeepsOnlyAMatchingSuffix|TestAgainstReferenceModel'
+
+# 104. The leader ignores that the entries a follower needs are compacted: it
+#      never offers the snapshot, and the follower never catches up.
+mutant "a-leader-offers-a-snapshot-when-entries-are-compacted" internal/raft/raft.go \
+  '	if base, baseTerm := r.log.Boundary(); next <= base {' \
+  '	if base, baseTerm := r.log.Boundary(); false && next <= base {' \
+  "./internal/raft ./internal/raftsim" 'TestLaggingFollowerCatchesUpBySnapshot|TestSimLaggingFollowerInstallsASnapshot'
+
+# 105. A transfer is accepted before it is complete.
+mutant "only-a-complete-transfer-is-accepted" internal/snapshot/transfer.go \
+  '	if t.received < t.total {
+		return nil, nil
+	}' \
+  '	if false && t.received < t.total {
+		return nil, nil
+	}' \
+  "./internal/snapshot ./internal/raftsim" 'TestReceiverAcceptsOnlyAnInOrderCompleteSnapshot|TestSimLaggingFollowerInstallsASnapshot'
+
+# 106. Chunks are accepted out of order (a duplicate or skipped chunk is written).
+mutant "chunks-are-accepted-in-order-only" internal/snapshot/transfer.go \
+  '		t.total != c.Total || t.received != c.Offset {' \
+  '		t.total != c.Total {' \
+  "./internal/snapshot ./internal/raftsim" 'TestReceiverAcceptsOnlyAnInOrderCompleteSnapshot|TestSimDuplicatedAndReorderedTransfers'
+
+# 107. An install discards a valid suffix, in memory.
+mutant "an-install-keeps-a-matching-suffix" internal/replication/log.go \
+  '	if t, err := l.Term(index); err == nil && t == term && index <= l.LastIndex() {' \
+  '	if t, err := l.Term(index); false && err == nil && t == term && index <= l.LastIndex() {' \
+  "./internal/replication ./internal/raft" 'TestInstallSnapshotKeepsOnlyAMatchingSuffix|TestFollowerInstallKeepsAMatchingSuffix'
+
+# 108. Replaying a boundary record discards a valid suffix, on disk.
+mutant "replay-keeps-a-matching-suffix" internal/raftlog/raftlog.go \
+  '		if rec.Entries[b.Index-cur.Index-1].Term == b.Term {' \
+  '		if false && rec.Entries[b.Index-cur.Index-1].Term == b.Term {' \
+  ./internal/raftlog 'TestInstallAppliesTheInstallRule|TestRandomLogHistoriesMatchTheModel'
+
+# 109. A restart forgets its snapshot: the state machine is validated against
+#      it but not restored, while the applied index says it was.
+mutant "restart-restores-the-published-snapshot" internal/raftnode/node.go \
+  '		if err := ssm.RestoreSnapshot(meta.Index, data); err != nil {' \
+  '		if err := ssm.ValidateSnapshot(meta.Index, data); err != nil {' \
+  "./internal/raftnode ./internal/raftsim" 'TestRecoverFromSnapshotAndSuffix|TestSimRestartFromSnapshotAfterPowerLoss'
+
+# 110. A restart with a compacted log and no snapshot starts anyway — from an
+#      empty state machine that believes it applied the prefix.
+mutant "recovery-refuses-a-compacted-log-without-a-snapshot" internal/raftnode/node.go \
+  '	case rec.Boundary.Index > 0:
+		return fail(' \
+  '	case false && rec.Boundary.Index > 0:
+		return fail(' \
+  ./internal/raftnode 'TestRecoverRefusesAContradictedSnapshot'
+
+# 111. Startup deletes the published snapshot along with the temporaries.
+mutant "startup-keeps-the-published-snapshot" internal/snapshot/files.go \
+  '	for _, p := range []string{f.TmpPath(), f.RecvPath()} {' \
+  '	for _, p := range []string{f.TmpPath(), f.RecvPath(), f.Path()} {' \
+  ./internal/raftnode 'TestRecoverFromSnapshotAndSuffix'
+
+# 112. An install publishes the snapshot before the new term is durable: a crash
+#      between leaves a snapshot whose term exceeds the durable currentTerm.
+mutant "install-persists-the-term-before-publishing" internal/raftnode/snapshot.go \
+  '	if hs != nil {
+		if cur := d.Log.HardState(); hs.Term != cur.Term || hs.Vote != cur.Vote {
+			if err := d.Log.Save(&raftlog.HardState{Term: hs.Term, Vote: hs.Vote, Commit: cur.Commit}, nil); err != nil {
+				return err
+			}
+		}
+	}
+	if err := at.hit(BeforeInstallPublish, meta.Index); err != nil {
+		return err
+	}
+	if err := s.Files.PublishReceived(); err != nil {
+		return err
+	}' \
+  '	if err := at.hit(BeforeInstallPublish, meta.Index); err != nil {
+		return err
+	}
+	if err := s.Files.PublishReceived(); err != nil {
+		return err
+	}
+	if hs != nil {
+		if cur := d.Log.HardState(); hs.Term != cur.Term || hs.Vote != cur.Vote {
+			if err := d.Log.Save(&raftlog.HardState{Term: hs.Term, Vote: hs.Vote, Commit: cur.Commit}, nil); err != nil {
+				return err
+			}
+		}
+	}' \
+  ./internal/raftnode 'TestInstallOrderIsTermPublishBoundary'
+
+# 113. An install records the boundary before publishing the snapshot: a crash
+#      between leaves a log compacted past its only snapshot.
+mutant "install-publishes-before-recording-the-boundary" internal/raftnode/snapshot.go \
+  '	if err := s.Files.PublishReceived(); err != nil {
+		return err
+	}
+	s.meta, s.file = st.Meta, nil
+	if err := at.hit(AfterInstallPublish, meta.Index); err != nil {
+		return err
+	}
+	if err := d.Log.Install(meta.Index, meta.Term); err != nil {
+		return err
+	}' \
+  '	if err := d.Log.Install(meta.Index, meta.Term); err != nil {
+		return err
+	}
+	if err := s.Files.PublishReceived(); err != nil {
+		return err
+	}
+	s.meta, s.file = st.Meta, nil
+	if err := at.hit(AfterInstallPublish, meta.Index); err != nil {
+		return err
+	}' \
+  "./internal/raftnode ./internal/raftsim" 'TestInstallOrderIsTermPublishBoundary|TestSnapshotCrashMatrix'
+
+# 114. Open fsyncs the directory only when it creates the log (what the crash
+#      test found): after a compaction's rename survived a process crash, an
+#      acknowledged append is lost with the name on a power loss.
+mutant "open-makes-the-log-name-durable" internal/raftlog/raftlog.go \
+  '	if err := fsys.SyncDir(filepath.Dir(path)); err != nil {
+		_ = f.Close()
+		return nil, nil, err
+	}' \
+  '	if _, statErr := fsys.Stat(path + ".never"); statErr == nil {
+		_ = f.Close()
+		return nil, nil, statErr
+	}' \
+  ./internal/raftlog 'TestCompactIsAtomicUnderEveryCrash'
+
+# 115. A Ready's installed snapshot is not made durable and active before its
+#      response leaves.
+mutant "an-installed-snapshot-is-made-durable-before-the-response" internal/raftnode/crashpoint.go \
+  '		if rd.Snapshot != nil {
+			in, ok := st.(Installer)' \
+  '		if false && rd.Snapshot != nil {
+			in, ok := st.(Installer)' \
+  "./internal/raftnode ./internal/raftsim" 'TestLaggingFollowerCatchesUpBySnapshot|TestSimLaggingFollowerInstallsASnapshot'
+
+# 116. A transfer's state is not validated before the core sees it.
+mutant "a-transfer-is-validated-before-the-core-sees-it" internal/raftnode/snapshot.go \
+  '	if err := s.SM.ValidateSnapshot(got.Meta.Index, got.Data); err != nil {' \
+  '	if err := error(nil); err != nil {' \
+  ./internal/raftnode 'TestReceiveRefusesWhatCannotBeInstalled'
+
+# 117. Another group's snapshot is accepted.
+mutant "a-transfer-must-be-this-groups" internal/raftnode/snapshot.go \
+  '	if !snapshot.SameGroup(got.Meta.Members, s.Members) {' \
+  '	if false && !snapshot.SameGroup(got.Meta.Members, s.Members) {' \
+  ./internal/raftnode 'TestReceiveRefusesWhatCannotBeInstalled'
+
+# 118. A write whose index an install replaced is reported as applied — with no
+#      result: its outcome is unknown, not success.
+mutant "an-install-leaves-a-write-unknown" internal/raftnode/waiters.go \
+  '				wt.ch <- Outcome{Index: idx, Err: ErrSuperseded}' \
+  '				wt.ch <- Outcome{Index: idx}' \
+  ./internal/raftnode 'TestWaitersSettleOnInstall'
+
+# 119. Recovery does not complete an install that crashed after publishing.
+mutant "recovery-completes-an-interrupted-install" internal/raftnode/node.go \
+  '		if repair {' \
+  '		if false && repair {' \
+  "./internal/raftnode ./internal/raftsim" 'TestInstallCrashPointsRecover|TestSnapshotCrashMatrix'
+
+echo "== Phase 14: the same rules, killed by real processes ALONE =="
+
+# 120. The session table left out of the snapshot, on real processes: the
+#      retry of a request whose entry was compacted away on every node, after
+#      every process restarted, is executed again instead of answered.
+mutant "the-snapshot-carries-the-session-table (real processes)" internal/kv/snapshot.go \
+  '	b = binary.AppendUvarint(b, uint64(len(ids)))
+	for _, id := range ids {' \
+  '	ids = nil
+	b = binary.AppendUvarint(b, uint64(len(ids)))
+	for _, id := range ids {' \
+  ./tests/integration 'TestRealRetryAfterSnapshotIsADuplicate'
+
+# 121. Recovery does not complete an interrupted install, on real processes.
+mutant "recovery-completes-an-interrupted-install (real processes)" internal/raftnode/node.go \
+  '		if repair {' \
+  '		if false && repair {' \
+  ./tests/integration 'TestRealFollowerCrashesDuringSnapshotInstallation'
 
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
