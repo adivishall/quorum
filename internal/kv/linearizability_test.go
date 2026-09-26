@@ -10,6 +10,7 @@ import (
 	"github.com/adivishall/quorum/internal/kv"
 	"github.com/adivishall/quorum/internal/kv/workload"
 	"github.com/adivishall/quorum/internal/lincheck"
+	"github.com/adivishall/quorum/internal/raftnode"
 	"github.com/adivishall/quorum/internal/transport"
 )
 
@@ -333,6 +334,13 @@ func TestSessionClientsUnderFaultsRetryAndStayLinearizable(t *testing.T) {
 		t1 := c.node(l).Status().Term
 		rec, st := runFaults(t, c, opts, func(rec *lincheck.Recorder) {
 			waitServed(t, rec, 30, 30*time.Second)
+			// The leader dies right after applying a client's write, before
+			// answering it (not at an arbitrary instant, when no request may
+			// be in flight there): that client's outcome is unknown, and its
+			// retry at the new leader is a duplicate.
+			fired := c.armCrash(l, raftnode.AfterAppliedTo, 0)
+			fired.Wait()
+			c.setHook(nil)
 			c.crash(l)
 			c.waitLeader(t1, 10*time.Second)
 			waitServed(t, rec, 30, 30*time.Second)
@@ -341,6 +349,9 @@ func TestSessionClientsUnderFaultsRetryAndStayLinearizable(t *testing.T) {
 		})
 		check(t, rec, st)
 		requireSessionEffects(t, st)
+		if st.Unknown == 0 {
+			t.Fatalf("the leader died after applying a client's write, yet no attempt was unknown: %s", st)
+		}
 	})
 	t.Run("leader-partition", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
