@@ -10,6 +10,7 @@ import (
 
 	"github.com/adivishall/quorum/internal/fault"
 	"github.com/adivishall/quorum/internal/kv"
+	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftnode"
 	"github.com/adivishall/quorum/internal/transport"
 )
@@ -331,9 +332,12 @@ func TestConcurrentDuplicatesAtTwoNodes(t *testing.T) {
 	}
 }
 
-// TestDuplicateSentBeforeTheOriginalCommits: replication is held so the
-// original cannot commit; its duplicate is sent meanwhile; both entries then
-// commit, in order — the original executes, the duplicate is answered from it.
+// TestDuplicateSentBeforeTheOriginalCommits: the followers' acknowledgements
+// are held so the original cannot commit; its duplicate is sent meanwhile; both
+// entries then commit, in order — the original executes, the duplicate is
+// answered from it. (The ACKS are held, not the AppendEntries: holding those
+// would silence the heartbeats too, and a follower that hears none campaigns
+// and deposes the leader the test is about.)
 func TestDuplicateSentBeforeTheOriginalCommits(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -342,13 +346,13 @@ func TestDuplicateSentBeforeTheOriginalCommits(t *testing.T) {
 	s := register(t, c, kv.SessionOptions{AttemptTimeout: 300 * time.Millisecond, MaxAttempts: 1}, l)
 	c.quiesce(l)
 	held := c.net.Stats().Held
-	hold := c.net.AddRule(fault.Rule{Kinds: []transport.MsgKind{transport.MsgAppendEntries}, Action: fault.Hold})
+	hold := c.net.AddRule(fault.Rule{Kinds: []transport.MsgKind{transport.MsgAppendEntriesResponse}, Action: fault.Hold})
 	rid := s.Reserve()
 	first := s.Send(ctx, rid, kv.ReqPut, []byte("k"), []byte("A"), nil)
 	if first.Known {
 		t.Fatalf("a write that cannot commit was answered: %+v", first)
 	}
-	waitFor(t, "the original's replication to be held", 5*time.Second, func() bool { return c.net.Stats().Held > held })
+	waitFor(t, "the acknowledgements to be held", 5*time.Second, func() bool { return c.net.Stats().Held > held })
 	dup := kv.ResumeSession(c.doers(l), kv.SessionOptions{AttemptTimeout: 10 * time.Second, MaxAttempts: 1}, s.ID(), s.Next())
 	dup.Hold(rid)
 	done := make(chan kv.Outcome, 1)
@@ -361,6 +365,9 @@ func TestDuplicateSentBeforeTheOriginalCommits(t *testing.T) {
 	out := <-done
 	if out.Err != nil || !out.Response.Duplicate {
 		t.Fatalf("the duplicate must be answered from the original's execution: %+v", out)
+	}
+	if st := c.node(l).Status(); st.Role != raft.Leader {
+		t.Fatalf("premise: %s must have led throughout, it is now %s in term %d", l, st.Role, st.Term)
 	}
 }
 
