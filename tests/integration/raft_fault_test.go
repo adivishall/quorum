@@ -324,9 +324,14 @@ func (c *rcluster) liveLog(id string) *raftlog.Recovered {
 	return rec
 }
 
-// committedPrefix is a node's log up to the commit index it reported.
+// committedPrefix is a node's log up to the commit index it reported. It needs
+// an uncompacted log (Phase 14: a compacted one no longer holds the prefix).
 func (c *rcluster) committedPrefix(id string) []raftlog.Entry {
-	entries := c.liveLog(id).Entries
+	rec := c.liveLog(id)
+	if rec.Boundary.Index != 0 {
+		c.t.Fatalf("%s's log is compacted through %d; committedPrefix needs the whole log", id, rec.Boundary.Index)
+	}
+	entries := rec.Entries
 	commit := c.commitOf(id)
 	if commit > uint64(len(entries)) {
 		c.t.Fatalf("%s reports commit %d but its durable log holds %d entries", id, commit, len(entries))
@@ -351,9 +356,9 @@ func (c *rcluster) finish(mustKeep ...[]raftlog.Entry) {
 		c.procs[id] = nil
 	}
 	c.checkElectionSafety()
-	logs := map[string][]raftlog.Entry{}
+	logs := map[string]*raftlog.Recovered{}
 	for _, id := range c.ids {
-		logs[id] = c.liveLog(id).Entries
+		logs[id] = c.liveLog(id)
 	}
 	for i, a := range c.ids {
 		for _, b := range c.ids[i+1:] {
@@ -362,12 +367,16 @@ func (c *rcluster) finish(mustKeep ...[]raftlog.Entry) {
 	}
 	for _, prefix := range mustKeep {
 		for _, id := range c.ids {
-			if len(logs[id]) < len(prefix) {
-				c.t.Fatalf("%s lost committed entries: holds %d, %d were committed", id, len(logs[id]), len(prefix))
+			rec := logs[id]
+			if rec.LastIndex() < uint64(len(prefix)) {
+				c.t.Fatalf("%s lost committed entries: holds %d, %d were committed", id, rec.LastIndex(), len(prefix))
 			}
-			for i, e := range prefix {
-				if g := logs[id][i]; g.Term != e.Term || string(g.Data) != string(e.Data) {
-					c.t.Fatalf("%s index %d is (t%d) but (t%d) was committed there", id, i+1, g.Term, e.Term)
+			for _, e := range prefix {
+				if e.Index <= rec.Boundary.Index {
+					continue // compacted into a snapshot (Phase 14): checked by the state comparison
+				}
+				if g := rec.Entries[e.Index-rec.Boundary.Index-1]; g.Term != e.Term || string(g.Data) != string(e.Data) {
+					c.t.Fatalf("%s index %d is (t%d) but (t%d) was committed there", id, e.Index, g.Term, e.Term)
 				}
 			}
 		}
@@ -403,20 +412,19 @@ func (c *rcluster) checkElectionSafety() {
 }
 
 // checkLogMatching: if two logs hold an entry with the same index and term, they
-// are identical up to it (INV-R3, on the bytes on disk).
-func checkLogMatching(t *testing.T, a string, la []raftlog.Entry, b string, lb []raftlog.Entry) {
+// are identical up to it (INV-R3, on the bytes on disk) — over the indexes both
+// still hold (Phase 14: below a log's boundary, a snapshot holds the prefix).
+func checkLogMatching(t *testing.T, a string, ra *raftlog.Recovered, b string, rb *raftlog.Recovered) {
 	t.Helper()
-	hi := len(la)
-	if len(lb) < hi {
-		hi = len(lb)
-	}
-	for i := hi - 1; i >= 0; i-- {
-		if la[i].Term != lb[i].Term {
+	at := func(r *raftlog.Recovered, i uint64) raftlog.Entry { return r.Entries[i-r.Boundary.Index-1] }
+	lo := max(ra.Boundary.Index, rb.Boundary.Index)
+	for i := min(ra.LastIndex(), rb.LastIndex()); i > lo; i-- {
+		if at(ra, i).Term != at(rb, i).Term {
 			continue
 		}
-		for j := 0; j <= i; j++ {
-			if la[j].Term != lb[j].Term || string(la[j].Data) != string(lb[j].Data) {
-				t.Fatalf("durable logs of %s and %s share (index %d, term %d) but differ at %d", a, b, i+1, la[i].Term, j+1)
+		for j := lo + 1; j <= i; j++ {
+			if x, y := at(ra, j), at(rb, j); x.Term != y.Term || string(x.Data) != string(y.Data) {
+				t.Fatalf("durable logs of %s and %s share (index %d, term %d) but differ at %d", a, b, i, at(ra, i).Term, j)
 			}
 		}
 		return

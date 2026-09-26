@@ -74,12 +74,14 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		raftMode = fs.Bool("raft", false, "run a single Raft group over the transport (Phase 9) instead of the probe demo")
 		dataDir  = fs.String("data-dir", "", "directory for the durable Raft log (raft mode; a temp dir if empty)")
 		tickIvl  = fs.Duration("tick-interval", 50*time.Millisecond, "raft logical tick duration")
-		crashAt  = fs.String("crash-at", "", "TEST SEAM (raft mode): kill this process with SIGKILL at a crash point, e.g. after-save:2 (the 2nd time it is reached), fsync:3 (before the 3rd fsync of the durable log) or before-reply:1 (before the 1st client response is written); see docs/CRASH_RECOVERY.md")
+		crashAt  = fs.String("crash-at", "", "TEST SEAM (raft mode): kill this process with SIGKILL at a crash point, e.g. after-save:2 (the 2nd time it is reached), fsync:3 (before the 3rd fsync of any of the node's files — its Raft log and snapshot files), rename:1, syncdir:2, after-snapshot-publish:1 or before-reply:1 (before the 1st client response is written); see docs/CRASH_RECOVERY.md and docs/SNAPSHOTS.md")
 		crashArm = fs.Bool("crash-armed-by-signal", false, "TEST SEAM: count -crash-at occurrences only after this process receives SIGUSR1 (it logs event=crash_armed), so a test can crash at the Nth occurrence after a point of its choosing; driver and reply points only")
 		clientAt = fs.String("client-listen", "", "raft mode: serve the key-value client protocol (internal/kv, docs/API.md: PUT/GET/DELETE, REGISTER, request identity) on this host:port")
 		sessMax  = fs.Int("session-max", kv.DefaultLimits.MaxSessions, "raft mode: the most client sessions the state machine keeps; the least recently used is evicted beyond it (docs/DEDUP.md). Part of the replicated state machine: every node of a group MUST use the same value")
 		sessUnk  = fs.Int("session-max-unacked", kv.DefaultLimits.MaxUnacked, "raft mode: the most unacknowledged results one session may hold (docs/DEDUP.md). Every node of a group MUST use the same value")
 		forward  = fs.Bool("client-forwarding", true, "raft mode: a node that is not the leader forwards a client request one hop to the leader; false is redirect-only (NOT_LEADER with a leader hint)")
+		snapEv   = fs.Uint64("snapshot-every", 10000, "raft mode: snapshot the state machine every N applied entries and compact the Raft log behind the snapshot (docs/SNAPSHOTS.md); 0 never snapshots (the log then grows without bound). Each node decides on its own; values may differ")
+		snapKeep = fs.Uint64("snapshot-retain", 1000, "raft mode: entries kept in the Raft log below each new snapshot, so a follower slightly behind catches up by entries rather than a snapshot transfer")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -148,7 +150,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	if *raftMode {
 		r := raftRun{id: *id, peers: peers, tr: tr, dataDir: *dataDir, tick: *tickIvl, lg: lg, stderr: stderr, clientAddr: *clientAt, crash: crash,
-			limits: limits, redirectOnly: !*forward}
+			limits: limits, redirectOnly: !*forward, snapshotEvery: *snapEv, snapshotRetain: *snapKeep}
 		if crash != nil {
 			r.hook, r.fs = crash.install(ctx, lg, *id, *crashArm)
 		}
@@ -299,6 +301,8 @@ type raftRun struct {
 	crash        *crashPoint // -crash-at; nil in normal operation
 	limits       kv.Limits   // the session table's bounds, identical on every node (zero: kv.DefaultLimits)
 	redirectOnly bool        // -client-forwarding=false
+	// Phase 14: -snapshot-every and -snapshot-retain.
+	snapshotEvery, snapshotRetain uint64
 }
 
 // runRaft runs a single Raft group (Phase 9) over the already-built transport
@@ -338,7 +342,8 @@ func runRaft(ctx context.Context, r raftRun) int {
 		LogPath:      filepath.Join(dataDir, "raft-"+id+".log"),
 		StateMachine: store,
 		TickInterval: r.tick, Logf: lg.logf, FS: r.fs, // durable by default (DisableSync left false)
-		Hook: r.hook, // nil unless -crash-at (a test seam)
+		Hook:          r.hook, // nil unless -crash-at (a test seam)
+		SnapshotEvery: r.snapshotEvery, SnapshotRetain: r.snapshotRetain,
 	})
 	if err != nil {
 		fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
@@ -417,7 +422,8 @@ func runRaft(ctx context.Context, r raftRun) int {
 }
 
 // crashPoint is a parsed -crash-at: a driver point (raftnode.Point), an I/O
-// boundary of the durable log ("write", "fsync", "truncate") or a Phase 12
+// boundary of the node's files ("write", "fsync", "truncate", and since Phase
+// 14 "rename" and "syncdir"; the Raft log and the snapshot files) or a Phase 12
 // reply point of the client protocol ("before-reply", "after-reply"), and which
 // occurrence fires. It is a test seam for the Phase 11 real-process crash tests
 // (docs/CRASH_RECOVERY.md §8): at the point the process logs event=crash_point
@@ -476,6 +482,10 @@ func parseCrashAt(spec string) (*crashPoint, error) {
 		cp.op = fault.OpSync
 	case "truncate":
 		cp.op = fault.OpTruncate
+	case "rename":
+		cp.op = fault.OpRename
+	case "syncdir":
+		cp.op = fault.OpSyncDir
 	default:
 		return nil, fmt.Errorf("-crash-at %q: unknown crash point", spec)
 	}
@@ -500,8 +510,9 @@ func (cp *crashPoint) validate(armedBySignal, clientListen bool) error {
 // install returns the driver hook and the durable log's filesystem that make the
 // process die at the point (a reply point is installed on the client listener
 // instead; see crashListener). Driver points count occurrences from startup; I/O
-// points count that operation on the log file from startup too (the first fsync
-// is the one Open issues on the recovered state). With armedBySignal, driver
+// points count that operation on any of the node's files from startup too (the
+// first fsync is the one Open issues on the recovered state; every Open also
+// fsyncs the directory). With armedBySignal, driver
 // and reply points count only occurrences after the process receives SIGUSR1:
 // the test sends it, waits for event=crash_armed, then triggers exactly the
 // operation it wants the process to die inside.

@@ -237,3 +237,31 @@ func TestRaftModeCleanShutdownExitsZero(t *testing.T) {
 
 // compile-time guard that NodeID conversion stays valid.
 var _ transport.NodeID = transport.NodeID("x")
+
+// TestParseCrashAt pins the -crash-at syntax: every driver point (the Phase
+// 14 snapshot points included), every I/O point (rename and syncdir
+// included), the reply points, an occurrence, and the refusals.
+func TestParseCrashAt(t *testing.T) {
+	for spec, want := range map[string]fault.Op{"write:2": fault.OpWrite, "fsync": fault.OpSync, "truncate:1": fault.OpTruncate,
+		"rename:3": fault.OpRename, "syncdir:2": fault.OpSyncDir} {
+		cp, err := parseCrashAt(spec)
+		if err != nil || cp.op != want {
+			t.Errorf("%s: %+v %v", spec, cp, err)
+		}
+	}
+	for _, name := range []string{"after-save", "before-snapshot-publish", "after-snapshot-publish", "after-log-compact",
+		"before-install-publish", "after-install-publish", "after-install-boundary"} {
+		cp, err := parseCrashAt(name + ":4")
+		if err != nil || cp.driver == 0 || cp.nth != 4 || cp.driver.String() != name {
+			t.Errorf("%s: %+v %v", name, cp, err)
+		}
+	}
+	if cp, err := parseCrashAt("before-reply:1"); err != nil || cp.reply != replyBefore {
+		t.Errorf("before-reply: %+v %v", cp, err)
+	}
+	for _, bad := range []string{"nowhere:1", "after-save:0", "fsync:x", "rename:-1"} {
+		if _, err := parseCrashAt(bad); err == nil {
+			t.Errorf("%s accepted", bad)
+		}
+	}
+}

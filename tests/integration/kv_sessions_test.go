@@ -85,6 +85,9 @@ type dedupLog struct {
 func (c *rcluster) dedupEvidence(id string, limits kv.Limits) dedupLog {
 	c.t.Helper()
 	rec := c.liveLog(id)
+	if rec.Boundary.Index != 0 {
+		c.t.Fatalf("%s's log is compacted through %d; dedupEvidence replays the whole log", id, rec.Boundary.Index)
+	}
 	commit := min(rec.HardState.Commit, uint64(len(rec.Entries)))
 	store := kv.NewStoreWithLimits(limits)
 	model := lincheck.NewSessionModel(lincheck.SessionLimits{MaxSessions: limits.MaxSessions, MaxUnacked: limits.MaxUnacked})
