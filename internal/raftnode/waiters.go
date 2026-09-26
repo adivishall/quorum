@@ -14,11 +14,13 @@ import (
 var ErrLost = errors.New("raftnode: proposal lost: a different entry was committed at its index")
 
 // Outcome is what a Waiter learns: the index and term of the entry applied at
-// its index, or an error.
+// its index, the state machine's result for it (Phase 13; nil for a read
+// barrier, or a state machine without results), or an error.
 type Outcome struct {
-	Index uint64
-	Term  uint64
-	Err   error
+	Index  uint64
+	Term   uint64
+	Result any
+	Err    error
 }
 
 // Waiters is the table of client requests waiting for the state machine to reach
@@ -58,13 +60,13 @@ func (w *Waiters) Add(index, term, applied uint64) <-chan Outcome {
 	return ch
 }
 
-// Applied reports that the entry (index, term) has been applied: every waiter
-// at that index is completed — a write with its term matched succeeds, a write
-// with another term is ErrLost, a barrier succeeds — and, since application is
-// in order, so is any barrier registered at a lower index that was somehow
-// missed. Call it after AppliedTo, so a response can never precede the record
-// of the application it reports.
-func (w *Waiters) Applied(index, term uint64) {
+// Applied reports that the entry (index, term) has been applied with the given
+// result: every waiter at that index is completed — a write with its term
+// matched succeeds and receives the result (it was ITS entry), a write with
+// another term is ErrLost (the result belongs to someone else's entry and is
+// not handed over), a barrier succeeds. Call it after AppliedTo, so a response
+// can never precede the record of the application it reports.
+func (w *Waiters) Applied(index, term uint64, result any) {
 	ws, ok := w.byIndex[index]
 	if !ok {
 		return
@@ -73,8 +75,10 @@ func (w *Waiters) Applied(index, term uint64) {
 	w.n -= len(ws)
 	for _, wt := range ws {
 		switch {
-		case wt.term == 0 || wt.term == term:
+		case wt.term == 0:
 			wt.ch <- Outcome{Index: index, Term: term}
+		case wt.term == term:
+			wt.ch <- Outcome{Index: index, Term: term, Result: result}
 		default:
 			wt.ch <- Outcome{Index: index, Term: term, Err: ErrLost}
 		}
