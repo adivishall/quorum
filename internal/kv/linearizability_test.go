@@ -300,6 +300,14 @@ func TestSessionClientsUnderFaultsRetryAndStayLinearizable(t *testing.T) {
 				drop := c.net.AddRule(fault.Rule{Kinds: []transport.MsgKind{transport.MsgForward, transport.MsgForwardResponse, transport.MsgAppendEntries}, Action: fault.Drop, Count: 6})
 				waitFor(t, "dropping six messages", 10*time.Second, func() bool { return c.net.Stats().Dropped >= dropped+6 })
 				c.net.RemoveRule(drop)
+				// And exactly one forward RESPONSE: the leader executed the
+				// request, the forwarder never hears — UNKNOWN — and the
+				// client must retry the same request. (Drops that Raft heals
+				// by retransmission alone do not guarantee an unknown outcome.)
+				dropped = c.net.Stats().Dropped
+				lost := c.net.AddRule(fault.Rule{Kinds: []transport.MsgKind{transport.MsgForwardResponse}, Action: fault.Drop, Count: 1})
+				waitFor(t, "dropping a forward response", 10*time.Second, func() bool { return c.net.Stats().Dropped > dropped })
+				c.net.RemoveRule(lost)
 				waitServed(t, rec, 10, 30*time.Second)
 			}
 		})
