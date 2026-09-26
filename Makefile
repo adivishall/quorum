@@ -28,7 +28,8 @@ integration:
 
 ## mutation — mutation testing (Phase 9 Raft rules, Phase 10 failure handling and
 ## fault-model fidelity, Phase 11 crash-recovery rules, Phase 12 client-visible
-## consistency and the checker itself). Applies deliberate rule-violating edits to the source,
+## consistency and the checker itself, Phase 13 request identity, deduplication,
+## forwarding and the session client). Applies deliberate rule-violating edits to the source,
 ## runs the tests that must catch each, and requires every mutant to be killed
 ## (edits are reverted via git). Needs a clean working tree for the files it
 ## mutates. See docs/RAFT.md §12a and docs/FAULTS.md.

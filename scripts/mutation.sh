@@ -3,10 +3,13 @@
 # mutation.sh — Raft mutation testing: the Phase 9 protocol rules (docs/RAFT.md
 # §12a), the Phase 10 failure-handling rules and fault-model fidelity
 # (docs/FAULTS.md §12), the Phase 11 crash-recovery rules
-# (docs/CRASH_RECOVERY.md §10), and the Phase 12 client-visible consistency
+# (docs/CRASH_RECOVERY.md §10), the Phase 12 client-visible consistency
 # rules — ReadIndex, write completion, the client protocol and policy, the
 # state machine, and the linearizability checker itself
-# (docs/LINEARIZABILITY.md §11).
+# (docs/LINEARIZABILITY.md §11) — and the Phase 13 request-identity rules:
+# deduplication, conflicts, the watermark, bounds and eviction, forwarding, the
+# session client, the checker over logical operations and the session model
+# (docs/DEDUP.md §9).
 #
 # For each mutant it applies a real source edit that violates a specific Raft rule,
 # runs the test(s) that should catch that violation, and requires them to FAIL (the
@@ -573,6 +576,209 @@ mutant "codecs-accept-only-canonical-varints" internal/kv/command.go \
   '	if n > 0 && n != uvarintLen(v) {' \
   '	if false && n > 0 && n != uvarintLen(v) {' \
   ./internal/kv 'TestDecodeRejectsMalformedCommands|TestWireCodecsRoundTrip|FuzzDecodeIsTotal|FuzzDecodeRequestIsTotal|FuzzDecodeResponseIsTotal'
+
+echo "== Phase 13: request identity, deduplication, forwarding and the session client =="
+
+# 61. The dedup lookup is skipped: a retry of an executed request executes again.
+mutant "a-retry-is-answered-from-its-original" internal/kv/store.go \
+  '	if rec, ok := ss.results[c.RequestID]; ok {' \
+  '	if rec, ok := ss.results[c.RequestID]; ok && false {' \
+  "./internal/kv ./internal/raftsim" 'TestStoreAgreesWithTheSessionModel|TestUnknownWriteRetriedAfterLeaderCrashIsOneRequest|TestKVSimCommittedRequestRetriedAfterLeaderCrash'
+
+# 62. A reused request id is matched without its fingerprint: a DIFFERENT
+#     command under an executed id is answered as its duplicate.
+mutant "conflicting-reuse-is-detected-by-fingerprint" internal/kv/store.go \
+  '		if rec.fp == fp {' \
+  '		if true {' \
+  ./internal/kv 'TestStoreAgreesWithTheSessionModel|TestConflictingReuseAndIdentityScope'
+
+# 63. A conflicting reuse is refused but TAKES EFFECT.
+mutant "a-refused-conflict-has-no-effect" internal/kv/store.go \
+  '		return Result{Decision: Conflict}' \
+  '		s.write(c)
+		return Result{Decision: Conflict}' \
+  ./internal/kv 'TestStoreAgreesWithTheSessionModel|TestConflictingReuseAndIdentityScope'
+
+# 64. The fingerprint omits the value: PUT(k, x) and PUT(k, y) under one id are
+#     "the same request".
+mutant "the-fingerprint-covers-the-whole-command" internal/kv/command.go \
+  '	return sha256.Sum256(Command{Op: c.Op, Key: c.Key, Value: c.Value}.Encode())' \
+  '	return sha256.Sum256(Command{Op: c.Op, Key: c.Key}.Encode())' \
+  ./internal/kv 'TestConflictingReuseAndIdentityScope'
+
+# 65. An unknown (evicted) session is silently re-created: its retries execute
+#     again, their results forgotten with the eviction.
+mutant "an-evicted-session-is-never-revived" internal/kv/store.go \
+  '	if ss == nil {
+		return Result{Decision: Expired}
+	}' \
+  '	if ss == nil {
+		ss = &session{ackedBelow: 1, results: map[uint64]execution{}}
+		s.sessions[c.ClientID] = ss
+	}' \
+  "./internal/kv ./internal/raftsim" 'TestStoreAgreesWithTheSessionModel|TestEvictedSessionIsRefusedNotReexecuted|TestKVSeededHistoriesAreLinearizable/kv-sessions-evict'
+
+# 66. The watermark forgets the result AT it, not only below: a request still in
+#     flight loses its result.
+mutant "the-watermark-forgets-only-acknowledged-results" internal/kv/store.go \
+  '			if rid < w {' \
+  '			if rid <= w {' \
+  "./internal/kv ./internal/raftsim" 'TestStoreAgreesWithTheSessionModel|TestReplayRebuildsTheSessionTable|TestKVSeededHistoriesAreLinearizable/kv-sessions'
+
+# 67. A request below the watermark is executed instead of refused STALE.
+mutant "a-request-below-the-watermark-is-stale" internal/kv/store.go \
+  '	if c.RequestID < ss.ackedBelow {' \
+  '	if false && c.RequestID < ss.ackedBelow {' \
+  ./internal/kv 'TestStoreAgreesWithTheSessionModel|TestConflictingReuseAndIdentityScope'
+
+# 68. The unacknowledged-result bound is not enforced (unbounded memory).
+mutant "a-session-holds-at-most-maxunacked-results" internal/kv/store.go \
+  '	if len(ss.results) >= s.limits.MaxUnacked {' \
+  '	if false && len(ss.results) >= s.limits.MaxUnacked {' \
+  ./internal/kv 'TestStoreAgreesWithTheSessionModel|TestSessionLimitRefusesRatherThanForgets'
+
+# 69. LRU evicts the MOST recently used session — the one just registered.
+mutant "eviction-takes-the-least-recently-used" internal/kv/store.go \
+  '				if lru == 0 || ss.last < s.sessions[lru].last {' \
+  '				if lru == 0 || ss.last > s.sessions[lru].last {' \
+  "./internal/kv ./internal/raftsim" 'TestStoreAgreesWithTheSessionModel|TestEvictedSessionIsRefusedNotReexecuted|TestKVSeededHistoriesAreLinearizable/kv-sessions-evict'
+
+# 70. A forwarded request is forwarded again (forwarding can loop).
+mutant "a-forwarded-request-is-never-forwarded-again" internal/kv/server.go \
+  '	if resp.Status != StatusNotLeader || via != "" || redirectOnly {' \
+  '	if resp.Status != StatusNotLeader || redirectOnly {' \
+  ./internal/kv 'TestForwardedRequestIsNeverForwardedAgain'
+
+# 71. A forward that went unanswered is reported OK (the forwarder answers
+#     before, or without, the leader's answer).
+mutant "an-unanswered-forward-is-unknown" internal/kv/server.go \
+  '		return Response{Status: StatusUnknown, Node: s.id, Leader: leader, Message: "forwarded to " + leader + "; no answer before the deadline"}' \
+  '		return Response{Status: StatusOK, Node: s.id, Leader: leader, Message: "forwarded to " + leader + "; no answer before the deadline"}' \
+  ./internal/kv 'TestForwardedRequestWhoseAnswerIsLostIsRetriedSafely'
+
+# 72. The forwarder strips the request's identity: forwarded retries and
+#     duplicates are anonymous, never deduplicated.
+mutant "the-forwarder-keeps-the-identity" internal/kv/server.go \
+  '	payload := encodeForward(fid, budget, req)' \
+  '	payload := encodeForward(fid, budget, Request{Op: req.Op, Key: req.Key, Value: req.Value, Timeout: req.Timeout})' \
+  ./internal/kv 'TestConcurrentDuplicatesAtTwoNodes|TestForwardedRequestWhoseAnswerIsLostIsRetriedSafely'
+
+# 73. The session client sends every attempt after the first under a NEW
+#     request id (so a retry of an unknown outcome is a new request).
+mutant "a-retry-keeps-its-request-id" internal/kv/session.go \
+  'RequestID: rid, AckedBelow' \
+  'RequestID: rid + uint64(out.Attempts) - 1, AckedBelow' \
+  ./internal/kv 'TestUnknownWriteRetriedAfterLeaderCrashIsOneRequest|TestForwardedRequestWhoseAnswerIsLostIsRetriedSafely'
+
+# 74. The session client reports a request whose attempts went unanswered as
+#     KNOWN (a definite no-effect) when its attempts run out.
+mutant "an-unanswered-request-is-not-known" internal/kv/session.go \
+  '	out.Known = !unknown
+	if unknown {' \
+  '	out.Known = true
+	if unknown {' \
+  ./internal/kv 'TestDuplicateSentBeforeTheOriginalCommits'
+
+# 75. The session watermark ignores requests in flight: a concurrent request's
+#     AckedBelow passes an unanswered one, whose result the server forgets.
+mutant "the-watermark-waits-for-requests-in-flight" internal/kv/session.go \
+  '		if rid < w {
+			w = rid' \
+  '		if false && rid < w {
+			w = rid' \
+  ./internal/kv 'TestConcurrentRequestsFromOneSession'
+
+# 76. dkvd ignores -session-max / -session-max-unacked.
+mutant "dkvd-applies-the-configured-session-limits" cmd/dkvd/main.go \
+  '	store := kv.NewStoreWithLimits(limits)' \
+  '	store := kv.NewStore()' \
+  ./tests/integration 'TestRealSessionContractSurvivesFullClusterRestart'
+
+echo "== Phase 13: the checker over logical operations, and the reference model =="
+
+# 77. Request identity is not scoped by client: the same RequestID from two
+#     clients is merged into one request.
+mutant "checker-identity-includes-the-client" internal/lincheck/logical.go \
+  '		k := ident{op.ClientID, op.RequestID}' \
+  '		k := ident{1, op.RequestID}' \
+  ./internal/lincheck 'TestKnownGoodAndKnownBadCorpus|TestCheckerAgreesWithOracleOnRequestIdentity'
+
+# 78. Two different commands acknowledged under one identity are checked around
+#     instead of reported (an accepted conflicting reuse passes).
+mutant "checker-reports-an-accepted-conflict" internal/lincheck/logical.go \
+  '		if owner != nil && *owner != c {
+			return Op{}, fmt.Errorf("two different commands were both acknowledged' \
+  '		if false && owner != nil && *owner != c {
+			return Op{}, fmt.Errorf("two different commands were both acknowledged' \
+  ./internal/lincheck 'TestKnownGoodAndKnownBadCorpus|TestLogicalRefusesWhatTheContractForbidsOrLeavesOpen'
+
+# 79. A merged request is invoked at its LAST send, not its first (its effect
+#     from an early send becomes impossible).
+mutant "checker-invokes-a-request-at-its-first-send" internal/lincheck/logical.go \
+  '		if op.Invoke < m.Invoke {' \
+  '		if op.Invoke > m.Invoke || m.Invoke == math.MaxInt64 {' \
+  ./internal/lincheck 'TestKnownGoodAndKnownBadCorpus|TestCheckerAgreesWithOracleOnRequestIdentity'
+
+# 80. A merged request completes at its LAST acknowledgement, not its first
+#     (reads between the two may miss an acknowledged write).
+mutant "checker-completes-a-request-at-its-first-ok" internal/lincheck/logical.go \
+  '			if op.Complete < m.Complete {' \
+  '			if op.Complete > m.Complete || m.Complete == math.MaxInt64 {' \
+  ./internal/lincheck 'TestKnownGoodAndKnownBadCorpus|TestCheckerAgreesWithOracleOnRequestIdentity'
+
+# 81. Sends carrying another command are merged in (a refused conflicting reuse
+#     becomes part of the request).
+mutant "checker-excludes-sends-of-another-command" internal/lincheck/logical.go \
+  '		if commandOf(op) != *owner {
+			continue' \
+  '		if false && commandOf(op) != *owner {
+			continue' \
+  ./internal/lincheck 'TestKnownGoodAndKnownBadCorpus|TestCheckerAgreesWithOracleOnRequestIdentity'
+
+# 82. The reference session model deduplicates nothing (the store/model
+#     differential must cut both ways).
+mutant "model-answers-a-retry-from-its-original" internal/lincheck/session.go \
+  '		if r.rid == c.RequestID {' \
+  '		if false && r.rid == c.RequestID {' \
+  "./internal/lincheck ./internal/kv" 'TestSessionModelFollowsTheContract|TestStoreAgreesWithTheSessionModel'
+
+echo "== Phase 13: the same rules, killed by client-visible histories of real processes ALONE =="
+
+# 83. No dedup lookup, on real processes: in a crash window where the original
+#     committed, the history — A read, then B, then A again after the retry —
+#     is rejected by the checker, before any explicit assertion runs.
+mutant "a-retry-is-answered-from-its-original (real processes)" internal/kv/store.go \
+  '	if rec, ok := ss.results[c.RequestID]; ok {' \
+  '	if rec, ok := ss.results[c.RequestID]; ok && false {' \
+  ./tests/integration 'TestRealSessionRetryAcrossCrashWindows'
+
+# 84. The forwarder strips identity, on real processes: copies of one request
+#     sent through every node execute more than once.
+mutant "the-forwarder-keeps-the-identity (real processes)" internal/kv/server.go \
+  '	payload := encodeForward(fid, budget, req)' \
+  '	payload := encodeForward(fid, budget, Request{Op: req.Op, Key: req.Key, Value: req.Value, Timeout: req.Timeout})' \
+  ./tests/integration 'TestRealConcurrentDuplicatesThroughEveryNode'
+
+# 85. A new request id for a retry after a TRANSPORT failure (the connection
+#     died mid-request). In-process servers never fail at the transport, so no
+#     in-process test reaches this branch; real processes do: the retry after
+#     a forwarder died before relaying executes again.
+mutant "a-retry-after-a-dead-connection-keeps-its-request-id (real processes)" internal/kv/session.go \
+  '			unknown = true // sent, no answer: retry the same request' \
+  '			unknown = true // sent, no answer: retry the same request
+			rid = s.Reserve()' \
+  ./tests/integration 'TestRealForwarderDiesBeforeRelaying'
+
+# 86. An evicted session revived, on real processes, through a full restart.
+mutant "an-evicted-session-is-never-revived (real processes)" internal/kv/store.go \
+  '	if ss == nil {
+		return Result{Decision: Expired}
+	}' \
+  '	if ss == nil {
+		ss = &session{ackedBelow: 1, results: map[uint64]execution{}}
+		s.sessions[c.ClientID] = ss
+	}' \
+  ./tests/integration 'TestRealSessionContractSurvivesFullClusterRestart'
 
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
