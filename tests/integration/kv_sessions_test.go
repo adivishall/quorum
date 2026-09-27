@@ -158,6 +158,27 @@ func sessionWorkload(seed int64) workload.Options {
 	return o
 }
 
+// waitUnansweredWrite waits until a write attempt invoked at or after clock
+// position since has gone unanswered (its client timed out, or heard
+// UNKNOWN_OUTCOME) — the case a session client retries under the same identity.
+func (r *linRun) waitUnansweredWrite(since int64, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		for _, op := range r.rec.History().Ops {
+			if op.Kind == lincheck.Get {
+				continue
+			}
+			for _, a := range op.Attempts {
+				if a.Invoke >= since && strings.HasPrefix(a.Result, "unknown") {
+					return true
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
+}
+
 // killLeaderMidWrite kills the leader of a cluster started with
 // "-crash-at after-applied-to:1 -crash-armed-by-signal" at the point right
 // after it applies an entry — during the workload, a client's write whose
@@ -211,8 +232,18 @@ func TestRealSessionWorkloadsUnderFaults(t *testing.T) {
 			l, tm := c.waitStable(c.ids, 0, 30*time.Second)
 			r.event("isolate leader %s (term %d)", l, tm)
 			c.isolate(l)
+			since := r.rec.Mark()
 			l2, t2 := c.waitLeader(others(c.ids, l), tm, 20*time.Second)
 			r.event("%s leads term %d", l2, t2)
+			// The partition is held until it has left a session write
+			// unanswered — the attempt times out at the isolated leader,
+			// which can commit nothing, and is retried under its identity.
+			// Real timing does not guarantee it: a write already replicated
+			// before the cut commits in the new term and is answered after a
+			// short partition heals (what CI hit). If none goes unanswered in
+			// time, the attempt's premise is void.
+			r.premise(r.waitUnansweredWrite(since, 20*time.Second), "no session write went unanswered while %s was isolated", l)
+			r.event("a session write went unanswered")
 			r.waitServed(60, 60*time.Second)
 			c.healAll()
 			r.event("heal")
