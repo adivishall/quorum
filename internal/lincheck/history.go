@@ -501,6 +501,11 @@ func (r *Recorder) History() History {
 	for _, op := range r.ops {
 		cp := *op
 		cp.Outcome, cp.Complete = Incomplete, 0
+		// An op still in flight keeps recording attempts: copy them, so the
+		// history is a snapshot and not a view the recorder writes into (a
+		// data race for a caller reading it while clients run — found in Phase
+		// 14 by the first caller to read attempts mid-run).
+		cp.Attempts = append([]Attempt(nil), op.Attempts...)
 		h.Ops = append(h.Ops, cp)
 	}
 	sort.Slice(h.Ops, func(i, j int) bool { return h.Ops[i].ID < h.Ops[j].ID })
