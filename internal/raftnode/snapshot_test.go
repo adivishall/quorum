@@ -284,6 +284,7 @@ type snapCluster struct {
 	ctx           context.Context
 	dir           string
 	ids           []NodeID
+	addrs         map[NodeID]string
 	trs           map[NodeID]*transport.TCPTransport
 	nodes         map[NodeID]*Node
 	sms           map[NodeID]*snapSM
@@ -294,35 +295,38 @@ type snapCluster struct {
 
 func startSnapCluster(t *testing.T, ctx context.Context, n int, every, retain uint64) *snapCluster {
 	t.Helper()
-	c := &snapCluster{t: t, ctx: ctx, dir: t.TempDir(), trs: map[NodeID]*transport.TCPTransport{}, nodes: map[NodeID]*Node{},
-		sms: map[NodeID]*snapSM{}, every: every, retain: retain, logs: map[NodeID]*strings.Builder{}}
-	addrs := map[NodeID]string{}
+	c := &snapCluster{t: t, ctx: ctx, dir: t.TempDir(), addrs: map[NodeID]string{}, trs: map[NodeID]*transport.TCPTransport{},
+		nodes: map[NodeID]*Node{}, sms: map[NodeID]*snapSM{}, every: every, retain: retain, logs: map[NodeID]*strings.Builder{}}
 	for i := 0; i < n; i++ {
 		id := NodeID(fmt.Sprintf("n%d", i))
 		c.ids = append(c.ids, id)
-		addrs[id] = freeAddr(t)
+		c.addrs[id] = freeAddr(t)
 	}
+	t.Cleanup(c.stop)
 	for _, id := range c.ids {
-		peers := map[transport.NodeID]string{}
-		for _, other := range c.ids {
-			if other != id {
-				peers[transport.NodeID(other)] = addrs[other]
-			}
-		}
-		tr, err := transport.NewTCPTransport(transport.Config{NodeID: transport.NodeID(id), ListenAddr: addrs[id], Peers: peers})
-		if err != nil {
-			t.Fatal(err)
-		}
-		c.trs[id] = tr
 		c.logs[id] = &strings.Builder{}
 		c.start(id, nil)
 	}
-	t.Cleanup(c.stop)
 	return c
 }
 
+// start starts id's node — and its transport, if it is down — on the node's
+// durable log.
 func (c *snapCluster) start(id NodeID, hook Hook) {
 	c.t.Helper()
+	if c.trs[id] == nil {
+		peers := map[transport.NodeID]string{}
+		for _, other := range c.ids {
+			if other != id {
+				peers[transport.NodeID(other)] = c.addrs[other]
+			}
+		}
+		tr, err := transport.NewTCPTransport(transport.Config{NodeID: transport.NodeID(id), ListenAddr: c.addrs[id], Peers: peers})
+		if err != nil {
+			c.t.Fatal(err)
+		}
+		c.trs[id] = tr
+	}
 	sm := &snapSM{}
 	node, err := Start(c.ctx, Config{
 		ID: id, Peers: c.ids, Transport: c.trs[id], LogPath: filepath.Join(c.dir, string(id)+".log"),
@@ -340,6 +344,42 @@ func (c *snapCluster) start(id NodeID, hook Hook) {
 	c.nodes[id], c.sms[id] = node, sm
 }
 
+// down stops id as a process stops: its node and its transport, so nothing
+// the others send meanwhile waits to be delivered when it starts again — a
+// restarted follower sees only what its peers send it from then on.
+func (c *snapCluster) down(id NodeID) {
+	c.t.Helper()
+	_ = c.nodes[id].Close()
+	if err := c.trs[id].Close(); err != nil {
+		c.t.Fatal(err)
+	}
+	c.trs[id] = nil
+}
+
+// compactedPast waits until every node in ids has compacted its log past
+// index. A follower holding nothing beyond index can then catch up only by a
+// snapshot: Propose returns once an entry is durable in the leader's log, not
+// once it is committed, applied and snapshotted, so the tests that need a
+// snapshot transfer wait for it here.
+func (c *snapCluster) compactedPast(ids []NodeID, index uint64) {
+	c.t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		ok := true
+		for _, id := range ids {
+			ok = ok && c.nodes[id].Status().Boundary > index
+		}
+		if ok {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for _, id := range ids {
+		c.t.Logf("%s: %+v", id, c.nodes[id].Status())
+	}
+	c.t.Fatalf("the logs were not compacted past %d", index)
+}
+
 func (c *snapCluster) log(id NodeID) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -351,7 +391,9 @@ func (c *snapCluster) stop() {
 		_ = n.Close()
 	}
 	for _, tr := range c.trs {
-		_ = tr.Close()
+		if tr != nil {
+			_ = tr.Close()
+		}
 	}
 }
 
@@ -438,23 +480,17 @@ func TestLaggingFollowerCatchesUpBySnapshot(t *testing.T) {
 	ld := c.leader(c.ids)
 	lag := without(c.ids, ld)[0]
 	up := without(c.ids, lag)
-	c.nodes[lag].Close()
+	last := c.nodes[lag].Status().LastIndex
+	c.down(lag)
 
 	c.propose(up, cmds("b", 80))
-	// Propose returns once the entry is durable in the leader's log; the
-	// snapshots come as entries are applied.
-	nl := c.nodes[c.leader(up)]
-	waitApplied(t, nl, nl.Status().LastIndex)
-	if b := nl.Status().Boundary; b < 60 {
-		t.Fatalf("leader boundary %d: the log was not compacted past the lagging follower", b)
-	}
+	c.compactedPast(up, last)
 	c.start(lag, nil)
 	c.propose(c.ids, cmds("c", 3))
 	c.converged(c.ids)
-	// At least one install: offers the leader made while the follower's node
-	// was down reached its (still connected) transport and are delivered late,
-	// so an older snapshot may be installed before the newest — each above the
-	// commit index at the time, as the install rule allows.
+	// At least one install: an offer retried while a transfer is under way
+	// may bring a newer snapshot after the first — each above the commit
+	// index at the time, as the install rule allows.
 	_, _, restores := c.sms[lag].state()
 	if restores < 1 || !strings.Contains(c.log(lag), "event=raft_snapshot_received") {
 		t.Fatalf("the lagging follower did not catch up by a snapshot (restores %d):\n%s", restores, c.log(lag))
@@ -464,7 +500,7 @@ func TestLaggingFollowerCatchesUpBySnapshot(t *testing.T) {
 	}
 
 	// Restart the follower: it recovers from the snapshot it installed.
-	c.nodes[lag].Close()
+	c.down(lag)
 	before := len(c.log(lag))
 	c.start(lag, nil)
 	c.propose(c.ids, cmds("d", 3))
@@ -477,7 +513,10 @@ func TestLaggingFollowerCatchesUpBySnapshot(t *testing.T) {
 // TestInstallCrashPointsRecover crashes a lagging follower at each boundary of
 // installing the leader's snapshot (docs/SNAPSHOTS.md §8) and restarts it: it
 // recovers — completing the install itself after the snapshot was published
-// (the repair of §6) — and converges to the leader's state.
+// (the repair of §6) — and converges to the leader's state. The follower is
+// down, transport and all, until the others have compacted past its log, so
+// its first install is of a snapshot whose entry it does not hold: the install
+// the repair has to complete.
 func TestInstallCrashPointsRecover(t *testing.T) {
 	for _, p := range []Point{BeforeInstallPublish, AfterInstallPublish, AfterInstallBoundary} {
 		t.Run(p.String(), func(t *testing.T) {
@@ -488,8 +527,10 @@ func TestInstallCrashPointsRecover(t *testing.T) {
 			ld := c.leader(c.ids)
 			lag := without(c.ids, ld)[0]
 			up := without(c.ids, lag)
-			c.nodes[lag].Close()
+			last := c.nodes[lag].Status().LastIndex
+			c.down(lag)
 			c.propose(up, cmds("b", 50))
+			c.compactedPast(up, last)
 
 			hook, fired := crashHook(p, 1)
 			c.start(lag, hook)
@@ -499,7 +540,7 @@ func TestInstallCrashPointsRecover(t *testing.T) {
 				t.Fatalf("%s never reached:\n%s", p, c.log(lag))
 			}
 			<-c.nodes[lag].Done()
-			c.nodes[lag].Close()
+			c.down(lag)
 
 			c.start(lag, nil)
 			c.propose(c.ids, cmds("c", 3))

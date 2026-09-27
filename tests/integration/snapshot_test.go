@@ -230,8 +230,9 @@ func (c *rcluster) waitBoundary(id string, past uint64, d time.Duration) {
 	}
 }
 
-// lagFollower kills a follower, writes n keys, and waits until the leader's
-// log is compacted past everything the follower holds.
+// lagFollower kills a follower, writes n keys, and waits until every other
+// node's log is compacted past everything the follower holds — so whichever
+// of them leads when it returns can bring it up to date only by a snapshot.
 func (c *rcluster) lagFollower(w *writer, n int) (leader, lag string) {
 	c.t.Helper()
 	leader, _ = c.waitStable(c.ids, 0, 20*time.Second)
@@ -239,7 +240,9 @@ func (c *rcluster) lagFollower(w *writer, n int) (leader, lag string) {
 	c.kill(lag)
 	behind := c.liveLog(lag).LastIndex()
 	w.putN("lag", n)
-	c.waitBoundary(leader, behind, 20*time.Second)
+	for _, id := range others(c.ids, lag) {
+		c.waitBoundary(id, behind, 20*time.Second)
+	}
 	return leader, lag
 }
 

@@ -371,6 +371,18 @@ most `every` replayed, independent of how long the node has run — are asserted
    shows an unanswered write (a void premise restarts the scenario). Reading the history mid-run
    for that exposed a data race in `lincheck.Recorder.History`, which shared the attempts of ops in
    flight; it now copies them (`TestHistoryIsASnapshotWhileClientsRecord`, mutant 124).
+7. **CI found a second timing premise, in a unit test** (again not a product failure).
+   `TestInstallCrashPointsRecover` restarted its lagging follower as soon as the leader had
+   *accepted* the writes — `Propose` returns once an entry is durable in the leader's log, before
+   it commits — so on a loaded race runner nothing had been compacted yet and the follower caught
+   up by entries, never reaching the install crash point. The test cluster also left a stopped
+   node's transport open, so appends sent before the compaction were delivered after the restart,
+   and the follower could hold a snapshot's entry before installing it — then there is nothing for
+   recovery to repair. Reproduced locally (six parallel race runs at `GOMAXPROCS=1`: most subtests
+   failed). The test cluster now stops a node as a process stops — node and transport — and
+   restarts a lagging follower only once every other node has compacted past its log
+   (`compactedPast`; the real-process `lagFollower` now waits on every other node too, not only the
+   leader). The same stress then passed 192 of 192 runs.
 
 ## 18. Mutation testing
 
