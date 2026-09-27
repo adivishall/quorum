@@ -35,11 +35,16 @@ apply-time decision is checked against an independent model — are linearizable
 **Still verified from earlier phases.** Raft's safety properties (INV-R1..R10; Phase 9), under
 injected faults (Phase 10, `docs/FAULTS.md`), and across crashes at every boundary of the node's
 cycle (Phase 11, `docs/CRASH_RECOVERY.md`: application is at-least-once across restarts, exactly-once
-within an incarnation — the applied index is volatile and a restart replays the committed prefix).
+within an incarnation — the applied index is volatile and a restart replays the committed prefix
+after the published snapshot). Since Phase 14 all of the above holds with snapshots and log
+compaction (`docs/SNAPSHOTS.md`): a restored snapshot is exactly the replicated state at its index
+and the session table travels in it (INV-SN1..SN6), so linearizability and deduplication are
+unchanged across snapshots, installs and restarts from snapshots — verified by the `kv-snapshots-*`
+histories, the snapshot crash matrix and ten real-process snapshot tests.
 
 **Not yet verified.** More than one Raft group and routed keys (the routing layer is not wired to Raft); the Phase 15 API
-and `stale` reads (C5 — no such mode exists yet); snapshots and membership change (Phase 14+);
-the storage engine hosted by a node; real power-loss durability.
+and `stale` reads (C5 — no such mode exists yet); membership change (Phase 15+); the storage
+engine hosted by a node; real power-loss durability.
 
 ---
 

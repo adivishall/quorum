@@ -343,6 +343,14 @@ Consensus Algorithm"), sections 5.1–5.4 plus §7 snapshots.
 > registered count) and the read index raised to the leader's own no-op. Writes complete to the
 > client only when committed and applied in their proposal's term (`raftnode.Node.Write`). The
 > client-visible histories are checked for linearizability.
+>
+> **Phase 14 update (ADR-021, docs/SNAPSHOTS.md).** §7 snapshots are **implemented**: the log has a
+> compaction boundary; the core offers a snapshot when a follower's `nextIndex` is at or below it
+> and installs one by the §7 rule; the driver publishes a snapshot of the state machine (its
+> canonical encoding, session table included) by atomic rename before rewriting the durable log
+> without the prefix, streams it in ≤ 1 MiB chunks over the InstallSnapshot kind, and installs a
+> received one in the order term → publication → boundary record → restore; recovery reconciles
+> the snapshot with the log (docs/SNAPSHOTS.md §6).
 
 ### 8.1 Persistent state (fsynced before any RPC reply that depends on it)
 
@@ -449,8 +457,10 @@ transport still carries them as opaque bytes. `Forward` and `ForwardResponse` (a
 proxied one hop to the leader, and its answer) are **implemented in Phase 13** — the payload is a
 forward id, the remaining time budget and the client request (or response) in the client
 encoding, codec in `internal/kv`, carried by `raftnode.SendApp` and dispatched to the
-application's handler (`docs/API.md` §6, ADR-020). `InstallSnapshot` and its response remain a
-**reserved kind identifier** for Phase 14 with no codec or semantics yet.
+application's handler (`docs/API.md` §6, ADR-020). `InstallSnapshot` and its response are
+**implemented in Phase 14**: kind 20 carries one chunk of the published snapshot file (codec in
+`internal/snapshot`), kind 21 the core's `MsgSnapshotResponse` (codec in `internal/raft`) —
+ADR-021, `docs/SNAPSHOTS.md` §9.
 
 Payloads use a hand-written binary codec (explicit `Marshal`/`Unmarshal`, varints, no
 reflection). Not gob, not JSON, not protobuf. Reasons, in order of weight:
@@ -477,10 +487,14 @@ inspectable with `curl` during a demo.
 2.  Sweep orphan SSTables (on disk but not in the manifest) — delete.
 3.  Replay engine WAL segments >= logNumber into a fresh memtable.
         Torn tail → truncate (§2). Mid-log corruption → abort.
-4.  Open the raft log; replay Entry and HardState records; truncate a torn tail; fsync.
-        → currentTerm, votedFor, entries[]   (durable before the node acts on them — Phase 10;
-          every crash window of this step and of the cycle it recovers from is
+4.  Open the raft log; replay Entry, HardState and Boundary records; truncate a torn tail;
+        fsync the file and the directory.
+        → currentTerm, votedFor, boundary, entries[]   (durable before the node acts on them —
+          Phase 10; every crash window of this step and of the cycle it recovers from is
           tested in Phase 11, docs/CRASH_RECOVERY.md)
+4a. (Phase 14) Remove snapshot temporaries; load and validate the published snapshot;
+        reconcile it with the log — recover, complete an interrupted install, or refuse
+        (docs/SNAPSHOTS.md §6); restore the state machine from it.
 5.  Reconcile: engine.appliedIndex must be <= raft.lastIndex.
         If engine.appliedIndex > raft.lastIndex → ErrInconsistent, refuse to start.
         (This means the state machine is ahead of its own log: impossible unless the

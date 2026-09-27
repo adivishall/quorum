@@ -1,7 +1,7 @@
 # ARCHITECTURE
 
 Status: **specification.** Every claim here is a *design intent* for the finished system,
-not a description of what exists. As of Phase 13 these parts are real: the storage engine (WAL,
+not a description of what exists. As of Phase 14 these parts are real: the storage engine (WAL,
 memtable, SSTables, Bloom filters, compaction, MANIFEST — Phases 1–5), routing as a library
 (Phase 6), node processes and the TCP transport (Phase 7), the local replicated-log model (Phase
 8), a single Raft group with a durable log and node driver (Phase 9), fault injection (Phase 10),
@@ -9,9 +9,11 @@ crash-window recovery (Phase 11), and — Phase 12 — a replicated key-value st
 (`internal/kv`, in memory), linearizable reads through ReadIndex, write completion at
 commit-and-apply, and — Phase 13 — request identity (cluster-assigned sessions), deduplication at
 apply from a replicated session table, one-hop request forwarding and a retrying session client,
-over a framed client protocol (wire v2) on each node's `-client-listen` port. The HTTP client API,
-one Raft group per hosted shard, the LSM engine as the state machine, snapshots and the dashboard
-are still design.
+over a framed client protocol (wire v2) on each node's `-client-listen` port, and — Phase 14 —
+snapshots of the replicated state (session table included) with log compaction and follower
+installation over the InstallSnapshot transport kind (`docs/SNAPSHOTS.md`). The HTTP client API,
+one Raft group per hosted shard, the LSM engine as the state machine and the dashboard are still
+design.
 `docs/LIMITATIONS.md` and the per-phase reports record what is actually true of the code at any
 point in time.
 
@@ -252,6 +254,12 @@ Everything is validated under `go test -race`.
 
 Two logs exist per shard (Raft log and engine WAL). That is a real 2x write amplification
 and we are not going to hide it — see `docs/DESIGN.md` §"Write amplification".
+
+**As built (Phase 14), one group per node:** `<data-dir>/raft-<id>.log` (one record stream:
+entries, HardStates and boundary records — the HardState is not a separate file),
+`<data-dir>/raft-<id>.log.snap` (the one published snapshot), and the temporaries
+`raft-<id>.log.tmp` (a compaction's rewrite), `.snap.tmp` (a snapshot being published) and
+`.snap.recv` (a snapshot being received), all removed at startup (`docs/SNAPSHOTS.md` §12).
 
 ---
 

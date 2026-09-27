@@ -175,10 +175,14 @@ at-least-once across restarts and exactly-once within an incarnation — pinned 
 
 ## 10. Persistence and ordering (`internal/raftlog`)
 
-The durable log is an append-only record stream (§2 framing) of two record kinds:
+The durable log is an append-only record stream (§2 framing) of three record kinds:
 
 - **`Entry`** — `index, term, data` (bounded varints + length-prefixed bytes).
 - **`HardState`** — `currentTerm, votedFor, commitIndex` (commitIndex an optimization).
+- **`Boundary`** (Phase 14) — `index, term`: a durable snapshot covers the log through `index`.
+  Replay applies it by the install rule (keep the entries after it only if the log holds `index`
+  with that term); a compaction rewrites the file as boundary + HardState + the entries after it,
+  atomically (temporary file, fsync, rename, directory fsync) — §15, `docs/SNAPSHOTS.md` §5.
 
 A conflicting-suffix replacement is **appended**, not rewritten: recovery replays records in file
 order and applies each `Entry` at index `i` as "set `i`, drop anything above `i`" (the Phase 8
@@ -230,7 +234,12 @@ loss would still erase — the Phase 10 simulator found exactly that, `docs/FAUL
 startup path is one function, `raftnode.Recover`, which the deterministic simulator uses too. It builds a `MemoryLog` from the entries, sets `commitIndex`, and
 constructs the core in Follower state at the recovered term. Recovery verifies indexes are still
 contiguous, terms non-decreasing, and `currentTerm` does not move backward; incoherent state is
-refused, not repaired (`TestRecoverRefusesATermBelowItsLog`). Snapshot recovery is **not** Phase 9.
+refused, not repaired (`TestRecoverRefusesATermBelowItsLog`). Since Phase 14 recovery first loads
+and validates the published snapshot and reconciles it with the log — the in-memory log starts at
+the log's boundary, the state machine is restored from the snapshot and `appliedIndex` set to its
+index; an install that crashed after publishing is completed; every contradiction is refused
+(`docs/SNAPSHOTS.md` §6). Since Phase 14 `raftlog.Open` also fsyncs the log's directory on every
+open, so a compaction's rename that survived a process crash is durable before the node acts.
 Phase 11 (`docs/CRASH_RECOVERY.md`) crashes the node at every boundary of this cycle and of
 recovery itself and checks what each restart recovers against an independent record of every
 `Save` (INV-F2, INV-CR1..4).
@@ -332,3 +341,37 @@ membership (v1 never). Power-loss durability is not tested (SIGKILL only), as ev
 project (`docs/FAILURE_MODEL.md`). **No end-to-end linearizability guarantee, no client/API
 semantics, no snapshots, and no dynamic membership were added.** Raft functioning is a necessary
 part of the Quorum consistency model, not the whole of it.
+
+## 15. Snapshots and log compaction (Phase 14, Raft §7)
+
+The in-memory log (`replication.MemoryLog`) has a **boundary** `(index, term)` — the last compacted
+entry: `FirstIndex = boundary + 1`, `Term(boundary)` is answerable, anything below is
+`ErrCompacted`, and `boundary ≤ applied ≤ commit ≤ last`. `Compact(i)` needs `i ≤ applied`;
+`InstallSnapshot(i, t)` needs `i > commit`, keeps the suffix only if the log holds `i` with term
+`t`, and sets commit = applied = `i`. The pure core adds two messages and nothing impure:
+
+- **Leader.** When `nextIndex[peer] ≤ boundary` the entries the peer needs are gone: the core emits
+  `MsgSnapshot(boundary, term)` once, marks the peer pending, sends it only heartbeats at the
+  boundary meanwhile, ignores its rejections (they say nothing new), and withdraws the offer after
+  `SnapshotRetryTicks` ticks without an answer so the next heartbeat offers again. A success
+  (`MsgSnapshotResponse` or an AppendEntries success) at or beyond the offer ends it and
+  replication resumes at once.
+- **Follower.** Term rules as for AppendEntries. A snapshot at or below the commit index is already
+  covered: answered success at the commit, nothing changed. Otherwise the log is reset to it, and
+  the `Ready` carries `Snapshot` — which the driver must make durable (term, publication, boundary
+  record, state machine) before the `Ready`'s messages, the response among them.
+- **A stale rejection never backs `nextIndex` up to or below `matchIndex`** (the peer's log holds
+  the leader's entries through it for the rest of the term). Before Phase 14 such a rejection cost
+  a resend; with a compacted prefix it stranded the peer in a covered-snapshot loop — found by the
+  200-seed gate, `docs/SNAPSHOTS.md` §17.
+- **Boundary-aware helpers.** AppendEntries skips entries below the follower's boundary; the
+  conflict back-up (`firstIndexOfTerm`, `lastIndexOfTerm`) stops at the boundary; `TermAt` names a
+  snapshot for the driver.
+
+Every FirstIndex == 1 assumption was audited: the log, the core, the durable log, the driver, the
+simulator's checks and the integration harness are boundary-aware; helpers that need a whole log
+refuse a compacted one. Evidence: `internal/raft` snapshot tests (a lagging follower catching up,
+an unanswered offer re-offered, a matching suffix kept, a covered snapshot ignored, AppendEntries
+below a boundary, compaction needing the applied index, back-up stopping at the boundary) and 40
+randomized schedules with compaction; `internal/replication`'s differential test against a
+reference log with `Compact` and `InstallSnapshot`; everything in `docs/SNAPSHOTS.md`.

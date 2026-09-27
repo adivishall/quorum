@@ -390,3 +390,44 @@ passed the entire `internal/raft` suite.
   recovery — are Phase 11's (`docs/CRASH_RECOVERY.md`).
 - The real-process election-safety monitor samples every 20 ms and can miss a violation that
   lasts less; the simulator's check sees every event.
+
+## 15. Snapshots under faults (Phase 14)
+
+The fault model extends to snapshots without changing: the same seam, decorators and simulator,
+now driving snapshot creation, publication, compaction, transfer and installation through the
+driver's own functions (`docs/SNAPSHOTS.md`, ADR-021).
+
+- **New events.** `snapshot N` (create one now), `corrupt A B P N` (flip a byte of an in-flight
+  snapshot chunk), `corruptsnap N B` (damage a down node's published snapshot), `failpersist N
+  rename|syncdir` (a rename or directory fsync fails), and crash points at every rename and
+  directory fsync. `FailPersist` and the write/fsync crash points now reach every file of a node
+  (the log and its snapshot files). A snapshot travels as small chunk flights, so every message
+  fault — drop, duplicate, delay, reorder — applies to transfers.
+- **New profiles** (each must, across its seed set, snapshot and compact, install a snapshot on a
+  lagging node, restart from a snapshot, refuse a corrupted chunk, and crash at a snapshot point,
+  as its weights imply): `snapshots` (crashes, message faults, corrupted chunks), `snapshot-partitions`
+  (5 nodes, partitions and splits — the lagging-follower path), `snapshot-crashpoints` (every crash
+  on an exact boundary, snapshot points included), `snapshot-disk` (failed writes, fsyncs, renames
+  and directory fsyncs, power loss), and the client profiles `kv-snapshots-crashes`,
+  `kv-snapshots-crashpoints`, `kv-snapshots-partitions`, `kv-snapshots-evict` (tiny session
+  limits), whose histories must be linearizable. Profiles without snapshots arm only the Phase 11
+  points, exactly as before; the golden trace is unchanged. `FuzzSnapshotSchedule` searches the
+  same space.
+- **The spec's minimum set:** snapshot creation under disk failure (`snapshot-disk`;
+  `TestSnapshotCreationUnderAFailedDisk` — fail-stop, recovery from the full log;
+  `TestSnapshotCreationUnderAStalledDisk` — nothing compacted until the snapshot is durable);
+  installation under message duplication (`TestSimDuplicatedAndReorderedTransfers` — installed
+  once); transfer under partition (`snapshot-partitions`, `kv-snapshots-partitions`, real test 10);
+  recovery after crash (the snapshot crash matrix, real tests 4–6).
+- **Checks added** (checked at the instant each is defined): INV-SN1 (every snapshot is the
+  reference model's state at its index, byte-identical across nodes), INV-SN2 (a restore is of the
+  published, valid snapshot), INV-SN3 (no log compacted past its durable snapshot; a completed
+  publication survives every crash; published snapshots only move forward). Every earlier check is
+  boundary-aware.
+- **What the schedules found.** At 200 seeds, `kv-snapshots-partitions` found a core liveness bug
+  latent since Phase 9 and made reachable by compaction — a stale AppendEntries rejection backed
+  `nextIndex` below the peer's match, and with the prefix compacted the peer was offered covered
+  snapshots forever (seed 100) — and a simulator bug, a duplicated chunk losing its payload (seed
+  153). Both are fixed, replayed by `TestSnapshotRegressionSeeds` and pinned by mutants
+  (`docs/SNAPSHOTS.md` §17).
+- **Still modeled only:** real power loss; a real disk error during a snapshot on a real process.

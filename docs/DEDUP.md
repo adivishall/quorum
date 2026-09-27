@@ -203,8 +203,9 @@ orders of magnitude.
 limits (§6); a forwarder's table of forwards awaiting an answer by the requests in flight (each
 entry is removed when its forward completes or times out); a session client's in-flight set by the
 caller's concurrency. The one unbounded structure on the request path is pre-existing: the Raft log
-itself, which nothing truncates until Phase 14 — and every request, including a duplicate, a
-refusal decided at apply, or a request naming an unknown session, adds an entry to it.
+itself — every request, including a duplicate, a refusal decided at apply, or a request naming an
+unknown session, adds an entry to it. Since Phase 14 snapshots bound it: the log keeps fewer than
+`-snapshot-every` + `-snapshot-retain` applied entries (`docs/SNAPSHOTS.md` §15).
 
 ## 9. Mutants
 
@@ -224,9 +225,14 @@ killers.
 
 ## 10. Limitations
 
-- **No snapshots (Phase 14).** The table is rebuilt by replaying the whole log. Any snapshot must
-  include the session table — a snapshot without it would turn every retry after a restore into a
-  second execution. This is a constraint Phase 14 inherits, not something implemented here.
+- **The table travels in the snapshot (Phase 14).** A snapshot carries the whole session table —
+  every session's id, recency, watermark and remembered `(requestID, fingerprint, index)` — and the
+  limits it was built under; a restore restores it and the suffix after it is replayed as before.
+  A retry after a snapshot, a compaction that removed the request's entry everywhere, and a
+  restart of every node is still a duplicate of the original index (`docs/SNAPSHOTS.md` §10,
+  INV-SN5; mutants 101 and 120 leave the table out and are killed). A write whose index a follower
+  replaced by installing a snapshot before applying it is **unknown** (`ErrSuperseded`, status
+  `UNKNOWN_OUTCOME`), to be retried under its identity.
 - **Limits are configuration that must agree**, and nothing checks that they do.
 - **No authentication.** A client presenting another client's ClientID is that client
   (CLIENT_SEMANTICS §2).

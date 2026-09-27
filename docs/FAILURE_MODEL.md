@@ -95,7 +95,11 @@ it is not a defect we can engineer away, and any system claiming otherwise is wr
 - **Bit rot / silent data corruption** is *detected* (CRC on every record and every SSTable
   block) but not *repaired*. A corrupted SSTable makes that replica refuse to serve; repair
   means wiping the replica's data directory and letting it re-sync from the leader via
-  snapshot. That is the documented operational procedure, not an automatic one in v1.
+  snapshot. That is the documented operational procedure, not an automatic one in v1. (Since
+  Phase 14 the re-sync itself works: a fresh node catches up by installing the leader's snapshot,
+  `docs/SNAPSHOTS.md` §8. But a wiped node has also forgotten its durable term and vote, so
+  rejoining under the same id could let it vote twice in one term; without membership change the
+  procedure is not proven safe, and nothing enforces it — `docs/SNAPSHOTS.md` §16.)
 - **Full disk** and **I/O error** are surfaced as errors that fail the write and, for a Raft
   log write, stop the node rather than acknowledging something that is not durable. A node
   that cannot persist must not vote and must not acknowledge AppendEntries. *Implemented and

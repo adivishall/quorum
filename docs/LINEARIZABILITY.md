@@ -588,7 +588,10 @@ assumption for safety.
 - at-most-once semantics for **anonymous** writes under hidden retries (§4.3) — identified
   writes have them (§15); requests from a session that was evicted, or from a client that reuses
   another client's ClientID (§15.8);
-- snapshots and membership changes (Phase 14+) — the argument assumes fixed membership;
+- membership changes (Phase 15+) — the argument assumes fixed membership (snapshots, Phase 14,
+  do not change it: a restored snapshot is exactly the replicated state at its index — INV-SN1 —
+  and the `kv-snapshots-*` histories and the real-process snapshot tests are checked like every
+  other, `docs/SNAPSHOTS.md`);
 - the Phase 15 API and stale-mode reads (none exist yet).
 
 ---
@@ -887,5 +890,6 @@ replica-identical decisions (INV-X11); bounded memory (DEDUP §6).
 **Not claimed:** exactly-once *delivery*; anything for anonymous writes beyond Phase 12; a
 retry's answer after its session was evicted (`SESSION_EXPIRED`: the outcome of earlier attempts
 stays unknown); protection against a client that presents another client's ClientID or reuses a
-RequestID for another command (it is refused, not protected); snapshots (the session table is
-rebuilt by full replay; Phase 14 must carry it); more than one Raft group.
+RequestID for another command (it is refused, not protected); more than one Raft group. (Since
+Phase 14 the session table travels in the snapshot, and a retry after a snapshot, a compaction and
+a restart is still a duplicate — `docs/SNAPSHOTS.md` §10, INV-SN5.)

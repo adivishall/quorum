@@ -388,7 +388,37 @@ bounded result, not a proof over all executions (LINEARIZABILITY §12).
 "Verified" for INV-X1/X3 is a statement about recorded, finite histories from one Raft group of
 three nodes — real processes, the real driver, and seeded simulations — plus an argument
 (LINEARIZABILITY §3, §5.2) whose assumptions are named. It is not a proof over every execution,
-and it does not cover routed multi-group deployments, snapshots, membership change, or hidden
-retries of **anonymous** writes (identified writes: INV-X2, Phase 13). INV-X5..X8 and INV-X11 are
+and it does not cover routed multi-group deployments, membership change, or hidden retries of
+**anonymous** writes (identified writes: INV-X2, Phase 13). Since Phase 14 it covers histories with
+snapshots, compaction and installs: the `kv-snapshots-*` profiles and the real-process snapshot
+tests (INV-SN5). INV-X5..X8 and INV-X11 are
 implementation invariants checked at the instant they must hold in the simulator, independently of
 the history checker, so a checker bug could not hide a violation of them.
+
+## Snapshots and log compaction (Phase 14)
+
+Enforced by `internal/snapshot`, `internal/kv` (the state's encoding and validation),
+`internal/replication` and `internal/raft` (the boundary and the install rule), `internal/raftlog`
+(the boundary record and the compaction rewrite) and `internal/raftnode` (the orderings and
+recovery); specified in `docs/SNAPSHOTS.md` and introduced by ADR-021. The spec's candidates were
+named INV-S1..S6; `S` is the storage engine's namespace, so they are the `SN` series. Each was
+evaluated and adopted only with a check at the instant it must hold and mutants its tests kill.
+INV-R, F, CR and X stay in force throughout, boundary-aware.
+
+| ID | Invariant | Checked by | Status |
+|---|---|---|---|
+| INV-SN1 | **A snapshot is exactly the replicated state at its index.** The state a snapshot holds at index *S* — the key-value map and the whole session table — equals the reference session model folded over the committed log through *S*; it covers only committed entries; and every snapshot at one index, on any node, in any incarnation, is byte-identical (the encoding is canonical and deterministic). | `internal/raftsim`: `checkSnapshotState` at every creation and every restore, against `lincheck.SessionModel` and a per-index SHA-256; `internal/kv`: `TestRestoredStateMatchesTheModel`, `TestSnapshotRoundTripIsCanonical`; `internal/snapshot`: `TestRoundTripAndDeterminism`; mutants 101, 120 | VERIFIED (simulation; unit) |
+| INV-SN2 | **Nothing partial or invalid becomes active.** A state machine is restored only from a complete snapshot that validated — the file (records, checksums, SHA-256, metadata, nothing after the footer), the group and the state — and, at every restore, it is the node's published snapshot. | `internal/raftsim`: `checkRestored` at every restore; `TestReceiverAcceptsOnlyAnInOrderCompleteSnapshot`, `TestReceiveRefusesWhatCannotBeInstalled`, `TestEveryTruncationAndEveryBitFlipIsCorruption`, the two corpora (33 + 31 files), `TestSimCorruptedChunkIsRefusedAndRetried`, `TestSimDuplicatedAndReorderedTransfers`, `TestSimCorruptPublishedSnapshotRefusesToStart`; `FuzzDecode`, `FuzzUnmarshalChunk`, `FuzzRestoreSnapshot`; mutants 98–100, 105, 106, 116, 117 | VERIFIED |
+| INV-SN3 | **Compaction never discards the only record of committed state.** A node's durable log boundary is never above the index of its durable snapshot; a completed publication survives every crash; a node's published snapshot only moves forward; recovery refuses a log compacted past its snapshot. | `internal/raftsim`: `checkSN3` after every compaction and install (on the disk's durable view), the recovered snapshot checked against the last completed publication at every boot; the snapshot crash matrix (2,976 crashes); `TestPublishIsAtomicUnderEveryCrash`, `TestCompactIsAtomicUnderEveryCrash`, `TestReconcileTable`, `TestRecoverRefusesAContradictedSnapshot`; real processes: every node's durable files checked at the end of each snapshot test; mutants 93–95, 110, 111, 113, 114 | VERIFIED (simulation incl. modeled power loss; process kill) |
+| INV-SN4 | **Snapshot + suffix is the full log.** The state after restoring a snapshot and applying the committed entries after it equals the state replaying the uncompacted committed prefix would produce — at a restart, after an install, after a repaired install. | `TestSnapshotPlusSuffixEqualsFullReplay` (every cut of 120 runs); `internal/raftsim`: INV-X11 at every apply after every restore, `checkStores` after every run; `TestRecoverFromSnapshotAndSuffix`, `TestSimRestartFromSnapshotAfterPowerLoss`, `TestSimSuccessiveSnapshotsWithCrashesBetween`; real processes: durable states rebuilt from snapshot + log identical on every node; mutants 96, 97, 103, 107–109, 112, 119, 121 | VERIFIED |
+| INV-SN5 | **Deduplication survives snapshots.** Every request's decision after a restore — executed, duplicate with the original index, conflict, stale, expired, limit — is the decision the reference session model makes without snapshots; a retry of an executed request whose entry was compacted away everywhere is a duplicate of its original index. | INV-X11 at every apply of every replica in the `kv-snapshots-*` profiles; `TestSimDedupSurvivesSnapshotCompactionAndRestart`; `TestRealRetryAfterSnapshotIsADuplicate`, `TestRealConflictingRequestIDAfterSnapshot`; the logical histories linearizable; mutants 101, 118, 120 | VERIFIED (recorded histories; simulation; real processes) |
+| INV-SN6 | **A follower that installed a snapshot resumes replication.** It ends its leader's offer, continues by AppendEntries after the snapshot, and converges to the leader's log and state. | INV-F3 at the end of every simulator run; `TestSimLaggingFollowerInstallsASnapshot`, `TestLaggingFollowerCatchesUpBySnapshot` (core and driver), `TestRandomizedSchedulesWithCompaction`, `TestStaleRejectionNeverBacksUpBelowTheMatch`, `TestSnapshotRegressionSeeds`; real tests 2, 3, 9, 10; mutants 102, 104, 115, 122 | VERIFIED |
+
+### Note on the SN series and what it does not cover
+
+INV-SN3's crash half is proven against a process crash on real processes and files, and against a
+**modeled** power loss in the simulator — real power loss is untested, as everywhere. INV-SN1's
+model comparison runs in the simulator (where every snapshot's state is compared); real processes
+compare the nodes' durable states with each other and with every acknowledged write. None of the
+series says anything about a state beyond the 512 MiB snapshot bound (it is not snapshotted), about
+membership change, or about more than one group (`docs/SNAPSHOTS.md` §16).

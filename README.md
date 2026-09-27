@@ -6,7 +6,7 @@ Quorum is currently implementing its durable storage engine. No Raft library, no
 database, no consensus service — the storage engine and the consensus implementation are
 the project, and they are being built in that order.
 
-> **Status: Phase 13 of 25 — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, a working Raft consensus core, deterministic fault injection, a proven crash-recovery model for the Raft node, client-visible linearizability of single-key operations on one Raft group, and safe client retries: request identity, deduplication at apply and request forwarding, checked on real client histories.**
+> **Status: Phase 14 of 25 — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, a working Raft consensus core, deterministic fault injection, a proven crash-recovery model for the Raft node, client-visible linearizability of single-key operations on one Raft group, safe client retries (request identity, deduplication at apply and request forwarding), and snapshots with log compaction and follower installation, checked on real client histories.**
 >
 > **Implemented:** a write-ahead log, an ordered memtable, immutable on-disk SSTables, Bloom
 > filters, size-tiered compaction, crash-safe MANIFEST-based file publication, and restart
@@ -60,13 +60,24 @@ the project, and they are being built in that order.
 > of a real process, forwarders killed before relaying, concurrent copies through every node, a
 > full-cluster restart, and 1,200 more seeded simulator runs in which every replica's every
 > apply-time decision matches an independent model. 32 more mutants are killed.
+> Phase 14 adds **snapshots and log compaction** (`docs/SNAPSHOTS.md`): the replicated state —
+> key-value map and session table — in a versioned, checksummed, deterministic snapshot file,
+> published by atomic rename before the log is compacted behind it by an atomic rewrite; a follower
+> whose needed entries are gone catches up by installing the leader's snapshot, streamed in chunks
+> over the transport's InstallSnapshot kind; recovery reconciles the snapshot with the log and
+> refuses every contradiction. A 2,976-crash matrix over every snapshot window (0 failures), seeded
+> snapshot fault schedules, and ten real-process tests — including a SIGKILL after publication and
+> mid-install, and a retry whose entry was compacted away on every node answered as a duplicate.
+> 100,000 writes: a restart replays 1 entry instead of 100,001. 31 more mutants are killed; the
+> 200-seed schedules found a latent core liveness bug that compaction made reachable (a stale
+> rejection stranding a follower), now fixed.
 >
 > **What that claim is, exactly:** single-key PUT/GET/DELETE on **one** Raft group; every
 > recorded finite history linearizable, plus an argument with named assumptions — not a proof
 > over every execution; retries are inside the claim for identified writes (at most one execution
 > per request — exactly one if it executes; not exactly-once delivery), and anonymous writes keep
-> Phase 12's semantics. **Not implemented:** the HTTP API, multi-group routing, snapshots, dynamic
-> membership, a dashboard, the LSM engine as the replicated state machine. See
+> Phase 12's semantics. **Not implemented:** the HTTP API, multi-group routing, dynamic membership,
+> a dashboard, the LSM engine as the replicated state machine. See
 > [docs/ROADMAP.md](docs/ROADMAP.md) for exactly what is done and what is not.
 >
 > The binary is still called `dkv`; that is the command name, not the project name.
@@ -140,8 +151,13 @@ retry ─────────────▶│  sessions · request ids · 
                     │  logical-operation checking · session model        │
                     └────────────────────────────────────────────────────┘
 
+                    ┌───────── implemented, Phase 14 (snapshots) ────────┐
+log growth ────────▶│  snapshot + atomic publish · log compaction        │
+                    │  InstallSnapshot streaming · recovery reconcile    │
+                    │  session table in the snapshot · crash matrix      │
+                    └────────────────────────────────────────────────────┘
+
                     ┌──────────────── not implemented ───────────────────┐
-                    │  snapshots                                         │ Phase 14
                     │  HTTP API · dashboard                              │ Phases 15+
                     └────────────────────────────────────────────────────┘
 ```

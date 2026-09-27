@@ -137,7 +137,7 @@ must act on:
 | `SESSION_EXPIRED` | definite, no effect **for this attempt** | the session is unknown or evicted | register again; any earlier attempt whose outcome was unknown stays unknown forever |
 | `SESSION_LIMIT` | definite, no effect | too many unacknowledged results in this session | acknowledge (finish outstanding requests), then retry the same request |
 | `LOST` | definite, no effect **for this attempt** | the attempt's log entry was overwritten by a different one | identified: retry the same request; anonymous: it did not happen |
-| `UNKNOWN_OUTCOME` | unknown | a deadline passed, a node stopped, a forward was lost | identified: retry the same request; anonymous: do not retry a write |
+| `UNKNOWN_OUTCOME` | unknown | a deadline passed, a node stopped, a forward was lost, or (Phase 14) the serving node installed a leader's snapshot over the write's index before applying it | identified: retry the same request; anonymous: do not retry a write |
 
 A client that sees a transport failure *before* its request was sent treats it as `UNAVAILABLE`;
 *after* it was sent, as `UNKNOWN_OUTCOME`.
@@ -151,6 +151,14 @@ retries R — at any node, after any number of leader changes, restarts or recon
 retry's entry, applied after the original, is a duplicate: `OK`, with the index of the original
 execution, and no state change. The response of a duplicate is the proof the client could not get
 the first time.
+
+**Snapshots (Phase 14) change none of this.** The session table is part of the snapshot, so the
+retry of a request whose entry a snapshot has since covered — and a compaction discarded, on every
+node, and every node restarted — is still a duplicate with the original index
+(`docs/SNAPSHOTS.md` §10, `TestRealRetryAfterSnapshotIsADuplicate`). One new source of an unknown
+outcome: a node that proposed a write, lost leadership, and then caught up by installing the
+leader's snapshot cannot tell whether the entry at the write's index was its write (`ErrSuperseded`,
+reported as `UNKNOWN_OUTCOME`); the retry settles it.
 
 An unknown outcome stays unknown only if the client stops asking: it gives up (its attempts or
 its patience run out — `kv.Session` then reports `Known: false`), or its session is evicted before

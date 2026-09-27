@@ -67,7 +67,8 @@ continue; a parse failure closes the connection (matching `docs/FAILURE_MODEL.md
 
 `MaxFrameSize = 16 MiB` bounds a hostile peer's per-frame allocation. The declared `length` is
 range-checked against it **before** any buffer is sized, so a peer cannot induce a large
-allocation with a lie. (Snapshot streaming, Phase 14, will chunk rather than raise this.)
+allocation with a lie. (Snapshot streaming, Phase 14, chunks rather than raises this: a snapshot
+travels in chunks of at most 1 MiB — `docs/SNAPSHOTS.md` §9.)
 
 ## 3. Handshake
 
@@ -127,7 +128,7 @@ after the handshake both ends run a reader loop and share a mutex-guarded writer
 ## 5. Message kinds
 
 The 1-byte frame `kind` is the message type. Phase 7 implemented the probe kinds; Phase 9 activated
-the four Raft kinds; Phase 13 activated the forwarding kinds; the snapshot kinds remain reserved:
+the four Raft kinds; Phase 13 activated the forwarding kinds; Phase 14 activated the snapshot kinds:
 
 | kind | name | status |
 |---|---|---|
@@ -137,8 +138,8 @@ the four Raft kinds; Phase 13 activated the forwarding kinds; the snapshot kinds
 | 17 | `RequestVoteResponse` | implemented (Phase 9) |
 | 18 | `AppendEntries` | implemented (Phase 9) |
 | 19 | `AppendEntriesResponse` | implemented (Phase 9) |
-| 20 | `InstallSnapshot` | reserved for Phase 14 |
-| 21 | `InstallSnapshotResponse` | reserved for Phase 14 |
+| 20 | `InstallSnapshot` | implemented (Phase 14) — a snapshot chunk; codec in `internal/snapshot` (`Chunk`), streamed and reassembled by `internal/raftnode` |
+| 21 | `InstallSnapshotResponse` | implemented (Phase 14) — the core's `MsgSnapshotResponse`, codec in `internal/raft` |
 | 32 | `Forward` | implemented (Phase 13) — codec in `internal/kv`, sent with `raftnode.SendApp` |
 | 33 | `ForwardResponse` | implemented (Phase 13) |
 
@@ -147,9 +148,11 @@ transport stays ignorant of what a term means, ADR-013/ADR-016); `internal/raftn
 types to these kinds. The forwarding kinds carry a client request or response wrapped with a
 forward id (`docs/API.md` §6); `raftnode` hands every non-Raft kind it receives to the
 application's handler (`SetAppHandler`) and sends them for it (`SendApp`), so the transport and
-the Raft driver stay ignorant of client semantics. The still-reserved kinds (`InstallSnapshot`
-and its response) are **identifiers only**: their payloads depend on types that do not exist yet, and inventing fields for them now
-would be inventing later-phase behaviour. A frame with a reserved-but-unimplemented kind is accepted
+the Raft driver stay ignorant of client semantics. The snapshot kinds (Phase 14) are not a request
+and a response: kind 20 carries one chunk of the published snapshot file (`term, index, snapTerm,
+total, offset, data`, strictly decoded); the core's `MsgSnapshot` is realized as a transfer of
+chunks and a completed, validated transfer becomes a `MsgSnapshot` on the receiving side; kind 21 is
+the core's `MsgSnapshotResponse`. A frame with a reserved-but-unimplemented kind is accepted
 at the frame layer and ignored by a node that has no handler for it; an entirely unknown kind is
 `ErrUnknownKind` at the frame layer.
 
@@ -248,9 +251,8 @@ sends from one goroutine per peer (bounded outboxes), so a peer whose writes blo
 own messages (INV-F5); per-connection frame order is unaffected.
 
 **Built on top of the transport since:** Raft (Phase 9), client request forwarding (Phase 13,
-kinds 32/33). **Still not built:** shard serving, an HTTP API, a dashboard, dynamic membership and
-snapshots. The `InstallSnapshot` kinds remain reserved. `Probe` is a liveness probe, not a Raft
-heartbeat.
+kinds 32/33), snapshot installation (Phase 14, kinds 20/21). **Still not built:** shard serving, an
+HTTP API, a dashboard and dynamic membership. `Probe` is a liveness probe, not a Raft heartbeat.
 
 ## 12. Invariants
 

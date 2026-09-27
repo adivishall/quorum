@@ -89,9 +89,14 @@ This is the Raft convention (`docs/DESIGN.md` §8.4's `prevLogIndex/prevLogTerm`
 "before the log begins"), chosen here so Phase 9 inherits it rather than translating.
 
 A non-empty log occupies indexes `[1, LastIndex()]` with no gaps and no duplicates.
-`FirstIndex()` is **1** in Phase 8 and documented as such: nothing truncates the front of the
-log yet. Log compaction / snapshots (which would raise `FirstIndex`) are Phase 14 and are out of
-scope here.
+`FirstIndex()` was **1** in Phase 8: nothing truncated the front of the log. **Since Phase 14** the
+log has a compaction **boundary** `(index, term)` — the last entry a snapshot covers and the log no
+longer holds: a live log occupies `[boundary + 1, LastIndex()]`, `FirstIndex() = boundary + 1`,
+`Term(boundary)` is answerable (it is the snapshot's term), anything below is `ErrCompacted`, and
+`boundary ≤ applied ≤ commit ≤ last`. `Compact(i)` discards through an applied `i`;
+`InstallSnapshot(i, t)` resets the log to a snapshot above the commit index, keeping the entries
+after `i` only if the log holds `i` with term `t` (Raft §7). The reference-model differential and
+the fuzzer cover both (`docs/SNAPSHOTS.md` §1, `docs/RAFT.md` §15).
 
 ### 3.3 Term semantics
 
@@ -121,7 +126,7 @@ the local primitive Phase 9 needs and nothing that belongs to consensus.
 
 ```go
 type Log interface {
-    FirstIndex() uint64                       // 1 in Phase 8 (no front truncation)
+    FirstIndex() uint64                       // boundary + 1 (1 until a compaction, Phase 14)
     LastIndex() uint64                        // 0 when empty
 
     Term(index uint64) (uint64, error)        // Term(0) == 0; out-of-range errors

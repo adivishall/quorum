@@ -171,6 +171,11 @@ prefix**, from index 1, before it does anything else. Consequently:
   recovers a commit at least as high as anything the dead incarnation applied. No incarnation
   ever applies an entry the next one would not consider committed.
 
+**Since Phase 14** the prefix a restart re-applies starts after the published snapshot: the state
+machine is restored from the snapshot and only the committed entries after it are re-applied — at
+most `-snapshot-every` of them (`docs/SNAPSHOTS.md` §6, §14). The contract above holds for those
+entries; what the snapshot covers is restored, not replayed.
+
 This is the C4 "stage one" contract of `docs/CONSISTENCY.md`: application is at-least-once; a
 state machine that must be idempotent by log index (the engine, when it is hosted, records
 `appliedIndex` itself and skips at or below it — `docs/DESIGN.md` §10 step 7) will get that
@@ -267,6 +272,17 @@ brand-new log, after which a power loss removes the file and the node boots fres
 Recovery refuses a log whose last entry's term exceeds its `HardState` term rather than inventing
 a term (`TestRecoverRefusesATermBelowItsLog`) — the §5 order guarantees the node never writes one.
 
+**Phase 14 artifacts.** A `Boundary` record torn at any byte recovers the log before the install
+(`TestInstallSurvivesEveryCrash`); a boundary that moves backwards, repeats with another term,
+replaces a committed entry, or is followed by an entry at or below it is corruption
+(`TestReplayRefusesImpossibleBoundaryRecords`); a compaction's orphaned `log.tmp` is removed at
+`Open` (`TestOpenRemovesACompactionOrphan`); a crash before any I/O operation of a compaction — in
+either mode — recovers the whole old log or the whole compacted one
+(`TestCompactIsAtomicUnderEveryCrash`). That test found the phase's recovery bug: `Open` fsynced
+the directory only when it created the log, so after a compaction's rename survived a process
+crash, appends acknowledged by the restarted node could be lost with the log's name on a later
+power loss; `Open` now always fsyncs the directory (§14).
+
 ## 10. Invariants
 
 The Phase 11 invariants are the **CR** series (crash recovery), a fresh namespace; INV-F2 stays
@@ -333,3 +349,29 @@ the crash for the nth occurrence counting from the event; the trace line `crashp
 - **The storage engine behind the state-machine seam** (WAL, flush, compaction windows while
   hosted by a node) — the engine is not hosted yet; its standalone crash tests are Phases 2–4.
 - **Kernel fsync-error semantics** ("fsyncgate"), as in Phase 10.
+- **Snapshot windows on real processes** beyond the two SIGKILL points and the whole-process
+  kills of `tests/integration/snapshot_test.go`: the other snapshot points and every rename and
+  directory fsync are crashed in-process and in the simulator only.
+
+## 14. Snapshot crash windows (Phase 14)
+
+Snapshot creation and installation add six driver points — `before-snapshot-publish`,
+`after-snapshot-publish`, `after-log-compact`, `before-install-publish`, `after-install-publish`,
+`after-install-boundary` — and two I/O boundaries, `rename` and `syncdir`; the I/O points now count
+every file of the node (the log and its snapshot files). A rename or directory fsync has no handle
+for a process crash to kill, so the simulator crashes before one with a failing injection that the
+driver's error is recognized as. `dkvd -crash-at` accepts all of them. Recovery's reconciliation of
+the snapshot with the log — recover, repair (complete an interrupted install) or reject — is
+`docs/SNAPSHOTS.md` §6.
+
+Evidence: the **snapshot crash matrix** (`TestSnapshotCrashMatrix`) crashes at every one of the 992
+points of a scenario that snapshots, compacts, installs on a lagging follower, fail-stops on a torn
+write and restarts from snapshots, × process crash / power loss / torn power loss — 2,976 crashes,
+0 failures; `snapshot-crashpoints` and `kv-snapshots-crashpoints` seeded schedules; in-process
+crashes at every creation and install point (`TestSnapshotCrashPointsRecover`,
+`TestInstallCrashPointsRecover`); real processes killed at `after-snapshot-publish` and
+`after-install-publish`, their files inspected, their restarts checked (`repaired=true` for the
+interrupted install). At every restart the simulator checks the recovered log against the shadow
+(INV-F2, now boundary-aware, including a candidate plus the repair's boundary record), that no log
+is compacted past its snapshot and that a completed publication survived (INV-SN3), and that the
+restored state is the reference model's at the snapshot's index (INV-SN1).
