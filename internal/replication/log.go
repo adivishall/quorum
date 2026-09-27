@@ -12,6 +12,10 @@ type Entry struct {
 	Index uint64
 	Term  uint64
 	Data  []byte
+	// Type says what Data is (Phase 15): a state-machine command (EntryNormal,
+	// the zero value — every entry before Phase 15) or an encoded Configuration
+	// (EntryConfig), which the state machine never sees.
+	Type EntryType
 }
 
 // Log is the small, explicit interface for a local replicated log — the
@@ -305,9 +309,9 @@ func (l *MemoryLog) InstallSnapshot(index, term uint64) error {
 // (INV-P4). A nil Data stays nil; an empty non-nil Data is preserved as empty.
 func copyEntry(e Entry) Entry {
 	if e.Data == nil {
-		return Entry{Index: e.Index, Term: e.Term, Data: nil}
+		return Entry{Index: e.Index, Term: e.Term, Data: nil, Type: e.Type}
 	}
 	d := make([]byte, len(e.Data))
 	copy(d, e.Data)
-	return Entry{Index: e.Index, Term: e.Term, Data: d}
+	return Entry{Index: e.Index, Term: e.Term, Data: d, Type: e.Type}
 }
