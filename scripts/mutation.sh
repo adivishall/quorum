@@ -12,7 +12,7 @@
 # (docs/DEDUP.md §9) — and the Phase 14 snapshot and compaction rules: the
 # orderings of creation, publication, compaction and installation, the format's
 # validation, recovery's reconciliation, the protocol, and the session table's
-# place in the snapshot (docs/SNAPSHOTS.md §10).
+# place in the snapshot (docs/SNAPSHOTS.md §18).
 #
 # For each mutant it applies a real source edit that violates a specific Raft rule,
 # runs the test(s) that should catch that violation, and requires them to FAIL (the
@@ -118,8 +118,8 @@ mutant "no-overwrite-committed" internal/replication/log.go \
 
 # 5. Disable term-based conflict backtracking (fall back to naive per-index).
 mutant "conflict-term-backtracking" internal/raft/raft.go \
-  'back := r.backupNextIndex(m.ConflictTerm, m.ConflictIndex)' \
-  'back := r.nextIndex[peer] - 1' \
+  'back := max(r.backupNextIndex(m.ConflictTerm, m.ConflictIndex), r.matchIndex[peer]+1)' \
+  'back := max(r.nextIndex[peer]-1, r.matchIndex[peer]+1)' \
   ./internal/raft 'TestConflictBackupByTerm'
 
 # 6. Let stale (lower-term) messages mutate state instead of being rejected.
@@ -861,7 +861,7 @@ mutant "an-evicted-session-is-never-revived (real processes)" internal/kv/store.
 	}' \
   ./tests/integration 'TestRealSessionContractSurvivesFullClusterRestart'
 
-echo "== Phase 14: snapshots and log compaction (docs/SNAPSHOTS.md §10) =="
+echo "== Phase 14: snapshots and log compaction (docs/SNAPSHOTS.md §18) =="
 
 # 93. Compact before the snapshot is durable: the log is rewritten without the
 #     prefix before the snapshot covering it is published, so a crash between
@@ -1112,6 +1112,21 @@ mutant "recovery-completes-an-interrupted-install" internal/raftnode/node.go \
   '		if repair {' \
   '		if false && repair {' \
   "./internal/raftnode ./internal/raftsim" 'TestInstallCrashPointsRecover|TestSnapshotCrashMatrix'
+
+# 122. A stale rejection backs nextIndex up to or below matchIndex: with the
+#      prefix compacted the peer is offered a snapshot its commit covers and is
+#      stranded (what the 200-seed gate found, kv-snapshots-partitions seed 100).
+mutant "a-stale-rejection-never-backs-up-below-the-match" internal/raft/raft.go \
+  '	back := max(r.backupNextIndex(m.ConflictTerm, m.ConflictIndex), r.matchIndex[peer]+1)' \
+  '	back := r.backupNextIndex(m.ConflictTerm, m.ConflictIndex)' \
+  "./internal/raft ./internal/raftsim" 'TestStaleRejectionNeverBacksUpBelowTheMatch|TestSnapshotRegressionSeeds'
+
+# 123. The simulator duplicates a snapshot chunk without its payload (the
+#      harness bug seed 153 found): a duplicated transfer must still be chunks.
+mutant "sim-duplicates-a-chunk-with-its-payload" internal/raftsim/cluster.go \
+  '		c.flights = append(c.flights, &flight{seq: c.seq, msg: f.msg, chunk: f.chunk})' \
+  '		c.flights = append(c.flights, &flight{seq: c.seq, msg: f.msg})' \
+  ./internal/raftsim 'TestSimDuplicatedAndReorderedTransfers|TestSnapshotRegressionSeeds'
 
 echo "== Phase 14: the same rules, killed by real processes ALONE =="
 

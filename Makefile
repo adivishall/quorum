@@ -29,7 +29,8 @@ integration:
 ## mutation — mutation testing (Phase 9 Raft rules, Phase 10 failure handling and
 ## fault-model fidelity, Phase 11 crash-recovery rules, Phase 12 client-visible
 ## consistency and the checker itself, Phase 13 request identity, deduplication,
-## forwarding and the session client). Applies deliberate rule-violating edits to the source,
+## forwarding and the session client, Phase 14 snapshots and log compaction).
+## DRY=1 checks every mutant still applies without running tests. Applies deliberate rule-violating edits to the source,
 ## runs the tests that must catch each, and requires every mutant to be killed
 ## (edits are reverted via git). Needs a clean working tree for the files it
 ## mutates. See docs/RAFT.md §12a and docs/FAULTS.md.
@@ -43,13 +44,15 @@ mutation:
 ## linearizability, plus INV-X5..X8), including the Phase 13 session profiles
 ## (retries and concurrent duplicates under one request identity; every
 ## replica's apply-time decision checked against the session model, INV-X11,
-## and no identity executed twice, INV-X2). Every run is replayable: a failure prints
+## and no identity executed twice, INV-X2), and the Phase 14 snapshot profiles and
+## snapshot crash matrix (INV-SN1..SN3 checked throughout; docs/SNAPSHOTS.md).
+## Every run is replayable: a failure prints
 ## the exact command and a minimized script (or, for the matrix, the exact
 ## crashat event). See docs/FAULTS.md, docs/CRASH_RECOVERY.md and
 ## docs/LINEARIZABILITY.md.
 FAULT_SEEDS ?= 200
 faults:
-	$(GO) test -count=1 -run 'TestRandomizedFaultSchedules|TestSameSeedSameTrace|TestTraceIsPlatformIndependent|TestCrashMatrix|TestKVSeededHistoriesAreLinearizable|TestKVSameSeedSameHistory' ./internal/raftsim -raftsim.seeds=$(FAULT_SEEDS)
+	$(GO) test -count=1 -timeout 60m -run 'TestRandomizedFaultSchedules|TestSameSeedSameTrace|TestTraceIsPlatformIndependent|TestCrashMatrix|TestSnapshotCrashMatrix|TestKVSeededHistoriesAreLinearizable|TestKVSameSeedSameHistory' ./internal/raftsim -raftsim.seeds=$(FAULT_SEEDS)
 
 ## fuzz — run every fuzz target in the repository for FUZZTIME each (default 10s).
 FUZZTIME ?= 10s
