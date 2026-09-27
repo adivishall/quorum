@@ -1128,6 +1128,13 @@ mutant "sim-duplicates-a-chunk-with-its-payload" internal/raftsim/cluster.go \
   '		c.flights = append(c.flights, &flight{seq: c.seq, msg: f.msg})' \
   ./internal/raftsim 'TestSimDuplicatedAndReorderedTransfers|TestSnapshotRegressionSeeds'
 
+# 124. The recorder's History shares the attempts of ops in flight (the
+#      latent race the Phase 14 leader-partition fix exposed).
+mutant "a-history-is-a-snapshot" internal/lincheck/history.go \
+  '		cp.Attempts = append([]Attempt(nil), op.Attempts...)' \
+  '		cp.Attempts = op.Attempts' \
+  ./internal/lincheck 'TestHistoryIsASnapshotWhileClientsRecord'
+
 echo "== Phase 14: the same rules, killed by real processes ALONE =="
 
 # 120. The session table left out of the snapshot, on real processes: the

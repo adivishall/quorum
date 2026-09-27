@@ -68,7 +68,7 @@ the project, and they are being built in that order.
 > refuses every contradiction. A 2,976-crash matrix over every snapshot window (0 failures), seeded
 > snapshot fault schedules, and ten real-process tests — including a SIGKILL after publication and
 > mid-install, and a retry whose entry was compacted away on every node answered as a duplicate.
-> 100,000 writes: a restart replays 1 entry instead of 100,001. 31 more mutants are killed; the
+> 100,000 writes: a restart replays 1 entry instead of 100,001. 32 more mutants are killed; the
 > 200-seed schedules found a latent core liveness bug that compaction made reachable (a stale
 > rejection stranding a follower), now fixed.
 >

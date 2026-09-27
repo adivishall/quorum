@@ -364,11 +364,18 @@ most `every` replayed, independent of how long the node has run — are asserted
 5. The mutation runner counted a mutant that did not compile as killed, and four older mutants no
    longer matched after this phase's edits; a dry-run mode (`DRY=1`) now checks every pattern, and
    a build failure is reported as a failure of the runner.
+6. **CI found a timing premise and a latent checker race** (neither a consistency failure). A Phase
+   13 test's leader partition did not always leave a session write unanswered — a write replicated
+   before the cut committed in the new term and was answered after a short partition — so its
+   non-vacuity check failed on CI; the schedule now holds the partition until the recorded history
+   shows an unanswered write (a void premise restarts the scenario). Reading the history mid-run
+   for that exposed a data race in `lincheck.Recorder.History`, which shared the attempts of ops in
+   flight; it now copies them (`TestHistoryIsASnapshotWhileClientsRecord`, mutant 124).
 
 ## 18. Mutation testing
 
 `scripts/mutation.sh` mutants 93–123 break each snapshot rule in turn and require a real test to
-fail (`make mutation`: 123/123 killed). Orderings — compaction before the snapshot is durable,
+fail; mutant 124 pins the recorder fix of §17 (`make mutation`: 124/124 killed). Orderings — compaction before the snapshot is durable,
 publication before the new term is durable, the boundary record before publication, the response
 before the install is durable. Bounds — compaction past the applied index, past the durable
 commit. Validation — the SHA-256 skipped, bytes after the footer accepted, an incomplete or
