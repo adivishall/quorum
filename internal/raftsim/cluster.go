@@ -485,7 +485,7 @@ func (c *Cluster) Apply(e Event) {
 			return
 		}
 		c.seq++
-		c.flights = append(c.flights, &flight{seq: c.seq, msg: f.msg})
+		c.flights = append(c.flights, &flight{seq: c.seq, msg: f.msg, chunk: f.chunk})
 		c.stats.Duplicated++
 		c.trace.add(c.step, "dup #%d -> #%d %s>%s %s", f.seq, c.seq, f.msg.From, f.msg.To, describe(f.msg))
 	case Delay:
@@ -752,6 +752,12 @@ func (c *Cluster) remove(f *flight) {
 // recipient is down (the message is then lost). It returns the node touched.
 func (c *Cluster) deliver(f *flight) *node {
 	m := f.msg
+	if m.Type == raft.MsgSnapshot {
+		// A snapshot is only ever in flight as chunks (sendSnapshot); the core's
+		// MsgSnapshot never travels (docs/SNAPSHOTS.md §8).
+		c.violate("harness", "a MsgSnapshot without a chunk is in flight #%d %s>%s", f.seq, m.From, m.To)
+		return nil
+	}
 	if c.links.Blocked(string(m.From), string(m.To)) {
 		c.stats.DroppedPartition++
 		c.trace.add(c.step, "drop #%d %s>%s %s (partition)", f.seq, m.From, m.To, describe(m))
