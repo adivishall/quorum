@@ -1,6 +1,10 @@
 package raft
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+
+	"github.com/adivishall/quorum/internal/replication"
+)
 
 // Bounds for the hand-written, reflection-free message codec (ADR-003, ADR-016).
 // Every decoder checks a declared length against the bytes remaining and against
@@ -38,6 +42,7 @@ func (m Message) Marshal() []byte {
 		for _, e := range m.Entries {
 			w.uvarint(e.Index)
 			w.uvarint(e.Term)
+			w.byte(byte(e.Type))
 			w.bytes(e.Data)
 		}
 		w.uvarint(m.Seq)
@@ -51,6 +56,11 @@ func (m Message) Marshal() []byte {
 		w.uvarint(m.SnapshotIndex)
 		w.uvarint(m.SnapshotTerm)
 		w.uvarint(m.Seq)
+		if m.Conf != nil {
+			w.bytes(replication.EncodeConfiguration(*m.Conf))
+		} else {
+			w.bytes(nil)
+		}
 	case MsgSnapshotResponse:
 		w.bool(m.Success)
 		w.uvarint(m.MatchIndex)
@@ -110,8 +120,25 @@ func Unmarshal(payload []byte) (Message, error) {
 			if e.Term, err = r.uvarint(); err != nil {
 				return Message{}, err
 			}
+			t, err := r.byte()
+			if err != nil {
+				return Message{}, err
+			}
+			e.Type = replication.EntryType(t)
 			if e.Data, err = r.bytes(MaxEntryDataLen); err != nil {
 				return Message{}, err
+			}
+			// A configuration entry must decode (Phase 15): the core relies on
+			// every configuration entry in a log being valid, so an invalid one
+			// is refused here, at the wire, as malformed.
+			switch e.Type {
+			case replication.EntryNormal:
+			case replication.EntryConfig:
+				if _, err := replication.DecodeConfiguration(e.Data); err != nil {
+					return Message{}, ErrMalformedMessage
+				}
+			default:
+				return Message{}, ErrMalformedMessage
 			}
 			entries = append(entries, e)
 		}
@@ -144,6 +171,17 @@ func Unmarshal(payload []byte) (Message, error) {
 		}
 		if m.Seq, err = r.uvarint(); err != nil {
 			return Message{}, err
+		}
+		cb, err := r.bytes(MaxEntryDataLen)
+		if err != nil {
+			return Message{}, err
+		}
+		if len(cb) > 0 {
+			c, err := replication.DecodeConfiguration(cb)
+			if err != nil {
+				return Message{}, ErrMalformedMessage
+			}
+			m.Conf = &c
 		}
 	case MsgSnapshotResponse:
 		if m.Success, err = r.bool(); err != nil {

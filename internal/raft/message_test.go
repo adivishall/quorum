@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+
+	"github.com/adivishall/quorum/internal/replication"
 )
 
 // TestMessageRoundTrip proves every message type marshals and unmarshals back to
@@ -21,6 +23,9 @@ func TestMessageRoundTrip(t *testing.T) {
 		{Type: MsgAppendRequest, Term: 9, PrevLogIndex: 3, PrevLogTerm: 2, LeaderCommit: 3, Seq: 1 << 40},
 		{Type: MsgAppendResponse, Term: 9, Success: true, MatchIndex: 6, Seq: 77},
 		{Type: MsgSnapshot, Term: 9, SnapshotIndex: 1 << 33, SnapshotTerm: 8, Seq: 3},
+		{Type: MsgSnapshot, Term: 9, SnapshotIndex: 5, SnapshotTerm: 2, Seq: 3, Conf: &replication.Configuration{Voters: []replication.Member{{ID: "a", Addr: "a:1"}, {ID: "b"}}, Learners: []replication.Member{{ID: "c"}}}},
+		{Type: MsgAppendRequest, Term: 9, PrevLogIndex: 3, PrevLogTerm: 2, LeaderCommit: 3,
+			Entries: []Entry{{Index: 4, Term: 9, Type: replication.EntryConfig, Data: replication.EncodeConfiguration(replication.VotersOf([]NodeID{"a", "b"}))}}},
 		{Type: MsgSnapshotResponse, Term: 9, Success: true, MatchIndex: 1 << 33, Seq: 3},
 		{Type: MsgSnapshotResponse, Term: 10, Success: false},
 	}
@@ -42,12 +47,15 @@ func messagesEqual(a, b Message) bool {
 		a.LeaderCommit != b.LeaderCommit || a.Success != b.Success ||
 		a.ConflictTerm != b.ConflictTerm || a.ConflictIndex != b.ConflictIndex ||
 		a.MatchIndex != b.MatchIndex || a.Seq != b.Seq || len(a.Entries) != len(b.Entries) ||
-		a.SnapshotIndex != b.SnapshotIndex || a.SnapshotTerm != b.SnapshotTerm {
+		a.SnapshotIndex != b.SnapshotIndex || a.SnapshotTerm != b.SnapshotTerm || (a.Conf == nil) != (b.Conf == nil) {
+		return false
+	}
+	if a.Conf != nil && !a.Conf.Equal(*b.Conf) {
 		return false
 	}
 	for i := range a.Entries {
 		if a.Entries[i].Index != b.Entries[i].Index || a.Entries[i].Term != b.Entries[i].Term ||
-			!bytes.Equal(a.Entries[i].Data, b.Entries[i].Data) {
+			a.Entries[i].Type != b.Entries[i].Type || !bytes.Equal(a.Entries[i].Data, b.Entries[i].Data) {
 			return false
 		}
 	}

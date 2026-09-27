@@ -10,10 +10,20 @@ import (
 // goroutines, no locks, no clock, no sockets, no filesystem (ADR-002, ADR-016).
 // It is NOT safe for concurrent use — a single goroutine (the driver) owns it.
 type Raft struct {
-	id    NodeID
-	peers []NodeID // sorted, includes self; fixed membership (ADR-005)
-	log   replication.Log
-	rng   *rand.Rand
+	id  NodeID
+	log replication.Log
+	rng *rand.Rand
+
+	// Membership (Phase 15, docs/MEMBERSHIP.md; membership.go). conf is the
+	// current configuration — the latest configuration entry in the log, at
+	// confIndex — or, with none after the boundary, baseConf: the configuration
+	// the log's boundary represents (the snapshot's, or the genesis). peers is
+	// conf's members, sorted, for deterministic iteration; it need not contain
+	// this node (a leader being removed, a joiner, a removed node).
+	conf      Configuration
+	confIndex uint64
+	baseConf  Configuration
+	peers     []NodeID
 
 	electionTicks      int
 	heartbeatTicks     int
@@ -68,16 +78,16 @@ type pendingRead struct {
 
 // New constructs a Raft core from cfg. The core starts as a Follower at the
 // recovered term/vote (zero for a fresh node). The log's already-present entries
-// and commit index are treated as durable.
+// and commit index are treated as durable; the latest configuration entry among
+// them is the configuration (Raft §6), else cfg's base configuration.
 func New(cfg Config) (*Raft, error) {
 	cfg.withDefaults()
-	peers, err := cfg.validate()
+	base, err := cfg.validate()
 	if err != nil {
 		return nil, err
 	}
 	r := &Raft{
 		id:                 cfg.ID,
-		peers:              peers,
 		log:                cfg.Log,
 		rng:                cfg.Rand,
 		electionTicks:      cfg.ElectionTicks,
@@ -86,10 +96,38 @@ func New(cfg Config) (*Raft, error) {
 		role:               Follower,
 		currentTerm:        cfg.Term,
 		votedFor:           cfg.Vote,
+		baseConf:           base.Clone(),
+		nextIndex:          map[NodeID]uint64{},
+		matchIndex:         map[NodeID]uint64{},
 	}
+	r.setConf(base, 0)
+	if err := r.checkLogConfs(); err != nil {
+		return nil, err
+	}
+	r.reconcileConf()
 	r.lastPersistedCommit = r.log.CommitIndex()
 	r.resetElectionTimer()
 	return r, nil
+}
+
+// checkLogConfs verifies every configuration entry the recovered log holds
+// decodes — recovery refuses an undecodable one rather than guessing.
+func (r *Raft) checkLogConfs() error {
+	base, _ := r.log.Boundary()
+	for i := base + 1; i <= r.log.LastIndex(); i++ {
+		e, err := r.log.At(i)
+		if err != nil {
+			return err
+		}
+		if e.Type == replication.EntryConfig {
+			if _, err := replication.DecodeConfiguration(e.Data); err != nil {
+				return err
+			}
+		} else if e.Type != replication.EntryNormal {
+			return ErrMalformedMessage
+		}
+	}
+	return nil
 }
 
 // --- observability (read-only) ---
@@ -115,8 +153,9 @@ func (r *Raft) TermAt(index uint64) (uint64, error) { return r.log.Term(index) }
 // --- inputs ---
 
 // Tick advances the core's logical clock by one tick. A leader heartbeats every
-// heartbeatTicks; a follower/candidate starts an election after its randomized
-// election timeout.
+// heartbeatTicks; a follower/candidate that is a voter starts an election after
+// its randomized election timeout — a learner or a node outside its
+// configuration never does (docs/MEMBERSHIP.md §5).
 func (r *Raft) Tick() {
 	if r.role == Leader {
 		// A snapshot offer nobody answered in time is withdrawn: the next
@@ -141,7 +180,11 @@ func (r *Raft) Tick() {
 	}
 	r.electionElapsed++
 	if r.electionElapsed >= r.randElectionTO {
-		r.becomeCandidate()
+		if r.conf.IsVoter(r.id) {
+			r.becomeCandidate()
+		} else {
+			r.resetElectionTimer()
+		}
 	}
 }
 
@@ -166,13 +209,14 @@ func (r *Raft) Propose(data []byte) error {
 //
 // The read is NOT yet safe to serve. The leader must first confirm it is still
 // the leader: it advances its heartbeat sequence and broadcasts AppendEntries
-// carrying it, and the read is confirmed only when a quorum (itself included)
-// has echoed a sequence at least that high — acknowledgements that were in
-// flight before the read was registered do not count, because they prove
-// leadership only up to the time they were sent. A confirmed read appears in
-// Ready.ReadStates; the driver serves it once it has applied through its index.
-// A single-node group is its own quorum and confirms immediately. Stepping down
-// drops every unconfirmed read (the driver reports them as not-leader).
+// carrying it, and the read is confirmed only when a quorum (itself included,
+// if it is a voter) has echoed a sequence at least that high — acknowledgements
+// that were in flight before the read was registered do not count, because they
+// prove leadership only up to the time they were sent. A confirmed read appears
+// in Ready.ReadStates; the driver serves it once it has applied through its
+// index. A configuration whose only voter is this node is its own quorum and
+// confirms immediately. Stepping down drops every unconfirmed read (the driver
+// reports them as not-leader).
 func (r *Raft) ReadIndex() (ReadState, error) {
 	if r.role != Leader {
 		return ReadState{}, ErrNotLeader
@@ -182,7 +226,7 @@ func (r *Raft) ReadIndex() (ReadState, error) {
 	if r.termStart > rs.Index {
 		rs.Index = r.termStart
 	}
-	if quorum(len(r.peers)) == 1 {
+	if r.hasQuorum(func(id NodeID) bool { return id == r.id }) {
 		r.readStates = append(r.readStates, rs)
 		return rs, nil
 	}
@@ -199,13 +243,7 @@ func (r *Raft) ReadIndex() (ReadState, error) {
 func (r *Raft) confirmReads() {
 	for len(r.pending) > 0 {
 		p := r.pending[0]
-		acks := 1 // self
-		for _, peer := range r.peers {
-			if peer != r.id && r.ackSeq[peer] >= p.seq {
-				acks++
-			}
-		}
-		if acks < quorum(len(r.peers)) {
+		if !r.hasQuorum(func(id NodeID) bool { return id == r.id || r.ackSeq[id] >= p.seq }) {
 			return
 		}
 		r.readStates = append(r.readStates, ReadState{ID: p.id, Index: p.index})
@@ -215,11 +253,37 @@ func (r *Raft) confirmReads() {
 
 // Compact discards the log through index into a snapshot the driver has made
 // durable (Phase 14, docs/SNAPSHOTS.md §5): index must be applied. From then on a
-// follower that needs an entry at or below index is offered the snapshot.
-func (r *Raft) Compact(index uint64) error { return r.log.Compact(index) }
+// follower that needs an entry at or below index is offered the snapshot. The
+// configuration in effect at index becomes the base configuration (Phase 15).
+func (r *Raft) Compact(index uint64) error {
+	base, err := r.ConfAt(index)
+	if err != nil {
+		return err
+	}
+	if err := r.log.Compact(index); err != nil {
+		return err
+	}
+	r.baseConf = base
+	if r.confIndex != 0 && r.confIndex <= index {
+		r.confIndex = 0 // the entry is compacted: the configuration is the base now
+	}
+	return nil
+}
 
 // Step handles one inbound message. It is the only entry point for peer traffic.
 func (r *Raft) Step(m Message) error {
+	// A node outside this node's configuration (docs/MEMBERSHIP.md §5): its vote
+	// request is refused and its responses are dropped, and its term is never
+	// adopted — a removed node's inflated terms cannot depose the group's
+	// leader. What a LEADER sends (AppendEntries, a snapshot) is processed from
+	// anyone: a member that has fallen behind on configurations must be able to
+	// learn them from a leader it does not yet know.
+	if !r.conf.IsMember(m.From) && m.Type != MsgAppendRequest && m.Type != MsgSnapshot {
+		if m.Type == MsgVoteRequest {
+			r.send(Message{Type: MsgVoteResponse, To: m.From, Term: r.currentTerm, VoteGranted: false})
+		}
+		return nil
+	}
 	// Higher term: step down and adopt it before doing anything else. For an
 	// AppendEntries or a snapshot the sender is the new leader; otherwise we do
 	// not yet know one.
@@ -279,6 +343,8 @@ func (r *Raft) becomeFollower(term uint64, leader NodeID) {
 	r.resetElectionTimer()
 }
 
+// becomeCandidate starts an election: only a voter reaches here (Tick), and it
+// asks only the voters — a learner cannot vote, and is not asked.
 func (r *Raft) becomeCandidate() {
 	r.currentTerm++
 	r.votedFor = r.id
@@ -292,7 +358,7 @@ func (r *Raft) becomeCandidate() {
 	lastIdx := r.log.LastIndex()
 	lastTerm, _ := r.log.Term(lastIdx)
 	for _, p := range r.peers {
-		if p == r.id {
+		if p == r.id || !r.conf.IsVoter(p) {
 			continue
 		}
 		r.send(Message{
@@ -300,29 +366,22 @@ func (r *Raft) becomeCandidate() {
 			LastLogIndex: lastIdx, LastLogTerm: lastTerm,
 		})
 	}
-	r.maybeBecomeLeader() // a single-node group wins its own vote immediately
+	r.maybeBecomeLeader() // a single-voter group wins its own vote immediately
 }
 
 func (r *Raft) becomeLeader() {
 	r.role = Leader
 	r.leaderID = r.id
-	last := r.log.LastIndex()
-	r.nextIndex = make(map[NodeID]uint64, len(r.peers))
-	r.matchIndex = make(map[NodeID]uint64, len(r.peers))
-	for _, p := range r.peers {
-		if p == r.id {
-			continue
-		}
-		r.nextIndex[p] = last + 1
-		r.matchIndex[p] = 0
-	}
+	r.nextIndex = map[NodeID]uint64{}
+	r.matchIndex = map[NodeID]uint64{}
 	r.snapPending = map[NodeID]uint64{}
 	r.snapWait = map[NodeID]int{}
+	r.ackSeq = map[NodeID]uint64{}
+	r.syncProgress() // nextIndex = last+1, matchIndex = 0 for every member
 	// The no-op entry in the current term is mandatory (docs/DESIGN.md §8.2,
 	// §5.4.2): without it a new leader cannot commit entries from prior terms —
 	// and a ReadIndex may not be served below it.
-	r.termStart = last + 1
-	r.ackSeq = make(map[NodeID]uint64, len(r.peers))
+	r.termStart = r.log.LastIndex() + 1
 	r.pending = nil
 	r.appendEntry(nil)
 	r.heartbeatElapsed = 0
@@ -334,22 +393,20 @@ func (r *Raft) maybeBecomeLeader() {
 	if r.role != Candidate {
 		return
 	}
-	granted := 0
-	for _, ok := range r.votesGranted {
-		if ok {
-			granted++
-		}
-	}
-	if granted >= quorum(len(r.peers)) {
+	if r.hasQuorum(func(id NodeID) bool { return r.votesGranted[id] }) {
 		r.becomeLeader()
 	}
 }
 
 // --- message handlers (all called with m.Term == r.currentTerm) ---
 
+// handleVoteRequest grants a vote by the §5.2/§5.4.1 rules — one vote per
+// term, to a candidate whose log is at least as up to date — and only if this
+// node is a voter itself: a learner, or a node outside its own configuration,
+// never grants one (docs/MEMBERSHIP.md §5).
 func (r *Raft) handleVoteRequest(m Message) {
 	grant := false
-	if (r.votedFor == "" || r.votedFor == m.From) && r.candidateUpToDate(m.LastLogIndex, m.LastLogTerm) {
+	if r.conf.IsVoter(r.id) && (r.votedFor == "" || r.votedFor == m.From) && r.candidateUpToDate(m.LastLogIndex, m.LastLogTerm) {
 		grant = true
 		r.votedFor = m.From
 		r.hsDirty = true
@@ -358,8 +415,10 @@ func (r *Raft) handleVoteRequest(m Message) {
 	r.send(Message{Type: MsgVoteResponse, To: m.From, Term: r.currentTerm, VoteGranted: grant})
 }
 
+// handleVoteResponse counts a vote from a voter of the configuration; a vote
+// from anyone else is never counted.
 func (r *Raft) handleVoteResponse(m Message) {
-	if r.role != Candidate {
+	if r.role != Candidate || !r.conf.IsVoter(m.From) {
 		return
 	}
 	if m.VoteGranted {
@@ -475,7 +534,9 @@ func (r *Raft) progress(peer NodeID, match uint64) {
 }
 
 // handleSnapshot is a follower offered the leader's snapshot (Raft §7). The
-// driver hands it over only once the whole snapshot arrived and validated.
+// driver hands it over only once the whole snapshot arrived and validated,
+// together with the configuration the snapshot carries (Phase 15): the node
+// adopts it as its base configuration.
 func (r *Raft) handleSnapshot(m Message) {
 	r.becomeFollower(m.Term, m.From)
 	commit := r.log.CommitIndex()
@@ -484,6 +545,12 @@ func (r *Raft) handleSnapshot(m Message) {
 		// offer, or one we installed before): nothing to install. Our committed
 		// prefix matches the leader's.
 		r.send(Message{Type: MsgSnapshotResponse, To: m.From, Term: r.currentTerm, Success: true, MatchIndex: commit, Seq: m.Seq})
+		return
+	}
+	if m.Conf == nil {
+		// A snapshot without its configuration cannot be installed: the node would
+		// not know the group it belongs to. Refuse rather than guess.
+		r.send(Message{Type: MsgSnapshotResponse, To: m.From, Term: r.currentTerm, Success: false, Seq: m.Seq})
 		return
 	}
 	if err := r.log.InstallSnapshot(m.SnapshotIndex, m.SnapshotTerm); err != nil {
@@ -499,6 +566,10 @@ func (r *Raft) handleSnapshot(m Message) {
 			r.unstable = m.SnapshotIndex + 1
 		}
 	}
+	r.baseConf = m.Conf.Clone()
+	r.confIndex = 0
+	r.setConf(r.baseConf, 0)
+	r.reconcileConf() // the kept suffix, if any, may hold a later configuration
 	r.installed = &SnapshotMeta{Index: m.SnapshotIndex, Term: m.SnapshotTerm}
 	r.send(Message{Type: MsgSnapshotResponse, To: m.From, Term: r.currentTerm, Success: true, MatchIndex: m.SnapshotIndex, Seq: m.Seq})
 }
@@ -517,7 +588,7 @@ func (r *Raft) handleSnapshotResponse(m Message) {
 		return
 	}
 	r.progress(peer, m.MatchIndex)
-	if r.matchIndex[peer] < r.log.LastIndex() {
+	if r.role == Leader && r.matchIndex[peer] < r.log.LastIndex() {
 		r.sendAppend(peer) // resume replication after the snapshot at once
 	}
 }
@@ -537,7 +608,9 @@ func (r *Raft) appendEntry(data []byte) {
 // appendFollowerEntries installs the leader's entries after prevIndex, keeping any
 // identical prefix and replacing only the first divergent (uncommitted) suffix. It
 // returns false only if the log refuses the write (a committed-entry conflict),
-// which a correct leader never causes.
+// which a correct leader never causes. A batch that adds a configuration entry,
+// or a replacement that may have removed one, makes the node recompute its
+// configuration from the log (Phase 15).
 func (r *Raft) appendFollowerEntries(prevIndex uint64, entries []Entry) bool {
 	i := 0
 	for ; i < len(entries); i++ {
@@ -556,7 +629,8 @@ func (r *Raft) appendFollowerEntries(prevIndex uint64, entries []Entry) bool {
 	batch := entries[i:]
 	appendIdx := prevIndex + 1 + uint64(i)
 	var err error
-	if appendIdx == r.log.LastIndex()+1 {
+	truncates := appendIdx <= r.log.LastIndex()
+	if !truncates {
 		err = r.log.Append(batch...)
 	} else {
 		err = r.log.TruncateAndAppend(batch...)
@@ -565,6 +639,15 @@ func (r *Raft) appendFollowerEntries(prevIndex uint64, entries []Entry) bool {
 		return false
 	}
 	r.markUnstable(appendIdx)
+	hasConf := false
+	for _, e := range batch {
+		if e.Type == replication.EntryConfig {
+			hasConf = true
+		}
+	}
+	if hasConf || (truncates && r.confIndex >= appendIdx) {
+		r.reconcileConf()
+	}
 	return true
 }
 
@@ -653,7 +736,8 @@ func (r *Raft) sendAppend(peer NodeID) {
 }
 
 // broadcastAppend sends AppendEntries (a heartbeat when there is nothing to
-// replicate) to every peer, under a fresh heartbeat sequence.
+// replicate) to every member — voters of both sets and learners — under a fresh
+// heartbeat sequence.
 func (r *Raft) broadcastAppend() {
 	r.hbSeq++
 	for _, p := range r.peers {
@@ -664,26 +748,43 @@ func (r *Raft) broadcastAppend() {
 	}
 }
 
-// maybeCommit advances commitIndex to the highest N replicated on a quorum whose
-// entry is from the current term (§5.4.2 — the figure-8 rule).
+// maybeCommit advances commitIndex to the highest N replicated on a quorum of the
+// current configuration (docs/MEMBERSHIP.md §3: a majority of the voters and, in
+// a joint configuration, of the outgoing voters) whose entry is from the current
+// term (§5.4.2 — the figure-8 rule). The leader counts itself only if it is a
+// voter of the set in question.
 func (r *Raft) maybeCommit() {
-	matches := make([]uint64, 0, len(r.peers))
-	for _, p := range r.peers {
-		if p == r.id {
-			matches = append(matches, r.log.LastIndex())
-		} else {
-			matches = append(matches, r.matchIndex[p])
+	matchOf := func(id NodeID) uint64 {
+		if id == r.id {
+			return r.log.LastIndex()
+		}
+		return r.matchIndex[id]
+	}
+	// Candidate indexes: every voter's match, tried highest first.
+	var cands []uint64
+	for _, list := range [][]NodeID{r.conf.VoterIDs(), r.conf.OutgoingIDs()} {
+		for _, id := range list {
+			cands = append(cands, matchOf(id))
 		}
 	}
-	// Descending sort; the value at rank quorum-1 is matched by a majority.
-	sortDescU64(matches)
-	n := matches[quorum(len(r.peers))-1]
+	sortDescU64(cands)
+	var n uint64
+	for i, c := range cands {
+		if i > 0 && c == cands[i-1] {
+			continue
+		}
+		if r.hasQuorum(func(id NodeID) bool { return matchOf(id) >= c }) {
+			n = c
+			break
+		}
+	}
 	if n <= r.log.CommitIndex() {
 		return
 	}
 	t, _ := r.log.Term(n)
 	if t == r.currentTerm {
 		r.commitTo(n)
+		r.afterCommit()
 	}
 }
 

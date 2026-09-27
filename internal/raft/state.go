@@ -106,9 +106,13 @@ type Message struct {
 	Entries      []Entry
 	LeaderCommit uint64
 
-	// Snapshot (Phase 14): the last entry the offered snapshot covers.
+	// Snapshot (Phase 14): the last entry the offered snapshot covers, and
+	// (Phase 15) the configuration the snapshot carries — the follower's
+	// base configuration once installed. The driver fills Conf from the
+	// validated file; a MsgSnapshot never travels as such (chunks do).
 	SnapshotIndex uint64
 	SnapshotTerm  uint64
+	Conf          *replication.Configuration
 
 	// AppendResponse and SnapshotResponse.
 	Success       bool
@@ -139,7 +143,3 @@ type ReadState struct {
 	ID    uint64
 	Index uint64
 }
-
-// quorum returns the majority size for a group of n members: floor(n/2)+1. For
-// n==1 this is 1, so a single-node group commits on its own (ADR-016).
-func quorum(n int) int { return n/2 + 1 }

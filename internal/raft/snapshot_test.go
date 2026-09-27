@@ -14,6 +14,13 @@ import (
 // streaming of the snapshot's bytes is tested in raftnode; here the snapshot is
 // its metadata, and a follower that installs one takes its index as applied.
 
+// conf3 is the fixed configuration of the three-node group n1..n3, as a
+// snapshot of it carries (Phase 15).
+func conf3() *Configuration {
+	c := replication.VotersOf([]NodeID{"n1", "n2", "n3"})
+	return &c
+}
+
 // compact compacts id's log through index (which must be applied).
 func (nw *network) compact(id NodeID, index uint64) {
 	nw.t.Helper()
@@ -46,7 +53,11 @@ func (nw *network) converged(leader NodeID) bool {
 	if L.CommitIndex() != L.LastIndex() {
 		return false
 	}
+	conf, _ := nw.nodes[leader].Conf()
 	for _, id := range nw.ids {
+		if !conf.IsMember(id) {
+			continue
+		}
 		if l := nw.logs[id]; l.CommitIndex() != L.LastIndex() || l.LastIndex() != L.LastIndex() || nw.applyCount[id] != L.LastIndex() {
 			return false
 		}
@@ -60,7 +71,11 @@ func (nw *network) converged(leader NodeID) bool {
 func (nw *network) requireConverged(leader NodeID) {
 	nw.t.Helper()
 	L := nw.logs[leader]
+	conf, _ := nw.nodes[leader].Conf()
 	for _, id := range nw.ids {
+		if !conf.IsMember(id) {
+			continue // a joiner not yet added, or a removed node: the leader does not replicate to it (Phase 15)
+		}
 		l := nw.logs[id]
 		if l.CommitIndex() != L.CommitIndex() || l.LastIndex() != L.LastIndex() || nw.applyCount[id] != L.CommitIndex() {
 			nw.t.Fatalf("%s has not converged to %s:\n%s\n%s (applied %d)", id, leader, nw.dumpLog(id), nw.dumpLog(leader), nw.applyCount[id])
@@ -198,7 +213,7 @@ func drainReady(r *Raft) Ready {
 // the response.
 func TestFollowerInstallKeepsAMatchingSuffix(t *testing.T) {
 	r, lg := followerWith(t, 17, 5, 2)
-	if err := r.Step(Message{Type: MsgSnapshot, From: "n1", To: "n2", Term: 2, SnapshotIndex: 15, SnapshotTerm: 1, Seq: 4}); err != nil {
+	if err := r.Step(Message{Type: MsgSnapshot, From: "n1", To: "n2", Term: 2, SnapshotIndex: 15, SnapshotTerm: 1, Seq: 4, Conf: conf3()}); err != nil {
 		t.Fatal(err)
 	}
 	rd := drainReady(r)
@@ -222,7 +237,7 @@ func TestFollowerInstallKeepsAMatchingSuffix(t *testing.T) {
 func TestFollowerIgnoresASnapshotItAlreadyCovers(t *testing.T) {
 	r, lg := followerWith(t, 20, 20, 3)
 	for _, idx := range []uint64{5, 20} {
-		if err := r.Step(Message{Type: MsgSnapshot, From: "n1", To: "n2", Term: 3, SnapshotIndex: idx, SnapshotTerm: 1}); err != nil {
+		if err := r.Step(Message{Type: MsgSnapshot, From: "n1", To: "n2", Term: 3, SnapshotIndex: idx, SnapshotTerm: 1, Conf: conf3()}); err != nil {
 			t.Fatal(err)
 		}
 		rd := drainReady(r)
@@ -236,7 +251,7 @@ func TestFollowerIgnoresASnapshotItAlreadyCovers(t *testing.T) {
 	if b, _ := lg.Boundary(); b != 0 || lg.LastIndex() != 20 {
 		t.Fatal("a covered snapshot changed the log")
 	}
-	if err := r.Step(Message{Type: MsgSnapshot, From: "n1", To: "n2", Term: 2, SnapshotIndex: 30, SnapshotTerm: 2}); err != nil {
+	if err := r.Step(Message{Type: MsgSnapshot, From: "n1", To: "n2", Term: 2, SnapshotIndex: 30, SnapshotTerm: 2, Conf: conf3()}); err != nil {
 		t.Fatal(err)
 	}
 	rd := drainReady(r)
@@ -251,7 +266,7 @@ func TestFollowerIgnoresASnapshotItAlreadyCovers(t *testing.T) {
 // matches; the rest is appended.
 func TestAppendEntriesBelowAFollowersSnapshot(t *testing.T) {
 	r, lg := followerWith(t, 3, 3, 2)
-	if err := r.Step(Message{Type: MsgSnapshot, From: "n1", To: "n2", Term: 2, SnapshotIndex: 15, SnapshotTerm: 1}); err != nil {
+	if err := r.Step(Message{Type: MsgSnapshot, From: "n1", To: "n2", Term: 2, SnapshotIndex: 15, SnapshotTerm: 1, Conf: conf3()}); err != nil {
 		t.Fatal(err)
 	}
 	drainReady(r)

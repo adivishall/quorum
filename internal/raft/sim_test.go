@@ -91,6 +91,14 @@ func (nw *network) seedNode(id NodeID, entries []Entry, term uint64, vote NodeID
 // randomized timeouts are for.
 func newNetwork(t *testing.T, ids []NodeID, seedBase int64) *network {
 	t.Helper()
+	return newNetworkWith(t, ids, replication.VotersOf(ids), seedBase)
+}
+
+// newNetworkWith builds the nodes ids, of which those in base are members of
+// the group at its genesis; every other node is a JOINER (Phase 15): it starts
+// with an empty configuration and learns the membership from a leader.
+func newNetworkWith(t *testing.T, ids []NodeID, base replication.Configuration, seedBase int64) *network {
+	t.Helper()
 	nw := &network{
 		t:          t,
 		ids:        append([]NodeID(nil), ids...),
@@ -109,11 +117,15 @@ func newNetwork(t *testing.T, ids []NodeID, seedBase int64) *network {
 	sort.Slice(nw.ids, func(i, j int) bool { return nw.ids[i] < nw.ids[j] })
 	for i, id := range nw.ids {
 		lg := replication.NewMemoryLog()
+		conf := replication.Configuration{}
+		if base.IsMember(id) {
+			conf = base.Clone()
+		}
 		r, err := New(Config{
-			ID:    id,
-			Peers: ids,
-			Rand:  rand.New(rand.NewSource(seedBase + int64(i)*1000 + 1)),
-			Log:   lg,
+			ID:   id,
+			Conf: &conf,
+			Rand: rand.New(rand.NewSource(seedBase + int64(i)*1000 + 1)),
+			Log:  lg,
 		})
 		if err != nil {
 			t.Fatalf("New(%s): %v", id, err)
@@ -202,6 +214,24 @@ func (nw *network) deliver(m Message) {
 	}
 	if m.Type == MsgSnapshot {
 		nw.snapshotsSent[m.To]++
+		// The driver hands the core a snapshot together with the configuration
+		// the file carries (Phase 15); here the harness plays the driver: the
+		// sender's configuration at the snapshot's index.
+		if m.Conf == nil {
+			// A real driver sends its PUBLISHED snapshot, at or beyond its
+			// boundary; an offer queued before a later compaction names an index
+			// the sender no longer holds, so the boundary's configuration stands
+			// in (the membership is fixed in these schedules).
+			at := m.SnapshotIndex
+			if base, _ := nw.nodes[m.From].Boundary(); at < base {
+				at = base
+			}
+			c, err := nw.nodes[m.From].ConfAt(at)
+			if err != nil {
+				nw.t.Fatalf("configuration of %s's snapshot at %d: %v", m.From, at, err)
+			}
+			m.Conf = &c
+		}
 	}
 	if err := nw.nodes[m.To].Step(m); err != nil {
 		nw.t.Fatalf("Step(%s <- %s %s): %v", m.To, m.From, m.Type, err)
