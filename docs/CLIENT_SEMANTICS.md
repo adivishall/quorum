@@ -190,7 +190,12 @@ resends a forward: if the leader's answer does not come back in time the client 
 sent, the answer is `UNAVAILABLE` (definite). If the node knows no leader, `NOT_LEADER` with no
 hint. Forwarding cannot duplicate an identified request's effect, because nothing in the forwarding
 path decides whether a request executes — only the state machine's apply does (§4). For an
-anonymous request forwarding adds no risk either: a forward is sent at most once.
+anonymous request forwarding adds no risk either: a forward is sent at most once, and the transport
+never delivers a frame twice (`docs/TRANSPORT.md` §9). That is a premise, not a protection: a network
+that duplicated a forward would execute an anonymous write twice. Only identified requests are
+protected against duplicated delivery, and only they are tested under duplicated forwards;
+`TestLinearizableUnderMessageFaults` duplicates Raft traffic alone and checks, in every node's
+durable log, that each anonymous put occupies one entry.
 
 ## 10. What the guarantee is — and is not
 

@@ -2,6 +2,7 @@ package kv_test
 
 import (
 	"context"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/adivishall/quorum/internal/kv"
 	"github.com/adivishall/quorum/internal/kv/workload"
 	"github.com/adivishall/quorum/internal/lincheck"
+	"github.com/adivishall/quorum/internal/raftlog"
 	"github.com/adivishall/quorum/internal/raftnode"
 	"github.com/adivishall/quorum/internal/transport"
 )
@@ -173,16 +175,57 @@ func runFaults(t *testing.T, c *cluster, opts workload.Options, schedule func(re
 	return rec, <-done
 }
 
+// raftTraffic is the Raft protocol's own message kinds — what a test of
+// anonymous clients may duplicate. A duplicated forward of an anonymous write
+// is a second, unrecorded send of a write nothing deduplicates: it executes
+// twice, which the anonymous contract excludes (docs/CLIENT_SEMANTICS.md §2,
+// §9) and the real transport never does (docs/TRANSPORT.md §9). Duplicated
+// forwards are exercised with session clients, which deduplicate them
+// (TestSessionClientsUnderFaultsRetryAndStayLinearizable).
+var raftTraffic = []transport.MsgKind{
+	transport.MsgRequestVote, transport.MsgRequestVoteResponse,
+	transport.MsgAppendEntries, transport.MsgAppendEntriesResponse,
+	transport.MsgInstallSnapshot, transport.MsgInstallSnapshotResponse,
+}
+
+// requireEachPutOnce stops the cluster and checks every node's durable log:
+// each anonymous put — its value unique to its operation — occupies at most
+// one entry. The forwarder sends a request once and the history records one
+// operation; a second entry would be an execution the history cannot show.
+func requireEachPutOnce(t *testing.T, c *cluster) {
+	t.Helper()
+	c.stop()
+	for _, id := range c.ids {
+		rec, err := raftlog.Inspect(filepath.Join(c.dir, string(id)+".log"))
+		if err != nil {
+			t.Fatalf("%s's log: %v", id, err)
+		}
+		at := map[string][]uint64{}
+		for _, e := range rec.Entries {
+			if cmd, err := kv.Decode(e.Data); err == nil && cmd.Op == kv.OpPut {
+				k := string(cmd.Key) + "=" + string(cmd.Value)
+				at[k] = append(at[k], e.Index)
+			}
+		}
+		for k, idx := range at {
+			if len(idx) > 1 {
+				t.Errorf("%s: put %s executed at %v", id, k, idx)
+			}
+		}
+	}
+}
+
 // TestLinearizableUnderMessageFaults: scenario I(1–3) — delay (hold and release
 // in reverse), drop and duplication of Raft traffic while eight clients run.
 // Each fault is held until it has demonstrably engaged (the network's own
-// counters), and the clients make progress between rounds.
+// counters), and the clients make progress between rounds. Only Raft traffic
+// is duplicated (raftTraffic), and every put must have executed once.
 func TestLinearizableUnderMessageFaults(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := startCluster(t, ctx, 3, true)
 	c.waitLeader(0, 10*time.Second)
-	c.net.AddRule(fault.Rule{Action: fault.Duplicate, Copies: 1})
+	c.net.AddRule(fault.Rule{Kinds: raftTraffic, Action: fault.Duplicate, Copies: 1})
 	rec, st := runFaults(t, c, workload.Options{Clients: 8, OpsPerClient: 1 << 20, Keys: 3, Timeout: 3 * time.Second, Seed: 5, GetPct: 40, DeletePct: 10, MaxAttempts: 6, Backoff: 5 * time.Millisecond}, func(rec *lincheck.Recorder) {
 		waitServed(t, rec, 20, 30*time.Second)
 		for i := 0; i < 6; i++ {
@@ -204,6 +247,7 @@ func TestLinearizableUnderMessageFaults(t *testing.T) {
 	if s := c.net.Stats(); s.Duplicated == 0 || s.Dropped == 0 || s.Held == 0 || s.Released == 0 {
 		t.Fatalf("faults did not engage: %+v", s)
 	}
+	requireEachPutOnce(t, c)
 }
 
 // TestLinearizableAcrossLeaderCrashAndRestart: scenario H/J — the leader is

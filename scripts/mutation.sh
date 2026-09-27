@@ -1135,6 +1135,15 @@ mutant "a-history-is-a-snapshot" internal/lincheck/history.go \
   '		cp.Attempts = op.Attempts' \
   ./internal/lincheck 'TestHistoryIsASnapshotWhileClientsRecord'
 
+# 125. A forward sent twice (docs/CLIENT_SEMANTICS.md §9): an anonymous write
+#      executes twice — the premise the Phase 12 fault test now checks in
+#      every node's log (it had duplicated forwards itself; SNAPSHOTS.md §17).
+mutant "a-forward-is-sent-once" internal/kv/server.go \
+  '	if err := s.node.SendApp(ctx, raftnode.NodeID(leader), transport.MsgForward, payload); err != nil {' \
+  '	_ = s.node.SendApp(ctx, raftnode.NodeID(leader), transport.MsgForward, payload)
+	if err := s.node.SendApp(ctx, raftnode.NodeID(leader), transport.MsgForward, payload); err != nil {' \
+  ./internal/kv 'TestLinearizableUnderMessageFaults'
+
 echo "== Phase 14: the same rules, killed by real processes ALONE =="
 
 # 120. The session table left out of the snapshot, on real processes: the

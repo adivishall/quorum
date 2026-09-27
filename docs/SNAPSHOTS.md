@@ -383,11 +383,24 @@ most `every` replayed, independent of how long the node has run — are asserted
    restarts a lagging follower only once every other node has compacted past its log
    (`compactedPast`; the real-process `lagFollower` now waits on every other node too, not only the
    leader). The same stress then passed 192 of 192 runs.
+8. **A Phase 12 test duplicated what the anonymous contract excludes** (a test-model bug that
+   predates this phase: the pre-Phase-14 tree fails at the same rate). Found by the gate's race run
+   under CPU load: `TestLinearizableUnderMessageFaults` duplicated every message kind, forwards
+   included, so the leader executed forwarded anonymous writes twice — every node's log, in every
+   run, held 60–100 puts at two indexes — and when a second execution landed after a later write a
+   read exposed it, and the checker (correctly) rejected the recorded history. An anonymous write
+   has no deduplication; a duplicated forward is a second, unrecorded send, which the real system
+   never makes (the transport never delivers a frame twice; the forwarder never resends). The test
+   now duplicates Raft traffic only — what `docs/LINEARIZABILITY.md` §9 always said it did — and
+   checks from every node's durable log that each put occupies one entry; duplicated forwards stay
+   covered by the session test, which deduplicates them. Mutant 125 (a forward sent twice) is
+   killed by that check, and `docs/CLIENT_SEMANTICS.md` §9 now states the premise.
 
 ## 18. Mutation testing
 
 `scripts/mutation.sh` mutants 93–123 break each snapshot rule in turn and require a real test to
-fail; mutant 124 pins the recorder fix of §17 (`make mutation`: 124/124 killed). Orderings — compaction before the snapshot is durable,
+fail; mutant 124 pins the recorder fix of §17 and mutant 125 the single send of a forward
+(`make mutation`: 125/125 killed). Orderings — compaction before the snapshot is durable,
 publication before the new term is durable, the boundary record before publication, the response
 before the install is durable. Bounds — compaction past the applied index, past the durable
 commit. Validation — the SHA-256 skipped, bytes after the footer accepted, an incomplete or
