@@ -443,8 +443,15 @@ func (r *Raft) handleAppendResponse(m Message) {
 		return
 	}
 	// Rejection: back up nextIndex by a whole conflicting term (§10). Only act if
-	// it actually moves us backward, so a stale rejection cannot disturb progress.
-	back := r.backupNextIndex(m.ConflictTerm, m.ConflictIndex)
+	// it actually moves us backward, so a stale rejection cannot disturb progress
+	// — and never to or below matchIndex: the peer's log holds our entries
+	// through matchIndex, durably, for the rest of our term, so a rejection that
+	// would back up past it answers an earlier request and is stale. Acting on it
+	// once only wasted a resend; since Phase 14 it can strand the peer: with the
+	// prefix compacted, the leader offers a snapshot the peer's commit already
+	// covers, whose success says nothing new, and the peer is never caught up
+	// (found by the kv-snapshots-partitions schedules, seed 100).
+	back := max(r.backupNextIndex(m.ConflictTerm, m.ConflictIndex), r.matchIndex[peer]+1)
 	if back < r.nextIndex[peer] {
 		r.nextIndex[peer] = back
 		r.sendAppend(peer)

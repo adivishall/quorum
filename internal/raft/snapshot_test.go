@@ -404,3 +404,35 @@ func TestRandomizedSchedulesWithCompaction(t *testing.T) {
 		})
 	}
 }
+
+// TestStaleRejectionNeverBacksUpBelowTheMatch: a rejection delayed past the
+// success that followed it would back nextIndex up below what the peer has
+// already confirmed matching. It is stale and must not: once the prefix is
+// compacted, a nextIndex at or below the boundary makes the leader offer a
+// snapshot the peer's commit already covers, the covered answer says nothing
+// new, and the peer is stranded (the kv-snapshots-partitions seed-100 livelock).
+func TestStaleRejectionNeverBacksUpBelowTheMatch(t *testing.T) {
+	nw := newNetwork(t, []NodeID{"n1", "n2", "n3"}, 1)
+	nw.electLeader("n1")
+	nw.proposeN("n1", "a", 10)
+	nw.heartbeatRounds()
+	L := nw.nodes["n1"]
+	match := L.matchIndex["n2"]
+	stale := Message{Type: MsgAppendResponse, From: "n2", To: "n1", Term: L.Term(), Success: false, ConflictIndex: 2}
+	if err := L.Step(stale); err != nil {
+		t.Fatal(err)
+	}
+	if L.nextIndex["n2"] <= match {
+		t.Fatalf("a stale rejection backed nextIndex up to %d, below the match %d", L.nextIndex["n2"], match)
+	}
+	nw.compact("n1", L.AppliedIndex()-1)
+	if err := L.Step(stale); err != nil {
+		t.Fatal(err)
+	}
+	nw.proposeN("n1", "b", 3)
+	nw.heartbeatRounds()
+	if nw.snapshotsSent["n2"] != 0 {
+		t.Fatalf("an up-to-date follower was offered %d snapshots after a stale rejection", nw.snapshotsSent["n2"])
+	}
+	nw.requireConverged("n1")
+}

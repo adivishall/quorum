@@ -474,3 +474,20 @@ func TestSnapshotCrashMatrix(t *testing.T) {
 			len(fails), len(rep.Rows), cfg.Seed, (&MatrixReport{Rows: shown}).Text())
 	}
 }
+
+// TestSnapshotRegressionSeeds replays the two kv-snapshots-partitions seeds
+// the 200-seed gate caught: seed 100, a follower stranded behind a stale
+// rejection once the prefix was compacted (fixed in the core); seed 153, a
+// duplicated chunk delivered without its payload (fixed in the simulator).
+func TestSnapshotRegressionSeeds(t *testing.T) {
+	p, _ := KVProfileByName("kv-snapshots-partitions")
+	for _, seed := range []int64{100, 153} {
+		r := RunKV(p, seed)
+		if r.Violation != nil {
+			t.Fatalf("seed %d: %s", seed, r.Report(kvReproCommand(p, seed)))
+		}
+		if ok, lr := linearizable(r.History); !ok {
+			t.Fatalf("seed %d: not linearizable: %s", seed, lr.Reason)
+		}
+	}
+}
