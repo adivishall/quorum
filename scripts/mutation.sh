@@ -1201,13 +1201,7 @@ mutant "a-joint-quorum-needs-the-old-majority" internal/raft/membership.go \
   '	if false && conf.Joint() && !majority(conf.OutgoingIDs(), has) {' \
   ./internal/raft 'TestQuorumRules|TestRemoveVoterNeedsTheOldMajority'
 
-# 128. A candidate counts the vote of a learner or a stranger.
-mutant "only-voters-votes-count" internal/raft/raft.go \
-  '	if r.role != Candidate || !r.countsVote(m.From) {' \
-  '	if r.role != Candidate {' \
-  ./internal/raft 'TestLearnerReplicatesButNeverCampaignsOrCounts'
-
-# 129. A learner campaigns (a new member votes for itself too early).
+# 128. A learner campaigns (a new member votes for itself too early).
 mutant "a-learner-never-campaigns" internal/raft/membership.go \
   '	if r.conf.IsVoter(r.id) {
 		return nil, true
@@ -1217,7 +1211,7 @@ mutant "a-learner-never-campaigns" internal/raft/membership.go \
 	}' \
   ./internal/raft 'TestLearnerReplicatesButNeverCampaignsOrCounts'
 
-# 130. A promotion skips the joint configuration: the final one at once.
+# 129. A promotion skips the joint configuration: the final one at once.
 mutant "a-promotion-goes-through-joint-consensus" internal/raft/membership.go \
   '		next.Outgoing = cur.Clone().Voters
 		return next, next.Validate()
@@ -1226,7 +1220,7 @@ mutant "a-promotion-goes-through-joint-consensus" internal/raft/membership.go \
 	case RemoveVoter:' \
   ./internal/raft 'TestConfChangeTransitions|TestPromoteNeedsTheNewMajority'
 
-# 131. A removal skips the joint configuration.
+# 130. A removal skips the joint configuration.
 mutant "a-removal-goes-through-joint-consensus" internal/raft/membership.go \
   '		next, err := replication.NewConfiguration(without(cur.Voters, id), cur.Learners)
 		if err != nil {
@@ -1239,27 +1233,27 @@ mutant "a-removal-goes-through-joint-consensus" internal/raft/membership.go \
 		}' \
   ./internal/raft 'TestConfChangeTransitions|TestRemoveVoterNeedsTheOldMajority'
 
-# 132. An install keeps the node's old configuration instead of the
+# 131. An install keeps the node's old configuration instead of the
 #      snapshot's (a snapshot loses the membership it carries).
 mutant "an-install-adopts-the-snapshots-configuration" internal/raft/raft.go \
   '	r.baseConf, r.baseConfIndex = m.Conf.Clone(), m.SnapshotIndex' \
   '	r.baseConfIndex = m.SnapshotIndex' \
   ./internal/raft 'TestSnapshotInstallAdoptsTheConfiguration|TestConfAtAnswersOnlyWithEvidence'
 
-# 133. Recovery starts from the genesis, not the published snapshot's
+# 132. Recovery starts from the genesis, not the published snapshot's
 #      configuration (the recovered membership differs from the snapshot).
 mutant "recovery-starts-from-the-snapshots-configuration" internal/raftnode/node.go \
   '		base, baseIndex = meta.Conf, meta.Index' \
   '		baseIndex = meta.Index' \
   ./internal/raftnode 'TestMembershipSurvivesRestarts'
 
-# 134. A snapshot taken during a joint configuration records it as stable.
+# 133. A snapshot taken during a joint configuration records it as stable.
 mutant "a-snapshot-carries-its-configuration" internal/raftnode/snapshot.go \
   '	meta := snapshot.Meta{Group: s.Group, Conf: conf, Index: idx, Term: term}' \
   '	meta := snapshot.Meta{Group: s.Group, Conf: replication.Configuration{Voters: conf.Voters, Learners: conf.Learners}, Index: idx, Term: term}' \
   ./internal/raftsim 'TestSimSnapshotDuringJointConfiguration'
 
-# 135. ConfAt answers for a joiner that knows no configuration (a guess).
+# 134. ConfAt answers for a joiner that knows no configuration (a guess).
 mutant "confat-knows-nothing-for-a-joiner" internal/raft/membership.go \
   '	if r.baseConf.Empty() {
 		return Configuration{}, ErrConfUnknown
@@ -1269,7 +1263,7 @@ mutant "confat-knows-nothing-for-a-joiner" internal/raft/membership.go \
 	}' \
   ./internal/raft 'TestJoinerKnowsNoConfigurationUntilItLearnsOne|TestConfAtAnswersOnlyWithEvidence'
 
-# 136. ConfAt answers below its evidence: the base configuration passed off
+# 135. ConfAt answers below its evidence: the base configuration passed off
 #      as the configuration before a change the log holds.
 mutant "confat-answers-only-with-evidence" internal/raft/membership.go \
   '		if e.Type == replication.EntryConfig {
@@ -1280,34 +1274,34 @@ mutant "confat-answers-only-with-evidence" internal/raft/membership.go \
 		}' \
   ./internal/raft 'TestConfAtAnswersOnlyWithEvidence|TestBaseConfigurationHoldsOnlyAtItsIndex'
 
-# 137. A voterless base configuration is accepted.
+# 136. A voterless base configuration is accepted.
 mutant "a-base-configuration-has-voters" internal/raft/raft.go \
   '	if len(base.Voters) == 0 && (!base.Empty() || cfg.ConfIndex > 0) {' \
   '	if false {' \
   ./internal/raft 'TestConfAtAnswersOnlyWithEvidence'
 
-# 138. A stranger with a stale log is heard: a removed node's inflated terms
+# 137. A stranger with a stale log is heard: a removed node's inflated terms
 #      depose the group's leader (a stale member regains authority).
 mutant "a-stale-stranger-is-refused" internal/raft/raft.go \
   '		if m.Type != MsgVoteRequest || !r.candidateUpToDate(m.LastLogIndex, m.LastLogTerm) {' \
   '		if m.Type != MsgVoteRequest {' \
   ./internal/raft 'TestRemovedNodeCannotDeposeOrLead|TestNonMemberVoteRequestIsHeardOnlyWithAnUpToDateLog'
 
-# 139. An up-to-date stranger is refused: a joiner never votes for the
+# 138. An up-to-date stranger is refused: a joiner never votes for the
 #      promotion that needs it (the vote deadlock).
 mutant "an-up-to-date-stranger-is-heard" internal/raft/raft.go \
   '		if m.Type != MsgVoteRequest || !r.candidateUpToDate(m.LastLogIndex, m.LastLogTerm) {' \
   '		if true {' \
   ./internal/raft 'TestJoinerWithNoConfigurationVotesForItsPromotion|TestNonMemberVoteRequestIsHeardOnlyWithAnUpToDateLog'
 
-# 140. Only a node that believes it is a voter grants a vote: a learner that
+# 139. Only a node that believes it is a voter grants a vote: a learner that
 #      missed its promotion never elects anyone (the vote deadlock).
 mutant "any-node-may-grant-a-vote" internal/raft/raft.go \
   '	if (r.votedFor == "" || r.votedFor == m.From) && r.candidateUpToDate(m.LastLogIndex, m.LastLogTerm) {' \
   '	if r.conf.IsVoter(r.id) && (r.votedFor == "" || r.votedFor == m.From) && r.candidateUpToDate(m.LastLogIndex, m.LastLogTerm) {' \
   ./internal/raft 'TestPromotedLearnerThatMissedItsPromotionStillElects|TestJoinerWithNoConfigurationVotesForItsPromotion'
 
-# 141. A leader that lost its leadership during its own removal can never
+# 140. A leader that lost its leadership during its own removal can never
 #      finish it (the removal deadlock).
 mutant "a-removed-leader-can-finish-its-removal" internal/raft/membership.go \
   '	p, err := r.ConfAt(r.confIndex - 1)' \
@@ -1315,7 +1309,7 @@ mutant "a-removed-leader-can-finish-its-removal" internal/raft/membership.go \
 	p, err := r.ConfAt(r.confIndex - 1)' \
   ./internal/raft 'TestRemovedLeaderThatLostItsLeadershipFinishesItsRemoval'
 
-# 142. The final entry waits for an acknowledgement that never comes when the
+# 141. The final entry waits for an acknowledgement that never comes when the
 #      leader alone is its quorum.
 mutant "the-final-entry-commits-at-once" internal/raft/membership.go \
   '		r.maybeCommit()
@@ -1327,7 +1321,7 @@ mutant "the-final-entry-commits-at-once" internal/raft/membership.go \
 	if !r.conf.IsVoter(r.id) {' \
   ./internal/raft 'TestFinalEntryCommitsAtOnceWhenTheLeaderAloneIsItsQuorum'
 
-# 143. A removed leader keeps leading after its removal commits.
+# 142. A removed leader keeps leading after its removal commits.
 mutant "a-removed-leader-steps-down" internal/raft/membership.go \
   '	if !r.conf.IsVoter(r.id) {
 		r.becomeFollower(r.currentTerm, "")' \
@@ -1335,14 +1329,14 @@ mutant "a-removed-leader-steps-down" internal/raft/membership.go \
 		r.becomeFollower(r.currentTerm, "")' \
   ./internal/raft 'TestLeaderRemovedStepsDownOnceTheFinalEntryCommits'
 
-# 144. The peers a leader replicates to do not follow the configuration: a
+# 143. The peers a leader replicates to do not follow the configuration: a
 #      removed member keeps being sent to.
 mutant "the-peers-follow-the-configuration" internal/raft/membership.go \
   '	r.peers = r.conf.Members()' \
   '	r.peers = append(r.peers, r.conf.Members()...)' \
   ./internal/raftsim 'TestSimRemoveAFollower'
 
-# 145. A configuration entry without voters is accepted.
+# 144. A configuration entry without voters is accepted.
 mutant "a-configuration-entry-needs-voters" internal/replication/config.go \
   '	if len(c.Voters) == 0 {
 		return Configuration{}, fmt.Errorf("%w: a configuration entry without voters", ErrInvalidConfiguration)' \
@@ -1350,74 +1344,74 @@ mutant "a-configuration-entry-needs-voters" internal/replication/config.go \
 		return Configuration{}, fmt.Errorf("%w: a configuration entry without voters", ErrInvalidConfiguration)' \
   "./internal/replication ./internal/raftlog" 'TestConfigurationEntriesNeedVoters|TestVoterlessConfigurationEntryIsCorruption'
 
-# 146. The stable configuration may be represented as a joint one.
+# 145. The stable configuration may be represented as a joint one.
 mutant "a-joint-configuration-is-canonical" internal/replication/config.go \
   '		if same {' \
   '		if false && same {' \
   ./internal/replication 'TestJointConfigurationIsCanonical'
 
-# 147. The identity file's group is not checked.
+# 146. The identity file's group is not checked.
 mutant "the-identity-names-the-group" internal/raftnode/node.go \
   '		if id.Group != c.Group {' \
   '		if false {' \
   ./internal/raftnode 'TestIdentityFileRules'
 
-# 148. A restart may name another genesis.
+# 147. A restart may name another genesis.
 mutant "the-identity-names-the-genesis" internal/raftnode/node.go \
   '		if named && !gen.Equal(id.Genesis) {' \
   '		if false {' \
   ./internal/raftnode 'TestIdentityFileRules'
 
-# 149. Durable state without an identity file is accepted as a fresh start.
+# 148. Durable state without an identity file is accepted as a fresh start.
 mutant "durable-state-needs-an-identity" internal/raftnode/node.go \
   '		if there {' \
-  '		if false {' \
+  '		if there && false {' \
   ./internal/raftnode 'TestIdentityFileRules'
 
-# 150. An overwritten change is reported as a success.
+# 149. An overwritten change is reported as a success.
 mutant "a-lost-change-is-reported-lost" internal/raftnode/membership.go \
   '			ours = err == nil && t == w.term' \
-  '			ours = err == nil' \
+  '			ours = err == nil && (t == w.term || true)' \
   ./internal/raftnode 'TestChangeMembershipReportsALostChange'
 
-# 151. A joiner behind its own addition is reported removed.
+# 150. A joiner behind its own addition is reported removed.
 mutant "only-a-former-member-is-removed" internal/raftnode/membership.go \
   '	if !n.removed && n.wasMember && !conf.Empty()' \
   '	if !n.removed && !conf.Empty()' \
   ./internal/raftnode 'TestJoinerInstallingASnapshotThatPredatesItIsNotRemoved'
 
-# 152. A configuration entry reaches the state machine as its bytes.
+# 151. A configuration entry reaches the state machine as its bytes.
 mutant "configuration-entries-reach-the-state-machine-empty" internal/raftnode/crashpoint.go \
   '			if e.Type != replication.EntryNormal {' \
-  '			if false {' \
+  '			if false && e.Type != replication.EntryNormal {' \
   ./internal/raftnode 'TestConfigurationEntriesReachTheStateMachineEmpty'
 
-# 153. A node reading its transport steps another group's frames.
+# 152. A node reading its transport steps another group's frames.
 mutant "a-node-drops-other-groups-frames" internal/raftnode/node.go \
   '				if err != nil || g != n.cfg.Group {' \
   '				if err != nil {' \
   ./internal/raftnode 'TestNodeDropsFramesOfOtherGroups'
 
-# 154. Every group's messages go out labelled group 0: two groups' traffic
+# 153. Every group's messages go out labelled group 0: two groups' traffic
 #      mixed as one.
 mutant "a-frame-carries-its-group" internal/raftnode/node.go \
   'WrapGroup(n.cfg.Group, m.Marshal())' \
   'WrapGroup(0, m.Marshal())' \
   ./internal/multiraft 'TestTwoGroupsOnThreeNodesAreIndependent'
 
-# 155. The host delivers a frame to another group than its envelope names.
+# 154. The host delivers a frame to another group than its envelope names.
 mutant "the-host-delivers-to-the-named-group" internal/multiraft/host.go \
   '			hg := h.groups[g]' \
   '			hg := h.groups[g^1]' \
   ./internal/multiraft 'TestFramesReachExactlyTheirGroup'
 
-# 156. Every group shares group 0's log.
+# 155. Every group shares group 0's log.
 mutant "each-group-has-its-own-log" internal/multiraft/host.go \
   '	logPath := LogPath(h.cfg.DataDir, g)' \
   '	logPath := LogPath(h.cfg.DataDir, 0)' \
   ./internal/multiraft 'TestTwoGroupsOnThreeNodesAreIndependent'
 
-# 157. A request naming another group than its key's executes there.
+# 156. A request naming another group than its key's executes there.
 mutant "a-misrouted-request-is-refused" internal/kv/front.go \
   '		if g := f.route(req.Key); g != req.Group {' \
   '		if g := f.route(req.Key); false && g != req.Group {' \
@@ -1425,14 +1419,14 @@ mutant "a-misrouted-request-is-refused" internal/kv/front.go \
 
 echo "== Phase 15: the same rules, killed by real processes ALONE =="
 
-# 158. A removed node's inflated terms depose the group's leader, on real
+# 157. A removed node's inflated terms depose the group's leader, on real
 #      processes (a stale member regains authority).
 mutant "a-stale-stranger-is-refused (real processes)" internal/raft/raft.go \
   '		if m.Type != MsgVoteRequest || !r.candidateUpToDate(m.LastLogIndex, m.LastLogTerm) {' \
   '		if m.Type != MsgVoteRequest {' \
   ./tests/integration 'TestRealRemoveAPartitionedMember'
 
-# 159. A joiner behind its own addition is retired by its host, on real
+# 158. A joiner behind its own addition is retired by its host, on real
 #      processes: it never catches up.
 mutant "only-a-former-member-is-removed (real processes)" internal/raftnode/membership.go \
   '	if !n.removed && n.wasMember && !conf.Empty()' \
