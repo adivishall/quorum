@@ -25,9 +25,13 @@ func newHookTransport(id transport.NodeID) *hookTransport {
 	return &hookTransport{id: id, recv: make(chan transport.Envelope, 16)}
 }
 
+// Send hands onSend the frame's payload without its group envelope (Phase 15),
+// as the peer's node would see it.
 func (h *hookTransport) Send(ctx context.Context, peer transport.NodeID, kind transport.MsgKind, payload []byte) error {
 	if h.onSend != nil {
-		h.onSend(kind, payload)
+		if _, p, err := UnwrapGroup(payload); err == nil {
+			h.onSend(kind, p)
+		}
 	}
 	return nil
 }
@@ -73,7 +77,7 @@ func TestPersistBeforeReplyOnDriverPath(t *testing.T) {
 		// Inject a RequestVote at term 5 from z with an up-to-date (empty) log.
 		ht.recv <- transport.Envelope{
 			Peer: "z", Kind: transport.MsgRequestVote,
-			Payload: raft.Message{Type: raft.MsgVoteRequest, Term: 5, LastLogIndex: 0, LastLogTerm: 0}.Marshal(),
+			Payload: WrapGroup(0, raft.Message{Type: raft.MsgVoteRequest, Term: 5, LastLogIndex: 0, LastLogTerm: 0}.Marshal()),
 		}
 		awaitCheck(t, checkCh)
 	})
@@ -112,7 +116,7 @@ func TestPersistBeforeReplyOnDriverPath(t *testing.T) {
 		// persisted term.
 		ht.recv <- transport.Envelope{
 			Peer: "b", Kind: transport.MsgAppendEntries,
-			Payload: raft.Message{Type: raft.MsgAppendRequest, Term: 7, PrevLogIndex: 0, PrevLogTerm: 0}.Marshal(),
+			Payload: WrapGroup(0, raft.Message{Type: raft.MsgAppendRequest, Term: 7, PrevLogIndex: 0, PrevLogTerm: 0}.Marshal()),
 		}
 		awaitCheck(t, checkCh)
 	})

@@ -3,6 +3,7 @@ package integration
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -245,13 +246,20 @@ func TestRealCrashAtPoints(t *testing.T) {
 // window the crash matrix found — and requires each SIGKILL to leave a log that
 // reopens with a term no lower than any entry it holds, and each restart to
 // climb to a higher term (reachable only from the recovered one).
+//
+// Phase 15: a first start records the group identity file before the log
+// exists — the first write, fsync, rename and directory fsync of the process.
+// A crash at any of them leaves no log and either no identity file or the
+// complete one; the restart records or reads it and starts afresh. The log's
+// own early windows follow them: writes 2–4 and fsyncs 2–3.
 func TestRealCrashAtEveryEarlyPointIsRecoverable(t *testing.T) {
 	bin := buildDkvd(t)
 	var specs []string
 	for _, p := range []string{"before-save", "after-save", "before-advance", "after-advance", "before-apply", "after-apply", "after-applied-to"} {
 		specs = append(specs, p+":1")
 	}
-	for _, p := range []string{"write:1", "write:2", "write:3", "fsync:1", "fsync:2"} {
+	identity := map[string]bool{"write:1": true, "fsync:1": true, "rename:1": true, "syncdir:1": true}
+	for _, p := range []string{"write:1", "fsync:1", "rename:1", "syncdir:1", "write:2", "write:3", "write:4", "fsync:2", "fsync:3"} {
 		specs = append(specs, p)
 	}
 	for _, spec := range specs {
@@ -280,9 +288,18 @@ func TestRealCrashAtEveryEarlyPointIsRecoverable(t *testing.T) {
 			if !reCrashPoint.MatchString(buf.String()) {
 				t.Fatalf("no crash_point event logged\n%s", buf.String())
 			}
-			rec, err := raftlog.Inspect(logPath)
-			if err != nil {
-				t.Fatalf("log after SIGKILL at %s does not reopen: %v", spec, err)
+			rec := &raftlog.Recovered{}
+			if identity[spec] {
+				// Killed while recording the group identity: the log was never
+				// created.
+				if _, err := os.Stat(logPath); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("after %s the log exists: %v", spec, err)
+				}
+			} else {
+				var err error
+				if rec, err = raftlog.Inspect(logPath); err != nil {
+					t.Fatalf("log after SIGKILL at %s does not reopen: %v", spec, err)
+				}
 			}
 			if n := len(rec.Entries); n > 0 && rec.Entries[n-1].Term > rec.HardState.Term {
 				t.Fatalf("after %s: entry term %d above HardState term %d", spec, rec.Entries[n-1].Term, rec.HardState.Term)

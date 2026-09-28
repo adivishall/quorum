@@ -1094,10 +1094,11 @@ mutant "a-transfer-is-validated-before-the-core-sees-it" internal/raftnode/snaps
   '	if err := error(nil); err != nil {' \
   ./internal/raftnode 'TestReceiveRefusesWhatCannotBeInstalled'
 
-# 117. Another group's snapshot is accepted.
+# 117. Another group's snapshot is accepted (Phase 15: the identity is the
+#      group id; the same members in another group are another group).
 mutant "a-transfer-must-be-this-groups" internal/raftnode/snapshot.go \
-  '	if !snapshot.SameGroup(got.Meta.Members, s.Members) {' \
-  '	if false && !snapshot.SameGroup(got.Meta.Members, s.Members) {' \
+  '	if got.Meta.Group != s.Group {' \
+  '	if false && got.Meta.Group != s.Group {' \
   ./internal/raftnode 'TestReceiveRefusesWhatCannotBeInstalled'
 
 # 118. A write whose index an install replaced is reported as applied — with no

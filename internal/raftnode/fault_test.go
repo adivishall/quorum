@@ -43,7 +43,7 @@ func proposeWithin(n *Node, data []byte) error {
 func voteRequest(term uint64) transport.Envelope {
 	return transport.Envelope{
 		Peer: "z", Kind: transport.MsgRequestVote,
-		Payload: raft.Message{Type: raft.MsgVoteRequest, Term: term}.Marshal(),
+		Payload: WrapGroup(0, raft.Message{Type: raft.MsgVoteRequest, Term: term}.Marshal()),
 	}
 }
 

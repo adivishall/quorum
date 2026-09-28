@@ -14,6 +14,7 @@ import (
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftlog"
 	"github.com/adivishall/quorum/internal/raftnode"
+	"github.com/adivishall/quorum/internal/replication"
 	"github.com/adivishall/quorum/internal/snapshot"
 	"github.com/adivishall/quorum/internal/transport"
 )
@@ -179,7 +180,7 @@ func fileOf(b *testing.B, s *kv.Store) (snapshot.Meta, []byte) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	m := snapshot.Meta{Members: []string{"n0", "n1", "n2"}, Index: idx, Term: 1}
+	m := snapshot.Meta{Conf: replication.VotersOf([]replication.NodeID{"n0", "n1", "n2"}), Index: idx, Term: 1}
 	file, err := snapshot.Encode(m, data)
 	if err != nil {
 		b.Fatal(err)
@@ -299,7 +300,7 @@ func BenchmarkSnapshotInstall(b *testing.B) {
 				if err := lg.Save(&raftlog.HardState{Term: 2}, nil); err != nil {
 					b.Fatal(err)
 				}
-				snaps := &raftnode.Snapshots{Files: snapshot.Files{Base: base}, SM: kv.NewStore(), Members: m.Members}
+				snaps := &raftnode.Snapshots{Files: snapshot.Files{Base: base}, SM: kv.NewStore(), Group: m.Group}
 				d := &raftnode.Durable{Log: lg, Snap: snaps}
 				b.StartTimer()
 				var msg *raft.Message

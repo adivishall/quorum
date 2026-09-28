@@ -16,6 +16,7 @@ import (
 	"github.com/adivishall/quorum/internal/fault"
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftlog"
+	"github.com/adivishall/quorum/internal/replication"
 	"github.com/adivishall/quorum/internal/snapshot"
 	"github.com/adivishall/quorum/internal/transport"
 )
@@ -291,6 +292,11 @@ type snapCluster struct {
 	every, retain uint64
 	logs          map[NodeID]*strings.Builder
 	mu            sync.Mutex
+	// Phase 15: the genesis voters; nodes started as joiners; and whether a
+	// (re)start names no genesis at all, relying on the identity file.
+	genesis     []NodeID
+	joiners     map[NodeID]bool
+	genesisless bool
 }
 
 func startSnapCluster(t *testing.T, ctx context.Context, n int, every, retain uint64) *snapCluster {
@@ -302,6 +308,7 @@ func startSnapCluster(t *testing.T, ctx context.Context, n int, every, retain ui
 		c.ids = append(c.ids, id)
 		c.addrs[id] = freeAddr(t)
 	}
+	c.genesis = append([]NodeID(nil), c.ids...)
 	t.Cleanup(c.stop)
 	for _, id := range c.ids {
 		c.logs[id] = &strings.Builder{}
@@ -328,8 +335,14 @@ func (c *snapCluster) start(id NodeID, hook Hook) {
 		c.trs[id] = tr
 	}
 	sm := &snapSM{}
+	var peers []NodeID
+	switch {
+	case c.joiners[id], c.genesisless:
+	default:
+		peers = c.genesis
+	}
 	node, err := Start(c.ctx, Config{
-		ID: id, Peers: c.ids, Transport: c.trs[id], LogPath: filepath.Join(c.dir, string(id)+".log"),
+		ID: id, Peers: peers, Join: c.joiners[id], Transport: c.trs[id], LogPath: filepath.Join(c.dir, string(id)+".log"),
 		StateMachine: sm, TickInterval: 15 * time.Millisecond, DisableSync: true, Hook: hook,
 		SnapshotEvery: c.every, SnapshotRetain: c.retain,
 		Logf: func(f string, a ...any) {
@@ -630,12 +643,37 @@ func TestRecoverRefusesAContradictedSnapshot(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	rc, err := Recover(Config{ID: "n0", Peers: []NodeID{"n0", "n1", "n2"}, LogPath: path, StateMachine: &snapSM{}, Rand: newRand()})
+	// Phase 15: a restart that names another genesis is refused by the group
+	// identity file before anything is read; one configured for another group
+	// likewise; and a published snapshot of another group (the same members,
+	// another group id) is refused by the snapshot's identity.
+	if _, err := Recover(Config{ID: "n0", Peers: []NodeID{"n0", "n1", "n2"}, LogPath: path, StateMachine: &snapSM{}, Rand: newRand()}); !errors.Is(err, ErrIdentity) {
+		t.Fatalf("another genesis: %v", err)
+	}
+	if _, err := Recover(Config{ID: "n0", Group: 5, LogPath: path, StateMachine: &snapSM{}, Rand: newRand()}); !errors.Is(err, ErrIdentity) {
+		t.Fatalf("another group's data: %v", err)
+	}
+	meta, state, err := snapshot.Decode(good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.Group = 5
+	other, err := snapshot.Encode(meta, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(snapPath, other, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rc, err := Recover(Config{ID: "n0", LogPath: path, StateMachine: &snapSM{}, Rand: newRand()})
 	if !errors.Is(err, snapshot.ErrWrongGroup) {
 		if err == nil {
 			rc.Log.Close()
 		}
 		t.Fatalf("another group's snapshot: %v", err)
+	}
+	if err := os.WriteFile(snapPath, good, 0o644); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := Recover(Config{ID: "n0", Peers: []NodeID{"n0"}, LogPath: path, StateMachine: &recSM{}, Rand: newRand()}); !errors.Is(err, ErrSnapshot) {
 		t.Fatalf("a state machine that cannot restore: %v", err)
@@ -658,8 +696,8 @@ func TestInstallOrderIsTermPublishBoundary(t *testing.T) {
 	if err := lg.Save(&raftlog.HardState{Term: 1, Commit: 2}, []raftlog.Entry{{Index: 1, Term: 1}, {Index: 2, Term: 1}, {Index: 3, Term: 1}}); err != nil {
 		t.Fatal(err)
 	}
-	members := []string{"n0", "n1", "n2"}
-	snaps := &Snapshots{Files: snapshot.Files{FS: inj, Base: path}, SM: &snapSM{}, Members: members}
+	conf := replication.VotersOf([]NodeID{"n0", "n1", "n2"})
+	snaps := &Snapshots{Files: snapshot.Files{FS: inj, Base: path}, SM: &snapSM{}}
 	d := &Durable{Log: lg, Snap: snaps}
 	if err := d.InstallSnapshot(raft.SnapshotMeta{Index: 10, Term: 2}, &raftlog.HardState{Term: 2, Commit: 10}, nil); !errors.Is(err, ErrSnapshot) {
 		t.Fatalf("install with nothing staged: %v", err)
@@ -670,7 +708,7 @@ func TestInstallOrderIsTermPublishBoundary(t *testing.T) {
 		_ = src.Apply(uint64(i), []byte(fmt.Sprintf("c%d", i)))
 	}
 	_, data, _ := src.EncodeSnapshot()
-	meta := snapshot.Meta{Members: members, Index: 10, Term: 2}
+	meta := snapshot.Meta{Conf: conf, Index: 10, Term: 2}
 	file, err := snapshot.Encode(meta, data)
 	if err != nil {
 		t.Fatal(err)
@@ -903,8 +941,8 @@ func TestSnapshotCreationUnderAFailedDisk(t *testing.T) {
 // snapshot would be durable, and a node whose published snapshot its state
 // machine refuses cannot start (docs/SNAPSHOTS.md §7).
 func TestReceiveRefusesWhatCannotBeInstalled(t *testing.T) {
-	members := []string{"n0", "n1", "n2"}
-	snaps := &Snapshots{Files: snapshot.Files{FS: fault.NewMemFS(), Base: "/n/raft.log"}, SM: &snapSM{}, Members: members}
+	conf := replication.VotersOf([]NodeID{"n0", "n1", "n2"})
+	snaps := &Snapshots{Files: snapshot.Files{FS: fault.NewMemFS(), Base: "/n/raft.log"}, SM: &snapSM{}, Group: 3}
 	src := &snapSM{}
 	for i := 1; i <= 3; i++ {
 		_ = src.Apply(uint64(i), []byte("c"))
@@ -924,17 +962,25 @@ func TestReceiveRefusesWhatCannotBeInstalled(t *testing.T) {
 		}
 		return m, nil
 	}
-	if m, err := send(snapshot.Meta{Members: []string{"a", "b", "c"}, Index: 3, Term: 1}); m != nil || !errors.Is(err, snapshot.ErrWrongGroup) {
+	// Phase 15: the group id is the identity — the same members in another
+	// group are another group.
+	if m, err := send(snapshot.Meta{Group: 4, Conf: conf, Index: 3, Term: 1}); m != nil || !errors.Is(err, snapshot.ErrWrongGroup) {
 		t.Fatalf("another group's snapshot: %v %v", m, err)
 	}
-	if m, err := send(snapshot.Meta{Members: members, Index: 4, Term: 1}); m != nil || err == nil {
+	if m, err := send(snapshot.Meta{Group: 3, Conf: conf, Index: 4, Term: 1}); m != nil || err == nil {
 		t.Fatalf("a state the state machine refuses (state at 3, snapshot at 4): %v %v", m, err)
 	}
 	d := &Durable{Snap: snaps}
 	if err := d.InstallSnapshot(raft.SnapshotMeta{Index: 4, Term: 1}, nil, nil); !errors.Is(err, ErrSnapshot) {
 		t.Fatalf("a refused snapshot was left installable: %v", err)
 	}
-	if m, err := send(snapshot.Meta{Members: members, Index: 3, Term: 1}); m == nil || err != nil {
+	withLearner := replication.Configuration{Voters: conf.Voters, Learners: []replication.Member{{ID: "n3", Addr: "h:3"}}}
+	m, err := send(snapshot.Meta{Group: 3, Conf: withLearner, Index: 3, Term: 1})
+	if m == nil || err != nil {
 		t.Fatalf("the valid snapshot: %v %v", m, err)
+	}
+	// The core learns the snapshot's configuration with it (Phase 15).
+	if m.Conf == nil || !m.Conf.Equal(withLearner) {
+		t.Fatalf("the MsgSnapshot carries configuration %v, want %s", m.Conf, withLearner)
 	}
 }

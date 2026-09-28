@@ -42,7 +42,7 @@ func TestStartDoesNotTouchTheCoreOnceTheActorOwnsIt(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		tr := &preloadedTransport{id: "a", ch: make(chan transport.Envelope, 1)}
 		tr.ch <- transport.Envelope{Peer: "b", Kind: transport.MsgAppendEntries,
-			Payload: raft.Message{Type: raft.MsgAppendRequest, Term: 9, From: "b", To: "a"}.Marshal()}
+			Payload: WrapGroup(0, raft.Message{Type: raft.MsgAppendRequest, Term: 9, From: "b", To: "a"}.Marshal())}
 		n, err := Start(ctx, Config{ID: "a", Peers: []NodeID{"a", "b", "c"}, Transport: tr,
 			LogPath: filepath.Join(t.TempDir(), "a.log"), TickInterval: time.Hour, DisableSync: true})
 		if err != nil {

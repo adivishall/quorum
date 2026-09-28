@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/adivishall/quorum/internal/lincheck"
+	"github.com/adivishall/quorum/internal/replication"
 	"github.com/adivishall/quorum/internal/snapshot"
 )
 
@@ -290,7 +291,7 @@ var updateCorpus = flag.Bool("update-snapshots", false, "rewrite the snapshot st
 func corpusFiles(t *testing.T) map[string][]byte {
 	t.Helper()
 	wrap := func(index uint64, state []byte) []byte {
-		b, err := snapshot.Encode(snapshot.Meta{Members: []string{"n1", "n2", "n3"}, Index: index, Term: 2}, state)
+		b, err := snapshot.Encode(snapshot.Meta{Conf: replication.VotersOf([]replication.NodeID{"n1", "n2", "n3"}), Index: index, Term: 2}, state)
 		if err != nil {
 			t.Fatal(err)
 		}

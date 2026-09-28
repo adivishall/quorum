@@ -10,6 +10,7 @@ import (
 
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftlog"
+	"github.com/adivishall/quorum/internal/replication"
 	"github.com/adivishall/quorum/internal/transport"
 )
 
@@ -277,6 +278,11 @@ func TestRecoverRefusesATermBelowItsLog(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			logPath := filepath.Join(t.TempDir(), "bad.log")
+			// The group identity a first start records (Phase 15), so recovery
+			// reaches the log.
+			if err := writeIdentity(nil, logPath, Identity{Genesis: replication.VotersOf([]NodeID{"n0"})}); err != nil {
+				t.Fatal(err)
+			}
 			l, _, err := raftlog.Open(logPath, raftlog.Options{Sync: true})
 			if err != nil {
 				t.Fatal(err)

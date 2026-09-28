@@ -174,8 +174,9 @@ func TestRunStartsAndShutsDownCleanly(t *testing.T) {
 
 // TestRaftModeExitsNonZeroWhenTheLogFails drives the whole fail-stop path through
 // the real dkvd raft-mode code (INV-F1): the fsync that must make the node's
-// self-vote and election no-op durable fails. (fsync #1 is raftlog.Open making the
-// recovered log durable; #2 is the election's Save.) The process must report
+// self-vote and election no-op durable fails. (fsync #1 is the group identity
+// file a first start records (Phase 15); #2 is raftlog.Open making the recovered
+// log durable; #3 is the election's Save.) The process must report
 // event=raft_fatal and exit 1, and must never announce leadership it could not
 // persist.
 func TestRaftModeExitsNonZeroWhenTheLogFails(t *testing.T) {
@@ -184,7 +185,7 @@ func TestRaftModeExitsNonZeroWhenTheLogFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	inj := fault.NewInjectFS(nil)
-	inj.Arm(fault.Injection{Op: fault.OpSync, Nth: 2})
+	inj.Arm(fault.Injection{Op: fault.OpSync, Nth: 3})
 	out := &syncBuffer{}
 	done := make(chan int, 1)
 	go func() {
