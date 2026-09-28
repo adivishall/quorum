@@ -527,3 +527,36 @@ func TestChangeMembershipReportsALostChange(t *testing.T) {
 		}
 	}
 }
+
+// TestConfigurationEntriesReachTheStateMachineEmpty: the membership plane and
+// the data plane stay apart — a committed configuration entry is applied to
+// the state machine as an EMPTY command (it occupies its index, like the
+// election no-op), never as the configuration's bytes, which a key-value
+// store would refuse as a malformed command and stall on.
+func TestConfigurationEntriesReachTheStateMachineEmpty(t *testing.T) {
+	lg := replication.NewMemoryLog()
+	conf := replication.VotersOf([]NodeID{"n1", "n2"})
+	if err := lg.Append(
+		replication.Entry{Index: 1, Term: 1, Data: []byte("put")},
+		replication.Entry{Index: 2, Term: 1, Type: replication.EntryConfig, Data: replication.EncodeConfiguration(conf)},
+		replication.Entry{Index: 3, Term: 1, Data: []byte("after")},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := lg.Commit(3); err != nil {
+		t.Fatal(err)
+	}
+	base := replication.VotersOf([]NodeID{"n1"})
+	core, err := raft.New(raft.Config{ID: "n1", Conf: &base, Log: lg, Rand: newRand(), Term: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sm := &recSM{}
+	if err := ApplyCommitted(core, sm, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	got := sm.snapshot()
+	if len(got) != 3 || got[0] != "put" || got[1] != "" || got[2] != "after" {
+		t.Fatalf("applied %q; the configuration entry must arrive empty", got)
+	}
+}
