@@ -750,7 +750,7 @@ func (n *Node) actorLoop() {
 	ticker := time.NewTicker(n.cfg.TickInterval)
 	defer ticker.Stop()
 	for {
-		var accepted *proposal // a proposal the core appended, answered once durable
+		var accepted *proposal   // a proposal the core appended, answered once durable
 		var snapReply chan error // a snapshot request, answered once Status shows it
 		var snapErr error
 		select {
