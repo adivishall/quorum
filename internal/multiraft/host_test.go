@@ -78,17 +78,24 @@ func (c *hostCluster) add(id NodeID) {
 	c.mu.Unlock()
 }
 
+// static is every other known node, as static peers of id.
+func (c *hostCluster) static(id NodeID) map[NodeID]string {
+	peers := map[NodeID]string{}
+	for _, o := range c.ids {
+		if o != id {
+			peers[o] = c.addrs[o]
+		}
+	}
+	return peers
+}
+
 // startHost starts id's host, with every other known node as a static peer
 // when static is true.
 func (c *hostCluster) startHost(id NodeID, static bool) *Host {
 	c.t.Helper()
 	peers := map[NodeID]string{}
 	if static {
-		for _, o := range c.ids {
-			if o != id {
-				peers[o] = c.addrs[o]
-			}
-		}
+		peers = c.static(id)
 	}
 	h, err := Start(c.ctx, Config{
 		ID: id, DataDir: c.dirs[id], Transport: c.trs[id], StaticPeers: peers,
