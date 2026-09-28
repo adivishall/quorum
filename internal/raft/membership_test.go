@@ -1183,3 +1183,30 @@ func TestRemovedLeaderThatLostItsLeadershipFinishesItsRemoval(t *testing.T) {
 		t.Fatalf("n1 after its removal: %s voter=%v", n1.Role(), n1.IsVoter())
 	}
 }
+
+// TestFinalEntryCommitsAtOnceWhenTheLeaderAloneIsItsQuorum is the regression
+// for a liveness bug the bounded membership model found (sequence
+// remove-leader, crash-follower, remove-follower): the leader of {n1,n2}
+// removes n2. The joint entry {n1}/{n1,n2} commits with n2's acknowledgement;
+// the leader appends the final entry {n1} — whose quorum is the leader alone.
+// No voter will ever acknowledge it, and nothing retried the commit, so the
+// change stayed under way until some unrelated proposal came. The leader now
+// tries to commit as soon as it appends the final entry.
+func TestFinalEntryCommitsAtOnceWhenTheLeaderAloneIsItsQuorum(t *testing.T) {
+	nw := newNetworkWith(t, []NodeID{"n1", "n2"}, voters("n1", "n2"), 6)
+	nw.electLeader("n1")
+	nw.propose("n1", "a")
+	if err := nw.nodes["n1"].ProposeConfChange(ConfChange{Type: RemoveVoter, Member: Member{ID: "n2"}}); err != nil {
+		t.Fatal(err)
+	}
+	nw.drain("n1")
+	nw.deliverAll() // n2 acknowledges the joint entry; it commits; the final one follows
+	n1 := nw.nodes["n1"]
+	if c, _ := n1.Conf(); c.Joint() || c.IsMember("n2") {
+		t.Fatalf("premise: the final entry was not appended: %s", c)
+	}
+	if n1.ConfPending() {
+		c, idx := n1.Conf()
+		t.Fatalf("the final entry %s at %d is not committed (commit %d): nothing will ever commit it", c, idx, n1.CommitIndex())
+	}
+}

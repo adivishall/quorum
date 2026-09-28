@@ -420,8 +420,11 @@ func (r *Raft) afterCommit() {
 	if r.conf.Joint() {
 		r.appendConf(Final(r.conf))
 		r.broadcastAppend()
-		// The final entry cannot be committed by this call: it was just appended
-		// and no peer has acknowledged it. maybeCommit runs on the next response.
+		// When the leader alone is a quorum of the final configuration — the
+		// removal of all voters but it — no acknowledgement will ever come to
+		// retry the commit: try now (found by the bounded membership model).
+		// This recursion ends: the final configuration is not joint.
+		r.maybeCommit()
 		return
 	}
 	if !r.conf.IsVoter(r.id) {
