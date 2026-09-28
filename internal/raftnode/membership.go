@@ -117,8 +117,13 @@ func (n *Node) settleChanges() {
 // noteConf records a change of the node's configuration, logging it
 // (event=raft_conf) and, once a committed stable configuration no longer
 // includes this node, event=raft_removed — the signal the operator (or the
-// multi-Raft host) stops the node on (docs/MEMBERSHIP.md §5). It reports
-// whether the configuration changed.
+// multi-Raft host) stops the node on (docs/MEMBERSHIP.md §5). Only a node that
+// has BEEN a member — of its genesis, or of a configuration it has held — can
+// be removed: a joiner that installs a snapshot predating its own addition
+// holds a committed configuration without itself, and is simply not reached
+// by its addition yet (found by the real-process tests: the host retired such
+// a joiner's group before it learned it was a learner). It reports whether the
+// configuration changed.
 func (n *Node) noteConf() bool {
 	conf, idx := n.core.Conf()
 	changed := !n.confLogged || idx != n.confSeenIdx || !conf.Equal(n.confSeen)
@@ -126,7 +131,10 @@ func (n *Node) noteConf() bool {
 		n.confSeen, n.confSeenIdx, n.confLogged = conf, idx, true
 		n.logf("event=raft_conf node=%s group=%d index=%d pending=%v voter=%v conf=%q", n.cfg.ID, n.cfg.Group, idx, n.core.ConfPending(), conf.IsVoter(n.cfg.ID), conf.String())
 	}
-	if !n.removed && !conf.Empty() && !conf.IsMember(n.cfg.ID) && !n.core.ConfPending() {
+	if conf.IsMember(n.cfg.ID) {
+		n.wasMember = true
+	}
+	if !n.removed && n.wasMember && !conf.Empty() && !conf.IsMember(n.cfg.ID) && !n.core.ConfPending() {
 		n.removed = true
 		n.logf("event=raft_removed node=%s group=%d index=%d conf=%q", n.cfg.ID, n.cfg.Group, idx, conf.String())
 	}

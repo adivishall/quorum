@@ -181,6 +181,13 @@ func TestJoinerCatchesUpBySnapshotAndLearnsItsConfiguration(t *testing.T) {
 	if _, _, restores := c.sms["n3"].state(); restores < 1 {
 		t.Fatal("the joiner did not catch up by a snapshot")
 	}
+	// The snapshot it installed may predate its own addition: a configuration
+	// without it, committed. That is a joiner not yet reached by its addition,
+	// not a removed member — it must never be reported removed (the host would
+	// retire the group under it; found by the real-process tests).
+	if st := c.nodes["n3"].Status(); st.Removed || strings.Contains(c.log("n3"), "event=raft_removed") {
+		t.Fatalf("a joiner was reported removed: %+v\n%s", st, c.log("n3"))
+	}
 	c.down("n3")
 	c.start("n3", nil)
 	c.propose(c.ids, cmds("c", 3))
@@ -432,4 +439,38 @@ func FuzzDecodeIdentity(f *testing.F) {
 			t.Fatalf("accepted a non-canonical identity: %v", err)
 		}
 	})
+}
+
+// TestJoinerInstallingASnapshotThatPredatesItIsNotRemoved pins the bug the
+// real-process tests found: the only snapshot the leader can offer a joiner
+// predates the joiner's addition (snapshots every 20 entries; the addition is
+// entry ~32), so the joiner installs a committed configuration that does not
+// name it — a joiner not yet reached by its addition, NOT a removed member.
+// Reporting it removed made the host retire the group under it, and the
+// joiner never caught up. It is never reported removed; it learns it is a
+// learner from the entries after the snapshot, and catches up.
+func TestJoinerInstallingASnapshotThatPredatesItIsNotRemoved(t *testing.T) {
+	ctx := context.Background()
+	c := startSnapCluster(t, ctx, 3, 20, 2)
+	c.propose(c.ids, cmds("a", 30))
+	c.converged(c.ids)
+	c.compactedPast(c.ids, 10)
+	for _, id := range c.ids {
+		if s := c.nodes[id].Status().Snapshot; s >= 30 {
+			t.Fatalf("premise: %s's snapshot %d is not below the addition", id, s)
+		}
+	}
+	c.join("n3")
+	c.change(c.ids, raft.ConfChange{Type: raft.AddLearner, Member: raft.Member{ID: "n3"}})
+	c.propose(c.ids, cmds("b", 3))
+	c.converged(c.ids)
+	st := c.waitStatus("n3", "installed a snapshot and learned it is a learner", func(st Status) bool {
+		return st.Snapshot > 0 && st.Conf.IsLearner("n3")
+	})
+	if st.Snapshot >= 30 {
+		t.Fatalf("premise: the joiner installed snapshot %d, which names it already", st.Snapshot)
+	}
+	if st.Removed || strings.Contains(c.log("n3"), "event=raft_removed") {
+		t.Fatalf("a joiner was reported removed: %+v\n%s", st, c.log("n3"))
+	}
 }

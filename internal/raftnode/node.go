@@ -420,6 +420,7 @@ type Node struct {
 	confSeenIdx uint64
 	confLogged  bool
 	removed     bool
+	wasMember   bool // a member of its genesis, or of a configuration it held
 
 	mu      sync.Mutex
 	status  Status
@@ -550,6 +551,7 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		reads:     NewReads(),
 	}
 	n.dur.Snap.Installed = n.waiters.Installed
+	n.wasMember = rc.Identity.Genesis.IsMember(cfg.ID)
 	n.noteConf()
 	n.snapshotStatus()
 	if rc.Snapshot != nil {
