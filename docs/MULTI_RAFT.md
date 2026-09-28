@@ -1,9 +1,8 @@
 # MULTI_RAFT — hosting many Raft groups on one node (Phase 15)
 
-Status: **design (Phase 15, in progress).** `docs/MEMBERSHIP.md` is how one group's membership
-changes; this document is how a node hosts several groups, how a message finds its group, how a
-client finds a key's group, and what stays separate. Sections marked *evidence* are filled in as
-the tests land.
+Status: **implemented and verified (Phase 15).** `docs/MEMBERSHIP.md` is how one group's membership
+changes; this document is how a node hosts several groups, how a frame finds its group, how a client
+finds a key's group, and what stays separate. Every claim names the test that verifies it.
 
 ---
 
@@ -16,109 +15,194 @@ the tests land.
         │          │          │
       Group 0    Group 1    Group N          one GroupID each
         │          │          │
-      raftnode   raftnode   raftnode         one driver, one pure core each
+      raftnode   raftnode   raftnode         one driver and one pure core each
         │          │          │
-     log/snap   log/snap   log/snap          groups/<gid>/raft.log, .snap, .meta
+     log/snap   log/snap   log/snap          groups/<gid>/raft.log, .group, .snap
         │          │          │
-     kv.Store   kv.Store   kv.Store          one state machine, one session table each
+     kv.Store   kv.Store   kv.Store          one state machine and one session table each
 ```
 
 Each group is an independent consensus domain: its own membership, log, snapshot, commit index,
-applied index, leader, term, and session table. Nothing is shared between groups except the
-process, the transport connections, and the node's data directory. **There is no cluster-wide
+applied index, term, leader and session table. Nothing mutable is shared between groups; what they
+share is the process, the transport connections, and the data directory. **There is no cluster-wide
 Raft** and no cross-group atomicity: every client operation names one key, one key lives in one
-shard, one shard is served by one group (ADR-001, ADR-008). A node crash is a *correlated* failure
-of every group it hosts; each recovers on its own.
+shard, one shard is served by one group. A node crash is a *correlated* failure of every group it
+hosts; each recovers on its own.
 
 ## 2. Identities and assignment
 
-`ShardID → GroupID` is the identity function in Phase 15 (`docs/MEMBERSHIP.md` §1). Which nodes
-form each group's **initial** membership comes from the Phase 6 routing metadata and nothing
-else: the cluster bootstrap is a `routing.Config{ShardCount, ReplicationFactor, Nodes}` plus each
-node's address; `Router.ReplicaGroup(s)` is group `s`'s genesis voter set. No second assignment
-algorithm exists (INV-C1..C3 keep holding for `key → shard`). After bootstrap a group's membership
-is its own replicated configuration; the routing metadata is not consulted again for membership.
+`ShardID → GroupID` is the identity (`multiraft.Assignment`): shard `s` is group `GroupID(s)`. Which
+nodes form each group's **genesis** comes from the Phase 6 routing and nothing else: the cluster's
+routing configuration (`-shards`, `-rf`, `-nodes`, identical on every process) gives each shard's
+replica group, and that is its group's genesis voter set. A key's group is its shard on the
+consistent-hash ring — never a modulo — and no second routing algorithm exists
+(`TestAssignmentIsTheRouting`: 2, 4 and 8 groups over five nodes; every key's group is its routing
+shard). After genesis a group's membership is its own replicated configuration: the routing
+configuration describes where groups **started**; a membership change does not rewrite it.
 
 ## 3. The node host (`internal/multiraft`)
 
-The host owns:
+The host owns only what is per process:
 
-- **the group registry**: which groups this node hosts, discovered at start from
-  `groups/<gid>/raft.log.meta` (a directory without a valid `.meta` refuses the start — loud, never
-  guessed);
-- **group lifecycle**: create (write the genesis, then start), start, stop, join (create a group
-  with an empty genesis, to be added by its leader), and stop-on-removal (a group whose committed
-  configuration excludes this node is stopped; its files are kept — deletion is an operator's
-  explicit action, never automatic);
-- **inbound routing** (§4) and the transport's peer set (the union of every hosted group's members,
-  added as configurations arrive);
-- **client routing** (§6) and the admin operations (§7).
+- **the registry and lifecycle** — `Start` recovers every group found under `DataDir/groups/` in
+  ascending id order; a group that fails to recover is reported (`Failed`, `event=group_failed`) and
+  left down, and the others start (`TestAGroupThatFailsToRecoverDoesNotBlockTheOthers`). `Create`
+  starts a group for the first time as a genesis member or a joiner; `Stop` stops one, keeping its
+  files; `Open` starts a stopped one again from its own identity file; a group whose node reports its
+  removal (`docs/MEMBERSHIP.md` §7) is **retired** — stopped, files kept (`event=group_retired`,
+  `TestRemovedLeaderRetiresItsGroup`). Nothing is ever deleted automatically. A group directory is
+  created durably: each new directory's parent is fsynced, so a group can never vanish from a
+  node that held its state;
+- **the demultiplexer** (§4);
+- **the transport's peer set** — the members with addresses of every hosted group's current
+  configuration, plus the static peers (`-peers`), kept in step as configurations change
+  (`transport.PeerSet`: `AddPeer`, `RemovePeer`; `TestJoinerAddedThroughTheHost`,
+  `TestAddPeerConnectsAndRemovePeerDisconnects`). The host reads configurations from the groups —
+  replicated state — and never holds one authoritatively.
 
-Each group runs the unchanged Phase 14 driver (`raftnode.Node`) over its own files, with its own
-`kv.Store` and `kv.Server`.
+Each group runs the driver (`raftnode.Node`) over its own files, its own `kv.Store` and its own
+`kv.Server`; the host hands it a bounded inbox instead of the transport.
 
 ## 4. Message routing — the group envelope
 
-The transport still carries bytes tagged with a frame kind and attributes them to the connection's
-handshake identity (INV-T4). Every Raft, snapshot and forwarding payload a node sends is prefixed
-with the **group envelope**: `uvarint(GroupID) ‖ payload`. The host's receive loop unwraps it and
-hands the inner payload to that group's driver; a frame naming a group this node does not host
-is dropped and counted, never delivered to another group (INV-M6). The Raft core never sees a
-group id; the transport never interprets one. The envelope is the smallest boundary that lets one
-connection carry every group's traffic: no frame-format change, no per-group connections.
+The transport carries bytes tagged with a frame kind, attributed to the connection's handshake
+identity (INV-T4). Every payload a group's node sends — its Raft messages, its snapshot chunks, its
+forwarded client requests — is prefixed with the **group envelope**, `uvarint(GroupID) ‖ payload`,
+exactly once, at the driver's send boundary. The host's single receive loop removes it and hands the
+payload to that group's inbox — or drops and counts the frame: an unknown or stopped (or retired)
+group, a malformed envelope, a full inbox. It never delivers a frame to another group, and it never
+blocks on one group: a full inbox drops the frame (Raft retransmits) rather than stalling every
+other group (INV-MB6, INV-MB9). The core never sees a group id; the transport never interprets one.
+A node reading its transport itself (no host) drops frames of other groups the same way. A snapshot
+carries a second, independent identity — its file's group id — so a transfer misdelivered at any
+layer is still refused (`ErrWrongGroup`).
 
-Cases the routing must get right, each with a test (*evidence*): an unknown group; a stopped
-group; a group being created or removed while a message is in flight; a malformed envelope; a
-message meant for another node (the transport's handshake identity already prevents this); a
-duplicated frame.
+Tested cases (`TestFramesReachExactlyTheirGroup`, `TestNodeDropsFramesOfOtherGroups`,
+`TestEnvelopeRoundTripAndRefusals`, `FuzzUnwrapGroup`): a valid group; an unknown group; a stopped
+group; a group created after its frames started arriving; a malformed or non-canonical envelope; a
+group id over 32 bits; duplicated frames; one group's frame never moving another group's state.
 
 ## 5. Persistence layout
 
 ```
 <data-dir>/
-  node.meta                      this node's id and the cluster bootstrap (written once)
   groups/
     <gid>/
       raft.log                   the group's durable Raft log (entries, HardStates, boundaries)
-      raft.log.meta              the group's id and genesis configuration (written once)
+      raft.log.group             the group identity: group id + genesis configuration (written once)
       raft.log.snap              its one published snapshot (format v2: group id + configuration)
-      raft.log.tmp / .snap.tmp / .snap.recv    temporaries, removed at startup
+      raft.log.tmp, raft.log.group.tmp, raft.log.snap.tmp, raft.log.snap.recv
+                                 temporaries (a log rewrite, an identity, a snapshot being
+                                 written or received), removed at startup
 ```
 
-Groups are isolated by directory; a group's recovery reads only its own directory
-(`docs/SNAPSHOTS.md` §6), so a failure to recover one group is reported for that group and does
-not stop the others from starting (INV-M7). Phase 14's single-group layout (`raft-<id>.log`
-beside the data directory) is retired; `dkvd -raft` is group 0 of a one-group cluster.
+Groups are isolated by directory; a group's recovery reads only its own files. Two groups start,
+recover, snapshot, compact and fail independently (`TestGroupsSnapshotAndCompactIndependently`,
+`TestHostRestartRecoversEveryGroup`, `TestBreakingOneGroupLeavesTheOtherRunning`).
+`dkvd -raft` — the Phase 9–14 single-group deployment — is the host with one group, 0, whose log
+keeps its Phase 9–14 path (`<data-dir>/raft-<id>.log`) and its first-start I/O, so every earlier
+real-process test runs unchanged.
 
 ## 6. Client routing
 
-A client operation carries one key. The node that receives it computes `shard = Route(key)`,
-`group = GroupID(shard)`, and:
+```
+key ──Route──▶ shard ──identity──▶ group ──▶ that group's Server ──one hop──▶ the group's leader
+```
 
-- if it hosts the group, hands the request to that group's `kv.Server` — which serves it, or
-  forwards it one hop to the group's leader (Phase 13, unchanged; the forward travels in the group
-  envelope);
-- otherwise answers `NOT_LEADER` with a hint naming a member of the group it knows, and the client
-  goes there itself. There is never a second forwarding hop (INV-X13).
+A client computes the key's group with the cluster's routing and names it in the request
+(`Request.Group`; client protocol v3, `docs/API.md`). A node's `kv.Front`:
 
-`REGISTER` carries no key, so a request names its group explicitly (`Request.Group`; wire protocol
-v3); a **session is group-local** — its ClientID is a log index of that group — and a client that
-touches several shards holds one session per group (`kv.ShardedClient` does this for the tests;
-the request identity `(ClientID, RequestID)` is scoped by group, and no cross-group deduplication
-exists or is claimed).
+- refuses a keyed request whose key belongs to another group than it names (`INVALID_REQUEST`), so
+  a request can never execute in a group its session does not live in
+  (`TestFrontRefusesAMisroutedRequest`);
+- hands a request for a group it hosts to that group's `kv.Server`, which serves it or forwards it
+  one hop to the group's leader (Phase 13 semantics, unchanged — the forward travels in the group
+  envelope, with the request's identity intact);
+- answers a request for a group it does not host with `NOT_LEADER` and no hint: nothing was
+  proposed, and the client tries another node.
+
+`REGISTER` names its group. **A session is group-local**: its ClientID is a log index of that group,
+so the same number in two groups names two unrelated sessions, and a request identity
+`(ClientID, RequestID)` is deduplicated by its group alone. A client that touches several shards
+holds one session per group (`kv.Sharded`, which registers each on first use). Every operation is
+for exactly one key, hence exactly one group; there is no multi-key operation and no cross-group
+request semantics (`TestShardedClientRoutesEachKeyToItsGroup`).
 
 ## 7. Admin operations
 
-A minimal admin protocol on `-admin-listen`, separate from the client API: `Describe(group)`
-(configuration, leader, term, indexes), `AddLearner`, `Promote`, `RemoveVoter`, `RemoveLearner`,
-`Join(group)` (start hosting a group as a joiner), `Snapshot(group)` (a test snapshot). A
-membership operation is accepted only by the group's leader; any other node answers with the
-leader it believes in.
+A deliberately small protocol on `-admin-listen`, separate from the client port — one JSON line per
+request and per answer, acting on this node's groups only:
+
+| Op | Arguments | Effect |
+|---|---|---|
+| `status` | | every hosted group's role, term, leader, commit, applied, boundary, snapshot, configuration, pending change; the groups that failed to recover |
+| `add-learner` | group, id, addr | add a non-voting member (only the group's leader accepts; others name it) |
+| `promote` | group, id | a learner becomes a voter, by joint consensus |
+| `remove-voter` | group, id | by joint consensus |
+| `remove-learner` | group, id | |
+| `create-group` | group, `join` or `voters` | host a group for the first time: as a joiner, or as a genesis member |
+| `start-group` | group | start a stopped group again from its own files |
+| `stop-group` | group | stop hosting a group, keeping its files |
+| `snapshot` | group | snapshot the group's state machine now |
+
+A membership operation completes only when the group's log says so (`docs/MEMBERSHIP.md` §7). The
+protocol never decides membership (`TestAdminDrivesMembershipThroughTheLog`).
 
 ## 8. Evidence
 
-*Filled in as the phase's tests land.*
+- **Host** (`internal/multiraft`, real TCP, race detector): two groups on three nodes independent;
+  one group's quorum broken while the other commits; a group whose identity file is corrupt fails
+  alone; four groups rediscovered at restart; a joiner added to one group and reached by address
+  from the configuration alone; a removed leader's group retired; frames reach exactly their group;
+  two groups snapshotting and compacting independently.
+- **Client routing** (`internal/kv`): keys land in their own group on every replica; a misrouted
+  request executes nowhere; the wire's group round-trips and retired request kinds are refused.
+- **Multi-group simulator** (`internal/raftsim`): groups over nodes from the routing; node-level
+  faults fanned out to every group, a crash point killing the process in every group; seeded
+  schedules of 2 groups on 3 nodes, 4 on 5 (with snapshots) and 8 on 5 — every group converges,
+  keeps every invariant and, with clients, is linearizable on its own; same seed, same trace; each
+  group's trace reproduced exactly by replaying its own events alone (INV-MB9); one group broken by
+  persistence failures while the other commits. Its 100-seed runs found the self-removal liveness
+  bug (`docs/MEMBERSHIP.md` §8).
+- **Real processes** (`tests/integration/membership_test.go`, `-cluster` mode): two groups on three
+  nodes under concurrent session workloads (linearizable); a fourth node added to one group; group 0
+  stopped on two of three nodes while group 1 commits on the same processes, then restarted with
+  `start-group`; a full SIGKILL restart of a two-group cluster with every configuration and key
+  intact; the membership scenarios of `docs/MEMBERSHIP.md` §9.
 
-## 9. Limitations
+## 9. Performance
 
-*Filled in as the phase's tests land.*
+Measured on an Apple M4 (10 cores, 16 GiB), macOS 26.5, Go 1.27.1, `internal/multiraft`
+`-multiraft.measure` and the routing benchmarks. Timings describe this machine and are not asserted;
+the goroutine structure is.
+
+| Measurement | Result |
+|---|---|
+| goroutines per added group replica | 2 on one node (actor, receive loop); 4 on three nodes (+ one sender per peer) — asserted |
+| heap per idle replica | ≈113 KiB (one node, 8–128 groups); ≈215 KiB (three nodes) |
+| idle CPU per replica (50 ms tick) | ≈1.0 ms/s at 128 groups on one node; ≈1.1 ms/s on three nodes (heartbeats); higher per replica with few groups (fixed per-node costs) |
+| learner change (one entry, fsync) | p50 16.9 ms, p90 22.8 ms, max 186 ms over 40 changes |
+| `Promote` (joint + final, fsync) | 26 ms |
+| `RemoveVoter` (joint + final, fsync) | 31 ms |
+| new-member catch-up, 20,002 entries (100 B values over 2,000 keys) | 158 ms by entries; 23 ms by a snapshot at 20,000 + 2 entries |
+| a key's group (`Assignment.GroupOf`) | 175 ns (4 shards), 241 ns (16), 229 ns (64) |
+| the front's routing decision for one request | 403 ns |
+
+Largest configuration exercised: 128 groups per node in one process (three nodes × 128 groups =
+384 replicas). No claim is made beyond it.
+
+## 10. Limitations
+
+- **The group set is the shard set.** Groups are created from the routing at genesis, or joined
+  explicitly; there is no split, merge, shard movement between groups, or rebalancing policy.
+- **Bounded group counts.** Measured to 128 groups per node; every group has its own goroutines,
+  ticker and heartbeats, so an idle group is not free (§9). Thousands of groups per node are
+  neither tested nor claimed.
+- **One process-wide failure domain.** A node crash takes every group it hosts down together; a
+  group's persistence failure stops that group only (`-cluster`), or the process (`-raft`).
+- **No cross-group anything.** No transactions, no atomic multi-key operation, no global ordering, no
+  cross-group deduplication; a session lives in one group.
+- **A node that does not host a key's group redirects without a hint**; the client tries another
+  node. There is no routing directory beyond each client's copy of the routing configuration.
+- **A full inbox drops frames.** Under overload a group loses frames rather than stalling its
+  neighbours; Raft retransmits, forwarded client requests time out (unknown outcome).
