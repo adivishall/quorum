@@ -289,17 +289,25 @@ func (r *Raft) Compact(index uint64) error {
 
 // Step handles one inbound message. It is the only entry point for peer traffic.
 func (r *Raft) Step(m Message) error {
-	// A node outside this node's configuration (docs/MEMBERSHIP.md §5): its vote
-	// request is refused and its responses are dropped, and its term is never
-	// adopted — a removed node's inflated terms cannot depose the group's
-	// leader. What a LEADER sends (AppendEntries, a snapshot) is processed from
-	// anyone: a member that has fallen behind on configurations must be able to
-	// learn them from a leader it does not yet know.
+	// A node outside this node's configuration (docs/MEMBERSHIP.md §5): its
+	// responses are dropped, and its vote request is refused — its term never
+	// adopted — unless its log is at least as up to date as this node's. A
+	// removed node's log lacks the entry that removed it, so its inflated terms
+	// cannot depose the group's leader; but a candidate with an up-to-date log
+	// may be a voter of a configuration this node has not learned yet (this
+	// node lags, or is a joiner that has learned nothing), whose election may
+	// need this node's vote — refusing it could leave the group without a
+	// leader for ever (found by the membership chaos profiles, Phase 15). What a
+	// LEADER sends (AppendEntries, a snapshot) is processed from anyone: a
+	// member that has fallen behind must be able to learn from a leader it does
+	// not yet know.
 	if !r.conf.IsMember(m.From) && m.Type != MsgAppendRequest && m.Type != MsgSnapshot {
-		if m.Type == MsgVoteRequest {
-			r.send(Message{Type: MsgVoteResponse, To: m.From, Term: r.currentTerm, VoteGranted: false})
+		if m.Type != MsgVoteRequest || !r.candidateUpToDate(m.LastLogIndex, m.LastLogTerm) {
+			if m.Type == MsgVoteRequest {
+				r.send(Message{Type: MsgVoteResponse, To: m.From, Term: r.currentTerm, VoteGranted: false})
+			}
+			return nil
 		}
-		return nil
 	}
 	// Higher term: step down and adopt it before doing anything else. For an
 	// AppendEntries or a snapshot the sender is the new leader; otherwise we do
@@ -417,13 +425,18 @@ func (r *Raft) maybeBecomeLeader() {
 
 // --- message handlers (all called with m.Term == r.currentTerm) ---
 
-// handleVoteRequest grants a vote by the §5.2/§5.4.1 rules — one vote per
-// term, to a candidate whose log is at least as up to date — and only if this
-// node is a voter itself: a learner, or a node outside its own configuration,
-// never grants one (docs/MEMBERSHIP.md §5).
+// handleVoteRequest grants a vote by the §5.2/§5.4.1 rules — at most one per
+// term, to a candidate whose log is at least as up to date. It grants whether
+// or not this node believes it is
+// a voter (Phase 15): a learner, or a joiner, may already be a voter of a
+// configuration it has not received — a promotion that commits without it,
+// or whose joint entry needs its vote to be elected at all — and only the
+// candidate's configuration decides whether the vote counts
+// (handleVoteResponse). One vote per term, durable before the answer, is what
+// election safety rests on; that holds for every node.
 func (r *Raft) handleVoteRequest(m Message) {
 	grant := false
-	if r.conf.IsVoter(r.id) && (r.votedFor == "" || r.votedFor == m.From) && r.candidateUpToDate(m.LastLogIndex, m.LastLogTerm) {
+	if (r.votedFor == "" || r.votedFor == m.From) && r.candidateUpToDate(m.LastLogIndex, m.LastLogTerm) {
 		grant = true
 		r.votedFor = m.From
 		r.hsDirty = true

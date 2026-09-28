@@ -191,10 +191,14 @@ func (nw *network) confEntries(id NodeID) []Configuration {
 	return out
 }
 
-// TestLearnerReplicatesButNeverVotes (INV-M5): a joiner added as a learner
-// receives the log, never campaigns however long it waits for a leader, is not
-// asked for votes, refuses one when asked, and never counts toward a commit.
-func TestLearnerReplicatesButNeverVotes(t *testing.T) {
+// TestLearnerReplicatesButNeverCampaignsOrCounts (INV-M5): a joiner added as a
+// learner receives the log, never campaigns however long it waits for a
+// leader, is not asked for votes and has its vote ignored by a candidate, and
+// never counts toward a commit. Asked anyway, it grants a vote to an
+// up-to-date candidate: it may be a voter of a configuration it has not yet
+// received (TestPromotedLearnerThatMissedItsPromotionStillElects), and only
+// the candidate's configuration decides whether a vote counts.
+func TestLearnerReplicatesButNeverCampaignsOrCounts(t *testing.T) {
 	nw := newNetworkWith(t, []NodeID{"n1", "n2", "n3", "n4"}, voters("n1", "n2", "n3"), 1)
 	nw.electLeader("n1")
 	nw.propose("n1", "a")
@@ -218,15 +222,16 @@ func TestLearnerReplicatesButNeverVotes(t *testing.T) {
 	}
 	nw.heal()
 
-	// It refuses a vote, and a candidate never asks it.
+	// Asked, it grants an up-to-date candidate its one vote of the term; a
+	// candidate never asks it, and never counts its vote.
 	n4 := nw.nodes["n4"]
 	if err := n4.Step(Message{Type: MsgVoteRequest, From: "n2", To: "n4", Term: n4.Term() + 1, LastLogIndex: 99, LastLogTerm: 99}); err != nil {
 		t.Fatal(err)
 	}
 	rd := n4.Ready()
 	n4.Advance()
-	if len(rd.Messages) != 1 || rd.Messages[0].VoteGranted {
-		t.Fatalf("a learner granted a vote: %+v", rd.Messages)
+	if len(rd.Messages) != 1 || !rd.Messages[0].VoteGranted || rd.HardState == nil || rd.HardState.Vote != "n2" {
+		t.Fatalf("a learner asked by an up-to-date candidate: %+v", rd)
 	}
 	nw.isolate("n1") // n1 steps down eventually; make n2 campaign
 	nw.campaign("n2")
@@ -234,6 +239,13 @@ func TestLearnerReplicatesButNeverVotes(t *testing.T) {
 		if m.Type == MsgVoteRequest && m.To == "n4" {
 			t.Fatal("a candidate asked a learner for its vote")
 		}
+	}
+	n2 := nw.nodes["n2"]
+	if err := n2.Step(Message{Type: MsgVoteResponse, From: "n4", To: "n2", Term: n2.Term(), VoteGranted: true}); err != nil {
+		t.Fatal(err)
+	}
+	if n2.Role() != Candidate {
+		t.Fatalf("a learner's vote was counted: %s is %s", "n2", n2.Role())
 	}
 	nw.heal()
 	nw.deliverAll()
@@ -777,22 +789,39 @@ func TestRecoveryUsesTheLatestConfigurationInTheLog(t *testing.T) {
 // TestNonMemberVoteRequestDoesNotBumpTheTerm pins the containment rule
 // directly on one core: a vote request from a node outside the configuration
 // is refused and the term stays; from a member it is honoured.
-func TestNonMemberVoteRequestDoesNotBumpTheTerm(t *testing.T) {
-	r, _ := newCore(t, "a", ids(3), 1)
-	_ = r.Step(Message{Type: MsgVoteRequest, From: "z", To: "a", Term: 50, LastLogIndex: 9, LastLogTerm: 9})
+func TestNonMemberVoteRequestIsHeardOnlyWithAnUpToDateLog(t *testing.T) {
+	lg := replication.NewMemoryLog()
+	if err := lg.Append(Entry{Index: 1, Term: 2}, Entry{Index: 2, Term: 2}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{ID: "a", Peers: ids(3), Rand: rand.New(rand.NewSource(1)), Log: lg, Term: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A stranger whose log is behind ours — a removed node's lacks the entry
+	// that removed it — is refused without its term being adopted.
+	_ = r.Step(Message{Type: MsgVoteRequest, From: "z", To: "a", Term: 50, LastLogIndex: 1, LastLogTerm: 2})
 	rd := r.Ready()
 	r.Advance()
-	if r.Term() != 0 || len(rd.Messages) != 1 || rd.Messages[0].VoteGranted || rd.Messages[0].Term != 0 || rd.HardState != nil {
-		t.Fatalf("a stranger's vote request: term %d, %+v", r.Term(), rd)
+	if r.Term() != 2 || len(rd.Messages) != 1 || rd.Messages[0].VoteGranted || rd.Messages[0].Term != 2 || rd.HardState != nil {
+		t.Fatalf("a stranger with a stale log: term %d, %+v", r.Term(), rd)
 	}
 	_ = r.Step(Message{Type: MsgVoteResponse, From: "z", To: "a", Term: 50, VoteGranted: true})
-	if r.Term() != 0 {
+	if r.Term() != 2 {
 		t.Fatalf("a stranger's response bumped the term to %d", r.Term())
 	}
-	_ = r.Step(Message{Type: MsgVoteRequest, From: "b", To: "a", Term: 1, LastLogIndex: 0, LastLogTerm: 0})
+	// A stranger whose log is at least as up to date may be a voter of a
+	// configuration this node has not learned: it is heard.
+	_ = r.Step(Message{Type: MsgVoteRequest, From: "z", To: "a", Term: 60, LastLogIndex: 2, LastLogTerm: 2})
 	rd = r.Ready()
 	r.Advance()
-	if r.Term() != 1 || !rd.Messages[0].VoteGranted {
+	if r.Term() != 60 || len(rd.Messages) != 1 || !rd.Messages[0].VoteGranted {
+		t.Fatalf("a stranger with an up-to-date log: term %d, %+v", r.Term(), rd)
+	}
+	_ = r.Step(Message{Type: MsgVoteRequest, From: "b", To: "a", Term: 61, LastLogIndex: 2, LastLogTerm: 2})
+	rd = r.Ready()
+	r.Advance()
+	if r.Term() != 61 || !rd.Messages[0].VoteGranted {
 		t.Fatalf("a member's vote request: term %d granted %v", r.Term(), rd.Messages[0].VoteGranted)
 	}
 	// A leader's entries from a non-member are processed: a joiner learns the
@@ -1023,4 +1052,79 @@ func TestJoinerKnowsNoConfigurationUntilItLearnsOne(t *testing.T) {
 	if c, err := r.ConfAt(3); err != nil || !c.Equal(c1) {
 		t.Fatalf("ConfAt(3) after compacting through 3: %s %v", c, err)
 	}
+}
+
+// stepDown makes the leader id adopt a higher term from its member from — as a
+// removed or restarted node's campaign would — so it must be elected again.
+func (nw *network) stepDown(id, from NodeID) {
+	nw.t.Helper()
+	r := nw.nodes[id]
+	if err := r.Step(Message{Type: MsgVoteRequest, From: from, To: id, Term: r.Term() + 5}); err != nil {
+		nw.t.Fatal(err)
+	}
+	nw.drain(id)
+	nw.queue = nil
+	if r.Role() != Follower {
+		nw.t.Fatalf("%s did not step down: %s", id, r.Role())
+	}
+}
+
+// TestPromotedLearnerThatMissedItsPromotionStillElects is the regression for a
+// liveness bug the membership chaos profile found (seed 9): a single voter n1
+// promotes the learner n2 — the joint entry {n1,n2}/{n1} needs n2 to commit —
+// and steps down before the entry reaches n2. n1 can be elected only with
+// n2's vote, and n2 still believes it is a learner. Were a learner to refuse
+// every vote, the group would have no leader for ever; it grants, n1 is
+// elected, and the promotion completes.
+func TestPromotedLearnerThatMissedItsPromotionStillElects(t *testing.T) {
+	nw := newNetworkWith(t, []NodeID{"n1", "n2"}, voters("n1"), 3)
+	nw.electLeader("n1")
+	nw.change("n1", ConfChange{Type: AddLearner, Member: Member{ID: "n2"}})
+	nw.heartbeatRounds()
+	if c, _ := nw.nodes["n2"].Conf(); !c.IsLearner("n2") {
+		t.Fatalf("n2: %s", c)
+	}
+	nw.isolate("n2")
+	if err := nw.nodes["n1"].ProposeConfChange(ConfChange{Type: Promote, Member: Member{ID: "n2"}}); err != nil {
+		t.Fatal(err)
+	}
+	nw.drain("n1")
+	nw.queue = nil // the joint entry never reaches n2
+	nw.stepDown("n1", "n2")
+	nw.heal()
+	nw.electLeader("n1")
+	nw.settleChange("n1")
+	if c, _ := nw.nodes["n1"].Conf(); c.Joint() || !c.IsVoter("n2") {
+		t.Fatalf("after the election: %s", c)
+	}
+	nw.heartbeatRounds()
+	nw.requireConverged("n1")
+}
+
+// TestJoinerWithNoConfigurationVotesForItsPromotion: the same with a joiner
+// that received nothing at all — its configuration is empty, so the candidate
+// is not a member of it. The candidate's log is up to date, so the joiner
+// hears it, grants, and the promotion completes.
+func TestJoinerWithNoConfigurationVotesForItsPromotion(t *testing.T) {
+	nw := newNetworkWith(t, []NodeID{"n1", "n2"}, voters("n1"), 4)
+	nw.electLeader("n1")
+	nw.isolate("n2")
+	nw.change("n1", ConfChange{Type: AddLearner, Member: Member{ID: "n2"}}) // commits with n1 alone
+	if c, _ := nw.nodes["n2"].Conf(); !c.Empty() {
+		t.Fatalf("n2 learned something while isolated: %s", c)
+	}
+	if err := nw.nodes["n1"].ProposeConfChange(ConfChange{Type: Promote, Member: Member{ID: "n2"}}); err != nil {
+		t.Fatal(err)
+	}
+	nw.drain("n1")
+	nw.queue = nil
+	nw.stepDown("n1", "n2")
+	nw.heal()
+	nw.electLeader("n1")
+	nw.settleChange("n1")
+	nw.heartbeatRounds()
+	if c, _ := nw.nodes["n2"].Conf(); c.Joint() || !c.IsVoter("n2") {
+		t.Fatalf("n2 after the election: %s", c)
+	}
+	nw.requireConverged("n1")
 }
