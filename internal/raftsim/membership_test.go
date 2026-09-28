@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/adivishall/quorum/internal/lincheck"
 	"github.com/adivishall/quorum/internal/raft"
 )
 
@@ -404,4 +405,81 @@ func TestMembershipEventsRoundTrip(t *testing.T) {
 	if s.Stats().ConfChangesRejected != before+2 {
 		t.Fatalf("refusals: %d", s.Stats().ConfChangesRejected-before)
 	}
+}
+
+// TestKVSimRetryIsADuplicateAcrossMembershipSnapshotAndFullRestart: the
+// session table is replicated state, so request identity survives everything
+// Phase 15 can do to a group. c1's PUT executes and is applied, and its leader
+// n1 dies before the reply; a new leader adds n4, promotes it and removes n1;
+// every member snapshots and compacts past the write; every node loses power
+// and restarts from its snapshot. c1's retry of the SAME request, at the new
+// leader, is answered as a duplicate of the original execution — never
+// executed again — and the history is linearizable.
+func TestKVSimRetryIsADuplicateAcrossMembershipSnapshotAndFullRestart(t *testing.T) {
+	cfg := memberCfg(4, 3, 21)
+	cfg.SnapshotEvery, cfg.SnapshotRetain = 4, 0
+	s := &kvSim{newSimWith(t, cfg)}
+	s.electLeader("n1")
+	s.register("n1", "c1")
+	s.register("n1", "c2")
+	s.heartbeat("n1")
+	s.do(Event{Kind: CrashAt, Node: "n1", Point: "after-applied-to", Nth: 1})
+	s.put("n1", "c1", "k", "A")
+	s.DeliverAll()
+	s.heartbeat("n1")
+	if s.Up("n1") || !s.Busy("c1") {
+		t.Fatalf("premise: n1 died after applying c1's write, unanswered (n1 up %v, c1 busy %v)", s.Up("n1"), s.Busy("c1"))
+	}
+	s.do(Event{Kind: KVTimeout, Client: "c1"}) // that send is given up; the request stays open
+	l := s.electAmong("n2", "n3")
+	s.restart("n1")
+	s.member(l, "addlearner", "n4")
+	s.settleConf(l)
+	s.member(l, "promote", "n4")
+	s.settleConf(l)
+	s.member(l, "removevoter", "n1")
+	conf := s.settleConf(l)
+	if conf.IsMember("n1") || !conf.IsVoter("n4") {
+		t.Fatalf("after the membership changes: %s", conf)
+	}
+	for i := 0; i < 4; i++ {
+		s.put(l, "c2", fmt.Sprintf("other%d", i), "x")
+		s.DeliverAll()
+		s.heartbeat(l)
+	}
+	for _, id := range conf.Members() {
+		s.do(Event{Kind: SnapshotNow, Node: id})
+	}
+	s.settleConf(l)
+	for _, id := range conf.Members() {
+		if st := s.State(id); st.Boundary < 5 {
+			t.Fatalf("premise: %s did not compact past the write: %+v", id, st)
+		}
+	}
+	for _, id := range s.IDs() {
+		s.do(Event{Kind: Crash, Node: id, Power: true})
+	}
+	for _, id := range s.IDs() {
+		s.restart(id)
+	}
+	l = s.electAmong(conf.VoterIDs()...)
+	s.Apply(Event{Kind: KVRetry, Node: l, Client: "c1"})
+	for i := 0; i < 20 && s.Busy("c1"); i++ {
+		s.DeliverAll()
+		s.heartbeat(l)
+	}
+	op := s.last("c1")
+	last := op.Attempts[len(op.Attempts)-1]
+	if op.Outcome != lincheck.OK || !strings.HasPrefix(last.Result, "duplicate of index") {
+		t.Fatalf("the retry must be answered as a duplicate of the original: %s %+v", op, op.Attempts)
+	}
+	s.get(l, "c3", "k")
+	for i := 0; i < 20 && s.Busy("c3"); i++ {
+		s.DeliverAll()
+		s.heartbeat(l)
+	}
+	if op := s.last("c3"); op.Outcome != lincheck.OK || string(op.Output) != "A" {
+		t.Fatalf("k after the retry: %s", op)
+	}
+	s.requireLinearizable()
 }
