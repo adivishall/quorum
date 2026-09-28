@@ -103,3 +103,27 @@ func FuzzDecodeTypedEntry(f *testing.F) {
 	f.Add([]byte{})
 	f.Fuzz(func(t *testing.T, data []byte) { _, _ = decodeTypedEntry(data) })
 }
+
+// TestVoterlessConfigurationEntryIsCorruption: a configuration entry whose
+// configuration has no voters is no transition's result; the log refuses it.
+func TestVoterlessConfigurationEntryIsCorruption(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "raft.log")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := record.NewWriter(f)
+	voterless := Entry{Index: 1, Term: 1, Type: replication.EntryConfig,
+		Data: replication.EncodeConfiguration(replication.Configuration{Learners: []replication.Member{{ID: "n4"}}})}
+	if _, err := w.Append(kindEntryTyped, encodeTypedEntry(voterless)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Append(kindHardState, encodeHardState(HardState{Term: 1})); err != nil {
+		t.Fatal(err)
+	}
+	f.Sync()
+	f.Close()
+	if _, _, err := Open(path, Options{Sync: true}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("a voterless configuration entry opened: %v", err)
+	}
+}

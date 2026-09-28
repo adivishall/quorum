@@ -64,8 +64,22 @@ type Member struct {
 // §2). Voters are the current voting members — C_new while a joint transition is
 // in progress; Outgoing is C_old, non-empty exactly while the configuration is
 // joint; Learners are replicated to but never vote, never count, never campaign.
-// Each list is sorted by id. The zero Configuration is the empty one: a node that
-// joins a group starts with it and learns the membership from its leader.
+// The zero Configuration is the empty one: a node that joins a group starts with
+// it and learns the membership from its leader.
+//
+// The representation is canonical — one meaning, one value, one encoding:
+//
+//   - each list is sorted strictly ascending by id: no duplicate within a list;
+//   - a STABLE configuration has no Outgoing list;
+//   - a JOINT configuration lists C_new in Voters and C_old in Outgoing, both
+//     non-empty and different as sets of ids. A member of both is listed in
+//     BOTH, deliberately: its vote and its acknowledgement count toward each
+//     majority (a joint quorum is a majority of Voters and a majority of
+//     Outgoing). It is one member, so it carries the same address in both. An
+//     Outgoing list equal to Voters would be a second representation of the
+//     stable configuration, and is refused;
+//   - a learner is in neither voter set;
+//   - at most MaxMembers distinct ids across the lists.
 type Configuration struct {
 	Voters   []Member
 	Outgoing []Member
@@ -176,6 +190,25 @@ func (c Configuration) Validate() error {
 			return fmt.Errorf("%w: %q is both a learner and a voter", ErrInvalidConfiguration, m.ID)
 		}
 	}
+	if c.Joint() {
+		if len(c.Voters) == 0 {
+			return fmt.Errorf("%w: a joint configuration without incoming voters", ErrInvalidConfiguration)
+		}
+		same := len(c.Voters) == len(c.Outgoing)
+		for i, m := range c.Outgoing {
+			for _, v := range c.Voters {
+				if v.ID == m.ID && v.Addr != m.Addr {
+					return fmt.Errorf("%w: %q has address %q as a voter and %q as an outgoing voter", ErrInvalidConfiguration, m.ID, v.Addr, m.Addr)
+				}
+			}
+			if same && c.Voters[i].ID != m.ID {
+				same = false
+			}
+		}
+		if same {
+			return fmt.Errorf("%w: a joint configuration whose outgoing voters are its voters (the stable one, represented twice)", ErrInvalidConfiguration)
+		}
+	}
 	if n := len(c.Members()); n > MaxMembers {
 		return fmt.Errorf("%w: %d members, at most %d", ErrInvalidConfiguration, n, MaxMembers)
 	}
@@ -201,6 +234,24 @@ func EncodeConfiguration(c Configuration) []byte {
 		}
 	}
 	return b
+}
+
+// DecodeConfigurationEntry decodes the payload of a configuration LOG ENTRY
+// (or of a snapshot's configuration): a configuration DecodeConfiguration
+// accepts, which must also have voters. Every transition of
+// docs/MEMBERSHIP.md §4 yields voters — the last voter can never be removed —
+// and a group whose log held a voterless configuration could never elect a
+// leader again. Only a joiner's genesis, which is never a log entry, is
+// empty.
+func DecodeConfigurationEntry(b []byte) (Configuration, error) {
+	c, err := DecodeConfiguration(b)
+	if err != nil {
+		return Configuration{}, err
+	}
+	if len(c.Voters) == 0 {
+		return Configuration{}, fmt.Errorf("%w: a configuration entry without voters", ErrInvalidConfiguration)
+	}
+	return c, nil
 }
 
 // DecodeConfiguration parses an encoded configuration strictly: canonical

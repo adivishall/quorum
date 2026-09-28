@@ -84,15 +84,17 @@ func TestEncodeRefusesInvalidMetadata(t *testing.T) {
 }
 
 // TestLargestConfigurationFits: the largest valid configuration — every member
-// at the id and address bounds, each listed as a voter and an outgoing voter —
-// fits the header's bound and round-trips.
+// at the id and address bounds, a joint one listing all of them as voters and
+// all but one of them again as outgoing voters (a removal in progress; an
+// outgoing set equal to the voters is not a valid joint configuration) — fits
+// the header's bound and round-trips.
 func TestLargestConfigurationFits(t *testing.T) {
 	var all []replication.Member
 	for i := 0; i < replication.MaxMembers; i++ {
 		id := fmt.Sprintf("%03d", i) + strings.Repeat("i", replication.MaxMemberLen-3)
 		all = append(all, replication.Member{ID: replication.NodeID(id), Addr: strings.Repeat("a", replication.MaxMemberLen)})
 	}
-	c := replication.Configuration{Voters: all, Outgoing: all}
+	c := replication.Configuration{Voters: all, Outgoing: all[:len(all)-1]}
 	if n := len(replication.EncodeConfiguration(c)); n > replication.MaxEncodedConfiguration {
 		t.Fatalf("the largest configuration encodes to %d bytes, over the %d bound", n, replication.MaxEncodedConfiguration)
 	}
@@ -257,7 +259,12 @@ func corpus(t *testing.T) map[string]struct {
 		"bad/conf-voters-unsorted":    {withConf(replication.EncodeConfiguration(replication.Configuration{Voters: mem("n2", "n1")})), ErrCorrupt},
 		"bad/conf-duplicate-voter":    {withConf(replication.EncodeConfiguration(replication.Configuration{Voters: mem("n1", "n1")})), ErrCorrupt},
 		"bad/conf-learner-is-a-voter": {withConf(replication.EncodeConfiguration(replication.Configuration{Voters: mem("n1", "n2"), Learners: mem("n2")})), ErrCorrupt},
-		"bad/conf-length-over-bound":  {cat(rec(t, kindHeader, header(magic, Version, 0, make([]byte, replication.MaxEncodedConfiguration+1), 10, 2, uint64(len(data)), sum)), rec(t, kindData, data), rec(t, kindFooter, footer(10, 2))), ErrCorrupt},
+		// A joint configuration whose outgoing voters are its voters is the
+		// stable one represented twice; one member may not carry two addresses.
+		"bad/conf-joint-outgoing-equals-voters": {withConf(replication.EncodeConfiguration(replication.Configuration{Voters: mem("n1", "n2"), Outgoing: mem("n1", "n2")})), ErrCorrupt},
+		"bad/conf-joint-member-two-addresses": {withConf(replication.EncodeConfiguration(replication.Configuration{Voters: mem("n1", "n2"),
+			Outgoing: []replication.Member{{ID: "n1", Addr: "elsewhere"}, {ID: "n3", Addr: "127.0.0.1:n3"}}})), ErrCorrupt},
+		"bad/conf-length-over-bound": {cat(rec(t, kindHeader, header(magic, Version, 0, make([]byte, replication.MaxEncodedConfiguration+1), 10, 2, uint64(len(data)), sum)), rec(t, kindData, data), rec(t, kindFooter, footer(10, 2))), ErrCorrupt},
 	}
 	return c
 }

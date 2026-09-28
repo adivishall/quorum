@@ -168,3 +168,58 @@ func FuzzDecodeConfiguration(f *testing.F) {
 		}
 	})
 }
+
+// TestJointConfigurationIsCanonical pins the representation of a joint
+// configuration (docs/MEMBERSHIP.md §2): a member of both voter sets is listed
+// in both — its vote counts toward each majority — with one address; it
+// round-trips byte-identically. Refused: an outgoing set equal to the voters
+// (the stable configuration, represented twice), a joint configuration without
+// incoming voters, and a member with two addresses.
+func TestJointConfigurationIsCanonical(t *testing.T) {
+	joint := Configuration{Voters: mem("a", "b", "d"), Outgoing: mem("a", "b", "c")}
+	b := EncodeConfiguration(joint)
+	got, err := DecodeConfiguration(b)
+	if err != nil || !got.Equal(joint) || !bytes.Equal(EncodeConfiguration(got), b) {
+		t.Fatalf("round trip: %s %v", got, err)
+	}
+	if len(got.Voters) != 3 || len(got.Outgoing) != 3 || len(got.Members()) != 4 {
+		t.Fatalf("a and b must be listed in both sets, counted once as members: %s", got)
+	}
+	twoAddrs := Configuration{Voters: mem("a", "b"), Outgoing: []Member{{ID: "a", Addr: "elsewhere"}, {ID: "c", Addr: "127.0.0.1:c"}}}
+	for name, c := range map[string]Configuration{
+		"outgoing equal to the voters":    {Voters: mem("a", "b"), Outgoing: mem("a", "b")},
+		"no incoming voters":              {Outgoing: mem("a", "b")},
+		"one member, two addresses":       twoAddrs,
+		"duplicate within the voters":     {Voters: mem("a", "a", "b"), Outgoing: mem("a", "c")},
+		"a learner among outgoing voters": {Voters: mem("a"), Outgoing: mem("a", "b"), Learners: mem("b")},
+		"a learner among incoming voters": {Voters: mem("a", "b"), Outgoing: mem("a"), Learners: mem("b")},
+	} {
+		if err := c.Validate(); !errors.Is(err, ErrInvalidConfiguration) {
+			t.Errorf("%s: Validate = %v", name, err)
+		}
+		if _, err := DecodeConfiguration(EncodeConfiguration(c)); !errors.Is(err, ErrInvalidConfiguration) {
+			t.Errorf("%s: decoded", name)
+		}
+	}
+}
+
+// TestConfigurationEntriesNeedVoters: the payload of a configuration log entry
+// must have voters — no transition produces a voterless configuration, and a
+// log holding one could never elect a leader again — while the empty
+// configuration remains valid as a joiner's genesis.
+func TestConfigurationEntriesNeedVoters(t *testing.T) {
+	if err := (Configuration{}).Validate(); err != nil {
+		t.Fatalf("the empty configuration (a joiner's genesis): %v", err)
+	}
+	for name, c := range map[string]Configuration{
+		"empty":         {},
+		"learners only": {Learners: mem("a")},
+	} {
+		if _, err := DecodeConfigurationEntry(EncodeConfiguration(c)); !errors.Is(err, ErrInvalidConfiguration) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if _, err := DecodeConfigurationEntry(EncodeConfiguration(Configuration{Voters: mem("a")})); err != nil {
+		t.Fatal(err)
+	}
+}

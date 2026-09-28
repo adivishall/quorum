@@ -107,6 +107,11 @@ func New(cfg Config) (*Raft, error) {
 		nextIndex:          map[NodeID]uint64{},
 		matchIndex:         map[NodeID]uint64{},
 	}
+	if len(base.Voters) == 0 && (!base.Empty() || cfg.ConfIndex > 0) {
+		// Only a joiner's genesis is voterless, and then empty and at index 0;
+		// a snapshot's configuration always has voters.
+		return nil, fmt.Errorf("%w: a base configuration without voters (%s at %d)", replication.ErrInvalidConfiguration, base, cfg.ConfIndex)
+	}
 	boundary, _ := r.log.Boundary()
 	if cfg.ConfIndex > r.log.LastIndex() {
 		return nil, fmt.Errorf("%w: base configuration at %d, past the log's last index %d", ErrConfMismatch, cfg.ConfIndex, r.log.LastIndex())
@@ -135,7 +140,7 @@ func (r *Raft) checkLogConfs() error {
 			return err
 		}
 		if e.Type == replication.EntryConfig {
-			c, err := replication.DecodeConfiguration(e.Data)
+			c, err := replication.DecodeConfigurationEntry(e.Data)
 			if err != nil {
 				return err
 			}

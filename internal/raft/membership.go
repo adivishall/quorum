@@ -211,7 +211,7 @@ func (r *Raft) ConfAt(index uint64) (Configuration, error) {
 			return Configuration{}, err
 		}
 		if e.Type == replication.EntryConfig {
-			return replication.DecodeConfiguration(e.Data)
+			return replication.DecodeConfigurationEntry(e.Data)
 		}
 	}
 	// No configuration entry in (boundary, index]: the configuration at index is
@@ -248,7 +248,7 @@ func (r *Raft) baseAfter(index uint64) (Configuration, uint64) {
 			break
 		}
 		if e.Type == replication.EntryConfig {
-			if c, err := replication.DecodeConfiguration(e.Data); err == nil {
+			if c, err := replication.DecodeConfigurationEntry(e.Data); err == nil {
 				return c, i
 			}
 		}
@@ -394,7 +394,7 @@ func (r *Raft) reconcileConf() {
 			continue
 		}
 		if i != r.confIndex {
-			c, err := replication.DecodeConfiguration(e.Data)
+			c, err := replication.DecodeConfigurationEntry(e.Data)
 			if err != nil {
 				// The codec refused it on the wire and recovery refuses it on
 				// disk; a configuration entry in the log is always decodable.

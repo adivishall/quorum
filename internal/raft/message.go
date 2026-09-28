@@ -134,7 +134,7 @@ func Unmarshal(payload []byte) (Message, error) {
 			switch e.Type {
 			case replication.EntryNormal:
 			case replication.EntryConfig:
-				if _, err := replication.DecodeConfiguration(e.Data); err != nil {
+				if _, err := replication.DecodeConfigurationEntry(e.Data); err != nil {
 					return Message{}, ErrMalformedMessage
 				}
 			default:

@@ -608,7 +608,7 @@ func decodeTypedEntry(p []byte) (Entry, error) {
 	case replication.EntryNormal:
 		return Entry{}, fmt.Errorf("%w: a normal entry written as a typed record", ErrCorrupt)
 	case replication.EntryConfig:
-		if _, err := replication.DecodeConfiguration(e.Data); err != nil {
+		if _, err := replication.DecodeConfigurationEntry(e.Data); err != nil {
 			return Entry{}, fmt.Errorf("%w: configuration entry %d: %v", ErrCorrupt, e.Index, err)
 		}
 	default:
