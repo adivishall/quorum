@@ -111,8 +111,8 @@ mutant "mandatory-election-no-op" internal/raft/raft.go \
 
 # 3. Allow a second vote to a different candidate in the same term.
 mutant "one-vote-per-term" internal/raft/raft.go \
-  'if (r.votedFor == "" || r.votedFor == m.From) && r.candidateUpToDate(' \
-  'if (true || r.votedFor == m.From) && r.candidateUpToDate(' \
+  'if r.conf.IsVoter(r.id) && (r.votedFor == "" || r.votedFor == m.From) && r.candidateUpToDate(' \
+  'if r.conf.IsVoter(r.id) && (true || r.votedFor == m.From) && r.candidateUpToDate(' \
   ./internal/raft 'TestVoteGrantedOncePerTerm|TestVoteAgainstReferenceModel'
 
 # 4. Permit overwriting a committed suffix (the Phase 8 log guard).
@@ -187,12 +187,12 @@ mutant "fail-stop-on-persist-failure" internal/raftnode/crashpoint.go \
 # 13. The actor sends synchronously, so one wedged peer stalls the whole node.
 mutant "actor-never-blocks-on-a-peer" internal/raftnode/node.go \
   '	select {
-	case ch <- m:
+	case ob.ch <- m:
 	default:' \
   '	n.sendMessage(m)
 	return
 	select {
-	case ch <- m:
+	case ob.ch <- m:
 	default:' \
   ./internal/raftnode 'TestWedgedPeerDoesNotStallTheLeader'
 
@@ -285,7 +285,7 @@ mutant "dialer-backs-off-after-dead-conn" internal/transport/transport.go \
 		// Redialling immediately would spin at CPU speed against a peer that
 		// accepts and instantly closes — a crash-looping peer, or a partition
 		// that resets connections — burning ports and flooding logs.
-		if t.sleep(t.cfg.DialRetryInterval) {
+		if sleepCtx(ctx, t.cfg.DialRetryInterval) {
 			return
 		}' \
   '		t.serve(peer, nc, "outbound") // blocks until the connection dies' \
@@ -348,10 +348,10 @@ mutant "mid-log-corruption-is-fatal" internal/raftlog/raftlog.go \
 #     (recovery inventing coherence instead of refusing an incoherent log).
 mutant "recover-refuses-term-below-log" internal/raft/config.go \
   '		if c.Term < lt {
-			return nil, ErrTermRegression
+			return none, ErrTermRegression
 		}' \
   '		if false && c.Term < lt {
-			return nil, ErrTermRegression
+			return none, ErrTermRegression
 		}' \
   ./internal/raftnode 'TestRecoverRefusesATermBelowItsLog'
 
@@ -368,10 +368,14 @@ mutant "applied-recorded-only-after-apply" internal/raftnode/crashpoint.go \
   '		var result any
 		if sm != nil {
 			var err error
+			cmd := e.Data
+			if e.Type != replication.EntryNormal {
+				cmd = nil
+			}
 			if rsm != nil {
-				result, err = rsm.ApplyResult(e.Index, e.Data)
+				result, err = rsm.ApplyResult(e.Index, cmd)
 			} else {
-				err = sm.Apply(e.Index, e.Data)
+				err = sm.Apply(e.Index, cmd)
 			}
 			if err != nil {
 				return fmt.Errorf("%w: index %d: %w", ErrApply, e.Index, err)
@@ -389,10 +393,14 @@ mutant "applied-recorded-only-after-apply" internal/raftnode/crashpoint.go \
 		var result any
 		if sm != nil {
 			var err error
+			cmd := e.Data
+			if e.Type != replication.EntryNormal {
+				cmd = nil
+			}
 			if rsm != nil {
-				result, err = rsm.ApplyResult(e.Index, e.Data)
+				result, err = rsm.ApplyResult(e.Index, cmd)
 			} else {
-				err = sm.Apply(e.Index, e.Data)
+				err = sm.Apply(e.Index, cmd)
 			}
 			if err != nil {
 				return fmt.Errorf("%w: index %d: %w", ErrApply, e.Index, err)
@@ -436,8 +444,8 @@ mutant "readindex-ignores-acks-sent-before-the-read" internal/raft/raft.go \
 
 # 37. A ReadIndex confirmed without a quorum (the leader alone suffices).
 mutant "readindex-needs-a-quorum" internal/raft/raft.go \
-  '		if acks < quorum(len(r.peers)) {' \
-  '		if acks < 1 {' \
+  '		if !r.hasQuorum(func(id NodeID) bool { return id == r.id || r.ackSeq[id] >= p.seq }) {' \
+  '		if false && !r.hasQuorum(func(id NodeID) bool { return id == r.id || r.ackSeq[id] >= p.seq }) {' \
   "./internal/raft ./internal/raftsim" 'TestReadIndexIsConfirmedByAQuorumRound|TestIsolatedLeaderNeverConfirmsARead|TestKVStaleLeaderReadIsNeverServed|TestKVMinorityLeaderWithAFollowerNeverServesARead'
 
 # 38. Unconfirmed reads survive the leader stepping down in the core.
@@ -563,14 +571,14 @@ echo "== Phase 12: the same rules, killed by client-visible histories ALONE =="
 # 54. No-quorum ReadIndex, on five real processes: a minority leader that still
 #     has a follower acknowledging it serves a stale read.
 mutant "readindex-needs-a-quorum (real processes)" internal/raft/raft.go \
-  '		if acks < quorum(len(r.peers)) {' \
-  '		if acks < 1 {' \
+  '		if !r.hasQuorum(func(id NodeID) bool { return id == r.id || r.ackSeq[id] >= p.seq }) {' \
+  '		if false && !r.hasQuorum(func(id NodeID) bool { return id == r.id || r.ackSeq[id] >= p.seq }) {' \
   ./tests/integration 'TestRealMinorityLeaderWithAFollowerNeverServesARead'
 
 # 55. The same, in the simulator's scripted minority-leader attack.
 mutant "readindex-needs-a-quorum (simulated history)" internal/raft/raft.go \
-  '		if acks < quorum(len(r.peers)) {' \
-  '		if acks < 1 {' \
+  '		if !r.hasQuorum(func(id NodeID) bool { return id == r.id || r.ackSeq[id] >= p.seq }) {' \
+  '		if false && !r.hasQuorum(func(id NodeID) bool { return id == r.id || r.ackSeq[id] >= p.seq }) {' \
   ./internal/raftsim 'TestKVMinorityLeaderWithAFollowerNeverServesARead'
 
 # 56. Pre-read acknowledgements confirm the read: the simulated stale leader
@@ -762,13 +770,17 @@ mutant "durations-that-overflow-are-protocol-errors" internal/kv/wire.go \
 #     detector, so "-race" rides in the package list.
 mutant "start-reads-the-core-before-the-actor-owns-it" internal/raftnode/node.go \
   '	term, last := rc.Core.Term(), rc.Core.LastIndex()
+	conf, _ := rc.Core.Conf()
+	n.syncOutboxes()
 	n.wg.Add(2)
 	go n.receiveLoop()
 	go n.actorLoop()' \
-  '	n.wg.Add(2)
+  '	n.syncOutboxes()
+	n.wg.Add(2)
 	go n.receiveLoop()
 	go n.actorLoop()
-	term, last := rc.Core.Term(), rc.Core.LastIndex()' \
+	term, last := rc.Core.Term(), rc.Core.LastIndex()
+	conf, _ := rc.Core.Conf()' \
   "-race ./internal/raftnode" 'TestStartDoesNotTouchTheCoreOnceTheActorOwnsIt'
 
 # 92. The session client backs off a fixed interval (no doubling): it spends
