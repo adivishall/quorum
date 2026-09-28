@@ -54,4 +54,17 @@ var (
 	// ErrUnknownMessageType means a message payload carried a type byte that is
 	// not a defined Raft message type.
 	ErrUnknownMessageType = errors.New("raft: unknown message type")
+
+	// --- membership (Phase 15, see membership.go) ---
+
+	// ErrConfUnknown means the configuration at an index is not known to this
+	// node: the index lies before the configuration the node's base holds at,
+	// with a configuration entry in between, or the node is a joiner that has
+	// not yet learned any configuration of its group. The core never guesses one.
+	ErrConfUnknown = errors.New("raft: configuration unknown at that index")
+
+	// ErrConfMismatch means the base configuration a node was started with
+	// contradicts the configuration entries its log holds at or below the base's
+	// index: a snapshot and a log that disagree. Recovery refuses it.
+	ErrConfMismatch = errors.New("raft: base configuration contradicts the log")
 )

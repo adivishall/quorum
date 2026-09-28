@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"math/rand"
 
 	"github.com/adivishall/quorum/internal/replication"
@@ -16,14 +17,17 @@ type Raft struct {
 
 	// Membership (Phase 15, docs/MEMBERSHIP.md; membership.go). conf is the
 	// current configuration — the latest configuration entry in the log, at
-	// confIndex — or, with none after the boundary, baseConf: the configuration
-	// the log's boundary represents (the snapshot's, or the genesis). peers is
-	// conf's members, sorted, for deterministic iteration; it need not contain
-	// this node (a leader being removed, a joiner, a removed node).
-	conf      Configuration
-	confIndex uint64
-	baseConf  Configuration
-	peers     []NodeID
+	// confIndex — or, with none after the boundary, baseConf. baseConf is the
+	// configuration at log index baseConfIndex (>= the boundary, <= the commit
+	// index): the snapshot's at its index, or the genesis at 0; empty for a
+	// joiner that has learned none. peers is conf's members, sorted, for
+	// deterministic iteration; it need not contain this node (a leader being
+	// removed, a joiner, a removed node).
+	conf          Configuration
+	confIndex     uint64
+	baseConf      Configuration
+	baseConfIndex uint64
+	peers         []NodeID
 
 	electionTicks      int
 	heartbeatTicks     int
@@ -100,6 +104,11 @@ func New(cfg Config) (*Raft, error) {
 		nextIndex:          map[NodeID]uint64{},
 		matchIndex:         map[NodeID]uint64{},
 	}
+	boundary, _ := r.log.Boundary()
+	if cfg.ConfIndex > r.log.LastIndex() {
+		return nil, fmt.Errorf("%w: base configuration at %d, past the log's last index %d", ErrConfMismatch, cfg.ConfIndex, r.log.LastIndex())
+	}
+	r.baseConfIndex = max(cfg.ConfIndex, boundary)
 	r.setConf(base, 0)
 	if err := r.checkLogConfs(); err != nil {
 		return nil, err
@@ -111,21 +120,31 @@ func New(cfg Config) (*Raft, error) {
 }
 
 // checkLogConfs verifies every configuration entry the recovered log holds
-// decodes — recovery refuses an undecodable one rather than guessing.
+// decodes — recovery refuses an undecodable one rather than guessing — and that
+// the latest one at or below the base configuration's index agrees with it (a
+// snapshot and a log that disagree are refused, never reconciled).
 func (r *Raft) checkLogConfs() error {
 	base, _ := r.log.Boundary()
+	var atBase *Configuration
 	for i := base + 1; i <= r.log.LastIndex(); i++ {
 		e, err := r.log.At(i)
 		if err != nil {
 			return err
 		}
 		if e.Type == replication.EntryConfig {
-			if _, err := replication.DecodeConfiguration(e.Data); err != nil {
+			c, err := replication.DecodeConfiguration(e.Data)
+			if err != nil {
 				return err
+			}
+			if i <= r.baseConfIndex {
+				atBase = &c
 			}
 		} else if e.Type != replication.EntryNormal {
 			return ErrMalformedMessage
 		}
+	}
+	if atBase != nil && !atBase.Equal(r.baseConf) {
+		return fmt.Errorf("%w: the log's configuration at %d is %s, the base is %s", ErrConfMismatch, r.baseConfIndex, atBase, r.baseConf)
 	}
 	return nil
 }
@@ -254,16 +273,14 @@ func (r *Raft) confirmReads() {
 // Compact discards the log through index into a snapshot the driver has made
 // durable (Phase 14, docs/SNAPSHOTS.md §5): index must be applied. From then on a
 // follower that needs an entry at or below index is offered the snapshot. The
-// configuration in effect at index becomes the base configuration (Phase 15).
+// base configuration moves up with the boundary where it is known (Phase 15,
+// baseAfter).
 func (r *Raft) Compact(index uint64) error {
-	base, err := r.ConfAt(index)
-	if err != nil {
-		return err
-	}
+	base, at := r.baseAfter(index)
 	if err := r.log.Compact(index); err != nil {
 		return err
 	}
-	r.baseConf = base
+	r.baseConf, r.baseConfIndex = base, at
 	if r.confIndex != 0 && r.confIndex <= index {
 		r.confIndex = 0 // the entry is compacted: the configuration is the base now
 	}
@@ -547,9 +564,10 @@ func (r *Raft) handleSnapshot(m Message) {
 		r.send(Message{Type: MsgSnapshotResponse, To: m.From, Term: r.currentTerm, Success: true, MatchIndex: commit, Seq: m.Seq})
 		return
 	}
-	if m.Conf == nil {
+	if m.Conf == nil || len(m.Conf.Voters) == 0 {
 		// A snapshot without its configuration cannot be installed: the node would
-		// not know the group it belongs to. Refuse rather than guess.
+		// not know the group it belongs to. Refuse rather than guess. (A snapshot
+		// is of applied state, and only a configuration with voters applies.)
 		r.send(Message{Type: MsgSnapshotResponse, To: m.From, Term: r.currentTerm, Success: false, Seq: m.Seq})
 		return
 	}
@@ -566,7 +584,7 @@ func (r *Raft) handleSnapshot(m Message) {
 			r.unstable = m.SnapshotIndex + 1
 		}
 	}
-	r.baseConf = m.Conf.Clone()
+	r.baseConf, r.baseConfIndex = m.Conf.Clone(), m.SnapshotIndex
 	r.confIndex = 0
 	r.setConf(r.baseConf, 0)
 	r.reconcileConf() // the kept suffix, if any, may hold a later configuration

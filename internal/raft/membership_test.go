@@ -860,4 +860,167 @@ func TestSnapshotWithoutAConfigurationIsRefused(t *testing.T) {
 	if b, _ := lg.Boundary(); b != 0 {
 		t.Fatal("the log was reset")
 	}
+	// Nor one whose configuration has no voters: no group applies without one.
+	learnersOnly := Configuration{Learners: members("n2")}
+	if err := r.Step(Message{Type: MsgSnapshot, From: "n1", To: "n2", Term: 2, SnapshotIndex: 15, SnapshotTerm: 1, Conf: &learnersOnly}); err != nil {
+		t.Fatal(err)
+	}
+	if rd := drainReady(r); rd.Snapshot != nil || len(rd.Messages) != 1 || rd.Messages[0].Success {
+		t.Fatalf("a snapshot whose configuration has no voters was installed: %+v", rd)
+	}
+}
+
+// TestBaseConfigurationHoldsOnlyAtItsIndex: a recovered core whose log keeps
+// entries below its snapshot (Phase 14's retain) knows its base configuration
+// at the snapshot's index, not at the log's boundary. Below a configuration
+// entry that precedes the snapshot's index, ConfAt answers ErrConfUnknown — it
+// never passes the snapshot's configuration off as an earlier one. A base that
+// contradicts the log's configuration entry at or below its index, or that
+// claims an index past the log, is refused. A compaction below the base's index
+// keeps it.
+func TestBaseConfigurationHoldsOnlyAtItsIndex(t *testing.T) {
+	base := voters("n1", "n2", "n3")
+	c1, _ := ConfChange{Type: AddLearner, Member: Member{ID: "n4"}}.Apply(base)
+	build := func() *replication.MemoryLog {
+		lg := replication.NewMemoryLog()
+		if err := lg.InstallSnapshot(2, 1); err != nil {
+			t.Fatal(err)
+		}
+		if err := lg.Append(
+			Entry{Index: 3, Term: 1, Data: []byte("a")},
+			Entry{Index: 4, Term: 1, Type: replication.EntryConfig, Data: replication.EncodeConfiguration(c1)},
+			Entry{Index: 5, Term: 1, Data: []byte("b")},
+			Entry{Index: 6, Term: 1, Data: []byte("c")},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := lg.Commit(6); err != nil {
+			t.Fatal(err)
+		}
+		return lg
+	}
+	lg := build()
+	r, err := New(Config{ID: "n1", Conf: &c1, ConfIndex: 5, Log: lg, Rand: rand.New(rand.NewSource(1)), Term: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c, idx := r.Conf(); !c.Equal(c1) || idx != 4 {
+		t.Fatalf("recovered configuration %s at %d", c, idx)
+	}
+	for _, i := range []uint64{2, 3} {
+		if c, err := r.ConfAt(i); !errors.Is(err, ErrConfUnknown) {
+			t.Fatalf("ConfAt(%d) below the entry at 4 answered %s %v", i, c, err)
+		}
+	}
+	for _, i := range []uint64{4, 5, 6} {
+		if c, err := r.ConfAt(i); err != nil || !c.Equal(c1) {
+			t.Fatalf("ConfAt(%d): %s %v", i, c, err)
+		}
+	}
+	// A compaction below the base's index keeps the base where it holds.
+	if err := lg.Apply(6); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Compact(3); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ConfAt(3); !errors.Is(err, ErrConfUnknown) {
+		t.Fatalf("ConfAt(3) after compacting through 3: %v", err)
+	}
+	if err := r.Compact(5); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := r.ConfAt(5); err != nil || !c.Equal(c1) {
+		t.Fatalf("ConfAt(5) after compacting through 5: %s %v", c, err)
+	}
+	if c, idx := r.Conf(); !c.Equal(c1) || idx != 0 {
+		t.Fatalf("after compacting the entry away: %s at %d", c, idx)
+	}
+
+	// With no configuration entry between the boundary and the base's index,
+	// the base is the boundary's too.
+	plain := replication.NewMemoryLog()
+	_ = plain.InstallSnapshot(2, 1)
+	_ = plain.Append(Entry{Index: 3, Term: 1}, Entry{Index: 4, Term: 1}, Entry{Index: 5, Term: 1})
+	r2, err := New(Config{ID: "n1", Conf: &base, ConfIndex: 5, Log: plain, Rand: rand.New(rand.NewSource(1)), Term: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c, err := r2.ConfAt(2); err != nil || !c.Equal(base) {
+		t.Fatalf("ConfAt(boundary) with no entry in between: %s %v", c, err)
+	}
+
+	// A base contradicting the log's configuration at its index is refused.
+	if _, err := New(Config{ID: "n1", Conf: &base, ConfIndex: 5, Log: build(), Rand: rand.New(rand.NewSource(1)), Term: 1}); !errors.Is(err, ErrConfMismatch) {
+		t.Fatalf("a base contradicting the log: %v", err)
+	}
+	// A base claimed past the log's last index is refused.
+	if _, err := New(Config{ID: "n1", Conf: &c1, ConfIndex: 7, Log: build(), Rand: rand.New(rand.NewSource(1)), Term: 1}); !errors.Is(err, ErrConfMismatch) {
+		t.Fatalf("a base past the log: %v", err)
+	}
+	// An entry above the base's index may differ: it is a later change.
+	if _, err := New(Config{ID: "n1", Conf: &base, ConfIndex: 3, Log: build(), Rand: rand.New(rand.NewSource(1)), Term: 1}); err != nil {
+		t.Fatalf("a base below a later configuration entry: %v", err)
+	}
+}
+
+// TestJoinerKnowsNoConfigurationUntilItLearnsOne: a joiner starts with an empty
+// configuration — it never campaigns, and ConfAt answers ErrConfUnknown rather
+// than an empty configuration (which no snapshot may carry). Entries replicated
+// before the first configuration entry it receives stay unknown; from that
+// entry on it knows. A compaction below that entry moves its base up to it,
+// since it is committed.
+func TestJoinerKnowsNoConfigurationUntilItLearnsOne(t *testing.T) {
+	base := voters("n1", "n2", "n3")
+	c1, _ := ConfChange{Type: AddLearner, Member: Member{ID: "n4"}}.Apply(base)
+	lg := replication.NewMemoryLog()
+	empty := Configuration{}
+	r, err := New(Config{ID: "n4", Conf: &empty, Log: lg, Rand: rand.New(rand.NewSource(1))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 100; i++ {
+		r.Tick()
+	}
+	if rd := drainReady(r); len(rd.Messages) != 0 || r.Role() != Follower {
+		t.Fatalf("a joiner campaigned: %+v", rd.Messages)
+	}
+	if _, err := r.ConfAt(0); !errors.Is(err, ErrConfUnknown) {
+		t.Fatalf("a joiner's ConfAt(0): %v", err)
+	}
+	if err := r.Step(Message{Type: MsgAppendRequest, From: "n1", To: "n4", Term: 1, LeaderCommit: 3, Entries: []Entry{
+		{Index: 1, Term: 1, Data: []byte("a")},
+		{Index: 2, Term: 1, Type: replication.EntryConfig, Data: replication.EncodeConfiguration(c1)},
+		{Index: 3, Term: 1, Data: []byte("b")},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	drainReady(r)
+	if c, idx := r.Conf(); !c.Equal(c1) || idx != 2 {
+		t.Fatalf("the joiner's configuration after the entries: %s at %d", c, idx)
+	}
+	if _, err := r.ConfAt(1); !errors.Is(err, ErrConfUnknown) {
+		t.Fatalf("ConfAt(1), before the first configuration entry: %v", err)
+	}
+	if c, err := r.ConfAt(3); err != nil || !c.Equal(c1) {
+		t.Fatalf("ConfAt(3): %s %v", c, err)
+	}
+	if err := lg.Apply(3); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Compact(1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ConfAt(1); !errors.Is(err, ErrConfUnknown) {
+		t.Fatalf("ConfAt(1) after compacting through it: %v", err)
+	}
+	if c, err := r.ConfAt(2); err != nil || !c.Equal(c1) {
+		t.Fatalf("ConfAt(2) after compacting through 1: %s %v", c, err)
+	}
+	if err := r.Compact(3); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := r.ConfAt(3); err != nil || !c.Equal(c1) {
+		t.Fatalf("ConfAt(3) after compacting through 3: %s %v", c, err)
+	}
 }

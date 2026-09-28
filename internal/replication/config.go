@@ -43,6 +43,13 @@ func (t EntryType) String() string {
 const (
 	MaxMembers   = 64
 	MaxMemberLen = 256
+	// MaxEncodedConfiguration bounds EncodeConfiguration's output for a valid
+	// configuration, for a container that length-prefixes one: a version and
+	// three counts, then at most 2*MaxMembers list entries (a member is listed
+	// twice when it is a voter and an outgoing voter), each an id and an address
+	// with their uvarint lengths.
+	MaxEncodedConfiguration = 4*binaryMaxUvarint + 2*MaxMembers*(2*MaxMemberLen+2*binaryMaxUvarint)
+	binaryMaxUvarint        = 10
 )
 
 // Member is one node of a group: its id and the address other members reach it

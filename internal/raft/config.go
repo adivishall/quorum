@@ -15,10 +15,11 @@ const (
 )
 
 // Config constructs a Raft core. The membership it starts from is Conf — the
-// configuration the log's boundary represents (a snapshot's, or the group's
-// genesis) — or, when Conf is nil, the fixed voter set Peers (Phase 9's form:
-// every node a voter, no addresses). The latest configuration entry in the log
-// overrides either (Raft §6, docs/MEMBERSHIP.md §2).
+// configuration at log index ConfIndex (a snapshot's, at the snapshot's index;
+// or the group's genesis, at 0) — or, when Conf is nil, the fixed voter set
+// Peers (Phase 9's form: every node a voter, no addresses). The latest
+// configuration entry in the log overrides either (Raft §6,
+// docs/MEMBERSHIP.md §2).
 type Config struct {
 	// ID is this node's id. With Peers it must appear in Peers; with Conf it need
 	// not appear at all — a joiner has an empty configuration, a removed node one
@@ -28,9 +29,15 @@ type Config struct {
 	// does not matter — New sorts it — but it must be non-empty with no empty or
 	// duplicate id.
 	Peers []NodeID
-	// Conf, if non-nil, is the base configuration (Phase 15): what the log's
-	// boundary represents. It may be empty.
+	// Conf, if non-nil, is the base configuration (Phase 15). It may be empty: a
+	// joiner that knows nothing of its group's configuration yet.
 	Conf *replication.Configuration
+	// ConfIndex is the log index at which Conf holds: the published snapshot's
+	// index on recovery (the log may keep entries below it, Phase 14's retain),
+	// 0 for the genesis. It must not exceed the log's last index; below the
+	// log's boundary it is taken as the boundary. A configuration entry at or
+	// below it in the log must agree with Conf (ErrConfMismatch otherwise).
+	ConfIndex uint64
 
 	// ElectionTicks and HeartbeatTicks default to 10 and 2. ElectionTicks must be
 	// strictly greater than HeartbeatTicks.

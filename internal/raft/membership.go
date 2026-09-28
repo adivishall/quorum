@@ -194,15 +194,18 @@ func (r *Raft) ConfPending() bool {
 func (r *Raft) IsVoter() bool { return r.conf.IsVoter(r.id) }
 
 // ConfAt returns the configuration in effect at index: the latest configuration
-// entry at or below it in the log, else the base configuration. index must be
-// held by the log or be its boundary (the driver names a snapshot's
-// configuration with it).
+// entry at or below it in the log, else the base configuration — when the base
+// is known to hold there. index must be held by the log or be its boundary (the
+// driver names a snapshot's configuration with it). ErrConfUnknown when the
+// node cannot know it: the index lies below the base's own index with a
+// configuration entry in between (a recovered log keeps entries below its
+// snapshot), or the node is a joiner that has learned no configuration yet.
 func (r *Raft) ConfAt(index uint64) (Configuration, error) {
-	base, _ := r.log.Boundary()
-	if index < base || index > r.log.LastIndex() {
+	boundary, _ := r.log.Boundary()
+	if index < boundary || index > r.log.LastIndex() {
 		return Configuration{}, replication.ErrOutOfRange
 	}
-	for i := index; i > base; i-- {
+	for i := index; i > boundary; i-- {
 		e, err := r.log.At(i)
 		if err != nil {
 			return Configuration{}, err
@@ -211,7 +214,46 @@ func (r *Raft) ConfAt(index uint64) (Configuration, error) {
 			return replication.DecodeConfiguration(e.Data)
 		}
 	}
+	// No configuration entry in (boundary, index]: the configuration at index is
+	// the boundary's. The base holds at baseConfIndex; it is the boundary's too
+	// unless a configuration entry lies between index and baseConfIndex.
+	if r.baseConf.Empty() {
+		return Configuration{}, ErrConfUnknown
+	}
+	for i := index + 1; i <= r.baseConfIndex; i++ {
+		e, err := r.log.At(i)
+		if err != nil {
+			return Configuration{}, err
+		}
+		if e.Type == replication.EntryConfig {
+			return Configuration{}, ErrConfUnknown
+		}
+	}
 	return r.baseConf.Clone(), nil
+}
+
+// baseAfter is the base configuration once the log is compacted through index:
+// the configuration at the later of index and the base's own index, where it is
+// known. A joiner that knows none there moves its base to its first committed
+// configuration entry above it (committed: never truncated), or keeps an
+// empty, unknown base.
+func (r *Raft) baseAfter(index uint64) (Configuration, uint64) {
+	j := max(index, r.baseConfIndex)
+	if c, err := r.ConfAt(j); err == nil {
+		return c, j
+	}
+	for i := j + 1; i <= r.log.CommitIndex(); i++ {
+		e, err := r.log.At(i)
+		if err != nil {
+			break
+		}
+		if e.Type == replication.EntryConfig {
+			if c, err := replication.DecodeConfiguration(e.Data); err == nil {
+				return c, i
+			}
+		}
+	}
+	return r.baseConf.Clone(), j
 }
 
 // ProposeConfChange starts a membership change on the leader (docs/MEMBERSHIP.md
