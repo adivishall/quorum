@@ -54,13 +54,17 @@ TOTAL=0
 mutant() {
   local name="$1" file="$2" search="$3" replace="$4" pkg="$5" tests="$6"
   TOTAL=$((TOTAL + 1))
-  TOUCHED+=("$file")
 
   if ! git diff --quiet -- "$file"; then
     echo "✗ $name: $file has uncommitted changes; refusing to mutate (revert safety)."
     FAIL=$((FAIL + 1))
     return
   fi
+  # Only a file this mutant is about to edit — clean, so a checkout loses
+  # nothing — goes on the exit trap's revert list. (Recording it before the
+  # check above made the trap check out a refused, dirty file at exit,
+  # discarding its uncommitted changes: found in Phase 15.)
+  TOUCHED+=("$file")
 
   S="$search" R="$replace" perl -0pi -e 's/\Q$ENV{S}\E/$ENV{R}/' "$file"
   if git diff --quiet -- "$file"; then
