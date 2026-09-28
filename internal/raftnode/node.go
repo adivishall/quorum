@@ -408,6 +408,7 @@ type Node struct {
 	writeCh   chan writeReq
 	readCh    chan readReq
 	confCh    chan confReq
+	snapCh    chan chan error
 	outboxes  map[NodeID]*outbox // actor-owned; one per peer it has sent to
 	waiters   *Waiters           // requests waiting for an apply (actor-owned)
 	reads     *Reads             // unconfirmed ReadIndex requests (actor-owned)
@@ -543,6 +544,7 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		writeCh:   make(chan writeReq),
 		readCh:    make(chan readReq),
 		confCh:    make(chan confReq),
+		snapCh:    make(chan chan error),
 		outboxes:  map[NodeID]*outbox{},
 		waiters:   NewWaiters(),
 		reads:     NewReads(),
@@ -677,6 +679,28 @@ func (n *Node) ReadIndex(ctx context.Context) (uint64, error) {
 	}
 }
 
+// Snapshot makes the node snapshot its state machine at its applied index now
+// and compact its log behind the snapshot, as the SnapshotEvery trigger does
+// (docs/SNAPSHOTS.md §5) — an operator's or a test's request (the admin API's
+// "snapshot"). Nothing applied since the published snapshot: nothing to do.
+// A durability failure stops the node, as a failed Save does.
+func (n *Node) Snapshot(ctx context.Context) error {
+	r := make(chan error, 1)
+	select {
+	case n.snapCh <- r:
+	case <-n.ctx.Done():
+		return raft.ErrStopped
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-r:
+		return err
+	case <-n.ctx.Done():
+		return raft.ErrStopped
+	}
+}
+
 // Status returns one consistent snapshot of the node's state. Use it (not the
 // single-field accessors) whenever more than one field is needed together.
 func (n *Node) Status() Status {
@@ -725,6 +749,8 @@ func (n *Node) actorLoop() {
 	defer ticker.Stop()
 	for {
 		var accepted *proposal // a proposal the core appended, answered once durable
+		var snapReply chan error // a snapshot request, answered once Status shows it
+		var snapErr error
 		select {
 		case <-n.ctx.Done():
 			return
@@ -762,16 +788,39 @@ func (n *Node) actorLoop() {
 			} else {
 				n.changes = append(n.changes, &confWait{since: n.core.LastIndex(), term: n.core.Term(), result: c.result})
 			}
+		case r := <-n.snapCh:
+			if n.dur.Snap.SM == nil {
+				r <- fmt.Errorf("%w: this node's state machine cannot snapshot", ErrSnapshot)
+				break
+			}
+			before := n.dur.Snap.Published().Index
+			err := n.dur.Snapshot(n.core, n.cfg.Hook)
+			if err != nil && !errors.Is(err, snapshot.ErrTooLarge) && !errors.Is(err, raft.ErrConfUnknown) {
+				r <- err
+				n.fail(err) // a durability failure, exactly as in processReady
+				return
+			}
+			snapReply, snapErr = r, err
+			if after := n.dur.Snap.Published(); after.Index != before {
+				b, _ := n.core.Boundary()
+				n.logf("event=raft_snapshot node=%s index=%d term=%d boundary=%d group=%d trigger=request", n.cfg.ID, after.Index, after.Term, b, n.cfg.Group)
+			}
 		}
 		if err := n.processReady(); err != nil {
 			if accepted != nil {
 				accepted.result <- err
+			}
+			if snapReply != nil {
+				snapReply <- err
 			}
 			n.fail(err)
 			return
 		}
 		if accepted != nil {
 			accepted.result <- nil
+		}
+		if snapReply != nil {
+			snapReply <- snapErr
 		}
 	}
 }
