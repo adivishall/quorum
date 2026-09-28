@@ -49,8 +49,11 @@ import (
 
 	"github.com/adivishall/quorum/internal/fault"
 	"github.com/adivishall/quorum/internal/kv"
+	"github.com/adivishall/quorum/internal/multiraft"
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftnode"
+	"github.com/adivishall/quorum/internal/replication"
+	"github.com/adivishall/quorum/internal/routing"
 	"github.com/adivishall/quorum/internal/transport"
 	"github.com/adivishall/quorum/internal/vfs"
 )
@@ -82,6 +85,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		forward  = fs.Bool("client-forwarding", true, "raft mode: a node that is not the leader forwards a client request one hop to the leader; false is redirect-only (NOT_LEADER with a leader hint)")
 		snapEv   = fs.Uint64("snapshot-every", 10000, "raft mode: snapshot the state machine every N applied entries and compact the Raft log behind the snapshot (docs/SNAPSHOTS.md); 0 never snapshots (the log then grows without bound). Each node decides on its own; values may differ")
 		snapKeep = fs.Uint64("snapshot-retain", 1000, "raft mode: entries kept in the Raft log below each new snapshot, so a follower slightly behind catches up by entries rather than a snapshot transfer")
+		cluster  = fs.Bool("cluster", false, "run one Raft group per shard of the routing (Phase 15, docs/MULTI_RAFT.md): this node hosts the groups whose genesis replica group names it, under -data-dir/groups/, plus every group found there and every -join group; clients are routed key -> shard -> group")
+		shards   = fs.Int("shards", 4, "cluster mode: the routing's shard count = the number of groups; identical on every node")
+		rf       = fs.Int("rf", 3, "cluster mode: the routing's replication factor = each group's genesis size; identical on every node")
+		nodesArg = fs.String("nodes", "", "cluster mode: comma-separated node ids of the routing (the genesis cluster); default this node and its -peers. Identical on every node, including one that joins later")
+		joinArg  = fs.String("join", "", "raft/cluster mode: comma-separated group ids this node hosts as a JOINER — it starts with no configuration and its group's leader adds it (admin add-learner); -raft takes only 0")
+		adminAt  = fs.String("admin-listen", "", "raft/cluster mode: serve the admin protocol (docs/MULTI_RAFT.md §7: status, add-learner, promote, remove-voter, remove-learner, create-group, stop-group, snapshot) on this host:port — separate from the client port")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -137,10 +146,40 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	lg.logf("event=ready node=%s addr=%s peers=%d", *id, tr.LocalAddr(), len(peers))
 
-	if *clientAt != "" && !*raftMode {
-		fmt.Fprintln(stderr, "dkvd: -client-listen requires -raft")
+	if *raftMode && *cluster {
+		fmt.Fprintln(stderr, "dkvd: -raft and -cluster are exclusive")
 		_ = tr.Close()
 		return 2
+	}
+	if (*clientAt != "" || *adminAt != "" || *joinArg != "") && !*raftMode && !*cluster {
+		fmt.Fprintln(stderr, "dkvd: -client-listen, -admin-listen and -join require -raft or -cluster")
+		_ = tr.Close()
+		return 2
+	}
+	join, err := parseGroups(*joinArg)
+	if err != nil || (*raftMode && (len(join) > 1 || len(join) == 1 && join[0] != 0)) {
+		fmt.Fprintf(stderr, "dkvd: bad -join %q (with -raft only group 0): %v\n", *joinArg, err)
+		_ = tr.Close()
+		return 2
+	}
+	var assign *multiraft.Assignment
+	if *cluster {
+		nodes := []routing.NodeID{routing.NodeID(*id)}
+		for p := range peers {
+			nodes = append(nodes, routing.NodeID(p))
+		}
+		if *nodesArg != "" {
+			nodes = nil
+			for _, n := range strings.Split(*nodesArg, ",") {
+				nodes = append(nodes, routing.NodeID(strings.TrimSpace(n)))
+			}
+		}
+		assign, err = multiraft.NewAssignment(routing.Config{ShardCount: *shards, ReplicationFactor: *rf, Nodes: nodes})
+		if err != nil {
+			fmt.Fprintf(stderr, "dkvd: the cluster's routing: %v\n", err)
+			_ = tr.Close()
+			return 2
+		}
 	}
 	limits := kv.Limits{MaxSessions: *sessMax, MaxUnacked: *sessUnk}
 	if limits.MaxSessions < 1 || limits.MaxUnacked < 1 {
@@ -148,9 +187,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		_ = tr.Close()
 		return 2
 	}
-	if *raftMode {
-		r := raftRun{id: *id, peers: peers, tr: tr, dataDir: *dataDir, tick: *tickIvl, lg: lg, stderr: stderr, clientAddr: *clientAt, crash: crash,
-			limits: limits, redirectOnly: !*forward, snapshotEvery: *snapEv, snapshotRetain: *snapKeep}
+	if *raftMode || *cluster {
+		r := raftRun{id: *id, listen: *listen, peers: peers, tr: tr, dataDir: *dataDir, tick: *tickIvl, lg: lg, stderr: stderr, clientAddr: *clientAt, crash: crash,
+			limits: limits, redirectOnly: !*forward, snapshotEvery: *snapEv, snapshotRetain: *snapKeep,
+			assign: assign, join: join, adminAddr: *adminAt}
 		if crash != nil {
 			r.hook, r.fs = crash.install(ctx, lg, *id, *crashArm)
 		}
@@ -286,6 +326,7 @@ func (n *node) probeLoop(ctx context.Context, interval time.Duration) {
 // injector to drive the fail-stop path end to end.
 type raftRun struct {
 	id      string
+	listen  string // this node's transport address (a genesis member's address)
 	peers   map[transport.NodeID]string
 	tr      transport.Transport
 	dataDir string
@@ -294,31 +335,43 @@ type raftRun struct {
 	stderr  io.Writer
 	fs      vfs.FS
 	hook    raftnode.Hook // -crash-at driver point; nil in normal operation
-	// clientAddr, if set, serves the Phase 12 key-value protocol (internal/kv)
-	// on that address: PUT/DELETE complete when committed and applied here,
-	// GET goes through ReadIndex. The node's state machine is a kv.Store.
+	// clientAddr, if set, serves the key-value protocol (internal/kv) on that
+	// address, for every group the node hosts (kv.Front).
 	clientAddr   string
 	crash        *crashPoint // -crash-at; nil in normal operation
 	limits       kv.Limits   // the session table's bounds, identical on every node (zero: kv.DefaultLimits)
 	redirectOnly bool        // -client-forwarding=false
 	// Phase 14: -snapshot-every and -snapshot-retain.
 	snapshotEvery, snapshotRetain uint64
+	// Phase 15: -cluster mode's assignment (nil: -raft, one group 0 of this
+	// node and its peers); -join's groups; -admin-listen.
+	assign    *multiraft.Assignment
+	join      []multiraft.GroupID
+	adminAddr string
 }
 
-// runRaft runs a single Raft group (Phase 9) over the already-built transport
-// instead of the probe demo. The group membership is this node plus its peers. It
-// emits machine-readable events — raft_leader, raft_follower, raft_commit — so a
-// test or an operator can watch an election and replication happen over real TCP.
-// Each event is derived from ONE consistent status snapshot, so a leader claim
-// always pairs a role with the term it was actually held in. It returns 0 on a
-// clean shutdown, 2 on a startup error, and 1 (after event=raft_fatal) if the node
-// fail-stops at runtime.
+// groupWatch is what the event loop last reported for one group.
+type groupWatch struct {
+	leaderTerm, commit, followTerm uint64
+	leader                         raftnode.NodeID
+}
+
+// runRaft runs this node's Raft groups (Phase 15, docs/MULTI_RAFT.md) over the
+// already-built transport, through the node host (internal/multiraft): with
+// -raft one group, 0, of this node and its peers — the Phase 9–14 single-group
+// deployment, its log still at DATA/raft-ID.log; with -cluster one group per
+// shard of the routing whose genesis names this node, under DATA/groups/ID/,
+// plus every group found there and every -join group. It emits machine-readable
+// events per group — raft_leader, raft_follower, raft_commit, each ending
+// group=G — so a test or an operator can watch elections and replication over
+// real TCP; each is derived from ONE consistent status snapshot, so a leader
+// claim always pairs a role with the term it was actually held in. It returns 0
+// on a clean shutdown, 2 on a startup error, and 1 (after event=raft_fatal) if
+// the -raft group fail-stops at runtime. In -cluster mode a group that
+// fail-stops is stopped alone (event=raft_fatal ... group=G) and the others go
+// on: one group's failure must not take the others down (INV-M9).
 func runRaft(ctx context.Context, r raftRun) int {
 	id, lg := r.id, r.lg
-	group := []raftnode.NodeID{raftnode.NodeID(id)}
-	for p := range r.peers {
-		group = append(group, raftnode.NodeID(p))
-	}
 	dataDir := r.dataDir
 	if dataDir == "" {
 		d, err := os.MkdirTemp("", "dkvd-raft-")
@@ -331,70 +384,184 @@ func runRaft(ctx context.Context, r raftRun) int {
 		fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
 		return 2
 	}
-
 	limits := r.limits
 	if limits == (kv.Limits{}) {
 		limits = kv.DefaultLimits
 	}
-	store := kv.NewStoreWithLimits(limits)
-	n, err := raftnode.Start(ctx, raftnode.Config{
-		ID: raftnode.NodeID(id), Peers: group, Transport: r.tr,
-		LogPath:      filepath.Join(dataDir, "raft-"+id+".log"),
-		StateMachine: store,
-		TickInterval: r.tick, Logf: lg.logf, FS: r.fs, // durable by default (DisableSync left false)
-		Hook:          r.hook, // nil unless -crash-at (a test seam)
+	var route func([]byte) replication.GroupID
+	if r.assign != nil {
+		route = r.assign.GroupOf
+	}
+	front := kv.NewFront(id, route)
+	front.SetForwarding(!r.redirectOnly)
+	static := map[multiraft.NodeID]string{}
+	for p, addr := range r.peers {
+		static[multiraft.NodeID(p)] = addr
+	}
+	hc := multiraft.Config{
+		ID: raftnode.NodeID(id), DataDir: dataDir, Transport: r.tr, StaticPeers: static,
+		NewStateMachine: func(multiraft.GroupID) raftnode.StateMachine { return kv.NewStoreWithLimits(limits) },
+		OnGroup: func(g multiraft.GroupID, node *raftnode.Node, sm raftnode.StateMachine) {
+			if node == nil {
+				front.Detach(g)
+				return
+			}
+			front.Attach(g, node, sm.(*kv.Store))
+		},
+		TickInterval: r.tick, FS: r.fs, Hook: r.hook, // durable by default (DisableSync left false)
 		SnapshotEvery: r.snapshotEvery, SnapshotRetain: r.snapshotRetain,
-	})
+		Logf: lg.logf,
+	}
+	if r.assign == nil {
+		hc.LogPathFor = func(multiraft.GroupID) string { return filepath.Join(dataDir, "raft-"+id+".log") }
+	}
+	host, err := multiraft.Start(ctx, hc)
 	if err != nil {
 		fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
 		return 2
 	}
+	// The genesis groups, then the joined ones. A group already running (found
+	// on disk) is left as it is; a group that cannot start is fatal in -raft
+	// mode and reported in -cluster mode.
+	type creation struct {
+		g    multiraft.GroupID
+		boot *replication.Configuration
+	}
+	var creations []creation
+	joining := map[multiraft.GroupID]bool{}
+	for _, g := range r.join {
+		joining[g] = true
+	}
+	if r.assign == nil {
+		if !joining[0] {
+			ids := []raftnode.NodeID{raftnode.NodeID(id)}
+			for p := range r.peers {
+				ids = append(ids, raftnode.NodeID(p))
+			}
+			conf := replication.VotersOf(ids)
+			creations = append(creations, creation{0, &conf})
+		}
+	} else {
+		addrs := map[multiraft.NodeID]string{multiraft.NodeID(id): r.listen}
+		for p, addr := range r.peers {
+			addrs[multiraft.NodeID(p)] = addr
+		}
+		for _, g := range r.assign.GenesisGroups(multiraft.NodeID(id)) {
+			if joining[g] {
+				continue
+			}
+			conf, err := r.assign.Genesis(g, addrs)
+			if err != nil {
+				fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
+				_ = host.Close()
+				return 2
+			}
+			creations = append(creations, creation{g, &conf})
+		}
+	}
+	for _, g := range r.join {
+		creations = append(creations, creation{g, nil})
+	}
+	for _, c := range creations {
+		if host.Group(c.g) != nil {
+			continue
+		}
+		if _, err := host.Create(c.g, c.boot); err != nil {
+			if r.assign == nil {
+				fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
+				_ = host.Close()
+				return 2
+			}
+			lg.logf("event=group_failed node=%s group=%d err=%v", id, c.g, err)
+		}
+	}
+	if r.assign == nil && host.Group(0) == nil {
+		err := host.Failed()[0]
+		fmt.Fprintf(r.stderr, "dkvd: group 0: %v\n", err)
+		_ = host.Close()
+		return 2
+	}
+
 	var clientLn net.Listener
 	if r.clientAddr != "" {
 		clientLn, err = net.Listen("tcp", r.clientAddr)
 		if err != nil {
 			fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
-			_ = n.Close()
+			_ = host.Close()
 			return 2
 		}
 		if r.crash != nil && r.crash.reply != 0 {
 			clientLn = &crashListener{Listener: clientLn, cp: r.crash}
 		}
-		srv := kv.NewServer(id, n, store)
-		srv.SetForwarding(!r.redirectOnly)
-		go kv.Serve(ctx, clientLn, srv, lg.logf)
-		lg.logf("event=client_ready node=%s addr=%s forwarding=%t sessions=%d unacked=%d", id, clientLn.Addr(), !r.redirectOnly, limits.MaxSessions, limits.MaxUnacked)
+		go kv.Serve(ctx, clientLn, front, lg.logf)
+		lg.logf("event=client_ready node=%s addr=%s forwarding=%t sessions=%d unacked=%d groups=%d", id, clientLn.Addr(), !r.redirectOnly, limits.MaxSessions, limits.MaxUnacked, len(host.Groups()))
+	}
+	var adminLn net.Listener
+	if r.adminAddr != "" {
+		adminLn, err = net.Listen("tcp", r.adminAddr)
+		if err != nil {
+			fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
+			if clientLn != nil {
+				_ = clientLn.Close()
+			}
+			_ = host.Close()
+			return 2
+		}
+		go multiraft.ServeAdmin(ctx, adminLn, host, lg.logf)
+		lg.logf("event=admin_ready node=%s addr=%s", id, adminLn.Addr())
 	}
 
+	fatal := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		t := time.NewTicker(20 * time.Millisecond)
 		defer t.Stop()
-		var loggedLeaderTerm, lastCommit, lastFollowTerm uint64
-		var lastLeader raftnode.NodeID
+		watch := map[multiraft.GroupID]*groupWatch{}
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-n.Done():
-				return
 			case <-t.C:
-				st := n.Status() // one snapshot: role, term, leader and commit agree
-				if st.Role == raft.Leader && st.Term > loggedLeaderTerm {
-					lg.logf("event=raft_leader node=%s term=%d", id, st.Term)
-					loggedLeaderTerm = st.Term
+			}
+			for _, g := range host.Groups() {
+				grp := host.Group(g)
+				if grp == nil {
+					continue
+				}
+				select {
+				case <-grp.Node.Done():
+					if err := grp.Node.Err(); err != nil {
+						lg.logf("event=raft_fatal node=%s err=%v group=%d", id, err, g)
+						if r.assign == nil {
+							close(fatal)
+							return
+						}
+						_ = host.Stop(g)
+					}
+					continue
+				default:
+				}
+				w := watch[g]
+				if w == nil {
+					w = &groupWatch{}
+					watch[g] = w
+				}
+				st := grp.Node.Status() // one snapshot: role, term, leader and commit agree
+				if st.Role == raft.Leader && st.Term > w.leaderTerm {
+					lg.logf("event=raft_leader node=%s term=%d group=%d", id, st.Term, g)
+					w.leaderTerm = st.Term
 				}
 				// A follower reports every (term, leader) it follows, so an observer
 				// sees a node re-elected in a new term, not only a change of leader.
-				if st.Role == raft.Follower && st.Leader != "" && (st.Leader != lastLeader || st.Term != lastFollowTerm) {
-					lg.logf("event=raft_follower node=%s term=%d leader=%s", id, st.Term, st.Leader)
-					lastLeader, lastFollowTerm = st.Leader, st.Term
+				if st.Role == raft.Follower && st.Leader != "" && (st.Leader != w.leader || st.Term != w.followTerm) {
+					lg.logf("event=raft_follower node=%s term=%d leader=%s group=%d", id, st.Term, st.Leader, g)
+					w.leader, w.followTerm = st.Leader, st.Term
 				}
-				if st.Commit != lastCommit {
-					lg.logf("event=raft_commit node=%s index=%d", id, st.Commit)
-					lastCommit = st.Commit
+				if st.Commit != w.commit {
+					lg.logf("event=raft_commit node=%s index=%d group=%d", id, st.Commit, g)
+					w.commit = st.Commit
 				}
 			}
 		}
@@ -403,21 +570,24 @@ func runRaft(ctx context.Context, r raftRun) int {
 	code := 0
 	select {
 	case <-ctx.Done():
-	case <-n.Done():
-		if err := n.Err(); err != nil {
-			lg.logf("event=raft_fatal node=%s err=%v", id, err)
-			code = 1
-		}
+	case <-fatal:
+		code = 1
 	}
 	lg.logf("event=shutdown_start node=%s", id)
 	if clientLn != nil {
 		_ = clientLn.Close()
 	}
-	_ = n.Close()
+	if adminLn != nil {
+		_ = adminLn.Close()
+	}
+	var last raftnode.Status
+	if grp := host.Group(0); grp != nil {
+		last = grp.Node.Status()
+	}
+	_ = host.Close()
 	_ = r.tr.Close()
 	wg.Wait()
-	st := n.Status()
-	lg.logf("event=shutdown_done node=%s role=%s term=%d commit=%d", id, st.Role, st.Term, st.Commit)
+	lg.logf("event=shutdown_done node=%s role=%s term=%d commit=%d", id, last.Role, last.Term, last.Commit)
 	return code
 }
 
@@ -603,6 +773,28 @@ func (c *crashConn) Write(b []byte) (int, error) {
 
 // parsePeers parses "id=host:port,id=host:port" into a map. It rejects empty
 // entries, a missing '=', an empty id, and a duplicate id — never silently.
+// parseGroups parses -join's comma-separated group ids.
+func parseGroups(s string) ([]multiraft.GroupID, error) {
+	if s == "" {
+		return nil, nil
+	}
+	var out []multiraft.GroupID
+	seen := map[multiraft.GroupID]bool{}
+	for _, f := range strings.Split(s, ",") {
+		v, err := strconv.ParseUint(strings.TrimSpace(f), 10, 32)
+		if err != nil {
+			return nil, err
+		}
+		g := multiraft.GroupID(v)
+		if seen[g] {
+			return nil, fmt.Errorf("group %d twice", g)
+		}
+		seen[g] = true
+		out = append(out, g)
+	}
+	return out, nil
+}
+
 func parsePeers(s string) (map[transport.NodeID]string, error) {
 	peers := make(map[transport.NodeID]string)
 	s = strings.TrimSpace(s)
