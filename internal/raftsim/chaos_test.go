@@ -143,6 +143,11 @@ func requireEveryFaultOccurred(t *testing.T, p Profile, s Stats) {
 	need(snap && p.Crash+p.CrashAt > 0, s.Restores > 0, "a restart from a snapshot")
 	need(p.CorruptChunk > 0, s.ChunksCorrupted > 0 && s.ChunksRefused > 0, "a corrupted snapshot chunk refused")
 	need(snap && p.CrashAt > 0, s.SnapshotPointCrashes > 0, "a crash at a snapshot crash point")
+	// Phase 15: a membership profile must commit every kind of transition —
+	// a learner added or removed, a joint configuration, and its final one.
+	need(p.Member > 0, s.LearnerCommits > 0, "a committed learner change")
+	need(p.Member > 0, s.JointCommits > 0 && s.FinalCommits > 0, "a committed joint and final configuration")
+	need(p.Member > 0 && snap && p.Crash+p.CrashAt > 0, s.Installs > 0, "a snapshot installed during membership changes")
 	if len(missing) > 0 {
 		t.Fatalf("profile %s: no run in the seed set produced %s — it does not exercise what it claims (%+v)",
 			p.Name, strings.Join(missing, ", "), s)
@@ -168,6 +173,11 @@ func addStats(a, b Stats) Stats {
 	a.ChunksCorrupted += b.ChunksCorrupted
 	a.SnapshotPointCrashes += b.SnapshotPointCrashes
 	a.MaxBoundary = max(a.MaxBoundary, b.MaxBoundary)
+	a.ConfChangesAccepted += b.ConfChangesAccepted
+	a.ConfCommits += b.ConfCommits
+	a.LearnerCommits += b.LearnerCommits
+	a.JointCommits += b.JointCommits
+	a.FinalCommits += b.FinalCommits
 	return a
 }
 

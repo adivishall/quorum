@@ -11,6 +11,7 @@ import (
 	"github.com/adivishall/quorum/internal/lincheck"
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftnode"
+	"github.com/adivishall/quorum/internal/replication"
 )
 
 // The deterministic client tier (Phase 12, docs/LINEARIZABILITY.md §8).
@@ -606,7 +607,7 @@ func (c *Cluster) checkDecision(n *node, e raft.Entry, result any) {
 	i := int(e.Index)
 	if i == len(c.kv.decisions)+1 {
 		d := decision{data: string(e.Data)}
-		if cmd, err := kv.Decode(e.Data); err == nil {
+		if cmd, err := kv.Decode(e.Data); err == nil && e.Type == replication.EntryNormal {
 			mc := lincheck.SessionCommand{Index: e.Index, Register: cmd.Op == kv.OpRegister, ClientID: cmd.ClientID,
 				RequestID: cmd.RequestID, AckedBelow: cmd.AckedBelow, Kind: lincheck.Put, Key: string(cmd.Key), Value: string(cmd.Value)}
 			if cmd.Op == kv.OpDelete {
@@ -636,7 +637,7 @@ func (c *Cluster) checkDecision(n *node, e raft.Entry, result any) {
 		c.violate("INV-X11", "%s decided index %d as %s@%d, the reference model as %s@%d", n.id, i, r.Decision, r.Index, want.d, want.index)
 		return
 	}
-	if r.Decision == kv.Executed {
+	if r.Decision == kv.Executed && e.Type == replication.EntryNormal {
 		if cmd, _ := kv.Decode(e.Data); cmd.ClientID != 0 {
 			id := [2]uint64{cmd.ClientID, cmd.RequestID}
 			if at, ok := c.kv.executed[id]; ok && at != e.Index {
@@ -749,6 +750,21 @@ var KVProfiles = []Profile{
 		KVPut: 50, KVGet: 30, KVDelete: 15, KVTimeout: 12, KVSessions: true, KVRegister: 40, KVRetry: 30, KVDup: 10,
 		KVLimits: kv.Limits{MaxSessions: 3, MaxUnacked: 2}, SnapshotEvery: 5, SnapshotRetain: 0,
 		Clients: 6, Keys: 2, FIFOPercent: 80},
+
+	// Phase 15 (INV-M10): the session clients — writes, reads, retries under
+	// one identity, concurrent duplicates — while the group's membership
+	// changes under them: spares join, learners are promoted, voters (the
+	// leader among them) are removed, across crashes, partitions and
+	// snapshots. The client-visible history must stay linearizable.
+	{Name: "kv-membership", Nodes: 5, Genesis: 3, Steps: 2500, Tick: 300, Deliver: 600, Member: 12,
+		Partition: 4, Heal: 10, Crash: 4, Restart: 30,
+		KVPut: 50, KVGet: 40, KVDelete: 15, KVTimeout: 12, KVSessions: true, KVRegister: 30, KVRetry: 40, KVDup: 12,
+		SnapshotEvery: 10, SnapshotRetain: 2,
+		Clients: 5, Keys: 2, FIFOPercent: 80, PowerLossPercent: 40, MaxTorn: 64},
+	{Name: "kv-membership-messages", Nodes: 5, Genesis: 3, Steps: 2500, Tick: 300, Deliver: 600, Member: 12,
+		Drop: 40, Duplicate: 40, Delay: 40, Pause: 3, Resume: 30,
+		KVPut: 50, KVGet: 40, KVDelete: 15, KVTimeout: 12, KVSessions: true, KVRegister: 30, KVRetry: 40, KVDup: 12,
+		Clients: 5, Keys: 2, FIFOPercent: 40, MaxDelay: 50},
 }
 
 // KVProfileByName returns the named client profile.
@@ -839,6 +855,18 @@ func RunKV(p Profile, seed int64) *Result {
 		c.SettleClients(p.Keys, 200)
 	}
 	if c.viol == nil {
+		// The clients' last writes and reads may complete on the leader alone
+		// (Phase 15: a single-voter configuration with learners), before any
+		// heartbeat carries them to the other members: let replication finish
+		// before comparing every member's store with the model.
+		for r := 0; r < 200 && c.viol == nil && !c.settled(); r++ {
+			for _, id := range c.ids {
+				c.Apply(Event{Kind: Tick, Node: id})
+			}
+			c.deliverAllFIFO()
+		}
+	}
+	if c.viol == nil {
 		c.checkStores()
 	}
 	return c.result(seed, p.Name)
@@ -920,12 +948,14 @@ func (c *Cluster) anyBusy() bool {
 // implementations of the Phase 1 semantics and of request identity). The model
 // decides each command exactly as it was decided on every replica at apply
 // time (INV-X11), so a duplicate, a conflict or an expired session's command
-// has no effect in it either.
+// has no effect in it either. Phase 15: every node of the committed
+// configuration — a node removed from the group, or a spare never added,
+// stopped receiving the log when it left, and its store rightly lags.
 func (c *Cluster) checkStores() {
 	model, keys := c.modelThrough(uint64(len(c.chk.committed)))
 	for _, id := range c.ids {
 		n := c.nodes[id]
-		if !n.up {
+		if !n.up || !c.chk.conf.IsMember(id) {
 			continue
 		}
 		if diffs := diffStore(n.store, model, keys); len(diffs) > 0 {

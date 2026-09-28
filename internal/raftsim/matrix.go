@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/adivishall/quorum/internal/raft"
 )
 
 // The bounded exhaustive crash matrix (Phase 11, docs/CRASH_RECOVERY.md §7).
@@ -74,6 +76,16 @@ type MatrixRow struct {
 	Violation string `json:"violation,omitempty"`
 	Converged bool   `json:"converged"`
 	TraceHash string `json:"trace_hash"`
+
+	// Phase 15, for a membership scenario (docs/MEMBERSHIP.md): the group (the
+	// simulator runs one), the transition under way when the crash fired, the
+	// committed configuration then and at the end of the run, and the crashed
+	// node's own configuration after its restart.
+	Group         uint32 `json:"group"`
+	Transition    string `json:"transition,omitempty"`
+	ConfBefore    string `json:"conf_before,omitempty"`
+	ConfAfter     string `json:"conf_after,omitempty"`
+	RecoveredConf string `json:"recovered_conf,omitempty"`
 }
 
 // OK reports whether the crash was survived: it fired, no invariant broke, and
@@ -124,10 +136,16 @@ func runCrash(cfg Config, scenario []Event, hit PointHit, mode CrashMode) Matrix
 	c.Apply(arm)
 	n := c.nodes[hit.Node]
 	restarted := false
+	membership := c.cfg.genesis() != c.cfg.Nodes
 	for _, e := range scenario {
 		if c.viol != nil {
 			break
 		}
+		var nodeConf raft.Configuration
+		if n.up {
+			nodeConf, _ = n.core.Conf()
+		}
+		committed := c.chk.conf
 		c.Apply(e)
 		if restarted || c.stats.PointCrashes == 0 {
 			continue
@@ -135,6 +153,9 @@ func runCrash(cfg Config, scenario []Event, hit PointHit, mode CrashMode) Matrix
 		// The crash fired during that event. Record what the node had persisted
 		// and what it was in the middle of, then bring it back at once.
 		row.Fired, row.CrashStep = true, c.step
+		if membership {
+			row.ConfBefore, row.Transition = committed.String(), transition(committed, nodeConf)
+		}
 		row.Persisted = summarize(n.shadow.persisted.hs, n.shadow.persisted.entries)
 		row.Interrupted = "none"
 		if p := n.shadow.pending; p != nil {
@@ -149,10 +170,17 @@ func runCrash(cfg Config, scenario []Event, hit PointHit, mode CrashMode) Matrix
 			rec := n.lastRecovered
 			row.Recovered = summarize(rec.HardState, rec.Entries)
 		}
+		if membership && n.up {
+			conf, _ := n.core.Conf()
+			row.RecoveredConf = conf.String()
+		}
 		restarted = true
 	}
 	if row.Fired && c.viol == nil {
 		c.Stabilize(400)
+	}
+	if membership {
+		row.ConfAfter = c.chk.conf.String()
 	}
 	if v := c.viol; v != nil {
 		row.Violation = v.Error()
@@ -160,6 +188,22 @@ func runCrash(cfg Config, scenario []Event, hit PointHit, mode CrashMode) Matrix
 	row.Converged = c.viol == nil && c.settled()
 	row.TraceHash = c.trace.Hash()
 	return row
+}
+
+// transition names the membership transition under way, from the committed
+// configuration and the crashing node's own (its log's latest).
+func transition(committed, node raft.Configuration) string {
+	switch {
+	case committed.Joint():
+		return "joint committed, final pending"
+	case node.Joint():
+		return "joint proposed"
+	case !node.Empty() && !node.Equal(committed):
+		return "change proposed"
+	case node.Empty():
+		return "joiner, no configuration"
+	}
+	return "stable"
 }
 
 func summarize(hs raftlogHardState, entries []raftEntry) DurableState {
@@ -231,6 +275,9 @@ func (r *MatrixReport) Text() string {
 		}
 		fmt.Fprintf(&b, "%s %s#%d %s step=%d persisted=%s interrupted=[%s] recovered=%s reapplied=%d restarts=%d %s  [%s]\n",
 			row.Node, row.Point, row.Nth, row.Mode, row.CrashStep, row.Persisted, row.Interrupted, row.Recovered, row.Reapplied, row.Restarts, result, row.Event)
+		if row.Transition != "" {
+			fmt.Fprintf(&b, "    group=%d transition=%q before=%s after=%s recovered-conf=%s\n", row.Group, row.Transition, row.ConfBefore, row.ConfAfter, row.RecoveredConf)
+		}
 	}
 	return b.String()
 }

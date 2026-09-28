@@ -47,12 +47,17 @@ type Profile struct {
 	SnapshotEvery, SnapshotRetain uint64
 	ChunkSize                     int
 	SnapshotNow, CorruptChunk     int
+	// Phase 15: Genesis voters of Nodes (the rest start as joiners), and the
+	// weight of a membership change submitted — mostly to a leader, mostly
+	// one that applies to its configuration (a spare added as a learner, a
+	// learner promoted or removed, a voter removed).
+	Genesis, Member int
 }
 
 // Config is the cluster configuration a run of the profile uses.
 func (p Profile) Config(seed int64) Config {
 	return Config{Nodes: p.Nodes, Seed: seed, KVLimits: p.KVLimits,
-		SnapshotEvery: p.SnapshotEvery, SnapshotRetain: p.SnapshotRetain, ChunkSize: p.ChunkSize}
+		SnapshotEvery: p.SnapshotEvery, SnapshotRetain: p.SnapshotRetain, ChunkSize: p.ChunkSize, Genesis: p.Genesis}
 }
 
 // Profiles are the built-in chaos mixes. Every one exercises the continuous
@@ -109,6 +114,32 @@ var Profiles = []Profile{
 	{Name: "snapshot-disk", Nodes: 3, Steps: 3000,
 		Tick: 300, Deliver: 600, Propose: 100, Crash: 4, Restart: 40, FailPersist: 10,
 		SnapshotEvery: 8, SnapshotRetain: 2,
+		FIFOPercent: 80, PowerLossPercent: 50, MaxTorn: 128},
+
+	// Phase 15: membership changes — joiners added as learners, promoted by
+	// joint consensus, voters and learners removed, the leader included —
+	// under each fault family. Three genesis voters of five nodes: the two
+	// spares start with no configuration until a change adds them.
+	{Name: "membership", Nodes: 5, Genesis: 3, Steps: 3000,
+		Tick: 300, Deliver: 600, Propose: 80, Member: 14, Drop: 15, Duplicate: 15, Delay: 15,
+		Partition: 4, Heal: 12, Crash: 4, Restart: 30,
+		FIFOPercent: 70, PowerLossPercent: 40, MaxDelay: 40, MaxTorn: 64},
+	{Name: "membership-partitions", Nodes: 5, Genesis: 3, Steps: 3000,
+		Tick: 300, Deliver: 600, Propose: 80, Member: 14, Partition: 10, Split: 3, Heal: 12,
+		FIFOPercent: 80},
+	// Snapshots with membership: a new member catches up by installing a
+	// snapshot that names it; a restart recovers its configuration from a
+	// snapshot and the entries after it.
+	{Name: "membership-snapshots", Nodes: 5, Genesis: 3, Steps: 3000,
+		Tick: 300, Deliver: 600, Propose: 100, Member: 14, Crash: 6, Restart: 30, Drop: 10, Duplicate: 10,
+		SnapshotNow: 3, CorruptChunk: 3, SnapshotEvery: 8, SnapshotRetain: 2,
+		FIFOPercent: 70, PowerLossPercent: 50, MaxTorn: 128},
+	// Every crash on an exact boundary — during the proposal, persistence,
+	// commit and finalization of configuration entries, and inside snapshot
+	// creation and installation — half with a power loss.
+	{Name: "membership-crashpoints", Nodes: 4, Genesis: 3, Steps: 3000,
+		Tick: 300, Deliver: 600, Propose: 100, Member: 14, CrashAt: 12, Restart: 40, SnapshotNow: 2,
+		SnapshotEvery: 6, SnapshotRetain: 1,
 		FIFOPercent: 80, PowerLossPercent: 50, MaxTorn: 128},
 }
 
@@ -243,10 +274,11 @@ func (c *Cluster) settled() bool {
 	}
 	L := c.nodes[ls[0]]
 	last := L.core.LastIndex()
-	if t, _ := L.mem.Term(last); last == 0 || t != L.core.Term() || L.core.CommitIndex() != last {
+	if t, _ := L.mem.Term(last); last == 0 || t != L.core.Term() || L.core.CommitIndex() != last || L.core.ConfPending() {
 		return false
 	}
-	for _, id := range c.ids {
+	conf, _ := L.core.Conf()
+	for _, id := range conf.Members() {
 		n := c.nodes[id]
 		if !n.up || n.core.Term() != L.core.Term() || n.core.LastIndex() != last ||
 			n.core.CommitIndex() != last || n.core.AppliedIndex() != last {
@@ -454,6 +486,32 @@ func (c *Cluster) generate(rng *rand.Rand, p Profile) Event {
 		return e
 	})
 	add(p.SnapshotNow, len(running) > 0, func() Event { return Event{Kind: SnapshotNow, Node: pick(running)} })
+	add(p.Member, len(running) > 0, func() Event {
+		target := pick(running)
+		if ls := c.Leaders(); len(ls) > 0 && rng.Intn(100) < 85 {
+			if n := c.nodes[ls[rng.Intn(len(ls))]]; !n.paused {
+				target = n.id
+			}
+		}
+		op := MemberOps[rng.Intn(len(MemberOps))]
+		member := pick(c.ids)
+		if n := c.nodes[target]; n.up && rng.Intn(100) < 90 {
+			conf, _ := n.core.Conf()
+			var cands []NodeID
+			for _, id := range c.ids {
+				switch {
+				case op == "addlearner" && !conf.IsMember(id),
+					(op == "promote" || op == "removelearner") && conf.IsLearner(id),
+					op == "removevoter" && conf.IsVoter(id):
+					cands = append(cands, id)
+				}
+			}
+			if len(cands) > 0 {
+				member = cands[rng.Intn(len(cands))]
+			}
+		}
+		return Event{Kind: Member, Node: target, Data: op, To: member}
+	})
 	var chunks []*flight
 	for _, f := range c.flights {
 		if f.chunk != nil {

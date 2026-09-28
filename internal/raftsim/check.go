@@ -5,6 +5,7 @@ import (
 
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftnode"
+	"github.com/adivishall/quorum/internal/replication"
 )
 
 // checker is the cross-node history the continuous invariants are checked
@@ -28,6 +29,11 @@ type checker struct {
 	// snapStates is the SHA-256 of the state of every snapshot seen at each
 	// index (Phase 14): one index, one state.
 	snapStates map[uint64][32]byte
+	// Phase 15: the latest committed configuration of the global record (the
+	// genesis before any), and the nodes a committed stable configuration
+	// excludes, with the removing entry's term (INV-M1, INV-M4).
+	conf      replication.Configuration
+	removedAt map[NodeID]uint64
 }
 
 type voteKey struct {
@@ -49,6 +55,7 @@ func (k *checker) init() {
 	k.appliedCmd = map[string]uint64{}
 	k.kvCommands = map[string]bool{}
 	k.snapStates = map[uint64][32]byte{}
+	k.removedAt = map[NodeID]uint64{}
 }
 
 func (k *checker) proposed(data string, step int) { k.proposals[data] = step }
@@ -164,6 +171,16 @@ func (c *Cluster) checkSend(n *node, m raft.Message) {
 			return
 		}
 	}
+	// INV-M5: only a voter of its own configuration campaigns, and only the
+	// voters of its configuration are asked. (Any node may GRANT a vote: it
+	// may be a voter of a configuration it has not received, and whether the
+	// vote counts is the candidate's configuration's decision.)
+	if m.Type == raft.MsgVoteRequest {
+		if conf, _ := n.core.Conf(); !conf.IsVoter(n.id) || !conf.IsVoter(m.To) {
+			c.violate("INV-M5", "%s sent %s under its configuration %s", n.id, describe(m), conf)
+			return
+		}
+	}
 	switch m.Type {
 	case raft.MsgVoteResponse:
 		if m.VoteGranted {
@@ -202,6 +219,9 @@ func (c *Cluster) checkApply(n *node, e raft.Entry) {
 		return
 	}
 	c.chk.applied[e.Index] = e
+	if e.Type != replication.EntryNormal {
+		return // a configuration entry is no command (Phase 15; INV-M1 checks it)
+	}
 	if len(e.Data) > 0 {
 		cmd := string(e.Data)
 		if _, ok := c.chk.proposals[cmd]; !ok {
@@ -225,6 +245,7 @@ func (c *Cluster) afterEvent(n *node) {
 	if n == nil || !n.up || c.viol != nil {
 		return
 	}
+	lastBefore := n.last() // the log as of the previous event (Phase 15, INV-M3)
 	n.refresh()
 	role, term, commit := n.core.Role(), n.core.Term(), n.core.CommitIndex()
 	if role != n.role || term != n.term {
@@ -252,6 +273,9 @@ func (c *Cluster) afterEvent(n *node) {
 			return
 		}
 		c.chk.termLeader[term] = n.id
+	}
+	if c.checkMembership(n, role, lastBefore); c.viol != nil {
+		return
 	}
 	n.role, n.term, n.commit = role, term, commit
 	if term > c.stats.MaxTerm {
@@ -305,6 +329,11 @@ func (c *Cluster) recordCommits(n *node) {
 			continue
 		}
 		c.chk.committed = append(c.chk.committed, committedEntry{e: e, commitTerm: n.core.Term()})
+		if e.Type == replication.EntryConfig {
+			if c.commitConf(e); c.viol != nil {
+				return
+			}
+		}
 	}
 	n.verified = max(n.verified, commit)
 }
@@ -412,7 +441,10 @@ func (c *Cluster) checkR10(n *node, before r10Snap, m raft.Message) {
 // checkConverged checks INV-F3 (liveness after faults stop): every node is up,
 // exactly one leads, every log is identical to the leader's, the leader has
 // committed an entry of its own term, and every node has committed and applied
-// the whole log.
+// the whole log. Phase 15: "every node" is every member of the leader's
+// configuration — a removed node or a spare that was never added has nothing
+// to converge to — and no membership change may still be under way (a joint
+// configuration is always completed).
 func (c *Cluster) checkConverged() {
 	c.trace.add(c.step, "check-converged")
 	var down []NodeID
@@ -438,8 +470,13 @@ func (c *Cluster) checkConverged() {
 			L.id, lterm, last, t, L.core.CommitIndex())
 		return
 	}
+	conf, _ := L.core.Conf()
+	if L.core.ConfPending() {
+		c.violate("INV-F3", "leader %s's membership change is still under way after stabilization: %s", L.id, conf)
+		return
+	}
 	L.refresh()
-	for _, id := range c.ids {
+	for _, id := range conf.Members() {
 		n := c.nodes[id]
 		n.refresh()
 		if n.core.Term() != lterm || n.last() != L.last() {
@@ -459,4 +496,247 @@ func (c *Cluster) checkConverged() {
 		}
 	}
 	c.trace.add(c.step, "converged leader=%s term=%d index=%d", L.id, lterm, last)
+}
+
+// --- Phase 15: membership (docs/MEMBERSHIP.md §8) ---
+
+// commitConf records a newly committed configuration entry of the global
+// record. INV-M1: it is reached from the previous committed configuration by
+// exactly one transition of docs/MEMBERSHIP.md §4 — an independent statement
+// of the rules, not the core's own function. A committed stable configuration
+// excludes the nodes outside it from ever leading a later term (INV-M4).
+func (c *Cluster) commitConf(e raft.Entry) {
+	next, err := replication.DecodeConfiguration(e.Data)
+	if err != nil {
+		c.violate("INV-M1", "committed configuration entry %d does not decode: %v", e.Index, err)
+		return
+	}
+	prev := c.chk.conf
+	if why := invalidTransition(prev, next); why != "" {
+		c.violate("INV-M1", "committed configuration %s at index %d does not follow %s: %s", next, e.Index, prev, why)
+		return
+	}
+	c.chk.conf = next
+	c.stats.ConfCommits++
+	switch {
+	case next.Joint():
+		c.stats.JointCommits++
+	case prev.Joint():
+		c.stats.FinalCommits++
+	default:
+		c.stats.LearnerCommits++
+	}
+	c.trace.add(c.step, "conf-committed index=%d term=%d %s", e.Index, e.Term, next)
+	if next.Joint() {
+		return
+	}
+	for _, id := range c.ids {
+		switch {
+		case next.IsMember(id):
+			delete(c.chk.removedAt, id) // (re-)added
+		case prev.IsMember(id):
+			c.chk.removedAt[id] = e.Term
+		}
+	}
+}
+
+// invalidTransition says why next is not one transition from prev, or "".
+func invalidTransition(prev, next replication.Configuration) string {
+	ids := func(ms []replication.Member) map[NodeID]bool {
+		out := map[NodeID]bool{}
+		for _, m := range ms {
+			out[m.ID] = true
+		}
+		return out
+	}
+	same := func(a, b map[NodeID]bool) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for id := range a {
+			if !b[id] {
+				return false
+			}
+		}
+		return true
+	}
+	// diff returns the ids in a not in b.
+	diff := func(a, b map[NodeID]bool) []NodeID {
+		var out []NodeID
+		for id := range a {
+			if !b[id] {
+				out = append(out, id)
+			}
+		}
+		return out
+	}
+	pv, pl := ids(prev.Voters), ids(prev.Learners)
+	nv, no, nl := ids(next.Voters), ids(next.Outgoing), ids(next.Learners)
+	if len(nv) == 0 {
+		return "no voters"
+	}
+	if prev.Joint() {
+		if next.Joint() {
+			return "a joint configuration follows a joint one"
+		}
+		if !same(nv, pv) || !same(nl, pl) {
+			return "the final configuration is not the joint one's voters and learners"
+		}
+		return ""
+	}
+	if !next.Joint() {
+		// A learner added or removed; the voters unchanged.
+		if !same(nv, pv) {
+			return "the voters changed without a joint configuration"
+		}
+		if len(diff(nl, pl))+len(diff(pl, nl)) != 1 {
+			return "not exactly one learner added or removed"
+		}
+		for _, id := range diff(nl, pl) {
+			if pv[id] {
+				return "a voter became a learner"
+			}
+		}
+		return ""
+	}
+	// A joint configuration: the outgoing voters are the previous voters, and
+	// the incoming differ by one — a promoted learner, or a removed voter.
+	if !same(no, pv) {
+		return "the outgoing voters are not the previous voters"
+	}
+	added, removed := diff(nv, pv), diff(pv, nv)
+	switch {
+	case len(added) == 1 && len(removed) == 0:
+		if !pl[added[0]] {
+			return "a voter was added that was not a learner"
+		}
+		if !same(nl, func() map[NodeID]bool {
+			m := ids(prev.Learners)
+			delete(m, added[0])
+			return m
+		}()) {
+			return "the learners are not the previous learners less the promoted one"
+		}
+	case len(added) == 0 && len(removed) == 1:
+		if !same(nl, pl) {
+			return "the learners changed with a voter's removal"
+		}
+	default:
+		return fmt.Sprintf("the voters changed by +%d/-%d", len(added), len(removed))
+	}
+	return ""
+}
+
+// derivedConf is the configuration a node's log and snapshot give — computed
+// independently of the core: the latest configuration entry in its log, else
+// its published snapshot's, else its genesis (a joiner's is empty).
+func (c *Cluster) derivedConf(n *node) replication.Configuration {
+	for i := len(n.entries) - 1; i >= 0; i-- {
+		if e := n.entries[i]; e.Type == replication.EntryConfig {
+			conf, _ := replication.DecodeConfiguration(e.Data)
+			return conf
+		}
+	}
+	if p := n.dur.Snap.Published(); p.Index > 0 {
+		return p.Conf
+	}
+	if n.idx <= c.cfg.genesis() {
+		return replication.VotersOf(c.ids[:c.cfg.genesis()])
+	}
+	return replication.Configuration{}
+}
+
+// confThrough is the configuration in n's log at index bound (>= its
+// boundary): the latest configuration entry at or below it, else the base.
+func (c *Cluster) confThrough(n *node, bound uint64) replication.Configuration {
+	for i := len(n.entries) - 1; i >= 0; i-- {
+		if e := n.entries[i]; e.Index <= bound && e.Type == replication.EntryConfig {
+			conf, _ := replication.DecodeConfiguration(e.Data)
+			return conf
+		}
+	}
+	if p := n.dur.Snap.Published(); p.Index > 0 {
+		return p.Conf
+	}
+	if n.idx <= c.cfg.genesis() {
+		return replication.VotersOf(c.ids[:c.cfg.genesis()])
+	}
+	return replication.Configuration{}
+}
+
+// holdsDurably reports whether node x's durable state holds the entry (i, t):
+// its persisted log has it, or its persisted boundary covers it.
+func holdsDurably(x *node, i, t uint64) bool {
+	p := x.shadow.persisted
+	switch {
+	case i < p.b.Index:
+		return true
+	case i == p.b.Index:
+		return p.b.Term == t
+	case i <= p.last():
+		return p.entries[i-p.b.Index-1].Term == t
+	}
+	return false
+}
+
+// checkMembership runs after every event on the node it touched:
+//
+//   - INV-M8 (and M2): the node's configuration is exactly the one its log
+//     and snapshot give — the core holds no membership of its own.
+//   - INV-M3: a leader that advanced its commit index did so with the entry
+//     durable on a majority of its configuration's voters AND, when joint, of
+//     its outgoing voters — its configuration being the one in effect when it
+//     decided (its log through the new commit and all it held before the
+//     event: a final entry appended by that very commit does not count).
+//   - INV-M5: a node that became leader is a voter of its configuration.
+//   - INV-M4: a leader whose committed configuration excludes it has stepped
+//     down, and a node a committed configuration removed never becomes leader
+//     of a later term.
+func (c *Cluster) checkMembership(n *node, role raft.Role, lastBefore uint64) {
+	conf, _ := n.core.Conf()
+	if want := c.derivedConf(n); !conf.Equal(want) {
+		c.violate("INV-M8", "%s holds configuration %s; its log and snapshot give %s", n.id, conf, want)
+		return
+	}
+	if role != raft.Leader {
+		return
+	}
+	term, commit := n.core.Term(), n.core.CommitIndex()
+	if n.role != raft.Leader || n.term != term {
+		if !conf.IsVoter(n.id) {
+			c.violate("INV-M5", "%s became leader of term %d while no voter of its configuration %s", n.id, term, conf)
+			return
+		}
+		if at, ok := c.chk.removedAt[n.id]; ok && term > at {
+			c.violate("INV-M4", "%s became leader of term %d after a configuration committed in term %d removed it", n.id, term, at)
+			return
+		}
+	}
+	if !conf.IsVoter(n.id) && !n.core.ConfPending() {
+		c.violate("INV-M4", "%s still leads term %d under a committed configuration %s without it", n.id, term, conf)
+		return
+	}
+	if commit <= n.commit {
+		return // no commit decided in this event
+	}
+	decided := c.confThrough(n, max(commit, lastBefore))
+	t := n.termAt(commit)
+	has := func(ids []NodeID) int {
+		k := 0
+		for _, id := range ids {
+			if x := c.nodes[id]; x != nil && holdsDurably(x, commit, t) {
+				k++
+			}
+		}
+		return k
+	}
+	if v := decided.VoterIDs(); has(v) <= len(v)/2 {
+		c.violate("INV-M3", "leader %s committed index %d (term %d) held durably by %d of the voters %v", n.id, commit, t, has(v), v)
+		return
+	}
+	if decided.Joint() {
+		if o := decided.OutgoingIDs(); has(o) <= len(o)/2 {
+			c.violate("INV-M3", "leader %s committed index %d (term %d) in joint configuration %s held durably by only %d of the outgoing voters %v", n.id, commit, t, decided, has(o), o)
+		}
+	}
 }

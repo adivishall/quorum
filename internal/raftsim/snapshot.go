@@ -11,6 +11,7 @@ import (
 	"github.com/adivishall/quorum/internal/lincheck"
 	"github.com/adivishall/quorum/internal/raftlog"
 	"github.com/adivishall/quorum/internal/raftnode"
+	"github.com/adivishall/quorum/internal/replication"
 	"github.com/adivishall/quorum/internal/snapshot"
 )
 
@@ -129,9 +130,10 @@ func (c *Cluster) modelThrough(index uint64) (*lincheck.SessionModel, map[string
 	model := lincheck.NewSessionModel(lincheck.SessionLimits{MaxSessions: l.MaxSessions, MaxUnacked: l.MaxUnacked})
 	keys := map[string]bool{}
 	for i := uint64(0); i < index && i < uint64(len(c.chk.committed)); i++ {
-		cmd, err := kv.Decode(c.chk.committed[i].e.Data)
-		if err != nil {
-			continue // the no-op and plain Propose commands
+		ce := c.chk.committed[i].e
+		cmd, err := kv.Decode(ce.Data)
+		if err != nil || ce.Type != replication.EntryNormal {
+			continue // the no-op, plain Propose commands, and configuration entries
 		}
 		mc := lincheck.SessionCommand{Index: i + 1, Register: cmd.Op == kv.OpRegister, ClientID: cmd.ClientID,
 			RequestID: cmd.RequestID, AckedBelow: cmd.AckedBelow, Kind: lincheck.Put, Key: string(cmd.Key), Value: string(cmd.Value)}

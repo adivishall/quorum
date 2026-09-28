@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftnode"
 )
 
@@ -93,7 +94,29 @@ const (
 	// CorruptSnapshot flips byte N of down Node's published snapshot file on
 	// disk (Phase 14): its restart must refuse to start.
 	CorruptSnapshot
+	// Member submits a membership change to Node (Phase 15): operation Data —
+	// addlearner, promote, removevoter or removelearner — on member To. The
+	// core refuses it unless Node leads and no change is under way.
+	Member
 )
+
+// memberOps are the Member event's operations.
+var memberOps = map[string]raft.ConfChangeType{
+	"addlearner": raft.AddLearner, "promote": raft.Promote,
+	"removevoter": raft.RemoveVoter, "removelearner": raft.RemoveLearner,
+}
+
+// MemberOps lists them, in a fixed order (for generators).
+var MemberOps = []string{"addlearner", "promote", "removevoter", "removelearner"}
+
+// confChangeOf is a Member event's change.
+func confChangeOf(e Event) (raft.ConfChange, bool) {
+	t, ok := memberOps[e.Data]
+	if !ok || e.To == "" {
+		return raft.ConfChange{}, false
+	}
+	return raft.ConfChange{Type: t, Member: raft.Member{ID: e.To}}, true
+}
 
 var kindNames = map[Kind]string{
 	Tick: "tick", Deliver: "deliver", Drop: "drop", Duplicate: "dup", Delay: "delay",
@@ -104,6 +127,7 @@ var kindNames = map[Kind]string{
 	KVPut: "kvput", KVGet: "kvget", KVDelete: "kvdel", KVTimeout: "kvtimeout", Split: "split",
 	KVRegister: "kvregister", KVRetry: "kvretry", KVDup: "kvdup",
 	SnapshotNow: "snapshot", CorruptChunk: "corrupt", CorruptSnapshot: "corruptsnap",
+	Member: "member",
 }
 
 func (k Kind) String() string {
@@ -153,6 +177,7 @@ func (o PersistOp) String() string { return persistNames[o] }
 //	SnapshotNow                               Node
 //	CorruptChunk                              From, To, Pos, N (byte)
 //	CorruptSnapshot                           Node, N (byte)
+//	Member                                    Node, Data (the operation), To (the member)
 //
 // A message is addressed by its link and its position among the messages
 // currently in flight on that link, oldest first (Pos 0 = the oldest). Addressing
@@ -221,6 +246,8 @@ func (e Event) String() string {
 		return fmt.Sprintf("corrupt %s %s %d %d", e.From, e.To, e.Pos, e.N)
 	case CorruptSnapshot:
 		return fmt.Sprintf("corruptsnap %s %d", e.Node, e.N)
+	case Member:
+		return fmt.Sprintf("member %s %s %s", e.Node, e.Data, e.To)
 	case FailPersist:
 		if e.Op == ShortWrite {
 			return fmt.Sprintf("failpersist %s short %d", e.Node, e.N)
@@ -377,6 +404,13 @@ func ParseEvent(line string) (Event, error) {
 		if err = need(3); err == nil {
 			e.Node = NodeID(f[1])
 			e.N, err = atoi(f[2])
+		}
+	case Member:
+		if err = need(4); err == nil {
+			e.Node, e.Data, e.To = NodeID(f[1]), f[2], NodeID(f[3])
+			if _, ok := memberOps[e.Data]; !ok {
+				err = fmt.Errorf("raftsim: unknown membership operation %q in %q", e.Data, line)
+			}
 		}
 	case Split:
 		if err = need(2); err == nil {

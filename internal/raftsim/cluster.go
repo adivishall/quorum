@@ -46,6 +46,10 @@ type Config struct {
 	// messages that can be dropped, duplicated, delayed and reordered).
 	SnapshotEvery, SnapshotRetain uint64
 	ChunkSize                     int
+	// Genesis is how many of the nodes — n1..nGenesis — form the group's
+	// genesis configuration (Phase 15); the rest start as joiners, with no
+	// configuration, until a Member event adds them. 0: every node.
+	Genesis int
 }
 
 func (c Config) chunkSize() int {
@@ -53,6 +57,14 @@ func (c Config) chunkSize() int {
 		return c.ChunkSize
 	}
 	return 256
+}
+
+// genesis is the number of genesis voters.
+func (c Config) genesis() int {
+	if c.Genesis > 0 && c.Genesis <= c.Nodes {
+		return c.Genesis
+	}
+	return c.Nodes
 }
 
 // Violation is a broken invariant, with the logical step at which it was seen.
@@ -83,6 +95,12 @@ type Stats struct {
 	Snapshots, Installs, Restores, SnapshotSends, ChunksRefused, ChunksCorrupted int
 	SnapshotPointCrashes                                                         int // crashes at a snapshot crash point
 	MaxBoundary                                                                  uint64
+	// Phase 15: membership changes accepted and refused by the core, and
+	// configuration entries committed (joint and final both count).
+	ConfChangesAccepted, ConfChangesRejected, ConfCommits int
+	// The committed configuration entries by kind: a learner added or
+	// removed, a joint configuration, a final one.
+	LearnerCommits, JointCommits, FinalCommits int
 }
 
 // flight is a message in the network. A snapshot travels as chunk flights
@@ -253,6 +271,10 @@ func New(cfg Config) (*Cluster, error) {
 		c.nodes[id] = &node{id: id, idx: i, disk: mem, inj: fault.NewInjectFS(mem), shadow: &shadowStore{}, hits: map[string]int{}}
 	}
 	c.trace.add(0, "boot nodes=%d seed=%d election=%d heartbeat=%d", cfg.Nodes, cfg.Seed, cfg.ElectionTicks, cfg.HeartbeatTicks)
+	if cfg.genesis() != cfg.Nodes {
+		c.trace.add(0, "genesis voters=%d joiners=%d", cfg.genesis(), cfg.Nodes-cfg.genesis())
+	}
+	c.chk.conf = replication.VotersOf(c.ids[:cfg.genesis()]) // the committed configuration, INV-M1
 	for _, id := range c.ids {
 		if err := c.boot(c.nodes[id]); err != nil {
 			return nil, fmt.Errorf("raftsim: boot %s: %w", id, err)
@@ -299,6 +321,9 @@ type NodeState struct {
 	Log       []raft.Entry // copies of the entries after the boundary
 	// Phase 14: the log's boundary and the published snapshot's index.
 	Boundary, Snapshot uint64
+	// Phase 15: the node's current configuration and its entry's index.
+	Conf      raft.Configuration
+	ConfIndex uint64
 }
 
 // State returns a node's current state (zero Role/Term etc. if it is down).
@@ -316,6 +341,7 @@ func (c *Cluster) State(id NodeID) NodeState {
 	s.Log, _ = n.mem.Slice(n.mem.FirstIndex(), n.mem.LastIndex()+1)
 	s.Boundary, _ = n.mem.Boundary()
 	s.Snapshot = n.dur.Snap.Published().Index
+	s.Conf, s.ConfIndex = n.core.Conf()
 	return s
 }
 
@@ -359,8 +385,12 @@ func (c *Cluster) boot(n *node) error {
 	// is restored into it (Phase 14).
 	n.kvNodeUp(c.kvLimits())
 	n.applied = 0
+	var peers []NodeID
+	if n.idx <= c.cfg.genesis() {
+		peers = c.ids[:c.cfg.genesis()] // a genesis member (Phase 15); the others join
+	}
 	rc, err := raftnode.Recover(raftnode.Config{
-		ID: n.id, Peers: c.ids, LogPath: logPath, FS: n.inj,
+		ID: n.id, Peers: peers, Join: peers == nil, LogPath: logPath, FS: n.inj,
 		Rand:          rand.New(rand.NewSource(c.nodeSeed(n))),
 		ElectionTicks: c.cfg.ElectionTicks, HeartbeatTicks: c.cfg.HeartbeatTicks,
 		StateMachine:  &snapSM{c: c, n: n},
@@ -660,6 +690,23 @@ func (c *Cluster) Apply(e Event) {
 		c.trace.add(c.step, "propose %s %q accepted idx=%d", n.id, e.Data, n.core.LastIndex())
 		c.drain(n)
 		touched = n
+	case Member:
+		n := c.runnable(e.Node)
+		cc, ok := confChangeOf(e)
+		if n == nil || !ok {
+			c.skip(e)
+			return
+		}
+		if err := n.core.ProposeConfChange(cc); err != nil {
+			c.stats.ConfChangesRejected++
+			c.trace.add(c.step, "member %s %s refused (%v)", n.id, cc, err)
+			return
+		}
+		c.stats.ConfChangesAccepted++
+		conf, idx := n.core.Conf()
+		c.trace.add(c.step, "member %s %s accepted idx=%d conf=%s", n.id, cc, idx, conf)
+		c.drain(n)
+		touched = n
 	case CheckConverged:
 		c.checkConverged()
 		return
@@ -926,7 +973,9 @@ func (c *Cluster) snapshot(n *node, force bool) {
 		switch {
 		case c.crashedBy(n, err):
 			c.crashFired(n)
-		case errors.Is(err, snapshot.ErrTooLarge):
+		case errors.Is(err, snapshot.ErrTooLarge), errors.Is(err, raft.ErrConfUnknown):
+			// Too large, or (Phase 15) a joiner that knows no configuration at
+			// its applied index yet: nothing written, retried later.
 			c.trace.add(c.step, "snapshot-skipped %s: %v", n.id, err)
 		default:
 			c.stats.PersistFailures++
@@ -1003,7 +1052,11 @@ func (s *simSM) ApplyResult(index uint64, _ []byte) (any, error) {
 		return nil, err
 	}
 	s.c.checkApply(s.n, e)
-	result, err := s.n.applyToStore(index, e.Data)
+	data := e.Data
+	if e.Type != replication.EntryNormal {
+		data = nil // a configuration entry is the core's, never the store's (Phase 15)
+	}
+	result, err := s.n.applyToStore(index, data)
 	if err != nil {
 		return nil, err
 	}
@@ -1433,7 +1486,7 @@ func sameDurable(d durableState, rec *raftlog.Recovered) bool {
 }
 
 func sameEntry(a, b raft.Entry) bool {
-	return a.Index == b.Index && a.Term == b.Term && bytes.Equal(a.Data, b.Data)
+	return a.Index == b.Index && a.Term == b.Term && a.Type == b.Type && bytes.Equal(a.Data, b.Data)
 }
 
 func (s *shadowStore) describe() string {
