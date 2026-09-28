@@ -409,3 +409,115 @@ func TestBadMagicClosesConnection(t *testing.T) {
 		_, _ = c.Write([]byte("NOPEnot-a-handshake"))
 	})
 }
+
+// --- Phase 15: a peer set that changes at runtime ---
+
+// TestAddPeerConnectsAndRemovePeerDisconnects: a peer unknown at construction
+// is refused; once both sides add each other the lower id dials and frames
+// flow; once one side removes the other the connection is closed, its
+// handshakes are refused again, and the dialer stops dialing it.
+func TestAddPeerConnectsAndRemovePeerDisconnects(t *testing.T) {
+	a := newTransport(t, "a", nil)
+	c := newTransport(t, "c", nil)
+	rawExpectClosed(t, a.LocalAddr().String(), func(nc net.Conn) { _ = writeHandshake(nc, "c") })
+
+	if err := c.AddPeer("a", a.LocalAddr().String()); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.AddPeer("c", c.LocalAddr().String()); err != nil {
+		t.Fatal(err)
+	}
+	waitConnected(t, a, "c", 3*time.Second)
+	waitConnected(t, c, "a", 3*time.Second)
+	if err := a.Send(context.Background(), "c", MsgProbe, Probe{RequestID: 7}.Marshal()); err != nil {
+		t.Fatal(err)
+	}
+	if env := recv(t, c, 2*time.Second); env.Peer != "a" || env.Kind != MsgProbe {
+		t.Fatalf("c received %+v", env)
+	}
+	// Adding it again at the same address does nothing; at another is refused.
+	if err := a.AddPeer("c", c.LocalAddr().String()); err != nil {
+		t.Fatalf("re-adding a known peer: %v", err)
+	}
+	if err := a.AddPeer("c", "127.0.0.1:1"); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("re-adding a known peer at another address: %v", err)
+	}
+
+	if err := c.RemovePeer("a"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for c.hasConn("a") || a.hasConn("c") {
+		if time.Now().After(deadline) {
+			t.Fatalf("still connected after the removal: a->c %v, c->a %v", a.hasConn("c"), c.hasConn("a"))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// a keeps dialing c, and c refuses every attempt: no connection comes back
+	// over several retry intervals.
+	time.Sleep(300 * time.Millisecond)
+	if c.hasConn("a") || a.hasConn("c") {
+		t.Fatal("a removed peer reconnected")
+	}
+	if _, ok := c.Peers()["a"]; ok {
+		t.Fatal("Peers still lists the removed peer")
+	}
+	if err := c.RemovePeer("a"); err != nil {
+		t.Fatalf("removing an unknown peer: %v", err)
+	}
+	// Re-admitting it restores the link.
+	if err := c.AddPeer("a", a.LocalAddr().String()); err != nil {
+		t.Fatal(err)
+	}
+	waitConnected(t, a, "c", 3*time.Second)
+}
+
+// TestAddPeerRefusesInvalidPeers: the same rules as the construction-time peer
+// set, and nothing after Close.
+func TestAddPeerRefusesInvalidPeers(t *testing.T) {
+	a := newTransport(t, "a", nil)
+	for name, tc := range map[string]struct {
+		id   NodeID
+		addr string
+	}{
+		"empty id":   {"", "127.0.0.1:1"},
+		"self":       {"a", "127.0.0.1:1"},
+		"long id":    {NodeID(make([]byte, MaxNodeIDLen+1)), "127.0.0.1:1"},
+		"bad addr":   {"b", "nowhere"},
+		"empty addr": {"b", ""},
+	} {
+		if err := a.AddPeer(tc.id, tc.addr); !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	_ = a.Close()
+	if err := a.AddPeer("b", "127.0.0.1:1"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("AddPeer after Close: %v", err)
+	}
+}
+
+// TestRemovedPeerDialLoopExits: removing a peer this node dials stops its dial
+// loop — goroutines return to the baseline without closing the transport.
+func TestRemovedPeerDialLoopExits(t *testing.T) {
+	a := newTransport(t, "a", nil)
+	base := runtime.NumGoroutine()
+	for i := 0; i < 20; i++ {
+		id := NodeID("p" + string(rune('a'+i)))
+		if err := a.AddPeer(id, "127.0.0.1:1"); err != nil { // nothing listens: the loop keeps retrying
+			t.Fatal(err)
+		}
+	}
+	if runtime.NumGoroutine() < base+20 {
+		t.Fatalf("expected 20 dial loops: have %d goroutines, base %d", runtime.NumGoroutine(), base)
+	}
+	for i := 0; i < 20; i++ {
+		_ = a.RemovePeer(NodeID("p" + string(rune('a'+i))))
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for runtime.NumGoroutine() > base+2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("dial loops did not exit: have %d goroutines, base %d", runtime.NumGoroutine(), base)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}

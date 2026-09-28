@@ -23,8 +23,9 @@ const (
 	DefaultReadIdleTimeout = 0
 )
 
-// Config is a node's transport configuration. Membership is static (ADR-005):
-// Peers is fixed at construction and never mutated at runtime.
+// Config is a node's transport configuration. Peers is the peer set at
+// construction; since Phase 15 the owner may change it at runtime (PeerSet:
+// AddPeer, RemovePeer), and the Config itself is never mutated.
 type Config struct {
 	// NodeID is this node's identity, announced in the handshake.
 	NodeID NodeID
