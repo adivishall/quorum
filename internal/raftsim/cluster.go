@@ -50,6 +50,9 @@ type Config struct {
 	// genesis configuration (Phase 15); the rest start as joiners, with no
 	// configuration, until a Member event adds them. 0: every node.
 	Genesis int
+	// GenesisIDs, if set, names the genesis voters explicitly instead (the
+	// multi-group simulator: each group's are its shard's replica group).
+	GenesisIDs []NodeID
 }
 
 func (c Config) chunkSize() int {
@@ -59,13 +62,30 @@ func (c Config) chunkSize() int {
 	return 256
 }
 
-// genesis is the number of genesis voters.
-func (c Config) genesis() int {
-	if c.Genesis > 0 && c.Genesis <= c.Nodes {
-		return c.Genesis
+// genesis returns the genesis voters among ids (n1..nNodes).
+func (c Config) genesis(ids []NodeID) []NodeID {
+	if len(c.GenesisIDs) > 0 {
+		return append([]NodeID(nil), c.GenesisIDs...)
 	}
-	return c.Nodes
+	if c.Genesis > 0 && c.Genesis <= c.Nodes {
+		return ids[:c.Genesis]
+	}
+	return ids
 }
+
+// isGenesis reports whether id is a genesis voter.
+func (c *Cluster) isGenesis(id NodeID) bool {
+	for _, g := range c.cfg.genesis(c.ids) {
+		if g == id {
+			return true
+		}
+	}
+	return false
+}
+
+// membership reports whether the run involves membership: some node is not a
+// genesis voter.
+func (c *Cluster) membership() bool { return len(c.cfg.genesis(c.ids)) != len(c.ids) }
 
 // Violation is a broken invariant, with the logical step at which it was seen.
 type Violation struct {
@@ -271,10 +291,10 @@ func New(cfg Config) (*Cluster, error) {
 		c.nodes[id] = &node{id: id, idx: i, disk: mem, inj: fault.NewInjectFS(mem), shadow: &shadowStore{}, hits: map[string]int{}}
 	}
 	c.trace.add(0, "boot nodes=%d seed=%d election=%d heartbeat=%d", cfg.Nodes, cfg.Seed, cfg.ElectionTicks, cfg.HeartbeatTicks)
-	if cfg.genesis() != cfg.Nodes {
-		c.trace.add(0, "genesis voters=%d joiners=%d", cfg.genesis(), cfg.Nodes-cfg.genesis())
+	if g := cfg.genesis(c.ids); len(g) != cfg.Nodes {
+		c.trace.add(0, "genesis voters=%v joiners=%d", g, cfg.Nodes-len(g))
 	}
-	c.chk.conf = replication.VotersOf(c.ids[:cfg.genesis()]) // the committed configuration, INV-M1
+	c.chk.conf = replication.VotersOf(cfg.genesis(c.ids)) // the committed configuration, INV-M1
 	for _, id := range c.ids {
 		if err := c.boot(c.nodes[id]); err != nil {
 			return nil, fmt.Errorf("raftsim: boot %s: %w", id, err)
@@ -386,8 +406,8 @@ func (c *Cluster) boot(n *node) error {
 	n.kvNodeUp(c.kvLimits())
 	n.applied = 0
 	var peers []NodeID
-	if n.idx <= c.cfg.genesis() {
-		peers = c.ids[:c.cfg.genesis()] // a genesis member (Phase 15); the others join
+	if c.isGenesis(n.id) {
+		peers = c.cfg.genesis(c.ids) // a genesis member (Phase 15); the others join
 	}
 	rc, err := raftnode.Recover(raftnode.Config{
 		ID: n.id, Peers: peers, Join: peers == nil, LogPath: logPath, FS: n.inj,

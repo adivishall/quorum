@@ -136,7 +136,7 @@ func runCrash(cfg Config, scenario []Event, hit PointHit, mode CrashMode) Matrix
 	c.Apply(arm)
 	n := c.nodes[hit.Node]
 	restarted := false
-	membership := c.cfg.genesis() != c.cfg.Nodes
+	membership := c.membership()
 	for _, e := range scenario {
 		if c.viol != nil {
 			break

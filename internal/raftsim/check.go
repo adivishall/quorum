@@ -172,11 +172,18 @@ func (c *Cluster) checkSend(n *node, m raft.Message) {
 		}
 	}
 	// INV-M5: only a voter of its own configuration campaigns, and only the
-	// voters of its configuration are asked. (Any node may GRANT a vote: it
-	// may be a voter of a configuration it has not received, and whether the
-	// vote counts is the candidate's configuration's decision.)
+	// voters whose votes count are asked. (Any node may GRANT a vote: it may be
+	// a voter of a configuration it has not received, and whether the vote
+	// counts is the candidate's configuration's decision.) The one other
+	// campaign: a node whose own uncommitted removal is its configuration,
+	// under the joint configuration that removal finalizes.
 	if m.Type == raft.MsgVoteRequest {
-		if conf, _ := n.core.Conf(); !conf.IsVoter(n.id) || !conf.IsVoter(m.To) {
+		conf, prev := c.campaignConfs(n)
+		ok := conf.IsVoter(n.id) && conf.IsVoter(m.To)
+		if prev != nil {
+			ok = prev.IsVoter(n.id) && (conf.IsVoter(m.To) || prev.IsVoter(m.To))
+		}
+		if !ok {
 			c.violate("INV-M5", "%s sent %s under its configuration %s", n.id, describe(m), conf)
 			return
 		}
@@ -640,8 +647,8 @@ func (c *Cluster) derivedConf(n *node) replication.Configuration {
 	if p := n.dur.Snap.Published(); p.Index > 0 {
 		return p.Conf
 	}
-	if n.idx <= c.cfg.genesis() {
-		return replication.VotersOf(c.ids[:c.cfg.genesis()])
+	if c.isGenesis(n.id) {
+		return replication.VotersOf(c.cfg.genesis(c.ids))
 	}
 	return replication.Configuration{}
 }
@@ -658,10 +665,36 @@ func (c *Cluster) confThrough(n *node, bound uint64) replication.Configuration {
 	if p := n.dur.Snap.Published(); p.Index > 0 {
 		return p.Conf
 	}
-	if n.idx <= c.cfg.genesis() {
-		return replication.VotersOf(c.ids[:c.cfg.genesis()])
+	if c.isGenesis(n.id) {
+		return replication.VotersOf(c.cfg.genesis(c.ids))
 	}
 	return replication.Configuration{}
+}
+
+// campaignConfs derives, from n's log alone, the configuration it campaigns
+// under and — when its configuration is the uncommitted final entry of its
+// own removal and it was a voter of the joint configuration before it — that
+// joint configuration, which it must also win (raft.campaignRule's case).
+func (c *Cluster) campaignConfs(n *node) (raft.Configuration, *raft.Configuration) {
+	conf := c.derivedConf(n)
+	if conf.IsVoter(n.id) {
+		return conf, nil
+	}
+	at := -1
+	for i := len(n.entries) - 1; i >= 0; i-- {
+		if n.entries[i].Type == replication.EntryConfig {
+			at = i
+			break
+		}
+	}
+	if at < 0 || n.entries[at].Index <= n.core.CommitIndex() {
+		return conf, nil
+	}
+	prev := c.confThrough(n, n.entries[at].Index-1)
+	if !prev.Joint() || !prev.IsVoter(n.id) || !raft.Final(prev).Equal(conf) {
+		return conf, nil
+	}
+	return conf, &prev
 }
 
 // holdsDurably reports whether node x's durable state holds the entry (i, t):
@@ -703,7 +736,7 @@ func (c *Cluster) checkMembership(n *node, role raft.Role, lastBefore uint64) {
 	}
 	term, commit := n.core.Term(), n.core.CommitIndex()
 	if n.role != raft.Leader || n.term != term {
-		if !conf.IsVoter(n.id) {
+		if _, prev := c.campaignConfs(n); !conf.IsVoter(n.id) && prev == nil {
 			c.violate("INV-M5", "%s became leader of term %d while no voter of its configuration %s", n.id, term, conf)
 			return
 		}
