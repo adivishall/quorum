@@ -82,6 +82,24 @@ func TestQuorumRules(t *testing.T) {
 		{"add a fourth: two acks satisfy old only", joint(abc, voters("a", "b", "c", "d")), set("a", "b"), false},
 		{"add a fourth: the newcomer with one old", joint(abc, voters("a", "b", "c", "d")), set("a", "d"), false},
 		{"add a fourth: three acks", joint(abc, voters("a", "b", "c", "d")), set("a", "b", "d"), true},
+		{"add a fourth: the new member unavailable", joint(abc, voters("a", "b", "c", "d")), set("a", "b", "c"), true},
+		{"add a fourth: an old member and the new one unavailable", joint(abc, voters("a", "b", "c", "d")), set("a", "b"), false},
+
+		// Two voters: both are needed.
+		{"stable 2: both", voters("a", "b"), set("a", "b"), true},
+		{"stable 2: one", voters("a", "b"), set("a"), false},
+		// The leader a removes itself from {a,b}: the new set needs b, the old
+		// set needs both — a alone never suffices, b alone neither.
+		{"leader removed: the leader alone", joint(voters("a", "b"), voters("b")), set("a"), false},
+		{"leader removed: the remaining voter alone", joint(voters("a", "b"), voters("b")), set("b"), false},
+		{"leader removed: both", joint(voters("a", "b"), voters("b")), set("a", "b"), true},
+		{"leader removed: the final configuration, the remaining voter", voters("b"), set("b"), true},
+		// Removing c of {a,b,c}: the old member c unavailable is fine.
+		{"remove c: the removed member unavailable", joint(abc, voters("a", "b")), set("a", "b"), true},
+		{"remove c: an old member unavailable", joint(abc, voters("a", "b")), set("a", "c"), false},
+		// A stable configuration is never held to a joint rule: its (absent)
+		// Outgoing list is not consulted.
+		{"stable: no outgoing rule", voters("a", "b", "c"), set("a", "b"), true},
 	}
 	for _, tc := range cases {
 		if got := quorumOf(tc.conf, tc.has); got != tc.want {
