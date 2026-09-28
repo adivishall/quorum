@@ -237,7 +237,7 @@ func TestSimNewMemberCatchesUpBySnapshot(t *testing.T) {
 // joint configuration is committed and its final one is not yet — the
 // snapshot carries the joint configuration — then loses power and restarts
 // from that snapshot and its log: it recovers the final configuration from the
-// log's suffix (INV-M8 checks the derivation at every step), and the change
+// log's suffix (INV-MB8 checks the derivation at every step), and the change
 // completes.
 func TestSimSnapshotDuringJointConfiguration(t *testing.T) {
 	cfg := memberCfg(4, 3, 7)

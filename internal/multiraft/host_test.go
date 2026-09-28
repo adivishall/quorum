@@ -466,7 +466,7 @@ func (c *chanTransport) Receive() <-chan transport.Envelope { return c.ch }
 func (c *chanTransport) LocalID() transport.NodeID          { return c.id }
 func (c *chanTransport) Close() error                       { c.once.Do(func() { close(c.ch) }); return nil }
 
-// TestFramesReachExactlyTheirGroup (INV-M6): a frame is delivered to the group
+// TestFramesReachExactlyTheirGroup (INV-MB6): a frame is delivered to the group
 // its envelope names and to no other; an unknown group's, a stopped group's
 // and a malformed frame are dropped and counted; a group created afterwards
 // receives its frames; a full inbox drops rather than stalling the others.

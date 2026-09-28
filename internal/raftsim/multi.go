@@ -24,7 +24,7 @@ import (
 // cluster-mode host does. Everything is still a pure function of the
 // configuration and the event stream: same seed, same trace.
 //
-// INV-M9 is checked by construction and by replay: a group's trace in a
+// INV-MB9 is checked by construction and by replay: a group's trace in a
 // multi-group run is reproduced exactly by replaying, on a lone Cluster, the
 // events that group received (TestMultiGroupIsolation) — its behaviour is a
 // function of its own inputs alone, with nothing shared between groups.

@@ -48,7 +48,7 @@ type (
 
 // DefaultInboxSize bounds each group's queue of inbound frames. A group whose
 // actor falls behind loses frames beyond it — Raft retransmits — rather than
-// stalling the demultiplexer, and with it every other group (INV-M9).
+// stalling the demultiplexer, and with it every other group (INV-MB9).
 const DefaultInboxSize = 1024
 
 // Errors.
@@ -383,7 +383,7 @@ func (h *Host) Close() error {
 }
 
 // demux delivers each inbound frame to the group its envelope names, or drops
-// it (INV-M6). It never blocks on a group: a full inbox drops the frame.
+// it (INV-MB6). It never blocks on a group: a full inbox drops the frame.
 func (h *Host) demux() {
 	defer h.wg.Done()
 	rc := h.cfg.Transport.Receive()

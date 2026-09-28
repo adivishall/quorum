@@ -209,7 +209,7 @@ func (nw *network) confEntries(id NodeID) []Configuration {
 	return out
 }
 
-// TestLearnerReplicatesButNeverCampaignsOrCounts (INV-M5): a joiner added as a
+// TestLearnerReplicatesButNeverCampaignsOrCounts (INV-MB5): a joiner added as a
 // learner receives the log, never campaigns however long it waits for a
 // leader, is not asked for votes and has its vote ignored by a candidate, and
 // never counts toward a commit. Asked anyway, it grants a vote to an
@@ -287,7 +287,7 @@ func TestLearnerReplicatesButNeverCampaignsOrCounts(t *testing.T) {
 	nw.requireConverged(L)
 }
 
-// TestPromoteNeedsTheNewMajority (INV-M3): promoting the learner n4 appends a
+// TestPromoteNeedsTheNewMajority (INV-MB3): promoting the learner n4 appends a
 // joint entry {n1,n2,n3,n4}/{n1,n2,n3}; with n3 and n4 cut off, n1 and n2 are a
 // majority of the OLD set but not of the new — nothing commits; with n3 back
 // (three of four) the joint entry commits, the leader appends the final entry,
@@ -334,7 +334,7 @@ func TestPromoteNeedsTheNewMajority(t *testing.T) {
 	}
 }
 
-// TestRemoveVoterNeedsTheOldMajority (INV-M3): removing n4 from {n1..n4} makes
+// TestRemoveVoterNeedsTheOldMajority (INV-MB3): removing n4 from {n1..n4} makes
 // the joint entry need three of the old four, not only two of the new three:
 // with n3 and n4 cut off, n1 and n2 are a majority of the NEW set and nothing
 // commits; with n3 back it does, and n4 — still a voter of the outgoing set
@@ -492,7 +492,7 @@ func TestCandidateThatLearnsItIsRemovedStopsCampaigning(t *testing.T) {
 	}
 }
 
-// TestRemovedNodeCannotDeposeOrLead (INV-M4): n3 sits out its removal in a
+// TestRemovedNodeCannotDeposeOrLead (INV-MB4): n3 sits out its removal in a
 // partition, believing itself a voter of the old set; it campaigns in ever
 // higher terms. When it returns its vote requests are refused WITHOUT the
 // members adopting its term — the leader keeps its term and its seat, keeps
@@ -563,7 +563,7 @@ func TestConfigurationRevertsWhenItsEntryIsTruncated(t *testing.T) {
 	}
 }
 
-// TestSnapshotInstallAdoptsTheConfiguration (INV-M8): a joiner added as a
+// TestSnapshotInstallAdoptsTheConfiguration (INV-MB8): a joiner added as a
 // learner while the leader compacts its log catches up by a snapshot and
 // adopts the configuration the snapshot carries, in which it is a learner;
 // promoted afterwards, its vote counts.

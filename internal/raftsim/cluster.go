@@ -294,7 +294,7 @@ func New(cfg Config) (*Cluster, error) {
 	if g := cfg.genesis(c.ids); len(g) != cfg.Nodes {
 		c.trace.add(0, "genesis voters=%v joiners=%d", g, cfg.Nodes-len(g))
 	}
-	c.chk.conf = replication.VotersOf(cfg.genesis(c.ids)) // the committed configuration, INV-M1
+	c.chk.conf = replication.VotersOf(cfg.genesis(c.ids)) // the committed configuration, INV-MB1
 	for _, id := range c.ids {
 		if err := c.boot(c.nodes[id]); err != nil {
 			return nil, fmt.Errorf("raftsim: boot %s: %w", id, err)

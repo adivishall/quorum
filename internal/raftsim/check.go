@@ -31,7 +31,7 @@ type checker struct {
 	snapStates map[uint64][32]byte
 	// Phase 15: the latest committed configuration of the global record (the
 	// genesis before any), and the nodes a committed stable configuration
-	// excludes, with the removing entry's term (INV-M1, INV-M4).
+	// excludes, with the removing entry's term (INV-MB1, INV-MB4).
 	conf      replication.Configuration
 	removedAt map[NodeID]uint64
 }
@@ -171,7 +171,7 @@ func (c *Cluster) checkSend(n *node, m raft.Message) {
 			return
 		}
 	}
-	// INV-M5: only a voter of its own configuration campaigns, and only the
+	// INV-MB5: only a voter of its own configuration campaigns, and only the
 	// voters whose votes count are asked. (Any node may GRANT a vote: it may be
 	// a voter of a configuration it has not received, and whether the vote
 	// counts is the candidate's configuration's decision.) The one other
@@ -184,7 +184,7 @@ func (c *Cluster) checkSend(n *node, m raft.Message) {
 			ok = prev.IsVoter(n.id) && (conf.IsVoter(m.To) || prev.IsVoter(m.To))
 		}
 		if !ok {
-			c.violate("INV-M5", "%s sent %s under its configuration %s", n.id, describe(m), conf)
+			c.violate("INV-MB5", "%s sent %s under its configuration %s", n.id, describe(m), conf)
 			return
 		}
 	}
@@ -227,7 +227,7 @@ func (c *Cluster) checkApply(n *node, e raft.Entry) {
 	}
 	c.chk.applied[e.Index] = e
 	if e.Type != replication.EntryNormal {
-		return // a configuration entry is no command (Phase 15; INV-M1 checks it)
+		return // a configuration entry is no command (Phase 15; INV-MB1 checks it)
 	}
 	if len(e.Data) > 0 {
 		cmd := string(e.Data)
@@ -252,7 +252,7 @@ func (c *Cluster) afterEvent(n *node) {
 	if n == nil || !n.up || c.viol != nil {
 		return
 	}
-	lastBefore := n.last() // the log as of the previous event (Phase 15, INV-M3)
+	lastBefore := n.last() // the log as of the previous event (Phase 15, INV-MB3)
 	n.refresh()
 	role, term, commit := n.core.Role(), n.core.Term(), n.core.CommitIndex()
 	if role != n.role || term != n.term {
@@ -508,19 +508,19 @@ func (c *Cluster) checkConverged() {
 // --- Phase 15: membership (docs/MEMBERSHIP.md §8) ---
 
 // commitConf records a newly committed configuration entry of the global
-// record. INV-M1: it is reached from the previous committed configuration by
+// record. INV-MB1: it is reached from the previous committed configuration by
 // exactly one transition of docs/MEMBERSHIP.md §4 — an independent statement
 // of the rules, not the core's own function. A committed stable configuration
-// excludes the nodes outside it from ever leading a later term (INV-M4).
+// excludes the nodes outside it from ever leading a later term (INV-MB4).
 func (c *Cluster) commitConf(e raft.Entry) {
 	next, err := replication.DecodeConfiguration(e.Data)
 	if err != nil {
-		c.violate("INV-M1", "committed configuration entry %d does not decode: %v", e.Index, err)
+		c.violate("INV-MB1", "committed configuration entry %d does not decode: %v", e.Index, err)
 		return
 	}
 	prev := c.chk.conf
 	if why := invalidTransition(prev, next); why != "" {
-		c.violate("INV-M1", "committed configuration %s at index %d does not follow %s: %s", next, e.Index, prev, why)
+		c.violate("INV-MB1", "committed configuration %s at index %d does not follow %s: %s", next, e.Index, prev, why)
 		return
 	}
 	c.chk.conf = next
@@ -714,21 +714,22 @@ func holdsDurably(x *node, i, t uint64) bool {
 
 // checkMembership runs after every event on the node it touched:
 //
-//   - INV-M8 (and M2): the node's configuration is exactly the one its log
+//   - INV-MB2 (and INV-MB8, after an install or a boot): the node's
+//     configuration is exactly the one its log
 //     and snapshot give — the core holds no membership of its own.
-//   - INV-M3: a leader that advanced its commit index did so with the entry
+//   - INV-MB3: a leader that advanced its commit index did so with the entry
 //     durable on a majority of its configuration's voters AND, when joint, of
 //     its outgoing voters — its configuration being the one in effect when it
 //     decided (its log through the new commit and all it held before the
 //     event: a final entry appended by that very commit does not count).
-//   - INV-M5: a node that became leader is a voter of its configuration.
-//   - INV-M4: a leader whose committed configuration excludes it has stepped
+//   - INV-MB5: a node that became leader is a voter of its configuration.
+//   - INV-MB4: a leader whose committed configuration excludes it has stepped
 //     down, and a node a committed configuration removed never becomes leader
 //     of a later term.
 func (c *Cluster) checkMembership(n *node, role raft.Role, lastBefore uint64) {
 	conf, _ := n.core.Conf()
 	if want := c.derivedConf(n); !conf.Equal(want) {
-		c.violate("INV-M8", "%s holds configuration %s; its log and snapshot give %s", n.id, conf, want)
+		c.violate("INV-MB2", "%s holds configuration %s; its log and snapshot give %s", n.id, conf, want)
 		return
 	}
 	if role != raft.Leader {
@@ -737,16 +738,16 @@ func (c *Cluster) checkMembership(n *node, role raft.Role, lastBefore uint64) {
 	term, commit := n.core.Term(), n.core.CommitIndex()
 	if n.role != raft.Leader || n.term != term {
 		if _, prev := c.campaignConfs(n); !conf.IsVoter(n.id) && prev == nil {
-			c.violate("INV-M5", "%s became leader of term %d while no voter of its configuration %s", n.id, term, conf)
+			c.violate("INV-MB5", "%s became leader of term %d while no voter of its configuration %s", n.id, term, conf)
 			return
 		}
 		if at, ok := c.chk.removedAt[n.id]; ok && term > at {
-			c.violate("INV-M4", "%s became leader of term %d after a configuration committed in term %d removed it", n.id, term, at)
+			c.violate("INV-MB4", "%s became leader of term %d after a configuration committed in term %d removed it", n.id, term, at)
 			return
 		}
 	}
 	if !conf.IsVoter(n.id) && !n.core.ConfPending() {
-		c.violate("INV-M4", "%s still leads term %d under a committed configuration %s without it", n.id, term, conf)
+		c.violate("INV-MB4", "%s still leads term %d under a committed configuration %s without it", n.id, term, conf)
 		return
 	}
 	if commit <= n.commit {
@@ -764,12 +765,12 @@ func (c *Cluster) checkMembership(n *node, role raft.Role, lastBefore uint64) {
 		return k
 	}
 	if v := decided.VoterIDs(); has(v) <= len(v)/2 {
-		c.violate("INV-M3", "leader %s committed index %d (term %d) held durably by %d of the voters %v", n.id, commit, t, has(v), v)
+		c.violate("INV-MB3", "leader %s committed index %d (term %d) held durably by %d of the voters %v", n.id, commit, t, has(v), v)
 		return
 	}
 	if decided.Joint() {
 		if o := decided.OutgoingIDs(); has(o) <= len(o)/2 {
-			c.violate("INV-M3", "leader %s committed index %d (term %d) in joint configuration %s held durably by only %d of the outgoing voters %v", n.id, commit, t, decided, has(o), o)
+			c.violate("INV-MB3", "leader %s committed index %d (term %d) in joint configuration %s held durably by only %d of the outgoing voters %v", n.id, commit, t, decided, has(o), o)
 		}
 	}
 }

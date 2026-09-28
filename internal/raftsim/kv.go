@@ -751,7 +751,7 @@ var KVProfiles = []Profile{
 		KVLimits: kv.Limits{MaxSessions: 3, MaxUnacked: 2}, SnapshotEvery: 5, SnapshotRetain: 0,
 		Clients: 6, Keys: 2, FIFOPercent: 80},
 
-	// Phase 15 (INV-M10): the session clients — writes, reads, retries under
+	// Phase 15 (INV-MB10): the session clients — writes, reads, retries under
 	// one identity, concurrent duplicates — while the group's membership
 	// changes under them: spares join, learners are promoted, voters (the
 	// leader among them) are removed, across crashes, partitions and

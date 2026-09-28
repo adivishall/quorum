@@ -369,7 +369,7 @@ type groupWatch struct {
 // on a clean shutdown, 2 on a startup error, and 1 (after event=raft_fatal) if
 // the -raft group fail-stops at runtime. In -cluster mode a group that
 // fail-stops is stopped alone (event=raft_fatal ... group=G) and the others go
-// on: one group's failure must not take the others down (INV-M9).
+// on: one group's failure must not take the others down (INV-MB9).
 func runRaft(ctx context.Context, r raftRun) int {
 	id, lg := r.id, r.lg
 	dataDir := r.dataDir

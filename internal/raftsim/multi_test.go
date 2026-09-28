@@ -94,7 +94,7 @@ func TestMultiSameSeedSameTrace(t *testing.T) {
 	}
 }
 
-// TestMultiGroupIsolation (INV-M9): in a multi-group run, each group's trace
+// TestMultiGroupIsolation (INV-MB9): in a multi-group run, each group's trace
 // is reproduced exactly by replaying, on a lone Cluster, the events that group
 // received — its own and the node-level ones fanned out to it. A group's
 // behaviour is a function of its own inputs alone: nothing another group did
