@@ -2,6 +2,7 @@ package fault
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/adivishall/quorum/internal/transport"
@@ -346,6 +347,25 @@ func (t *faultTransport) sendOne(ctx context.Context, from string, peer transpor
 			return t.inner.Send(ctx, peer, kind, payload)
 		}
 	}
+}
+
+// AddPeer and RemovePeer pass through to the wrapped transport when it has a
+// dynamic peer set (Phase 15); the fault rules are keyed by node id and apply
+// to a peer added later as to any other.
+func (t *faultTransport) AddPeer(id transport.NodeID, addr string) error {
+	ps, ok := t.inner.(transport.PeerSet)
+	if !ok {
+		return fmt.Errorf("fault: the wrapped transport has a fixed peer set")
+	}
+	return ps.AddPeer(id, addr)
+}
+
+func (t *faultTransport) RemovePeer(id transport.NodeID) error {
+	ps, ok := t.inner.(transport.PeerSet)
+	if !ok {
+		return fmt.Errorf("fault: the wrapped transport has a fixed peer set")
+	}
+	return ps.RemovePeer(id)
 }
 
 func (t *faultTransport) Receive() <-chan transport.Envelope { return t.inner.Receive() }

@@ -6,6 +6,7 @@ import (
 
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftlog"
+	"github.com/adivishall/quorum/internal/replication"
 )
 
 // Point is a crash point: a boundary in the driver's persist → send → advance →
@@ -201,7 +202,9 @@ type ResultStateMachine interface {
 // and with what the application decided. It returns a state-machine failure
 // wrapped in ErrApply (the remaining entries are left unapplied for the next
 // cycle), or a hook's abort as-is. It is shared by the node's actor loop and the
-// simulator.
+// simulator. A configuration entry (Phase 15) reaches the state machine as an
+// empty command, as the election no-op does: membership is the core's state,
+// never the application's, and the entry still occupies its index.
 func ApplyCommitted(core *raft.Raft, sm StateMachine, at Hook, applied func(raft.Entry, any)) error {
 	rsm, _ := sm.(ResultStateMachine)
 	for _, e := range core.NextApply() {
@@ -211,10 +214,14 @@ func ApplyCommitted(core *raft.Raft, sm StateMachine, at Hook, applied func(raft
 		var result any
 		if sm != nil {
 			var err error
+			cmd := e.Data
+			if e.Type != replication.EntryNormal {
+				cmd = nil
+			}
 			if rsm != nil {
-				result, err = rsm.ApplyResult(e.Index, e.Data)
+				result, err = rsm.ApplyResult(e.Index, cmd)
 			} else {
-				err = sm.Apply(e.Index, e.Data)
+				err = sm.Apply(e.Index, cmd)
 			}
 			if err != nil {
 				return fmt.Errorf("%w: index %d: %w", ErrApply, e.Index, err)

@@ -63,11 +63,38 @@ const OutboxSize = 256
 type StateMachine = replication.StateMachine
 
 // Config constructs a Node.
+//
+// Phase 15 (docs/MEMBERSHIP.md, docs/MULTI_RAFT.md): a node is a member of one
+// group, Group. Its genesis configuration — the configuration below its log's
+// first entry — is named once, at its first start, by exactly one of Peers,
+// Bootstrap and Join, and recorded in the group identity file beside the log
+// (identity.go); a restart may name the same genesis again or none at all, and
+// is refused if it names another. From then on the group's configuration is
+// replicated state: configuration entries in the log, carried by snapshots.
 type Config struct {
-	ID        NodeID
-	Peers     []NodeID // fixed group membership including ID (ADR-005)
+	ID NodeID
+	// Group is the Raft group this node is a member of. It is the identity its
+	// snapshots and every frame it sends carry (envelope.go). Group 0 on a
+	// transport of its own is the Phase 9–14 single-group deployment.
+	Group replication.GroupID
+	// Peers is the Phase 9 form of the genesis: every node a voter, no
+	// addresses, including ID.
+	Peers []NodeID
+	// Bootstrap is the genesis configuration, with addresses (Phase 15).
+	Bootstrap *replication.Configuration
+	// Join starts a node that is not in the genesis: its genesis is the empty
+	// configuration, and it learns its group's configuration from the leader
+	// that adds it (docs/MEMBERSHIP.md §4). It never campaigns until a
+	// configuration makes it a voter.
+	Join bool
+
 	Transport transport.Transport
-	LogPath   string // durable raft log file for this group
+	// Inbox, if non-nil, is where the node receives its group's frames, their
+	// group envelope already removed: the multi-Raft host demultiplexes one
+	// transport among its groups (internal/multiraft). Nil: the node reads the
+	// transport itself and drops frames of any other group.
+	Inbox   <-chan transport.Envelope
+	LogPath string // durable raft log file for this group
 
 	StateMachine   StateMachine // optional
 	TickInterval   time.Duration
@@ -110,13 +137,95 @@ func (c Config) snapshotFiles() snapshot.Files {
 	return snapshot.Files{FS: c.FS, Base: c.LogPath}
 }
 
-// members is the group identity a snapshot records: the peer ids, sorted.
-func (c Config) members() []string {
-	ids := make([]string, len(c.Peers))
-	for i, p := range c.Peers {
-		ids[i] = string(p)
+// genesis returns the genesis configuration the config names — Peers, Bootstrap
+// or the empty one of Join — and false when it names none (a restart that
+// relies on the identity file). Naming more than one is an error, as is a Peers
+// list that is empty-id, duplicated or without ID (raft's sentinel errors), or
+// a Bootstrap without voters.
+func (c Config) genesis() (replication.Configuration, bool, error) {
+	named := 0
+	for _, b := range []bool{len(c.Peers) > 0, c.Bootstrap != nil, c.Join} {
+		if b {
+			named++
+		}
 	}
-	return snapshot.Group(ids)
+	if named > 1 {
+		return replication.Configuration{}, false, fmt.Errorf("%w: at most one of Peers, Bootstrap and Join names the genesis", ErrIdentity)
+	}
+	switch {
+	case len(c.Peers) > 0:
+		seen := map[NodeID]bool{}
+		for _, p := range c.Peers {
+			if p == "" {
+				return replication.Configuration{}, false, raft.ErrEmptyPeer
+			}
+			if seen[p] {
+				return replication.Configuration{}, false, raft.ErrDuplicatePeer
+			}
+			seen[p] = true
+		}
+		if !seen[c.ID] {
+			return replication.Configuration{}, false, raft.ErrIDNotInPeers
+		}
+		conf := replication.VotersOf(c.Peers)
+		return conf, true, conf.Validate()
+	case c.Bootstrap != nil:
+		if err := c.Bootstrap.Validate(); err != nil {
+			return replication.Configuration{}, false, err
+		}
+		if len(c.Bootstrap.Voters) == 0 || c.Bootstrap.Joint() {
+			return replication.Configuration{}, false, fmt.Errorf("%w: a genesis needs voters and cannot be joint", ErrIdentity)
+		}
+		return c.Bootstrap.Clone(), true, nil
+	case c.Join:
+		return replication.Configuration{}, true, nil
+	}
+	return replication.Configuration{}, false, nil
+}
+
+// identity reconciles the group identity file with the config (docs/MEMBERSHIP.md
+// §2): an existing file must name this group and, if the config names a
+// genesis, the same one; without a file there may be no durable state yet (a
+// log or snapshot without an identity is refused), and the config must name the
+// genesis, which is then recorded durably before anything else is written.
+func (c Config) identity(files snapshot.Files) (Identity, error) {
+	gen, named, err := c.genesis()
+	if err != nil {
+		return Identity{}, err
+	}
+	if err := removeIdentityOrphan(c.FS, c.LogPath); err != nil {
+		return Identity{}, err
+	}
+	id, found, err := LoadIdentity(c.FS, c.LogPath)
+	if err != nil {
+		return Identity{}, err
+	}
+	if found {
+		if id.Group != c.Group {
+			return Identity{}, fmt.Errorf("%w: %s holds group %d, this node is configured for group %d", ErrIdentity, c.LogPath, id.Group, c.Group)
+		}
+		if named && !gen.Equal(id.Genesis) {
+			return Identity{}, fmt.Errorf("%w: the configured genesis %s differs from the recorded %s", ErrIdentity, gen, id.Genesis)
+		}
+		return id, nil
+	}
+	for _, p := range []string{c.LogPath, files.Path()} {
+		there, err := exists(c.FS, p)
+		if err != nil {
+			return Identity{}, err
+		}
+		if there {
+			return Identity{}, fmt.Errorf("%w: %s exists and the group identity file does not", ErrIdentity, p)
+		}
+	}
+	if !named {
+		return Identity{}, fmt.Errorf("%w: a first start needs a genesis: Peers, Bootstrap or Join", ErrIdentity)
+	}
+	id = Identity{Group: c.Group, Genesis: gen}
+	if err := writeIdentity(c.FS, c.LogPath, id); err != nil {
+		return Identity{}, err
+	}
+	return id, nil
 }
 
 // raftlogOptions returns the durable-log options this config implies. The default
@@ -147,27 +256,39 @@ type Recovered struct {
 	// (nil: none); Repaired says recovery completed an interrupted install.
 	Snapshot *snapshot.Meta
 	Repaired bool
+	// Identity is the group identity the node recovered (or recorded, on a
+	// first start).
+	Identity Identity
 	// Durable is the log and snapshots, for the Ready cycle.
 	Durable *Durable
 }
 
 // Recover rebuilds a node from its durable state (docs/SNAPSHOTS.md §6): it
-// removes orphaned temporary files, loads and fully validates the published
-// snapshot (if any), opens the durable log at cfg.LogPath (on cfg.FS), and
+// reconciles the group identity file with cfg (recording it on a first start,
+// docs/MEMBERSHIP.md §2), removes orphaned temporary files, loads and fully
+// validates the published snapshot (if any) — refusing one of another group —,
+// opens the durable log at cfg.LogPath (on cfg.FS), and
 // reconciles the two — completing an install that crashed after publishing
 // its snapshot, and refusing any contradiction. The in-memory log starts at
 // the log's boundary; the commit index is the persisted (clamped) value, at
 // least the snapshot's index; the state machine is restored from the snapshot
 // and the applied index set to it; the core starts at the recovered term and
-// vote, as a Follower. It is the exact startup path of Start, exported so the
+// vote, as a Follower, with the snapshot's configuration at its index (else the
+// genesis) as its base configuration — the log's configuration entries override
+// it (Raft §6). It is the exact startup path of Start, exported so the
 // deterministic simulator restarts nodes through the same code. It uses ID,
-// Peers, LogPath, FS, DisableSync, Rand (required here), ElectionTicks,
-// HeartbeatTicks, StateMachine, SnapshotEvery and SnapshotRetain.
+// Group, Peers/Bootstrap/Join, LogPath, FS, DisableSync, Rand (required here),
+// ElectionTicks, HeartbeatTicks, StateMachine, SnapshotEvery and
+// SnapshotRetain.
 func Recover(cfg Config) (*Recovered, error) {
 	if cfg.Rand == nil {
 		return nil, raft.ErrNoRand
 	}
 	files := cfg.snapshotFiles()
+	ident, err := cfg.identity(files)
+	if err != nil {
+		return nil, err
+	}
 	if err := files.RemoveOrphans(); err != nil {
 		return nil, err
 	}
@@ -175,8 +296,8 @@ func Recover(cfg Config) (*Recovered, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: the published snapshot: %w", ErrSnapshot, err)
 	}
-	if found && !snapshot.SameGroup(meta.Members, cfg.members()) {
-		return nil, fmt.Errorf("%w: the published snapshot is of group %v, this node's is %v", snapshot.ErrWrongGroup, meta.Members, cfg.members())
+	if found && meta.Group != cfg.Group {
+		return nil, fmt.Errorf("%w: the published snapshot is of group %d, this node's is %d", snapshot.ErrWrongGroup, meta.Group, cfg.Group)
 	}
 	ssm, _ := cfg.StateMachine.(SnapshotStateMachine)
 	if found && ssm == nil {
@@ -247,19 +368,23 @@ func Recover(cfg Config) (*Recovered, error) {
 		}
 		restored = &meta
 	}
+	base, baseIndex := ident.Genesis, uint64(0)
+	if found {
+		base, baseIndex = meta.Conf, meta.Index
+	}
 	core, err := raft.New(raft.Config{
-		ID: cfg.ID, Peers: cfg.Peers, Rand: cfg.Rand, Log: mlog,
+		ID: cfg.ID, Conf: &base, ConfIndex: baseIndex, Rand: cfg.Rand, Log: mlog,
 		ElectionTicks: cfg.ElectionTicks, HeartbeatTicks: cfg.HeartbeatTicks,
 		Term: rec.HardState.Term, Vote: rec.HardState.Vote,
 	})
 	if err != nil {
 		return fail(err)
 	}
-	snaps := &Snapshots{Files: files, SM: ssm, Members: cfg.members(), Every: cfg.SnapshotEvery, Retain: cfg.SnapshotRetain}
+	snaps := &Snapshots{Files: files, SM: ssm, Group: cfg.Group, Every: cfg.SnapshotEvery, Retain: cfg.SnapshotRetain}
 	if found {
 		snaps.meta = meta
 	}
-	return &Recovered{Core: core, Log: lg, Mem: mlog, State: rec, Snapshot: restored, Repaired: repaired,
+	return &Recovered{Core: core, Log: lg, Mem: mlog, State: rec, Snapshot: restored, Repaired: repaired, Identity: ident,
 		Durable: &Durable{Log: lg, Snap: snaps}}, nil
 }
 
@@ -282,9 +407,18 @@ type Node struct {
 	proposeCh chan proposal
 	writeCh   chan writeReq
 	readCh    chan readReq
-	outboxes  map[NodeID]chan raft.Message
-	waiters   *Waiters // requests waiting for an apply (actor-owned)
-	reads     *Reads   // unconfirmed ReadIndex requests (actor-owned)
+	confCh    chan confReq
+	outboxes  map[NodeID]*outbox // actor-owned; one per peer it has sent to
+	waiters   *Waiters           // requests waiting for an apply (actor-owned)
+	reads     *Reads             // unconfirmed ReadIndex requests (actor-owned)
+	changes   []*confWait        // membership changes awaiting completion (actor-owned)
+
+	// Phase 15: the configuration last reported (actor-owned), for the
+	// raft_conf and raft_removed events and for retiring outboxes.
+	confSeen    replication.Configuration
+	confSeenIdx uint64
+	confLogged  bool
+	removed     bool
 
 	mu      sync.Mutex
 	status  Status
@@ -312,12 +446,15 @@ func (n *Node) SetAppHandler(h AppHandler) {
 }
 
 // SendApp sends an application message to a peer over the node's transport —
-// the same connections, framing and fault injection as Raft traffic. An error
-// means the message was not handed to the connection (e.g. the peer is not
-// connected): nothing was sent.
+// the same connections, framing, group envelope and fault injection as Raft
+// traffic. An error means the message was not handed to the connection (e.g.
+// the peer is not connected): nothing was sent.
 func (n *Node) SendApp(ctx context.Context, peer NodeID, kind transport.MsgKind, payload []byte) error {
-	return n.tr.Send(ctx, transport.NodeID(peer), kind, payload)
+	return n.tr.Send(ctx, transport.NodeID(peer), kind, WrapGroup(n.cfg.Group, payload))
 }
+
+// Group returns the group this node is a member of.
+func (n *Node) Group() replication.GroupID { return n.cfg.Group }
 
 type proposal struct {
 	data   []byte
@@ -357,6 +494,7 @@ type readAccepted struct {
 // Status is one consistent snapshot of a node's Raft state, taken by the actor
 // after it finished processing an event.
 type Status struct {
+	Group     replication.GroupID
 	Role      raft.Role
 	Term      uint64
 	Leader    NodeID
@@ -367,6 +505,16 @@ type Status struct {
 	// discarded) and the published snapshot's index (0: none).
 	Boundary uint64
 	Snapshot uint64
+	// Phase 15: the node's current configuration — the latest in its log,
+	// committed or not — and the index of its entry (0: the base); whether a
+	// change is under way; whether this node votes in it.
+	Conf        replication.Configuration
+	ConfIndex   uint64
+	ConfPending bool
+	Voter       bool
+	// Removed: a committed configuration without this node was seen — it is
+	// no longer a member of its group (docs/MEMBERSHIP.md §5).
+	Removed bool
 }
 
 // Start recovers durable state, constructs the core, and launches the actor,
@@ -394,33 +542,28 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		proposeCh: make(chan proposal),
 		writeCh:   make(chan writeReq),
 		readCh:    make(chan readReq),
-		outboxes:  map[NodeID]chan raft.Message{},
+		confCh:    make(chan confReq),
+		outboxes:  map[NodeID]*outbox{},
 		waiters:   NewWaiters(),
 		reads:     NewReads(),
 	}
 	n.dur.Snap.Installed = n.waiters.Installed
+	n.noteConf()
 	n.snapshotStatus()
 	if rc.Snapshot != nil {
-		n.logf("event=raft_snapshot_restored node=%s index=%d term=%d repaired=%v", cfg.ID, rc.Snapshot.Index, rc.Snapshot.Term, rc.Repaired)
+		n.logf("event=raft_snapshot_restored node=%s index=%d term=%d repaired=%v group=%d", cfg.ID, rc.Snapshot.Index, rc.Snapshot.Term, rc.Repaired, cfg.Group)
 	}
 
-	for _, p := range cfg.Peers {
-		if p == cfg.ID {
-			continue
-		}
-		ch := make(chan raft.Message, OutboxSize)
-		n.outboxes[p] = ch
-		n.wg.Add(1)
-		go n.senderLoop(ch)
-	}
 	// Read what the start line reports while this goroutine still owns the
 	// core: once the actor runs, only it may touch the core (it may be
 	// stepping a message already).
 	term, last := rc.Core.Term(), rc.Core.LastIndex()
+	conf, _ := rc.Core.Conf()
+	n.syncOutboxes()
 	n.wg.Add(2)
 	go n.receiveLoop()
 	go n.actorLoop()
-	n.logf("event=raft_started node=%s peers=%d term=%d lastIndex=%d", cfg.ID, len(cfg.Peers), term, last)
+	n.logf("event=raft_started node=%s peers=%d term=%d lastIndex=%d group=%d conf=%q", cfg.ID, len(conf.Members()), term, last, cfg.Group, conf.String())
 	return n, nil
 }
 
@@ -536,7 +679,13 @@ func (n *Node) ReadIndex(ctx context.Context) (uint64, error) {
 
 // Status returns one consistent snapshot of the node's state. Use it (not the
 // single-field accessors) whenever more than one field is needed together.
-func (n *Node) Status() Status { n.mu.Lock(); defer n.mu.Unlock(); return n.status }
+func (n *Node) Status() Status {
+	n.mu.Lock()
+	st := n.status
+	n.mu.Unlock()
+	st.Conf = st.Conf.Clone() // the caller's own copy
+	return st
+}
 
 // Role, Term, LeaderID, CommitIndex return single fields of the latest snapshot.
 func (n *Node) Role() raft.Role     { return n.Status().Role }
@@ -607,6 +756,12 @@ func (n *Node) actorLoop() {
 			} else {
 				r.result <- readAccepted{done: n.reads.Add(rs.ID, n.core.Term())}
 			}
+		case c := <-n.confCh:
+			if err := n.core.ProposeConfChange(c.cc); err != nil {
+				c.result <- confOutcome{err: err}
+			} else {
+				n.changes = append(n.changes, &confWait{since: n.core.LastIndex(), term: n.core.Term(), result: c.result})
+			}
 		}
 		if err := n.processReady(); err != nil {
 			if accepted != nil {
@@ -643,10 +798,10 @@ func (n *Node) processReady() error {
 	// durability failure and stops the node, as a failed Save does.
 	before := n.dur.Snap.Published().Index
 	if err := n.dur.MaybeSnapshot(n.core, n.cfg.Hook); err != nil {
-		if !errors.Is(err, snapshot.ErrTooLarge) {
+		if !errors.Is(err, snapshot.ErrTooLarge) && !errors.Is(err, raft.ErrConfUnknown) {
 			return err
 		}
-		n.logf("event=raft_snapshot_skipped node=%s applied=%d err=%v", n.cfg.ID, n.core.AppliedIndex(), err)
+		n.logf("event=raft_snapshot_skipped node=%s applied=%d group=%d err=%v", n.cfg.ID, n.core.AppliedIndex(), n.cfg.Group, err)
 	}
 	if after := n.dur.Snap.Published(); after.Index != before {
 		b, _ := n.core.Boundary()
@@ -655,6 +810,10 @@ func (n *Node) processReady() error {
 	// A read registered in a term this node no longer leads will never be
 	// confirmed (the core dropped it): tell its client to go elsewhere.
 	n.reads.DropStale(n.core.Term(), n.core.Role() == raft.Leader)
+	if n.noteConf() {
+		n.syncOutboxes()
+	}
+	n.settleChanges()
 	n.snapshotStatus()
 	return nil
 }
@@ -687,6 +846,46 @@ func (n *Node) fail(err error) {
 	n.cancel()
 }
 
+// outbox is one peer's queue of messages awaiting transmission and the stop
+// signal of its sender goroutine.
+type outbox struct {
+	ch   chan raft.Message
+	stop chan struct{}
+}
+
+// outboxFor returns peer's outbox, starting its sender on first use (Phase 15:
+// the set of peers follows the configuration, so outboxes are made as the core
+// first addresses a peer).
+func (n *Node) outboxFor(peer NodeID) *outbox {
+	if ob := n.outboxes[peer]; ob != nil {
+		return ob
+	}
+	ob := &outbox{ch: make(chan raft.Message, OutboxSize), stop: make(chan struct{})}
+	n.outboxes[peer] = ob
+	n.wg.Add(1)
+	go n.senderLoop(ob)
+	return ob
+}
+
+// syncOutboxes gives every other member of the current configuration an outbox
+// and stops those of nodes that are no longer members (their queued messages
+// are dropped: a node outside the configuration has nothing to learn from
+// this one, and one that returns is replicated to afresh).
+func (n *Node) syncOutboxes() {
+	conf, _ := n.core.Conf()
+	for _, p := range conf.Members() {
+		if p != n.cfg.ID {
+			n.outboxFor(p)
+		}
+	}
+	for p, ob := range n.outboxes {
+		if !conf.IsMember(p) {
+			close(ob.stop)
+			delete(n.outboxes, p)
+		}
+	}
+}
+
 // enqueue hands a message (already persisted-for, by DrainReady's ordering) to its
 // peer's outbox without ever blocking the actor. A full outbox drops the message;
 // Raft's heartbeats retransmit whatever it carried.
@@ -695,13 +894,13 @@ func (n *Node) enqueue(m raft.Message) {
 		n.startTransfer(m)
 		return
 	}
-	ch, ok := n.outboxes[m.To]
-	if !ok {
+	if m.To == "" || m.To == n.cfg.ID {
 		n.logf("event=raft_send_dropped node=%s to=%s type=%s reason=unknown_peer", n.cfg.ID, m.To, m.Type)
 		return
 	}
+	ob := n.outboxFor(m.To)
 	select {
-	case ch <- m:
+	case ob.ch <- m:
 	default:
 		n.logf("event=raft_send_dropped node=%s to=%s type=%s reason=outbox_full", n.cfg.ID, m.To, m.Type)
 	}
@@ -709,27 +908,30 @@ func (n *Node) enqueue(m raft.Message) {
 
 // senderLoop transmits one peer's messages in order. It is the only goroutine that
 // can block on that peer's connection.
-func (n *Node) senderLoop(ch <-chan raft.Message) {
+func (n *Node) senderLoop(ob *outbox) {
 	defer n.wg.Done()
 	for {
 		select {
 		case <-n.ctx.Done():
 			return
-		case m := <-ch:
+		case <-ob.stop:
+			return
+		case m := <-ob.ch:
 			n.sendMessage(m)
 		}
 	}
 }
 
-// sendMessage marshals a core message and sends it over the transport. A peer that
-// is not currently connected is expected (the dialer reconnects); the message is
-// dropped and Raft retransmits on the next tick.
+// sendMessage marshals a core message and sends it over the transport, in its
+// group's envelope. A peer that is not currently connected is expected (the
+// dialer reconnects); the message is dropped and Raft retransmits on the next
+// tick.
 func (n *Node) sendMessage(m raft.Message) {
 	kind, ok := kindForType(m.Type)
 	if !ok {
 		return
 	}
-	if err := n.tr.Send(n.ctx, transport.NodeID(m.To), kind, m.Marshal()); err != nil {
+	if err := n.tr.Send(n.ctx, transport.NodeID(m.To), kind, WrapGroup(n.cfg.Group, m.Marshal())); err != nil {
 		// ErrPeerNotConnected / a write error: fine, Raft is retransmission-based.
 		n.logf("event=raft_send_failed node=%s to=%s type=%s err=%v", n.cfg.ID, m.To, m.Type, err)
 	}
@@ -737,10 +939,15 @@ func (n *Node) sendMessage(m raft.Message) {
 
 // receiveLoop decodes inbound transport frames into core messages and feeds them
 // to the actor. The message's sender is the connection's handshake identity
-// (env.Peer), never a payload field (INV-T4).
+// (env.Peer), never a payload field (INV-T4). Reading the transport itself (no
+// Inbox), it removes each frame's group envelope and drops frames of other
+// groups; from an Inbox, the host has done both.
 func (n *Node) receiveLoop() {
 	defer n.wg.Done()
-	rc := n.tr.Receive()
+	rc, unwrap := n.cfg.Inbox, false
+	if rc == nil {
+		rc, unwrap = n.tr.Receive(), true
+	}
 	for {
 		select {
 		case <-n.ctx.Done():
@@ -748,6 +955,14 @@ func (n *Node) receiveLoop() {
 		case env, ok := <-rc:
 			if !ok {
 				return // transport closed
+			}
+			if unwrap {
+				g, payload, err := UnwrapGroup(env.Payload)
+				if err != nil || g != n.cfg.Group {
+					n.logf("event=raft_frame_dropped node=%s group=%d from=%s kind=%d frame_group=%d err=%v", n.cfg.ID, n.cfg.Group, env.Peer, env.Kind, g, err)
+					continue
+				}
+				env.Payload = payload
 			}
 			if env.Kind == transport.MsgInstallSnapshot {
 				select {
@@ -785,13 +1000,17 @@ func (n *Node) receiveLoop() {
 }
 
 func (n *Node) snapshotStatus() {
-	n.mu.Lock()
 	b, _ := n.core.Boundary()
-	n.status = Status{
-		Role: n.core.Role(), Term: n.core.Term(), Leader: n.core.LeaderID(),
+	st := Status{
+		Group: n.cfg.Group,
+		Role:  n.core.Role(), Term: n.core.Term(), Leader: n.core.LeaderID(),
 		Commit: n.core.CommitIndex(), LastIndex: n.core.LastIndex(), Applied: n.core.AppliedIndex(),
 		Boundary: b, Snapshot: n.dur.Snap.Published().Index,
+		Conf: n.confSeen, ConfIndex: n.confSeenIdx, ConfPending: n.core.ConfPending(), Voter: n.core.IsVoter(),
+		Removed: n.removed,
 	}
+	n.mu.Lock()
+	n.status = st
 	n.mu.Unlock()
 }
 
@@ -832,7 +1051,7 @@ func (n *Node) transfer(peer NodeID, term uint64, meta snapshot.Meta, file []byt
 	}()
 	chunks := snapshot.Split(term, meta, file)
 	for _, c := range chunks {
-		if err := n.tr.Send(n.ctx, transport.NodeID(peer), transport.MsgInstallSnapshot, c.Marshal()); err != nil {
+		if err := n.tr.Send(n.ctx, transport.NodeID(peer), transport.MsgInstallSnapshot, WrapGroup(n.cfg.Group, c.Marshal())); err != nil {
 			n.logf("event=raft_snapshot_send_failed node=%s to=%s index=%d offset=%d err=%v", n.cfg.ID, peer, meta.Index, c.Offset, err)
 			return
 		}

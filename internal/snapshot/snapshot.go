@@ -15,18 +15,23 @@
 // A snapshot file is a sequence of records in the shared framing
 // (internal/record: CRC-32C per record), in this package's kind namespace:
 //
-//	Header (kind 1): magic "QSNP" | version | members | index | term | dataLen | SHA-256(data)
+//	Header (kind 1): magic "QSNP" | version | group | configuration | index | term | dataLen | SHA-256(data)
 //	Data   (kind 2): up to MaxDataRecord bytes of state, in order   (zero or more)
 //	Footer (kind 3): index | term                                    (end marker)
 //
-// Integers are canonical uvarints; the members (the group identity) are
-// length-prefixed, non-empty and strictly ascending. A file is valid only if it
-// is exactly one header, data records whose concatenation is dataLen bytes with
-// the header's SHA-256, and one footer repeating the header's index and term —
-// nothing torn, nothing after. There is no repair: a published snapshot was
-// fsynced before it was published, so any damage is corruption. The encoding is
-// deterministic — no timestamp, random id or host name — so the same state and
-// metadata always produce the same bytes.
+// Integers are canonical uvarints. The group id is the snapshot's identity (a
+// snapshot of another group is refused whatever its members), and the
+// configuration — length-prefixed, replication.EncodeConfiguration's bytes — is
+// the group's membership at the snapshot's index (Phase 15, docs/MEMBERSHIP.md
+// §6): a follower that installs the snapshot adopts it, a restart from the
+// snapshot starts from it. A file is valid only if it is exactly one header,
+// data records whose concatenation is dataLen bytes with the header's SHA-256,
+// and one footer repeating the header's index and term — nothing torn, nothing
+// after. There is no repair: a published snapshot was fsynced before it was
+// published, so any damage is corruption. The encoding is deterministic — no
+// timestamp, random id or host name — so the same state and metadata always
+// produce the same bytes. Version 1 (Phase 14: a member list as the identity)
+// is retired; nothing outside this repository wrote one.
 package snapshot
 
 import (
@@ -36,13 +41,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
 
 	"github.com/adivishall/quorum/internal/record"
+	"github.com/adivishall/quorum/internal/replication"
 )
 
 // Version is the snapshot format version this package writes and reads.
-const Version = 1
+const Version = 2
 
 const (
 	magic = "QSNP"
@@ -58,9 +63,6 @@ const (
 	// it is written, sent and received; this is the documented Phase 14 bound
 	// (docs/SNAPSHOTS.md), not a claim that larger states are supported.
 	MaxData = 512 << 20
-	// MaxMembers and MaxMemberLen bound the group identity.
-	MaxMembers   = 64
-	MaxMemberLen = 256
 )
 
 // Errors. ErrCorrupt covers every structural or checksum failure; ErrVersion a
@@ -73,49 +75,26 @@ var (
 	ErrTooLarge   = errors.New("snapshot: state exceeds the size bound")
 )
 
-// Meta identifies a snapshot: the group it belongs to and the last log entry it
-// covers.
+// Meta identifies a snapshot: the group it belongs to, the group's membership
+// at its index, and the last log entry it covers.
 type Meta struct {
-	Members []string // the group's member ids, strictly ascending
-	Index   uint64   // last entry the snapshot covers
-	Term    uint64   // that entry's term
-}
-
-// Group returns the canonical group identity for a member list: the ids,
-// sorted. Two nodes of one group always compute the same identity.
-func Group(members []string) []string {
-	out := append([]string(nil), members...)
-	sort.Strings(out)
-	return out
-}
-
-// SameGroup reports whether a and b name the same group.
-func SameGroup(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	Group replication.GroupID       // the snapshot's identity
+	Conf  replication.Configuration // the configuration in effect at Index
+	Index uint64                    // last entry the snapshot covers
+	Term  uint64                    // that entry's term
 }
 
 func (m Meta) validate() error {
 	if m.Index == 0 || m.Term == 0 {
 		return fmt.Errorf("%w: snapshot at index %d term %d", ErrCorrupt, m.Index, m.Term)
 	}
-	if len(m.Members) == 0 || len(m.Members) > MaxMembers {
-		return fmt.Errorf("%w: %d members", ErrCorrupt, len(m.Members))
+	if err := m.Conf.Validate(); err != nil {
+		return fmt.Errorf("%w: configuration: %v", ErrCorrupt, err)
 	}
-	for i, id := range m.Members {
-		if id == "" || len(id) > MaxMemberLen {
-			return fmt.Errorf("%w: member id of %d bytes", ErrCorrupt, len(id))
-		}
-		if i > 0 && m.Members[i-1] >= id {
-			return fmt.Errorf("%w: members not strictly ascending", ErrCorrupt)
-		}
+	if len(m.Conf.Voters) == 0 {
+		// A snapshot is of applied state, and only a group with voters applies
+		// anything: the configuration at any snapshot index has a voter.
+		return fmt.Errorf("%w: a configuration without voters", ErrCorrupt)
 	}
 	return nil
 }
@@ -131,11 +110,10 @@ func Encode(m Meta, data []byte) ([]byte, error) {
 	sum := sha256.Sum256(data)
 	h := []byte(magic)
 	h = binary.AppendUvarint(h, Version)
-	h = binary.AppendUvarint(h, uint64(len(m.Members)))
-	for _, id := range m.Members {
-		h = binary.AppendUvarint(h, uint64(len(id)))
-		h = append(h, id...)
-	}
+	h = binary.AppendUvarint(h, uint64(m.Group))
+	conf := replication.EncodeConfiguration(m.Conf)
+	h = binary.AppendUvarint(h, uint64(len(conf)))
+	h = append(h, conf...)
 	h = binary.AppendUvarint(h, m.Index)
 	h = binary.AppendUvarint(h, m.Term)
 	h = binary.AppendUvarint(h, uint64(len(data)))
@@ -235,13 +213,19 @@ func decodeHeader(p []byte) (Meta, uint64, [32]byte, error) {
 	if v := d.uint(); d.err == nil && v != Version {
 		return Meta{}, 0, sum, fmt.Errorf("%w: version %d (this build reads %d)", ErrVersion, v, Version)
 	}
-	n := d.uint()
-	if d.err == nil && (n == 0 || n > MaxMembers) {
-		return Meta{}, 0, sum, fmt.Errorf("%w: %d members", ErrCorrupt, n)
-	}
 	var m Meta
-	for i := uint64(0); i < n && d.err == nil; i++ {
-		m.Members = append(m.Members, string(d.bytes(MaxMemberLen)))
+	g := d.uint()
+	if d.err == nil && g > uint64(^uint32(0)) {
+		return Meta{}, 0, sum, fmt.Errorf("%w: group id %d", ErrCorrupt, g)
+	}
+	m.Group = replication.GroupID(g)
+	confBytes := d.bytes(replication.MaxEncodedConfiguration)
+	if d.err == nil {
+		c, err := replication.DecodeConfiguration(confBytes)
+		if err != nil {
+			return Meta{}, 0, sum, fmt.Errorf("%w: configuration: %v", ErrCorrupt, err)
+		}
+		m.Conf = c
 	}
 	m.Index, m.Term = d.uint(), d.uint()
 	dataLen := d.uint()

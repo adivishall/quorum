@@ -6,6 +6,7 @@ import (
 
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftlog"
+	"github.com/adivishall/quorum/internal/replication"
 	"github.com/adivishall/quorum/internal/snapshot"
 )
 
@@ -60,9 +61,9 @@ type Installer interface {
 // machine, the policy, and a leader's snapshot being received. It is owned by
 // the node's actor goroutine (or the simulator).
 type Snapshots struct {
-	Files   snapshot.Files
-	SM      SnapshotStateMachine // nil: this node neither creates nor installs snapshots
-	Members []string             // the group's identity (snapshot.Group)
+	Files snapshot.Files
+	SM    SnapshotStateMachine // nil: this node neither creates nor installs snapshots
+	Group replication.GroupID  // the group's identity (Phase 15)
 	// Every is the snapshot trigger: a snapshot is created once the applied
 	// index is Every entries past the published one (0: never). It reads only
 	// indexes — never a clock — so it is deterministic (docs/SNAPSHOTS.md §4).
@@ -106,8 +107,9 @@ func (s *Snapshots) SendFile() (snapshot.Meta, []byte, error) {
 // Receive takes one chunk of a snapshot a peer is sending (transport kind
 // InstallSnapshot). When the chunk completes a transfer that validates — the
 // file, the group, and the state itself (ValidateSnapshot) — the snapshot is
-// staged and Receive returns the MsgSnapshot to step into the core; the core
-// then installs it or ignores it (docs/SNAPSHOTS.md §8). Otherwise it returns
+// staged and Receive returns the MsgSnapshot to step into the core, carrying the
+// snapshot's configuration (Phase 15: the node's base configuration once
+// installed); the core then installs it or ignores it (docs/SNAPSHOTS.md §8). Otherwise it returns
 // nil: an incomplete transfer, or one refused (the error says why; the leader
 // offers again). The staged snapshot is consumed by InstallSnapshot within the
 // same Ready cycle, or dropped by Unstage.
@@ -126,15 +128,16 @@ func (s *Snapshots) Receive(from NodeID, payload []byte) (*raft.Message, error) 
 	if err != nil || got == nil {
 		return nil, err
 	}
-	if !snapshot.SameGroup(got.Meta.Members, s.Members) {
-		return nil, fmt.Errorf("%w: members %v, this group is %v", snapshot.ErrWrongGroup, got.Meta.Members, s.Members)
+	if got.Meta.Group != s.Group {
+		return nil, fmt.Errorf("%w: a snapshot of group %d, this node is of group %d", snapshot.ErrWrongGroup, got.Meta.Group, s.Group)
 	}
 	if err := s.SM.ValidateSnapshot(got.Meta.Index, got.Data); err != nil {
 		return nil, err
 	}
 	s.staged = got
+	conf := got.Meta.Conf.Clone()
 	return &raft.Message{Type: raft.MsgSnapshot, From: from, Term: got.Term,
-		SnapshotIndex: got.Meta.Index, SnapshotTerm: got.Meta.Term}, nil
+		SnapshotIndex: got.Meta.Index, SnapshotTerm: got.Meta.Term, Conf: &conf}, nil
 }
 
 // Unstage drops a staged snapshot the core did not install (it already had
@@ -236,7 +239,11 @@ func (d *Durable) MaybeSnapshot(core *raft.Raft, at Hook) error {
 // A state larger than snapshot.MaxData is not snapshotted: the error wraps
 // snapshot.ErrTooLarge, nothing is written, and no new attempt is made until
 // Every more entries are applied — the log then keeps growing (documented, not
-// hidden). Any other failure is a durability failure: the node stops.
+// hidden). Nor is a state whose configuration the node does not know (Phase 15:
+// a joiner that has not yet applied its group's first configuration entry it
+// received; raft.ErrConfUnknown): the snapshot must carry the configuration, so
+// it waits for the next applied entry. Any other failure is a durability
+// failure: the node stops.
 func (d *Durable) Snapshot(core *raft.Raft, at Hook) error {
 	s := d.Snap
 	if s.SM == nil {
@@ -256,7 +263,15 @@ func (d *Durable) Snapshot(core *raft.Raft, at Hook) error {
 	if err != nil {
 		return fmt.Errorf("%w: the term of applied entry %d: %w", ErrSnapshot, idx, err)
 	}
-	meta := snapshot.Meta{Members: s.Members, Index: idx, Term: term}
+	conf, err := core.ConfAt(idx)
+	if errors.Is(err, raft.ErrConfUnknown) {
+		s.skip = idx + 1
+		return fmt.Errorf("%w: at %d: %w", ErrSnapshot, idx, err)
+	}
+	if err != nil {
+		return fmt.Errorf("%w: the configuration at %d: %w", ErrSnapshot, idx, err)
+	}
+	meta := snapshot.Meta{Group: s.Group, Conf: conf, Index: idx, Term: term}
 	file, err := snapshot.Encode(meta, data)
 	if errors.Is(err, snapshot.ErrTooLarge) {
 		s.skip = idx + max(s.Every, 1)

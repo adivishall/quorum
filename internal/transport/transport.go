@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -37,6 +38,22 @@ type Transport interface {
 	Close() error
 }
 
+// PeerSet is a transport whose peers can change at runtime (Phase 15,
+// docs/MULTI_RAFT.md §4). The transport never decides membership: its owner —
+// the multi-Raft host, from the configurations of the groups it runs — adds
+// the members it must reach and removes the ones it no longer shares a group
+// with.
+type PeerSet interface {
+	// AddPeer admits peer at addr: its connections are accepted from now on
+	// and, if this node has the smaller id, it is dialed (ADR-014). Adding a
+	// known peer at the same address does nothing; at another address it is an
+	// error (remove it first).
+	AddPeer(id NodeID, addr string) error
+	// RemovePeer forgets peer: its dial loop stops, its connection is closed and
+	// its connections are refused from now on. An unknown peer is ignored.
+	RemovePeer(id NodeID) error
+}
+
 const recvBuffer = 256
 
 // TCPTransport is the framed-TCP implementation of Transport.
@@ -51,10 +68,20 @@ type TCPTransport struct {
 
 	mu     sync.Mutex
 	conns  map[NodeID]*conn
+	peers  map[NodeID]*peer // the peers it accepts and (smaller id) dials
 	closed bool
 }
 
-var _ Transport = (*TCPTransport)(nil)
+// peer is a known peer: its address and the cancellation of its dial loop.
+type peer struct {
+	addr string
+	stop context.CancelFunc
+}
+
+var (
+	_ Transport = (*TCPTransport)(nil)
+	_ PeerSet   = (*TCPTransport)(nil)
+)
 
 // NewTCPTransport validates cfg, starts listening, and starts the accept loop
 // and the dial loops for peers this node is responsible for dialing (the node
@@ -79,19 +106,97 @@ func NewTCPTransport(cfg Config) (*TCPTransport, error) {
 		ctx:    ctx,
 		cancel: cancel,
 		conns:  make(map[NodeID]*conn),
+		peers:  make(map[NodeID]*peer),
 	}
 
 	t.wg.Add(1)
 	go t.acceptLoop()
 
-	for peer, addr := range cfg.Peers {
-		if cfg.NodeID < peer { // smaller id dials
-			t.wg.Add(1)
-			go t.dialLoop(peer, addr)
-		}
+	t.mu.Lock()
+	for id, addr := range cfg.Peers {
+		t.addPeerLocked(id, addr)
 	}
+	t.mu.Unlock()
 	t.logf("event=node_started node=%s listen=%s peers=%d", cfg.NodeID, ln.Addr(), len(cfg.Peers))
 	return t, nil
+}
+
+// addPeerLocked records a peer and, if this node has the smaller id, starts
+// its dial loop. t.mu is held.
+func (t *TCPTransport) addPeerLocked(id NodeID, addr string) {
+	ctx, stop := context.WithCancel(t.ctx)
+	t.peers[id] = &peer{addr: addr, stop: stop}
+	if t.cfg.NodeID < id { // smaller id dials
+		t.wg.Add(1)
+		go t.dialLoop(ctx, id, addr)
+	}
+}
+
+// AddPeer admits a peer at runtime (PeerSet).
+func (t *TCPTransport) AddPeer(id NodeID, addr string) error {
+	switch {
+	case id == "":
+		return fmt.Errorf("%w: empty peer id", ErrInvalidConfig)
+	case len(id) > MaxNodeIDLen:
+		return fmt.Errorf("%w: peer id %q exceeds %d bytes", ErrInvalidConfig, id, MaxNodeIDLen)
+	case id == t.cfg.NodeID:
+		return fmt.Errorf("%w: peer id %q is this node's own id (self-dial)", ErrInvalidConfig, id)
+	}
+	if err := validateAddr(addr); err != nil {
+		return fmt.Errorf("%w: peer %q addr %q: %v", ErrInvalidConfig, id, addr, err)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return ErrClosed
+	}
+	if p, ok := t.peers[id]; ok {
+		if p.addr == addr {
+			return nil
+		}
+		return fmt.Errorf("%w: peer %q is known at %s, not %s", ErrInvalidConfig, id, p.addr, addr)
+	}
+	t.addPeerLocked(id, addr)
+	t.logf("event=peer_added node=%s peer=%s addr=%s", t.cfg.NodeID, id, addr)
+	return nil
+}
+
+// RemovePeer forgets a peer at runtime (PeerSet).
+func (t *TCPTransport) RemovePeer(id NodeID) error {
+	t.mu.Lock()
+	p, ok := t.peers[id]
+	if !ok {
+		t.mu.Unlock()
+		return nil
+	}
+	delete(t.peers, id)
+	p.stop()
+	c := t.conns[id]
+	t.mu.Unlock()
+	if c != nil {
+		c.close() // its serve deregisters it
+	}
+	t.logf("event=peer_removed node=%s peer=%s", t.cfg.NodeID, id)
+	return nil
+}
+
+// Peers returns the peers the transport currently knows, with their addresses.
+func (t *TCPTransport) Peers() map[NodeID]string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make(map[NodeID]string, len(t.peers))
+	for id, p := range t.peers {
+		out[id] = p.addr
+	}
+	return out
+}
+
+// isPeer reports whether id is a known peer.
+func (t *TCPTransport) isPeer(id NodeID) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, ok := t.peers[id]
+	return ok
 }
 
 // LocalID returns this node's id.
@@ -182,7 +287,7 @@ func (t *TCPTransport) handleInbound(nc net.Conn) {
 		_ = nc.Close()
 		return
 	}
-	if _, ok := t.cfg.Peers[peer]; !ok {
+	if !t.isPeer(peer) {
 		t.logf("event=handshake_failed dir=inbound peer=%s err=%v", peer, ErrUnknownPeer)
 		_ = nc.Close()
 		return
@@ -191,23 +296,24 @@ func (t *TCPTransport) handleInbound(nc net.Conn) {
 }
 
 // dialLoop maintains a connection to one peer: dial, handshake, serve until the
-// connection dies, then retry — bounded interval, cancelled on shutdown.
-func (t *TCPTransport) dialLoop(peer NodeID, addr string) {
+// connection dies, then retry — bounded interval, cancelled on shutdown or
+// when the peer is removed (ctx).
+func (t *TCPTransport) dialLoop(ctx context.Context, peer NodeID, addr string) {
 	defer t.wg.Done()
 	d := net.Dialer{Timeout: t.cfg.DialTimeout}
 	for {
-		if t.ctx.Err() != nil {
+		if ctx.Err() != nil {
 			return
 		}
 		if t.hasConn(peer) {
-			if t.sleep(t.cfg.DialRetryInterval) {
+			if sleepCtx(ctx, t.cfg.DialRetryInterval) {
 				return
 			}
 			continue
 		}
-		nc, err := d.DialContext(t.ctx, "tcp", addr)
+		nc, err := d.DialContext(ctx, "tcp", addr)
 		if err != nil {
-			if t.sleep(t.cfg.DialRetryInterval) {
+			if sleepCtx(ctx, t.cfg.DialRetryInterval) {
 				return
 			}
 			continue
@@ -216,7 +322,7 @@ func (t *TCPTransport) dialLoop(peer NodeID, addr string) {
 		if err := writeHandshake(nc, t.cfg.NodeID); err != nil {
 			t.logf("event=handshake_failed dir=outbound peer=%s err=%v", peer, mapTimeout(err))
 			_ = nc.Close()
-			if t.sleep(t.cfg.DialRetryInterval) {
+			if sleepCtx(ctx, t.cfg.DialRetryInterval) {
 				return
 			}
 			continue
@@ -227,7 +333,7 @@ func (t *TCPTransport) dialLoop(peer NodeID, addr string) {
 		// Redialling immediately would spin at CPU speed against a peer that
 		// accepts and instantly closes — a crash-looping peer, or a partition
 		// that resets connections — burning ports and flooding logs.
-		if t.sleep(t.cfg.DialRetryInterval) {
+		if sleepCtx(ctx, t.cfg.DialRetryInterval) {
 			return
 		}
 	}
@@ -246,6 +352,12 @@ func (t *TCPTransport) serve(peer NodeID, nc net.Conn, dir string) {
 	}
 	if _, exists := t.conns[peer]; exists {
 		// keep-existing: a connection to this peer already exists.
+		t.mu.Unlock()
+		c.close()
+		return
+	}
+	if _, known := t.peers[peer]; !known {
+		// Removed while this connection was being set up.
 		t.mu.Unlock()
 		c.close()
 		return
@@ -293,12 +405,12 @@ func (t *TCPTransport) hasConn(peer NodeID) bool {
 	return ok
 }
 
-// sleep waits for d or until shutdown; it returns true if shutdown fired.
-func (t *TCPTransport) sleep(d time.Duration) bool {
+// sleepCtx waits for d or until ctx ends; it returns true if ctx ended.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
-	case <-t.ctx.Done():
+	case <-ctx.Done():
 		return true
 	case <-timer.C:
 		return false
