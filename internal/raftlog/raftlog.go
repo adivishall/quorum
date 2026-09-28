@@ -59,6 +59,10 @@ const (
 	kindEntry     record.Kind = 1
 	kindHardState record.Kind = 2
 	kindBoundary  record.Kind = 3 // Phase 14
+	// kindEntryTyped is an entry with a type (Phase 15): a configuration entry.
+	// A kind-1 record is an EntryNormal — every entry before Phase 15 — so
+	// normal entries keep their encoding; only typed ones use this kind.
+	kindEntryTyped record.Kind = 4
 
 	// MaxEntryDataLen bounds one entry's opaque bytes on disk (the 1 MiB value
 	// limit, docs/DESIGN.md §1), so a corrupt length cannot drive a wild alloc
@@ -239,8 +243,14 @@ func readRecords(r io.Reader, name string, size int64) (*Recovered, int64, error
 			return nil, 0, fmt.Errorf("%w: %v", ErrCorrupt, err)
 		}
 		switch kind {
-		case kindEntry:
-			e, err := decodeEntry(payload)
+		case kindEntry, kindEntryTyped:
+			var e Entry
+			var err error
+			if kind == kindEntry {
+				e, err = decodeEntry(payload)
+			} else {
+				e, err = decodeTypedEntry(payload)
+			}
 			if err != nil {
 				return nil, 0, err
 			}
@@ -360,7 +370,7 @@ func (l *Log) Save(hs *HardState, entries []Entry) error {
 		}
 	}
 	for _, e := range entries {
-		if _, err := l.w.Append(kindEntry, encodeEntry(e)); err != nil {
+		if _, err := l.w.Append(entryKind(e), encodeAnyEntry(e)); err != nil {
 			return l.fail(err)
 		}
 	}
@@ -498,7 +508,7 @@ func (l *Log) Compact(index, term uint64) error {
 	}
 	for _, e := range rec.Entries[index-b.Index:] {
 		if err == nil {
-			err = write(kindEntry, encodeEntry(e))
+			err = write(entryKind(e), encodeAnyEntry(e))
 		}
 	}
 	if err == nil && l.sync {
@@ -558,6 +568,54 @@ func (l *Log) Close() error {
 }
 
 // --- payload codecs (bounded, explicit; ADR-003) ---
+
+// entryKind is the record kind an entry is written as: the Phase 9 kind for a
+// normal entry, the typed kind for any other.
+func entryKind(e Entry) record.Kind {
+	if e.Type == replication.EntryNormal {
+		return kindEntry
+	}
+	return kindEntryTyped
+}
+
+// encodeAnyEntry encodes an entry in the payload of its record kind.
+func encodeAnyEntry(e Entry) []byte {
+	if e.Type == replication.EntryNormal {
+		return encodeEntry(e)
+	}
+	return encodeTypedEntry(e)
+}
+
+// encodeTypedEntry is a typed entry's payload: type, then the entry as
+// encodeEntry writes it.
+func encodeTypedEntry(e Entry) []byte {
+	return append([]byte{byte(e.Type)}, encodeEntry(e)...)
+}
+
+// decodeTypedEntry decodes a typed entry. A configuration entry must carry a
+// configuration that decodes — the core relies on it — and an unknown type is
+// corruption; recovery refuses either rather than guessing.
+func decodeTypedEntry(p []byte) (Entry, error) {
+	if len(p) < 1 {
+		return Entry{}, fmt.Errorf("%w: empty typed entry", ErrCorrupt)
+	}
+	e, err := decodeEntry(p[1:])
+	if err != nil {
+		return Entry{}, err
+	}
+	e.Type = replication.EntryType(p[0])
+	switch e.Type {
+	case replication.EntryNormal:
+		return Entry{}, fmt.Errorf("%w: a normal entry written as a typed record", ErrCorrupt)
+	case replication.EntryConfig:
+		if _, err := replication.DecodeConfiguration(e.Data); err != nil {
+			return Entry{}, fmt.Errorf("%w: configuration entry %d: %v", ErrCorrupt, e.Index, err)
+		}
+	default:
+		return Entry{}, fmt.Errorf("%w: entry %d has unknown type %d", ErrCorrupt, e.Index, e.Type)
+	}
+	return e, nil
+}
 
 func encodeEntry(e Entry) []byte {
 	buf := make([]byte, 0, 2*binary.MaxVarintLen64+len(e.Data)+binary.MaxVarintLen64)
