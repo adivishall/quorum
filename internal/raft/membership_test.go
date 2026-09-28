@@ -1128,3 +1128,58 @@ func TestJoinerWithNoConfigurationVotesForItsPromotion(t *testing.T) {
 	}
 	nw.requireConverged("n1")
 }
+
+// TestRemovedLeaderThatLostItsLeadershipFinishesItsRemoval is the regression
+// for the second liveness bug the simulator found (multi-2x3, seed 83): in a
+// group of two voters, n1 removes itself. The joint entry {n2}/{n1,n2} commits,
+// n1 appends the final entry {n2} — and loses its leadership before that entry
+// reaches n2. n1's latest configuration excludes it, so it may not campaign as
+// a voter of it; n2, still in the joint configuration, needs n1's vote, and n1
+// refuses it — its log is longer. Nobody could ever be elected. n1 may
+// campaign under the configuration its final entry replaced, winning a quorum
+// of both; it is elected, commits its removal and steps down, and n2 leads.
+func TestRemovedLeaderThatLostItsLeadershipFinishesItsRemoval(t *testing.T) {
+	nw := newNetworkWith(t, []NodeID{"n1", "n2"}, voters("n1", "n2"), 5)
+	nw.electLeader("n1")
+	nw.propose("n1", "a")
+	if err := nw.nodes["n1"].ProposeConfChange(ConfChange{Type: RemoveVoter, Member: Member{ID: "n1"}}); err != nil {
+		t.Fatal(err)
+	}
+	nw.drain("n1")
+	n1 := nw.nodes["n1"]
+	for i := 0; i < 100; i++ {
+		if c, _ := n1.Conf(); !c.Joint() && n1.ConfPending() {
+			break
+		}
+		if !nw.deliverOne() {
+			nw.tick("n1")
+		}
+	}
+	if c, _ := n1.Conf(); c.Joint() || !n1.ConfPending() || c.IsMember("n1") {
+		t.Fatalf("premise: n1 is not between its joint and final configurations: %s", c)
+	}
+	nw.queue = nil // the final entry never reaches n2
+	if c, _ := nw.nodes["n2"].Conf(); !c.Joint() {
+		t.Fatalf("premise: n2 holds %s, not the joint configuration", c)
+	}
+	nw.stepDown("n1", "n2")
+	var leader NodeID
+	for i := 0; i < 400 && leader != "n2"; i++ {
+		nw.tickAll()
+		nw.deliverAll()
+		if ls := nw.leaders(); len(ls) == 1 {
+			leader = ls[0]
+		}
+	}
+	if leader != "n2" {
+		c1, _ := n1.Conf()
+		c2, _ := nw.nodes["n2"].Conf()
+		t.Fatalf("no leader of the group after the removal: leaders %v; n1 %s %s; n2 %s %s", nw.leaders(), n1.Role(), c1, nw.nodes["n2"].Role(), c2)
+	}
+	if c, _ := nw.nodes["n2"].Conf(); c.Joint() || nw.nodes["n2"].ConfPending() || c.IsMember("n1") {
+		t.Fatalf("n2 leads under %s (pending %v)", c, nw.nodes["n2"].ConfPending())
+	}
+	if n1.Role() == Leader || n1.IsVoter() {
+		t.Fatalf("n1 after its removal: %s voter=%v", n1.Role(), n1.IsVoter())
+	}
+}

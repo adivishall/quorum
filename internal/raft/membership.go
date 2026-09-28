@@ -301,12 +301,55 @@ func (r *Raft) setConf(c Configuration, idx uint64) {
 	if r.role == Leader {
 		r.syncProgress()
 	}
-	if r.role == Candidate && !r.conf.IsVoter(r.id) {
-		// A candidate that learns it is no longer a voter stops campaigning.
-		r.role = Follower
-		r.votesGranted = nil
-		r.resetElectionTimer()
+	if r.role == Candidate {
+		if prev, ok := r.campaignRule(); !ok {
+			// A candidate that learns it may no longer campaign stops.
+			r.role = Follower
+			r.votesGranted = nil
+			r.campaignPrev = nil
+			r.resetElectionTimer()
+		} else if (prev == nil) != (r.campaignPrev == nil) {
+			// Its configuration changed under the campaign: the rule it counts
+			// votes by changes with it. The votes it holds are kept; they count
+			// only if their voters count under the new rule.
+			r.campaignPrev = prev
+		}
 	}
+}
+
+// campaignRule says whether this node may campaign and, if so, the
+// configuration it must win a quorum of besides its own (docs/MEMBERSHIP.md
+// §5). A voter of its current configuration campaigns under that alone.
+// There is one other case: the final entry of this node's own removal is its
+// current configuration and is not committed — it led the change, appended
+// that entry, and lost its leadership before the entry reached a quorum. The
+// entry excludes it, yet the remaining voters may be unable to win without
+// it: lacking the entry, they are still in the joint configuration, which
+// needs this node's vote, and this node refuses them for having a shorter log
+// (found by the multi-group simulator, Phase 15). Such a node campaigns under
+// the joint configuration the final entry replaced, winning a quorum of both —
+// a quorum of the joint one is a quorum of both the old and the new voters, so
+// it intersects every quorum any other candidate of the term could win.
+// Elected, it replicates and commits its removal, then steps down.
+func (r *Raft) campaignRule() (prev *Configuration, ok bool) {
+	if r.conf.IsVoter(r.id) {
+		return nil, true
+	}
+	if r.confIndex == 0 || r.confIndex <= r.log.CommitIndex() || r.conf.Joint() {
+		return nil, false
+	}
+	p, err := r.ConfAt(r.confIndex - 1)
+	if err != nil || !p.Joint() || !p.IsVoter(r.id) || !Final(p).Equal(r.conf) {
+		return nil, false
+	}
+	return &p, true
+}
+
+// countsVote reports whether a vote from id counts toward this node's campaign:
+// id is a voter of its configuration or, under campaignRule's second case, of
+// the configuration it must also win.
+func (r *Raft) countsVote(id NodeID) bool {
+	return r.conf.IsVoter(id) || (r.campaignPrev != nil && r.campaignPrev.IsVoter(id))
 }
 
 // syncProgress gives every member the leader replicates to a nextIndex and

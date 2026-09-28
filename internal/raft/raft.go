@@ -28,6 +28,9 @@ type Raft struct {
 	baseConf      Configuration
 	baseConfIndex uint64
 	peers         []NodeID
+	// campaignPrev, while this node is a candidate by campaignRule's second
+	// case, is the configuration it must also win a quorum of.
+	campaignPrev *Configuration
 
 	electionTicks      int
 	heartbeatTicks     int
@@ -199,7 +202,7 @@ func (r *Raft) Tick() {
 	}
 	r.electionElapsed++
 	if r.electionElapsed >= r.randElectionTO {
-		if r.conf.IsVoter(r.id) {
+		if _, ok := r.campaignRule(); ok {
 			r.becomeCandidate()
 		} else {
 			r.resetElectionTimer()
@@ -365,11 +368,13 @@ func (r *Raft) becomeFollower(term uint64, leader NodeID) {
 	}
 	r.role = Follower
 	r.leaderID = leader
+	r.campaignPrev = nil
 	r.resetElectionTimer()
 }
 
-// becomeCandidate starts an election: only a voter reaches here (Tick), and it
-// asks only the voters — a learner cannot vote, and is not asked.
+// becomeCandidate starts an election: only a node campaignRule allows reaches
+// here (Tick), and it asks only the voters whose votes count — a learner is
+// never asked.
 func (r *Raft) becomeCandidate() {
 	r.currentTerm++
 	r.votedFor = r.id
@@ -378,12 +383,13 @@ func (r *Raft) becomeCandidate() {
 	r.role = Candidate
 	r.leaderID = ""
 	r.votesGranted = map[NodeID]bool{r.id: true}
+	r.campaignPrev, _ = r.campaignRule()
 	r.resetElectionTimer()
 
 	lastIdx := r.log.LastIndex()
 	lastTerm, _ := r.log.Term(lastIdx)
 	for _, p := range r.peers {
-		if p == r.id || !r.conf.IsVoter(p) {
+		if p == r.id || !r.countsVote(p) {
 			continue
 		}
 		r.send(Message{
@@ -397,6 +403,7 @@ func (r *Raft) becomeCandidate() {
 func (r *Raft) becomeLeader() {
 	r.role = Leader
 	r.leaderID = r.id
+	r.campaignPrev = nil
 	r.nextIndex = map[NodeID]uint64{}
 	r.matchIndex = map[NodeID]uint64{}
 	r.snapPending = map[NodeID]uint64{}
@@ -418,7 +425,8 @@ func (r *Raft) maybeBecomeLeader() {
 	if r.role != Candidate {
 		return
 	}
-	if r.hasQuorum(func(id NodeID) bool { return r.votesGranted[id] }) {
+	won := func(id NodeID) bool { return r.votesGranted[id] }
+	if r.hasQuorum(won) && (r.campaignPrev == nil || quorumOf(*r.campaignPrev, won)) {
 		r.becomeLeader()
 	}
 }
@@ -445,10 +453,10 @@ func (r *Raft) handleVoteRequest(m Message) {
 	r.send(Message{Type: MsgVoteResponse, To: m.From, Term: r.currentTerm, VoteGranted: grant})
 }
 
-// handleVoteResponse counts a vote from a voter of the configuration; a vote
-// from anyone else is never counted.
+// handleVoteResponse counts a vote from a voter of a configuration the
+// campaign must win; a vote from anyone else is never counted.
 func (r *Raft) handleVoteResponse(m Message) {
-	if r.role != Candidate || !r.conf.IsVoter(m.From) {
+	if r.role != Candidate || !r.countsVote(m.From) {
 		return
 	}
 	if m.VoteGranted {
