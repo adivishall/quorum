@@ -474,3 +474,56 @@ func TestJoinerInstallingASnapshotThatPredatesItIsNotRemoved(t *testing.T) {
 		t.Fatalf("a joiner was reported removed: %+v\n%s", st, c.log("n3"))
 	}
 }
+
+// TestChangeMembershipReportsALostChange: a leader cut off from its group
+// accepts a change — its configuration entry cannot commit — while the others
+// elect a leader and overwrite that index. When the cut-off node rejoins, its
+// entry is truncated and its ChangeMembership answers ErrConfLost: a definite
+// "did not happen", never success, and the configuration is the group's.
+func TestChangeMembershipReportsALostChange(t *testing.T) {
+	ctx := context.Background()
+	c := startSnapCluster(t, ctx, 3, 0, 0)
+	c.propose(c.ids, cmds("a", 3))
+	c.converged(c.ids)
+	old := c.leader(c.ids)
+	rest := without(c.ids, old)
+	cut := func(on bool) {
+		for _, a := range c.ids {
+			for _, b := range c.ids {
+				if a == b || (a != old && b != old) {
+					continue
+				}
+				if on {
+					_ = c.trs[a].RemovePeer(transport.NodeID(b))
+				} else if err := c.trs[a].AddPeer(transport.NodeID(b), c.addrs[b]); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	cut(true)
+	result := make(chan error, 1)
+	go func() {
+		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		_, _, err := c.nodes[old].ChangeMembership(cctx, raft.ConfChange{Type: raft.AddLearner, Member: raft.Member{ID: "n9"}})
+		result <- err
+	}()
+	c.waitStatus(old, "appended the change", func(st Status) bool { return st.Conf.IsLearner("n9") && st.ConfPending })
+	c.propose(rest, cmds("b", 3)) // the others elect a leader and write over the index
+	cut(false)
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrConfLost) {
+			t.Fatalf("the overwritten change answered %v, want ErrConfLost", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the overwritten change never answered")
+	}
+	c.converged(c.ids)
+	for _, id := range c.ids {
+		if st := c.nodes[id].Status(); st.Conf.IsMember("n9") {
+			t.Fatalf("%s holds the lost configuration %s", id, st.Conf)
+		}
+	}
+}
