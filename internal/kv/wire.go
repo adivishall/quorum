@@ -12,19 +12,22 @@ import (
 	"time"
 
 	"github.com/adivishall/quorum/internal/record"
+	"github.com/adivishall/quorum/internal/replication"
 )
 
-// The client wire protocol, version 2 (Phase 13, docs/API.md): a
+// The client wire protocol, version 3 (Phase 15, docs/API.md): a
 // request/response pair per operation over a plain TCP connection, each
 // message one record in the shared checksummed framing (docs/DESIGN.md §2).
 // Requests on one connection are answered in order, one at a time; a client
 // wanting concurrency opens more connections. The same request and response
 // encodings travel inside the internal forwarding messages (transport kinds
-// Forward and ForwardResponse). Version 1 (Phase 12: no identity, six
-// statuses) is retired — its record kinds (1, 2) are refused like any unknown
-// kind. It is a framed binary protocol, not the Phase 15 HTTP API.
+// Forward and ForwardResponse). Version 3 adds the request's group; the
+// response is version 2's. Versions 1 (Phase 12: no identity, six statuses)
+// and 2 (Phase 13: no group) are retired — their request kinds (1, 3) are
+// refused like any unknown kind. It is a framed binary protocol, not an HTTP
+// API.
 //
-//	request  (kind 3): op u8 | clientID | requestID | ackedBelow | timeoutMillis | key(len+bytes) | value(len+bytes, PUT only)
+//	request  (kind 5): op u8 | group | clientID | requestID | ackedBelow | timeoutMillis | key(len+bytes) | value(len+bytes, PUT only)
 //	                   (timeoutMillis at most maxMillis: a duration must fit time.Duration)
 //	response (kind 4): status u8 | flags u8 (bit 0 duplicate) | clientID | term | index |
 //	                   node | via | leader | value | message   (each len+bytes)
@@ -32,7 +35,7 @@ import (
 // All integers are canonical uvarints; decoding is strict and total — a frame
 // that is not exactly this is a protocol error and the connection is closed.
 const (
-	kindRequest  record.Kind = 3
+	kindRequest  record.Kind = 5
 	kindResponse record.Kind = 4
 
 	maxNodeIDLen  = 255
@@ -49,6 +52,7 @@ var ErrProtocol = errors.New("kv: protocol error")
 
 func encodeRequest(r Request) []byte {
 	b := []byte{byte(r.Op)}
+	b = binary.AppendUvarint(b, uint64(r.Group))
 	b = binary.AppendUvarint(b, r.ClientID)
 	b = binary.AppendUvarint(b, r.RequestID)
 	b = binary.AppendUvarint(b, r.AckedBelow)
@@ -74,6 +78,11 @@ func decodeRequest(b []byte) (Request, error) {
 		return Request{}, fmt.Errorf("%w: op %d", ErrProtocol, b[0])
 	}
 	d := decoder{b: b, i: 1}
+	g := d.uint()
+	if d.err == nil && g > uint64(^uint32(0)) {
+		return Request{}, fmt.Errorf("%w: group %d", ErrProtocol, g)
+	}
+	r.Group = replication.GroupID(g)
 	r.ClientID, r.RequestID, r.AckedBelow = d.uint(), d.uint(), d.uint()
 	r.Timeout = d.millis()
 	r.Key = d.bytes(MaxKeyLen)
@@ -289,11 +298,12 @@ func (r *bytesReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// Serve answers requests on ln with srv until ctx ends or ln is closed. Each
-// connection is served by one goroutine, requests strictly in order; a request
-// in progress is abandoned (its outcome unknown to the client) if the connection
-// drops. logf may be nil.
-func Serve(ctx context.Context, ln net.Listener, srv *Server, logf func(string, ...any)) {
+// Serve answers requests on ln with srv — a group's Server, or a node's Front
+// over all its groups — until ctx ends or ln is closed. Each connection is
+// served by one goroutine, requests strictly in order; a request in progress
+// is abandoned (its outcome unknown to the client) if the connection drops.
+// logf may be nil.
+func Serve(ctx context.Context, ln net.Listener, srv Doer, logf func(string, ...any)) {
 	var wg sync.WaitGroup
 	go func() {
 		<-ctx.Done()
@@ -313,7 +323,7 @@ func Serve(ctx context.Context, ln net.Listener, srv *Server, logf func(string, 
 	}
 }
 
-func serveConn(ctx context.Context, c net.Conn, srv *Server, logf func(string, ...any)) {
+func serveConn(ctx context.Context, c net.Conn, srv Doer, logf func(string, ...any)) {
 	defer c.Close()
 	cctx, cancel := context.WithCancel(ctx)
 	defer cancel()

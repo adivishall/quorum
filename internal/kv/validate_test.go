@@ -148,7 +148,7 @@ func TestMalformedIdentifiersAreProtocolErrors(t *testing.T) {
 // positive one below a millisecond into 0 (which would mean "the default").
 func TestDurationsThatOverflowAreProtocolErrors(t *testing.T) {
 	req := func(ms uint64) []byte {
-		b := []byte{byte(ReqGet), 0, 0, 0}
+		b := []byte{byte(ReqGet), 0, 0, 0, 0} // op, group, client, request, acked-below
 		b = binary.AppendUvarint(b, ms)
 		return append(b, 1, 'k')
 	}

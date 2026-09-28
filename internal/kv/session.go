@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/adivishall/quorum/internal/replication"
 )
 
 // Session is a client session (docs/CLIENT_SEMANTICS.md): the cluster-assigned
@@ -30,6 +32,10 @@ type Session struct {
 
 // SessionOptions shape a session's retry policy.
 type SessionOptions struct {
+	// Group is the group the session lives in (Phase 15: sessions are
+	// group-local). Every request of the session names it; a keyed request
+	// must be for a key of that group.
+	Group          replication.GroupID
 	AttemptTimeout time.Duration // per attempt (default 2s)
 	MaxAttempts    int           // per request, counting redirects and retries (default 8)
 	Backoff        time.Duration // after a refusal that names no usable leader (default 20ms), doubling per consecutive one up to maxBackoff
@@ -83,7 +89,7 @@ func Register(ctx context.Context, eps []Doer, opts SessionOptions) (*Session, e
 	for attempt := 0; attempt < opts.MaxAttempts && ctx.Err() == nil; attempt++ {
 		ep := s.target()
 		actx, cancel := context.WithTimeout(ctx, opts.AttemptTimeout)
-		resp, err := ep.Do(actx, Request{Op: ReqRegister, Timeout: opts.AttemptTimeout})
+		resp, err := ep.Do(actx, Request{Op: ReqRegister, Group: opts.Group, Timeout: opts.AttemptTimeout})
 		cancel()
 		switch {
 		case err != nil:
@@ -206,7 +212,7 @@ func (s *Session) Send(ctx context.Context, rid uint64, op ReqOp, key, value []b
 	for out.Attempts < s.opts.MaxAttempts && ctx.Err() == nil {
 		out.Attempts++
 		ep := s.target()
-		req := Request{Op: op, ClientID: s.id, RequestID: rid, AckedBelow: min(s.ackedBelow(), rid), Key: key, Value: value, Timeout: s.opts.AttemptTimeout}
+		req := Request{Op: op, Group: s.opts.Group, ClientID: s.id, RequestID: rid, AckedBelow: min(s.ackedBelow(), rid), Key: key, Value: value, Timeout: s.opts.AttemptTimeout}
 		var done func(Response, error)
 		if hook != nil {
 			done = hook(ep.Name())

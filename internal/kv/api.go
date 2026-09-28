@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/adivishall/quorum/internal/replication"
 )
 
 // The Phase 13 client API (docs/API.md, docs/CLIENT_SEMANTICS.md): one Request,
@@ -42,7 +44,16 @@ func (o ReqOp) String() string {
 // below it and will never send those ids again (docs/CLIENT_SEMANTICS.md §3).
 // A GET may carry an identity; reads are never deduplicated.
 type Request struct {
-	Op                              ReqOp
+	Op ReqOp
+	// Group is the Raft group the request is for (Phase 15,
+	// docs/MULTI_RAFT.md §6). For PUT, GET and DELETE it is the group of the
+	// key's shard, which the client computes with the cluster's routing; a
+	// server refuses a request whose key belongs to another group (INVALID),
+	// so a client with a different routing can never execute a request in a
+	// group its session does not live in. For REGISTER it names the group
+	// whose session table the new session joins: sessions are group-local
+	// (docs/CLIENT_SEMANTICS.md). Group 0 is the single-group deployment's.
+	Group                           replication.GroupID
 	ClientID, RequestID, AckedBelow uint64
 	Key, Value                      []byte
 	// Timeout is the client's budget for this attempt (0: the server default).
