@@ -236,6 +236,12 @@ func (h *Host) Create(g GroupID, bootstrap *replication.Configuration) (*Group, 
 	return h.start(g, nc)
 }
 
+// Open starts group g again from its own files — its identity file names its
+// genesis — after Stop, or after it failed to recover and was repaired. It is
+// ErrGroupExists if the group runs, and refused if no identity file exists
+// (a first start needs Create).
+func (h *Host) Open(g GroupID) (*Group, error) { return h.start(g, raftnode.Config{}) }
+
 // start runs group g's node with the genesis nc names (none: the identity
 // file supplies it).
 func (h *Host) start(g GroupID, nc raftnode.Config) (*Group, error) {

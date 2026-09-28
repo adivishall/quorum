@@ -32,6 +32,7 @@ import (
 //	remove-learner group id                  remove a learner
 //	create-group   group join                host the group as a joiner (its leader then adds this node)
 //	create-group   group voters              host the group as a genesis member of voters
+//	start-group    group                     start a stopped group again from its own files
 //	stop-group     group                     stop hosting the group, keeping its files
 //	snapshot       group                     snapshot the group's state machine now
 
@@ -247,6 +248,11 @@ func (h *Host) Admin(ctx context.Context, req AdminRequest) AdminResponse {
 			return fail(errors.New("create-group needs exactly one of join or voters"))
 		}
 		if _, err := h.Create(g, boot); err != nil {
+			return fail(err)
+		}
+		return AdminResponse{OK: true}
+	case "start-group":
+		if _, err := h.Open(g); err != nil {
 			return fail(err)
 		}
 		return AdminResponse{OK: true}

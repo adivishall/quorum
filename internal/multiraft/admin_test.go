@@ -102,6 +102,19 @@ func TestAdminDrivesMembershipThroughTheLog(t *testing.T) {
 	if r := call(t, admin["d"], AdminRequest{Op: "stop-group", Group: 1}); !r.OK || c.hosts["d"].Group(1) != nil {
 		t.Fatalf("stop-group: %+v", r)
 	}
+	// start-group recovers it from its own files, as the member it now is.
+	if r := call(t, admin["d"], AdminRequest{Op: "start-group", Group: 1}); !r.OK || c.hosts["d"].Group(1) == nil {
+		t.Fatalf("start-group: %+v", r)
+	}
+	if st := c.hosts["d"].Group(1).Node.Status(); !st.Conf.IsVoter("d") {
+		t.Fatalf("d restarted with %s", st.Conf)
+	}
+	if r := call(t, admin["d"], AdminRequest{Op: "start-group", Group: 1}); r.OK {
+		t.Fatal("start-group of a running group succeeded")
+	}
+	if r := call(t, admin["d"], AdminRequest{Op: "start-group", Group: 7}); r.OK {
+		t.Fatal("start-group of a group with no files succeeded")
+	}
 	// A malformed line is answered, and the connection stays usable.
 	conn, err := net.Dial("tcp", admin["a"])
 	if err != nil {
