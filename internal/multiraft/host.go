@@ -1,0 +1,523 @@
+// Package multiraft is the node host of Phase 15 (docs/MULTI_RAFT.md): it runs
+// the Raft groups one node process is a member of over ONE transport. Each
+// group is an independent consensus domain — its own raftnode.Node (its own
+// core, actor, durable log, snapshots, state machine, configuration and leader)
+// under its own directory — and the host shares nothing mutable between them.
+// What the host owns is only what is per-process:
+//
+//   - the group registry and lifecycle: recovering every group found on disk
+//     at startup (a group that fails to recover is reported and left down; the
+//     others start), creating a group explicitly (bootstrap or join), stopping
+//     one;
+//   - the demultiplexer: one goroutine reads the transport, removes each
+//     frame's group envelope (raftnode.UnwrapGroup) and hands the frame to that
+//     group's bounded inbox — or drops it (an unknown or stopped group, a
+//     malformed envelope, a full inbox), never delivering it anywhere else;
+//   - the transport's peer set: the union of the addresses the hosted groups'
+//     configurations name, plus the static peers, kept in step with the
+//     configurations (transport.PeerSet). The configurations are read from the
+//     groups — replicated state — and never held authoritatively here.
+//
+// It never decides membership: a group's configuration changes only through
+// its own log (raftnode.Node.ChangeMembership, docs/MEMBERSHIP.md).
+package multiraft
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/adivishall/quorum/internal/raftnode"
+	"github.com/adivishall/quorum/internal/replication"
+	"github.com/adivishall/quorum/internal/transport"
+	"github.com/adivishall/quorum/internal/vfs"
+)
+
+// GroupID and NodeID are re-exported for callers.
+type (
+	GroupID = replication.GroupID
+	NodeID  = raftnode.NodeID
+)
+
+// DefaultInboxSize bounds each group's queue of inbound frames. A group whose
+// actor falls behind loses frames beyond it — Raft retransmits — rather than
+// stalling the demultiplexer, and with it every other group (INV-M9).
+const DefaultInboxSize = 1024
+
+// Errors.
+var (
+	// ErrGroupExists: Create for a group that is already running.
+	ErrGroupExists = errors.New("multiraft: the group is already hosted")
+	// ErrNoGroup: the host runs no such group.
+	ErrNoGroup = errors.New("multiraft: no such group on this node")
+	// ErrClosed: the host is closed.
+	ErrClosed = errors.New("multiraft: host closed")
+)
+
+// Config configures a Host.
+type Config struct {
+	ID NodeID
+	// DataDir holds the groups: DataDir/groups/<group id>/raft.log and the
+	// files beside it (docs/MULTI_RAFT.md §5).
+	DataDir string
+	// LogPathFor, if set, places group g's log elsewhere (the single-group
+	// deployment keeps its Phase 9–14 path). Groups placed by it are not
+	// discovered at startup: their owner creates them.
+	LogPathFor func(GroupID) string
+	// Transport is shared by every group. When it is a transport.PeerSet the
+	// host keeps its peers in step with the groups' configurations.
+	Transport transport.Transport
+	// StaticPeers are transport peers the host never removes (the operator's
+	// -peers). A joiner reaches its group's members through them.
+	StaticPeers map[NodeID]string
+	// NewStateMachine makes a group's state machine (the key-value store).
+	NewStateMachine func(GroupID) raftnode.StateMachine
+	// Node settings every group uses (raftnode.Config).
+	TickInterval                  time.Duration
+	DisableSync                   bool
+	FS                            vfs.FS
+	Hook                          raftnode.Hook
+	SnapshotEvery, SnapshotRetain uint64
+	ElectionTicks, HeartbeatTicks int
+	InboxSize                     int
+	Logf                          func(string, ...any)
+	// OnGroup, if set, is told when a group starts (node non-nil) and when it
+	// stops (node nil) — the client front's registry follows it.
+	OnGroup func(g GroupID, node *raftnode.Node, sm raftnode.StateMachine)
+}
+
+// Group is one hosted group.
+type Group struct {
+	ID   GroupID
+	Node *raftnode.Node
+	SM   raftnode.StateMachine
+}
+
+type hosted struct {
+	g     *Group
+	inbox chan transport.Envelope
+}
+
+// Host runs a node's groups.
+type Host struct {
+	cfg    Config
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	mu      sync.Mutex
+	groups  map[GroupID]*hosted
+	failed  map[GroupID]error // groups on disk that did not recover
+	added   map[NodeID]string // transport peers the host added
+	dropped map[string]uint64 // frames dropped, by reason (observability)
+	closed  bool
+}
+
+// GroupDir is where group g lives under dataDir.
+func GroupDir(dataDir string, g GroupID) string {
+	return filepath.Join(dataDir, "groups", strconv.FormatUint(uint64(g), 10))
+}
+
+// LogPath is group g's Raft log under dataDir.
+func LogPath(dataDir string, g GroupID) string {
+	return filepath.Join(GroupDir(dataDir, g), "raft.log")
+}
+
+// Start recovers every group found under cfg.DataDir (docs/MULTI_RAFT.md §5):
+// a directory groups/<id>/ with a group identity file. Each recovers on its
+// own; one that fails is recorded (Failed) and left down, and the others
+// start — a failure recovering one group neither blocks nor touches another.
+// Groups are started in ascending id order, so startup is deterministic.
+func Start(ctx context.Context, cfg Config) (*Host, error) {
+	if cfg.ID == "" || cfg.DataDir == "" || cfg.Transport == nil || cfg.NewStateMachine == nil {
+		return nil, fmt.Errorf("multiraft: ID, DataDir, Transport and NewStateMachine are required")
+	}
+	if cfg.InboxSize <= 0 {
+		cfg.InboxSize = DefaultInboxSize
+	}
+	hctx, cancel := context.WithCancel(ctx)
+	h := &Host{cfg: cfg, ctx: hctx, cancel: cancel, groups: map[GroupID]*hosted{}, failed: map[GroupID]error{},
+		added: map[NodeID]string{}, dropped: map[string]uint64{}}
+	for id, addr := range cfg.StaticPeers {
+		if ps, ok := cfg.Transport.(transport.PeerSet); ok && id != cfg.ID {
+			if err := ps.AddPeer(transport.NodeID(id), addr); err != nil {
+				cancel()
+				return nil, err
+			}
+		}
+	}
+	var ids []GroupID
+	if cfg.LogPathFor == nil {
+		var err error
+		if ids, err = h.onDisk(); err != nil {
+			cancel()
+			return nil, err
+		}
+	}
+	for _, g := range ids {
+		if _, err := h.start(g, raftnode.Config{}); err != nil {
+			h.failed[g] = err
+			h.logf("event=group_failed node=%s group=%d err=%v", cfg.ID, g, err)
+		}
+	}
+	h.wg.Add(2)
+	go h.demux()
+	go h.peerLoop()
+	return h, nil
+}
+
+// mkdirDurable creates dir and any missing parents below DataDir, fsyncing
+// each new directory's parent so the new entry survives a power loss: a group
+// directory that vanished would make its node forget it ever held the group's
+// durable state.
+func (h *Host) mkdirDurable(dir string) error {
+	var missing []string
+	for d := dir; ; d = filepath.Dir(d) {
+		if _, err := os.Stat(d); err == nil {
+			break
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		missing = append(missing, d)
+		if filepath.Dir(d) == d {
+			break
+		}
+	}
+	for i := len(missing) - 1; i >= 0; i-- {
+		if err := os.Mkdir(missing[i], 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+		if err := vfs.Or(h.cfg.FS).SyncDir(filepath.Dir(missing[i])); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// onDisk lists the group ids with a directory under DataDir/groups.
+func (h *Host) onDisk() ([]GroupID, error) {
+	entries, err := os.ReadDir(filepath.Join(h.cfg.DataDir, "groups"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var ids []GroupID
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		v, err := strconv.ParseUint(e.Name(), 10, 32)
+		if err != nil || strconv.FormatUint(v, 10) != e.Name() {
+			h.logf("event=group_dir_ignored node=%s dir=%q", h.cfg.ID, e.Name())
+			continue
+		}
+		ids = append(ids, GroupID(v))
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids, nil
+}
+
+// Create starts group g on this node for the first time — as a member of its
+// genesis (bootstrap non-nil) or as a joiner (bootstrap nil), which the
+// group's leader then adds (docs/MEMBERSHIP.md §4). If the group's directory
+// already holds it, its recorded identity must agree (raftnode refuses
+// otherwise) and it simply starts. Creating a running group is ErrGroupExists.
+func (h *Host) Create(g GroupID, bootstrap *replication.Configuration) (*Group, error) {
+	nc := raftnode.Config{Join: bootstrap == nil, Bootstrap: bootstrap}
+	return h.start(g, nc)
+}
+
+// start runs group g's node with the genesis nc names (none: the identity
+// file supplies it).
+func (h *Host) start(g GroupID, nc raftnode.Config) (*Group, error) {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return nil, ErrClosed
+	}
+	if _, ok := h.groups[g]; ok {
+		h.mu.Unlock()
+		return nil, fmt.Errorf("%w: group %d", ErrGroupExists, g)
+	}
+	h.mu.Unlock()
+	logPath := LogPath(h.cfg.DataDir, g)
+	if h.cfg.LogPathFor != nil {
+		logPath = h.cfg.LogPathFor(g)
+	} else if err := h.mkdirDurable(GroupDir(h.cfg.DataDir, g)); err != nil {
+		return nil, err
+	}
+	sm := h.cfg.NewStateMachine(g)
+	inbox := make(chan transport.Envelope, h.cfg.InboxSize)
+	nc.ID, nc.Group, nc.Transport, nc.Inbox = h.cfg.ID, g, h.cfg.Transport, inbox
+	nc.LogPath, nc.StateMachine = logPath, sm
+	nc.TickInterval, nc.DisableSync, nc.FS, nc.Hook = h.cfg.TickInterval, h.cfg.DisableSync, h.cfg.FS, h.cfg.Hook
+	nc.SnapshotEvery, nc.SnapshotRetain = h.cfg.SnapshotEvery, h.cfg.SnapshotRetain
+	nc.ElectionTicks, nc.HeartbeatTicks = h.cfg.ElectionTicks, h.cfg.HeartbeatTicks
+	nc.Logf = h.cfg.Logf
+	node, err := raftnode.Start(h.ctx, nc)
+	if err != nil {
+		return nil, err
+	}
+	grp := &Group{ID: g, Node: node, SM: sm}
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		_ = node.Close()
+		return nil, ErrClosed
+	}
+	h.groups[g] = &hosted{g: grp, inbox: inbox}
+	delete(h.failed, g)
+	h.mu.Unlock()
+	h.logf("event=group_started node=%s group=%d", h.cfg.ID, g)
+	if h.cfg.OnGroup != nil {
+		h.cfg.OnGroup(g, node, sm)
+	}
+	h.syncPeers()
+	return grp, nil
+}
+
+// Stop stops group g's node, keeping its files: a later Start of the host (or
+// Create) recovers it. Frames for it are dropped meanwhile.
+func (h *Host) Stop(g GroupID) error {
+	h.mu.Lock()
+	hg, ok := h.groups[g]
+	if ok {
+		delete(h.groups, g)
+	}
+	h.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("%w: group %d", ErrNoGroup, g)
+	}
+	if h.cfg.OnGroup != nil {
+		h.cfg.OnGroup(g, nil, nil)
+	}
+	err := hg.g.Node.Close()
+	h.logf("event=group_stopped node=%s group=%d", h.cfg.ID, g)
+	h.syncPeers()
+	return err
+}
+
+// Group returns hosted group g, or nil.
+func (h *Host) Group(g GroupID) *Group {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if hg, ok := h.groups[g]; ok {
+		return hg.g
+	}
+	return nil
+}
+
+// Groups returns the hosted group ids, ascending.
+func (h *Host) Groups() []GroupID {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]GroupID, 0, len(h.groups))
+	for g := range h.groups {
+		out = append(out, g)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// Failed returns the groups found on disk that did not recover, and why.
+func (h *Host) Failed() map[GroupID]error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make(map[GroupID]error, len(h.failed))
+	for g, err := range h.failed {
+		out[g] = err
+	}
+	return out
+}
+
+// Dropped returns how many inbound frames were dropped, by reason.
+func (h *Host) Dropped() map[string]uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make(map[string]uint64, len(h.dropped))
+	for k, v := range h.dropped {
+		out[k] = v
+	}
+	return out
+}
+
+// Close stops every group and the host's goroutines. It does not close the
+// transport (its owner does).
+func (h *Host) Close() error {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return nil
+	}
+	h.closed = true
+	groups := make([]*hosted, 0, len(h.groups))
+	for _, hg := range h.groups {
+		groups = append(groups, hg)
+	}
+	h.groups = map[GroupID]*hosted{}
+	h.mu.Unlock()
+	h.cancel()
+	var first error
+	for _, hg := range groups {
+		if err := hg.g.Node.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	h.wg.Wait()
+	return first
+}
+
+// demux delivers each inbound frame to the group its envelope names, or drops
+// it (INV-M6). It never blocks on a group: a full inbox drops the frame.
+func (h *Host) demux() {
+	defer h.wg.Done()
+	rc := h.cfg.Transport.Receive()
+	for {
+		select {
+		case <-h.ctx.Done():
+			return
+		case env, ok := <-rc:
+			if !ok {
+				return
+			}
+			g, payload, err := raftnode.UnwrapGroup(env.Payload)
+			if err != nil {
+				h.drop("malformed", env, 0, err)
+				continue
+			}
+			h.mu.Lock()
+			hg := h.groups[g]
+			h.mu.Unlock()
+			if hg == nil {
+				h.drop("unknown_group", env, g, nil)
+				continue
+			}
+			env.Payload = payload
+			select {
+			case hg.inbox <- env:
+			default:
+				h.drop("inbox_full", env, g, nil)
+			}
+		}
+	}
+}
+
+func (h *Host) drop(reason string, env transport.Envelope, g GroupID, err error) {
+	h.mu.Lock()
+	h.dropped[reason]++
+	n := h.dropped[reason]
+	h.mu.Unlock()
+	// Logged sparsely: a removed node's campaign can send a frame per tick.
+	if n&(n-1) == 0 {
+		h.logf("event=host_frame_dropped node=%s reason=%s from=%s kind=%d group=%d count=%d err=%v", h.cfg.ID, reason, env.Peer, env.Kind, g, n, err)
+	}
+}
+
+// peerLoop keeps the transport's peers in step with the hosted groups'
+// configurations, once per tick interval.
+func (h *Host) peerLoop() {
+	defer h.wg.Done()
+	ivl := h.cfg.TickInterval
+	if ivl <= 0 {
+		ivl = raftnode.DefaultTickInterval
+	}
+	t := time.NewTicker(ivl)
+	defer t.Stop()
+	for {
+		select {
+		case <-h.ctx.Done():
+			return
+		case <-t.C:
+			h.retireRemoved()
+			h.syncPeers()
+		}
+	}
+}
+
+// retireRemoved stops every group whose node has seen a committed
+// configuration without it (docs/MEMBERSHIP.md §5): it is no longer a member,
+// and its files stay for inspection. A restart recovers it, and it is stopped
+// again as soon as its recovered configuration says so.
+func (h *Host) retireRemoved() {
+	for _, g := range h.Groups() {
+		grp := h.Group(g)
+		if grp == nil || !grp.Node.Status().Removed {
+			continue
+		}
+		// The decision is logged before it takes effect, so an observer that
+		// sees the group gone also sees why.
+		h.logf("event=group_retired node=%s group=%d reason=removed", h.cfg.ID, g)
+		_ = h.Stop(g)
+	}
+}
+
+// syncPeers adds a transport peer for every member, with an address, of every
+// hosted group's current configuration (committed or not: a leader replicates
+// to a learner from the moment it appends it), and removes the peers it added
+// that no group names any more. Static peers are never removed.
+func (h *Host) syncPeers() {
+	ps, ok := h.cfg.Transport.(transport.PeerSet)
+	if !ok {
+		return
+	}
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return
+	}
+	groups := make([]*hosted, 0, len(h.groups))
+	for _, hg := range h.groups {
+		groups = append(groups, hg)
+	}
+	h.mu.Unlock()
+	want := map[NodeID]string{}
+	for _, hg := range groups {
+		conf := hg.g.Node.Status().Conf
+		for _, list := range [][]replication.Member{conf.Voters, conf.Outgoing, conf.Learners} {
+			for _, m := range list {
+				if m.ID != h.cfg.ID && m.Addr != "" {
+					want[m.ID] = m.Addr
+				}
+			}
+		}
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for id, addr := range want {
+		if _, static := h.cfg.StaticPeers[id]; static {
+			continue
+		}
+		if h.added[id] == addr {
+			continue
+		}
+		if old, ok := h.added[id]; ok && old != addr {
+			_ = ps.RemovePeer(transport.NodeID(id))
+		}
+		if err := ps.AddPeer(transport.NodeID(id), addr); err != nil {
+			h.logf("event=peer_add_failed node=%s peer=%s addr=%s err=%v", h.cfg.ID, id, addr, err)
+			continue
+		}
+		h.added[id] = addr
+	}
+	for id := range h.added {
+		if _, ok := want[id]; !ok {
+			_ = ps.RemovePeer(transport.NodeID(id))
+			delete(h.added, id)
+		}
+	}
+}
+
+func (h *Host) logf(format string, args ...any) {
+	if h.cfg.Logf != nil {
+		h.cfg.Logf(format, args...)
+	}
+}
