@@ -135,6 +135,9 @@ both Darwin and Linux. `process_start_time_seconds` is also reported.
   actor publishes after every cycle, so they are at most one cycle old.
 - **No storage-engine metrics.** The LSM engine is not behind the node yet
   (`docs/ENGINEERING_ROADMAP.md` task 5); `dkv_raft_log_bytes` is the Raft log, not an engine WAL.
+- **The endpoint is unauthenticated plaintext HTTP.** It reveals node ids, peer counts, group
+  layout and traffic volume. Bind `-metrics-listen` to a private interface; the project has no
+  security model (`docs/LIMITATIONS.md`).
 
 ## 5. Cost (measured)
 
@@ -207,5 +210,8 @@ The instrumented request path is within the run-to-run noise of the uninstrument
    Status is published: 0 in 60. `TestWriteCompletionFollowsItsStatus` holds the actor between the
    apply and the Status and makes the old order fail every write (mutant 165). No client-visible
    response changed: a completion was never early relative to the apply, only relative to
-   `Status`.
+   `Status`. One cost: in a cycle that also creates a snapshot, the writes applied in it now wait
+   for the snapshot to be published before they complete. That is once every `-snapshot-every`
+   entries, and it adds that one creation's duration, about 50 ms at 100,000 keys
+   (`docs/SNAPSHOTS.md` §14). The actor was already blocked for that time.
 
