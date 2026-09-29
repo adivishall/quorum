@@ -585,13 +585,14 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		n.logf("event=raft_snapshot_restored node=%s index=%d term=%d repaired=%v group=%d", cfg.ID, rc.Snapshot.Index, rc.Snapshot.Term, rc.Repaired, cfg.Group)
 	}
 
+	cfg.Metrics.add(n) // its gauges read the Status published above
+
 	// Read what the start line reports while this goroutine still owns the
 	// core: once the actor runs, only it may touch the core (it may be
 	// stepping a message already).
 	term, last := rc.Core.Term(), rc.Core.LastIndex()
 	conf, _ := rc.Core.Conf()
 	n.syncOutboxes()
-	cfg.Metrics.add(n)
 	n.wg.Add(2)
 	go n.receiveLoop()
 	go n.actorLoop()

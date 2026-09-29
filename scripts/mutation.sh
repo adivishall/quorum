@@ -750,8 +750,8 @@ mutant "the-watermark-waits-for-requests-in-flight" internal/kv/session.go \
 # 76. dkvd ignores -session-max / -session-max-unacked.
 #     (Phase 15: the host builds every group's state machine.)
 mutant "dkvd-applies-the-configured-session-limits" cmd/dkvd/main.go \
-  'return kv.NewStoreWithLimits(limits) },' \
-  'return kv.NewStore() },' \
+  '			store := kv.NewStoreWithLimits(limits)' \
+  '			store := kv.NewStore()' \
   ./tests/integration 'TestRealSessionContractSurvivesFullClusterRestart'
 
 # 87. Request validation drops the watermark bound: a request with AckedBelow
