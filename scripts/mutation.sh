@@ -1433,6 +1433,18 @@ mutant "only-a-former-member-is-removed (real processes)" internal/raftnode/memb
   '	if !n.removed && !conf.Empty()' \
   ./tests/integration 'TestRealNewMemberCatchesUpBySnapshotAndTheClusterRestarts'
 
+echo "== Phase 15: found by the 200-seed gate =="
+
+# 159. The leader appends the final configuration before the joint entry is
+#      committed — on any commit while joint — and so switches to the final
+#      configuration's quorum before the joint one was ever satisfied. Killed by
+#      the core test the gate showed was missing, and by the simulator's INV-MB3
+#      precondition on the regression seeds.
+mutant "the-final-entry-waits-for-the-joint-commit" internal/raft/membership.go \
+  '	if r.role != Leader || r.confIndex > r.log.CommitIndex() {' \
+  '	if r.role != Leader || (r.confIndex > r.log.CommitIndex() && !r.conf.Joint()) {' \
+  './internal/raft ./internal/raftsim' 'TestFinalEntryWaitsForTheJointCommit|TestMembershipRegressionSeeds'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
 if [ "$FAIL" -ne 0 ]; then
