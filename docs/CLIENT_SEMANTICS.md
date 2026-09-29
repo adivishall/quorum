@@ -1,7 +1,9 @@
-# CLIENT SEMANTICS — Phase 13
+# CLIENT SEMANTICS — Phase 13, extended to groups and membership changes in Phase 15
 
 Status: **Phase 13 contract — implemented and verified** (on recorded histories and replayed
-logs, for one Raft group; `docs/DEDUP.md` §7, `docs/LINEARIZABILITY.md` §15). This document is the
+logs, for one Raft group; `docs/DEDUP.md` §7, `docs/LINEARIZABILITY.md` §15). **Phase 15** keeps it
+unchanged inside each group, makes a session group-local (§2), and verifies it through membership
+changes and across several groups (§11). This document is the
 client-visible contract for request identity,
 retries, duplicates, conflicting reuse, forwarding and unknown outcomes. `docs/DEDUP.md` is how the
 server keeps it (the replicated session table, its bounds, its recovery); `docs/API.md` is the wire
@@ -53,6 +55,12 @@ session. Consequences:
   session's unknown requests safely, and must report them as unknown.
 - **Never inferred from TCP**, never reused after it is evicted (a later `REGISTER` gets a larger
   index).
+- **Group-local** (Phase 15). A session lives in one Raft group: its id is an index of *that*
+  group's log, it is recorded only in that group's session table, and a request carrying it is
+  deduplicated by that group alone. The same number in two groups names two unrelated sessions, so
+  a request's full identity is `(group, ClientID, RequestID)`. Every keyed request names its group,
+  which must be its key's (`docs/API.md` §4); a client that uses several shards holds one session
+  per group (`kv.Sharded`). No session spans groups.
 - **Not authenticated** (no authentication exists, `docs/LIMITATIONS.md`): a client that presents
   another client's id is indistinguishable from it. The contract assumes each client uses only the
   ids it was given.
@@ -218,4 +226,34 @@ for every other**. It is **not**:
 - protection against a client that reuses an id for a different command (it gets
   `REQUEST_CONFLICT`, not a second execution), or presents another client's id;
 - a guarantee after eviction: once a session is evicted, a retry learns only that it expired;
-- deduplication of anonymous requests or of reads (neither is recorded).
+- deduplication of anonymous requests or of reads (neither is recorded);
+- anything across groups: no request touches two groups, no ordering between groups is promised,
+  and a session of one group is unknown to every other.
+
+## 11. Groups and membership changes (Phase 15)
+
+The contract above holds in each group, and a membership change does not weaken it:
+
+- **The session table is replicated state.** It lives in the state machine, travels in every
+  snapshot (`docs/SNAPSHOTS.md`), and is rebuilt identically by a node that joins by snapshot or by
+  entries. A configuration entry reaches the state machine as an empty command and changes nothing
+  in it (`TestConfigurationEntriesReachTheStateMachineEmpty`, mutant 151).
+- **A request's identity survives every transition.** A retry sent before a change and delivered
+  after it — to a new member, to a new leader elected under a joint configuration, after the old
+  leader removed itself, after snapshots, compaction and a full restart of every node — is the
+  same logical request and is answered from the original execution
+  (`TestKVSimRetryIsADuplicateAcrossMembershipSnapshotAndFullRestart`; the `kv-membership` and
+  `kv-membership-messages` simulator profiles, 200 seeds each, check every history for
+  linearizability with membership changes interleaved; `TestRealReplaceACrashedNode` and
+  `TestRealMembershipChangesUnderASessionWorkload` on real processes).
+- **A removed node serves nothing of its group.** It stops the group (it is retired, files kept) and
+  its front answers the group's requests `NOT_LEADER` with no hint, so a client moves on. A removed
+  leader's requests still in flight end in the Phase 12 outcome classes — `OK` only if committed
+  and applied in its term, otherwise `LOST` or `UNKNOWN_OUTCOME` — and the client retries the same
+  identity on another node.
+- **A new member answers only what it has applied.** It forwards to the leader, which is the only
+  node that completes writes and serves reads (`docs/LINEARIZABILITY.md` §5), so its lag is never
+  visible.
+
+What a membership change can cost is availability, never a duplicated or lost acknowledged write:
+a leader removing itself steps down, and requests during the election are refused or unknown.

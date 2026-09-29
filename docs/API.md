@@ -1,9 +1,10 @@
-# API — the client protocol (wire protocol v2, Phase 13)
+# API — the client protocol (wire protocol v3, Phase 15)
 
-Status: **Phase 13.** The protocol `dkvd -client-listen` serves and `internal/kv` implements
-(`wire.go`, `api.go`, `server.go`, `session.go`). It is a framed binary protocol over TCP — not the
-Phase 15 HTTP API, which does not exist yet. `docs/CLIENT_SEMANTICS.md` is the contract it carries
-(what every field and status *means*); `docs/DEDUP.md` is how the server keeps it.
+Status: **Phase 15.** The protocol `dkvd -client-listen` serves and `internal/kv` implements
+(`wire.go`, `api.go`, `front.go`, `server.go`, `session.go`, `sharded.go`). It is a framed binary
+protocol over TCP; there is no HTTP API. `docs/CLIENT_SEMANTICS.md` is the contract it carries (what
+every field and status *means*); `docs/DEDUP.md` is how the server keeps it; `docs/MULTI_RAFT.md` §6
+is how a request finds its group. Version 3 is version 2 (Phase 13) plus the request's **group**.
 
 ---
 
@@ -21,20 +22,24 @@ Phase 15 HTTP API, which does not exist yet. `docs/CLIENT_SEMANTICS.md` is the c
 - A connection carries no identity. Sessions (§3) are named in every request, so a client may use
   any number of connections, to any nodes, over the life of one session.
 
-Record kinds: **3 = request, 4 = response.** Kinds 1 and 2 were version 1 (Phase 12: no identity,
-six statuses); version 1 is retired and its kinds are refused like any unknown kind.
+Record kinds: **5 = request, 4 = response.** Kinds 1 and 2 were version 1 (Phase 12: no identity,
+six statuses) and kind 3 was version 2's request (Phase 13: no group); both versions are retired and
+their request kinds are refused like any unknown kind — the connection is closed unanswered and
+nothing reaches a server (`TestRetiredRequestKindsAreRefused`). The response is version 2's,
+unchanged.
 
 ## 2. Messages
 
 All integers are **canonical** unsigned LEB128 varints (a value written in more bytes than it needs
 is a protocol error). Byte strings are a varint length followed by the bytes.
 
-**Request** (kind 3):
+**Request** (kind 5):
 
 | Field | Type | Meaning |
 |---|---|---|
 | op | u8 | 1 PUT · 2 GET · 3 DELETE · 4 REGISTER (anything else: protocol error) |
-| clientID | varint | the session (0: anonymous) |
+| group | varint | the Raft group the request is for — for a keyed request, the key's (§4); above 32 bits: protocol error (`TestRequestGroupRoundTrips`) |
+| clientID | varint | the session — **of that group** (0: anonymous) |
 | requestID | varint | the request within the session (0 when anonymous) |
 | ackedBelow | varint | the client's watermark (0 when anonymous) |
 | timeoutMillis | varint | the client's budget for this attempt; 0 = the server default; more than fits a `time.Duration` (≈292 years): protocol error |
@@ -64,7 +69,7 @@ every decoder is fuzzed for totality (`FuzzDecodeRequestIsTotal`, `FuzzDecodeRes
 
 | Op | Needs a session | Proposed to Raft | Answer |
 |---|---|---|---|
-| `REGISTER` | no (carries no key, value or ids) | yes | OK with `clientID` = the index of the REGISTER entry |
+| `REGISTER` | no (carries no key, value or ids; names its group) | yes, to that group | OK with `clientID` = the index of the REGISTER entry in that group's log |
 | `PUT key value` | optional — identified writes are deduplicated | yes | OK (possibly duplicate) or a refusal (§5) |
 | `DELETE key` | optional — the same | yes | OK (deleting an absent key is OK) |
 | `GET key` | no; ids are validated, then **ignored** (reads are never deduplicated) | no — ReadIndex (`docs/LINEARIZABILITY.md` §5) | OK with the value, or NOT_FOUND |
@@ -73,6 +78,10 @@ A write is answered only after its entry is committed **and applied** on the ser
 term it was proposed in (`docs/LINEARIZABILITY.md` §3); the answer is the state machine's decision
 for that entry (`docs/DEDUP.md` §3).
 
+Every operation is for one key — hence one shard, hence one group — or registers a session in one
+group. There is no multi-key or cross-group operation; a session exists in exactly one group, and
+the same `clientID` in two groups names two unrelated sessions (CLIENT_SEMANTICS §3).
+
 ## 4. Validation (INVALID_REQUEST)
 
 A well-framed request whose fields break the contract is answered `INVALID_REQUEST` — nothing is
@@ -80,6 +89,9 @@ proposed. The rules (`Request.validate`; each pinned by
 `TestRequestValidationRejectsEveryOutOfContractField`, mutant 87):
 
 - op ∈ {PUT, GET, DELETE, REGISTER};
+- PUT/GET/DELETE: the group the request names is the group of its key under the cluster's routing
+  (`kv.Front`; a client whose routing differs from the cluster's gets `INVALID_REQUEST` naming both,
+  and nothing executes anywhere — `TestFrontRefusesAMisroutedRequest`, mutant 156);
 - REGISTER carries no key, value, clientID, requestID or ackedBelow;
 - PUT/GET/DELETE: a non-empty key of at most 4 KiB; a value only on PUT, at most 1 MiB;
 - anonymous (clientID 0): requestID = ackedBelow = 0;
@@ -102,7 +114,7 @@ maximum (10 s; 0 means that maximum).
 |---|---|---|
 | 0 | `OK` | definite, effect (now, or earlier when `duplicate`) |
 | 1 | `NOT_FOUND` | definite (a read found nothing) |
-| 2 | `NOT_LEADER` | definite, no effect; `leader` names a hint, if any |
+| 2 | `NOT_LEADER` | definite, no effect; `leader` names a hint, if any — none when this node hosts no replica of the request's group |
 | 3 | `UNAVAILABLE` | definite, no effect: nothing was sent onward |
 | 4 | `INVALID_REQUEST` | definite, no effect |
 | 5 | `REQUEST_CONFLICT` | definite, no effect: the requestID is taken by a different command |
@@ -122,7 +134,8 @@ the internal transport, and relays the answer with `via` set to itself:
 
 - transport kinds **32 `Forward`** — `forwardID varint | budgetMillis varint | request` — and
   **33 `ForwardResponse`** — `forwardID varint | response` — in the client encodings of §2
-  (`docs/TRANSPORT.md` §5);
+  (`docs/TRANSPORT.md` §5), inside the group envelope of the request's group, so a forward goes
+  only to that group's leader and is served only by that group (`docs/MULTI_RAFT.md` §4);
 - a forwarded request is **never forwarded again**: a non-leader receiving one answers
   `NOT_LEADER` (no loops, whatever the nodes believe; mutant 70);
 - a forward is **sent at most once**; its answer is waited for within the client's budget:
@@ -133,6 +146,9 @@ the internal transport, and relays the answer with `via` set to itself:
   forward is never matched to a new one; a response nobody waits for is dropped;
 - the request travels with its identity intact, so a forwarded retry is deduplicated like any
   other (mutant 72).
+
+A node that hosts no replica of the request's group answers `NOT_LEADER` with no hint: it knows
+no member of that group to forward to, and nothing was proposed.
 
 `dkvd -client-forwarding=false` is **redirect-only** mode: a non-leader answers `NOT_LEADER` naming
 the leader, and the client goes there itself.
@@ -147,7 +163,15 @@ out := s.Put(ctx, key, value, nil)   // one logical request; retried under its i
 // out.Err == nil: OK (out.Response.Duplicate tells whether this attempt found an earlier execution)
 // out.Known == false: the request may have taken effect — report it as unknown
 s2 := kv.ResumeSession(endpoints, opts, s.ID(), s.Next())   // after a client restart that persisted both
+
+c := kv.NewSharded(endpoints, opts, route)   // a multi-group cluster: route is the cluster's key → group
+out = c.Put(ctx, key, value, nil)            // registers the key's group's session on first use
 ```
+
+`SessionOptions.Group` is the group a `Session` lives in (0, the single-group deployment's, by
+default); every request it sends names that group. `kv.Sharded` holds one `Session` per group and
+sends each keyed request through the session of the key's group
+(`TestShardedClientRoutesEachKeyToItsGroup`).
 
 Per attempt: a `NOT_LEADER` hint is followed; `UNAVAILABLE` tries the next node after a back-off
 (`Backoff`, doubling for each consecutive refusal that names no usable leader, capped at 1 s, reset
@@ -161,6 +185,8 @@ Delete` on `kv.Server` and `kv.Client` remain as the anonymous Phase 12 calls.
 
 ## 8. Compatibility
 
-Version 2 replaced version 1 in place (Phase 13); nothing outside this repository spoke version 1.
-There is no version negotiation: a version-1 frame (kinds 1, 2) is a protocol error. The Phase 15
-HTTP API will be a separate listener.
+Version 2 replaced version 1 in place (Phase 13), and version 3 replaced version 2 (Phase 15);
+nothing outside this repository spoke either. There is no version negotiation: a version-1 or
+version-2 request (kinds 1, 3) is a protocol error. The single-group deployment (`dkvd -raft`) is
+group 0, so a version-3 client of it names group 0. There is no HTTP API; if one is built it will be
+a separate listener.

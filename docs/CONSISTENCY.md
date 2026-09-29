@@ -1,8 +1,8 @@
 # CONSISTENCY MODEL
 
-Status: **Phase 13 — client-visible linearizability of single-key operations is verified on
-recorded histories, for one Raft group, including under retries of identified writes (C4 stage
-two), with the conditions below.** `docs/CLIENT_SEMANTICS.md` is the Phase 13 contract (request
+Status: **Phase 15 — client-visible linearizability of single-key operations is verified on
+recorded histories, per Raft group, including under retries of identified writes (C4 stage two)
+and through membership changes, with the conditions below.** `docs/CLIENT_SEMANTICS.md` is the Phase 13 contract (request
 identity, retries, duplicates, statuses); `docs/DEDUP.md` how the server keeps it. `docs/LINEARIZABILITY.md` is
 the full statement (object model, write completion, ReadIndex and its safety argument,
 incomplete operations, the checker and how it was validated, every scenario, every mutant).
@@ -42,9 +42,20 @@ and the session table travels in it (INV-SN1..SN6), so linearizability and dedup
 unchanged across snapshots, installs and restarts from snapshots — verified by the `kv-snapshots-*`
 histories, the snapshot crash matrix and ten real-process snapshot tests.
 
-**Not yet verified.** More than one Raft group and routed keys (the routing layer is not wired to Raft); the Phase 15 API
-and `stale` reads (C5 — no such mode exists yet); membership change (Phase 15+); the storage
-engine hosted by a node; real power-loss durability.
+**What Phase 15 adds.** Keys are routed to groups: a key's shard (the Phase 6 ring) is its Raft
+group, a node hosts several groups, and each group is its own consensus domain with its own log,
+leader, snapshots and session table (`docs/MULTI_RAFT.md`). A group's membership changes one
+member at a time through joint consensus (`docs/MEMBERSHIP.md`). Each group's client-visible
+history stays linearizable, and identified writes stay at most once, through learner additions,
+promotions, voter removals — the leader's included — and replacements, combined with crashes,
+partitions, message faults, snapshots and restarts: two simulator profiles × 200 seeds, two
+multi-group profiles with clients in every group, and three real-process workloads
+(LINEARIZABILITY §16; INV-MB10). The mechanisms of C1 are unchanged; what changed is which sets
+are quorums, and every quorum decision asks the current configuration — both majorities while it
+is joint.
+
+**Not yet verified.** `stale` reads (C5 — no such mode exists); anything across groups (there is
+no cross-group operation); the storage engine hosted by a node; real power-loss durability.
 
 ---
 
@@ -66,8 +77,9 @@ Every `PUT`/`GET`/`DELETE` on key *k* is linearizable, provided:
 - (a) the write was acknowledged to the client (a timeout is *not* a failure — see C4);
 - (b) reads are served in `linearizable` mode (the default), which uses ReadIndex
   (`docs/DESIGN.md` §8.5) — not follower reads;
-- (c) no more than *f* of the shard's 2*f*+1 replicas have failed (for liveness; safety needs no
-  bound);
+- (c) a quorum of the group's current configuration is up and connected — a majority of its
+  voters, and while the configuration is joint a majority of both voter sets (for liveness; safety
+  needs no bound; `docs/MEMBERSHIP.md` §3);
 - (d) the client's retries are deduplicated (see C4) — **or**, in Phases 12 and before, every retry
   is recorded as a separate operation (LINEARIZABILITY §4.3).
 
@@ -162,6 +174,18 @@ The failure modes we are specifically defending against and testing:
 7. **Divergent replicas after compaction.** Different replicas compacting at different times
    must still expose identical logical state. Tested by comparing full key-space dumps across
    replicas after chaos.
+8. **Two disjoint quorums during a membership change** (Phase 15). Switching a group from one
+   voter set to another in one step would let the old set and the new set each elect a leader.
+   Prevented by joint consensus: a voter change passes through a configuration whose quorums need
+   majorities of both sets, and the final one is appended only after the joint one commits
+   (`docs/MEMBERSHIP.md` §3–§4). Tested by `TestPromoteNeedsTheNewMajority`,
+   `TestRemoveVoterNeedsTheOldMajority`, INV-MB3 at every commit of every simulator run, and
+   mutants 126, 127, 129 and 130, each killed.
+9. **A removed node regaining authority** (Phase 15). A node removed from a group keeps its old
+   log and may campaign with it. Its stale vote requests are refused by nodes with a newer log,
+   and once a configuration without it commits it can never lead a later term (INV-MB4;
+   `TestRealRemoveAFollowerAndRestartIt`, `TestSimRemovedNodeRestartsAndStaysOut`; mutants 137 and
+   157).
 
 ---
 
@@ -173,6 +197,13 @@ Per shard, with replication factor 3:
 - 2 failures: **unavailable for writes and for linearizable reads.** `stale` reads still work
   against whatever replica you can reach. This is the correct behavior and we do not attempt
   to "degrade gracefully" into serving writes without a quorum.
+
+During a membership change (Phase 15) a group needs a majority of both voter sets while joint,
+so a change can stall — safely — until majorities of both sets are reachable again
+(`docs/MEMBERSHIP.md` §3–§4). A leader that removes itself steps down once
+the final configuration commits, and the group elects again. Replacing a failed node — add a
+learner, promote it, remove the failed voter — restores the ability to survive a further failure;
+nothing does it automatically.
 
 Because shards are independent, losing a node makes *no* shard unavailable at RF=3 in a
 3-node cluster, but it does make every shard elect. Cluster-wide availability is the

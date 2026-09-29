@@ -21,6 +21,11 @@ Algorithm", against the repository-specific contract in `docs/DESIGN.md` §8.
 > read only once the store has applied through its confirmed read index (`Node.ReadIndex`,
 > `Reads`). The core is still pure. End-to-end linearizability of client histories is verified
 > there, with its bounds.
+>
+> **Phase 15 update (ADR-022, ADR-023, `docs/MEMBERSHIP.md`, `docs/MULTI_RAFT.md`).** Membership
+> is no longer static: the core implements Raft §6 joint consensus with learners, one member at a
+> time, and every quorum asks the current configuration (§13). A node hosts several groups, each
+> with its own core and driver. ADR-005's "static membership in v1" is superseded.
 
 ---
 
@@ -183,6 +188,11 @@ The durable log is an append-only record stream (§2 framing) of three record ki
   Replay applies it by the install rule (keep the entries after it only if the log holds `index`
   with that term); a compaction rewrites the file as boundary + HardState + the entries after it,
   atomically (temporary file, fsync, rename, directory fsync) — §15, `docs/SNAPSHOTS.md` §5.
+- **Typed `Entry`** (Phase 15, record kind 4) — a type byte, then the `Entry` encoding. Only a
+  configuration entry uses it, so a Phase 9–14 log reads unchanged. Recovery refuses a typed record
+  whose configuration does not decode or has no voters, an unknown type, and a normal entry written
+  as typed — each is corruption, never repaired (`TestVoterlessConfigurationEntryIsCorruption`).
+  Compaction's rewrite preserves types.
 
 A conflicting-suffix replacement is **appended**, not rewritten: recovery replays records in file
 order and applies each `Entry` at index `i` as "set `i`, drop anything above `i`" (the Phase 8
@@ -316,13 +326,35 @@ its crash-recovery rules (`docs/CRASH_RECOVERY.md` §11); Phase 12 adds 27 for R
 completion, the client protocol and policy, the state machine, the codecs and the checker
 (`docs/LINEARIZABILITY.md` §11); `make mutation` runs all 60.
 
-## 13. Multi-Raft and membership
+## 13. Multi-Raft and membership (Phase 15)
 
-One shard = one independent Raft group (ADR-001). The core operates on a single group; the driver
-instantiates one per shard in a later phase. Membership is **static** (ADR-005): no join/leave,
-promotion, or reconfiguration; quorum is `⌊n/2⌋+1` over the fixed group. A one-node group commits on
-its own; 2- and 3-node groups are tested. Phase 9 implements no client routing or API — routing
-stays declarative (ADR-012).
+*Phases 9–14:* membership was static (ADR-005) and quorum was `⌊n/2⌋+1` over a fixed peer list.
+*Phase 15* replaces both; `docs/MEMBERSHIP.md` is the full specification and this section is what
+changed in the core.
+
+- **The configuration is replicated state.** A group's configuration — voters, learners and,
+  while joint, the outgoing voters — is the latest configuration entry in the node's log, committed
+  or not, or else the base configuration its snapshot (or genesis) gives. The core holds no
+  membership of its own; `ConfAt(i)` answers the configuration at index `i` only with evidence and
+  says it does not know otherwise (`TestConfAtAnswersOnlyWithEvidence`).
+- **One quorum function.** Elections, commit and ReadIndex confirmation all ask `quorumOf` over the
+  current configuration: a majority of its voters, and while joint a majority of its outgoing
+  voters too. Learners never count. No count of peers remains.
+- **Four operations, one at a time.** `AddLearner`, `RemoveLearner` (one entry each), `Promote` and
+  `RemoveVoter` (a joint entry, then the final one, which the leader appends as soon as the joint
+  one commits). A change is refused while another is under way.
+- **Who campaigns, whose votes count.** A voter of the current configuration campaigns; so does a
+  leader that lost its leadership while removing itself, under the joint and final configurations
+  together, so a removal can always finish. Any node may grant a vote; a candidate counts only the
+  voters. Messages from a non-member are dropped, except a vote request whose log is at least as
+  up to date as the receiver's.
+- **Leaving.** A leader whose final configuration excludes it steps down when that configuration
+  commits; a removed node never leads a later term (INV-MB4).
+- **Snapshots carry the configuration** at their index, joint included, and an install adopts it.
+
+**Multi-Raft.** One shard is one independent Raft group (ADR-001). A node runs one core and one
+driver per group it hosts; groups share only the process, the transport and the data directory
+(`docs/MULTI_RAFT.md`). The core never sees a group id.
 
 ## 14. What Phase 9 proves, and what it does not
 
@@ -337,7 +369,7 @@ stale lower-term messages are inert (R10). See `docs/INVARIANTS.md` for the exac
 qualifiers stated there); end-to-end linearizability (Phase 12); client
 retry / dedup / exactly-once application (Phase 13); linearizable-read serving / ReadIndex; an HTTP
 API or request forwarding (Phases 13/15); snapshots and log compaction (Phase 14); dynamic
-membership (v1 never). Power-loss durability is not tested (SIGKILL only), as everywhere in this
+membership (Phase 15, §13). Power-loss durability is not tested (SIGKILL only), as everywhere in this
 project (`docs/FAILURE_MODEL.md`). **No end-to-end linearizability guarantee, no client/API
 semantics, no snapshots, and no dynamic membership were added.** Raft functioning is a necessary
 part of the Quorum consistency model, not the whole of it.

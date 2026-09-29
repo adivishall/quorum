@@ -5,7 +5,7 @@ membership changes at runtime, what is safe about it, and how each claim is veri
 names the test that verifies it; a claim without one is not made (§9, §10).
 
 Phase 14 left every group with a fixed member set (ADR-005): a node could fail and rejoin under its
-own id, but nothing could be added, removed or replaced. Phase 15 replaces ADR-005 (ADR-023) with a
+own id, but nothing could be added, removed or replaced. Phase 15 replaces ADR-005 (ADR-022) with a
 replicated, safe transition protocol — Raft §6 **joint consensus** — plus a non-voting **learner**
 stage that catches a new member up before it may vote.
 

@@ -1,6 +1,8 @@
 # DEDUP — how the server keeps the request-identity contract (Phase 13)
 
-Status: **Phase 13, implemented and verified on recorded histories for one Raft group.**
+Status: **Phase 13, implemented and verified on recorded histories for one Raft group.** Phase
+15 runs one session table per group, unchanged, and verifies it through membership changes
+(CLIENT_SEMANTICS §11).
 `docs/CLIENT_SEMANTICS.md` is the contract this document implements; `docs/API.md` is the wire
 protocol; `docs/LINEARIZABILITY.md` §15 is how the resulting histories are checked; ADR-020
 records the decisions and the alternatives rejected.
@@ -238,6 +240,7 @@ killers.
   (CLIENT_SEMANTICS §2).
 - **No time-based expiry.** An idle session lives until 1024 newer sessions have been used after
   it; a client that registers in a loop evicts everyone else's sessions.
-- **One Raft group.** Multi-group routing would need a session per group or a global one; neither
-  exists.
+- **One table per group (Phase 15).** A session exists in one group only; there is no global
+  session and no deduplication across groups (CLIENT_SEMANTICS §2). A configuration entry is applied
+  as an empty command and never touches the table.
 - The LRU and watermark scans are linear in the limits (§8).

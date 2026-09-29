@@ -1,7 +1,7 @@
-# LINEARIZABILITY — Phases 12 and 13
+# LINEARIZABILITY — Phases 12, 13 and 15
 
-Status: **Phase 13 complete** (Phase 12: §1–§14; Phase 13, logical operations under retries and
-deduplication: §15). This document states exactly what the running system guarantees
+Status: **Phase 15 complete** (Phase 12: §1–§14; Phase 13, logical operations under retries and
+deduplication: §15; Phase 15, membership changes and several groups: §16). This document states exactly what the running system guarantees
 to a client, what mechanism provides it, how it is checked, and — just as precisely — what it
 does not guarantee and what was not tested. It is the reference the code comments point at
 (`docs/LINEARIZABILITY.md §N`). ADR-019 records the decisions; `docs/CONSISTENCY.md` is the
@@ -582,17 +582,16 @@ assumption for safety.
 
 **Not tested / not claimed:**
 - histories longer than those recorded (hours-long runs, millions of operations);
-- more than one Raft group, or keys routed across groups (Phase 6 routing is not wired to Raft);
+- linearizability *across* groups: each group's history is checked on its own (§16), and no
+  operation spans two groups, so there is no multi-group history to check;
 - real power loss on real hardware (the simulator's power-loss model only);
 - Byzantine faults, clock-based anything (none is used);
 - at-most-once semantics for **anonymous** writes under hidden retries (§4.3) — identified
   writes have them (§15); requests from a session that was evicted, or from a client that reuses
   another client's ClientID (§15.8);
-- membership changes (Phase 15+) — the argument assumes fixed membership (snapshots, Phase 14,
-  do not change it: a restored snapshot is exactly the replicated state at its index — INV-SN1 —
-  and the `kv-snapshots-*` histories and the real-process snapshot tests are checked like every
-  other, `docs/SNAPSHOTS.md`);
-- the Phase 15 API and stale-mode reads (none exist yet).
+- membership changes other than the four single-member operations of `docs/MEMBERSHIP.md` §4
+  (§16);
+- an HTTP API and stale-mode reads (neither exists).
 
 ---
 
@@ -893,3 +892,76 @@ stays unknown); protection against a client that presents another client's Clien
 RequestID for another command (it is refused, not protected); more than one Raft group. (Since
 Phase 14 the session table travels in the snapshot, and a retry after a snapshot, a compaction and
 a restart is still a duplicate — `docs/SNAPSHOTS.md` §10, INV-SN5.)
+
+---
+
+# Phase 15
+
+## 16. Membership changes and several groups
+
+### 16.1 Why §3 and §5 survive a membership change
+
+The write and read arguments rest on two facts: an entry committed by a leader is in every later
+leader's log (Leader Completeness), and a ReadIndex confirmed by a quorum cannot be overtaken by a
+leader the confirming nodes did not know of. Both are statements about quorums intersecting.
+Phase 15 changes which sets are quorums — never how completion or reads work:
+
+- every quorum decision — election, commit, ReadIndex confirmation — asks one function over the
+  node's **current** configuration, and a joint configuration needs a majority of **both** voter
+  sets (`docs/MEMBERSHIP.md` §3);
+- a configuration takes effect when appended, before it commits, and the leader appends the final
+  configuration only after the joint one committed. So any two configurations under which two
+  leaders could act at once are the same, or one is joint and contains the other's voter set —
+  their quorums intersect (Raft §6, the argument `docs/MEMBERSHIP.md` §4 relies on);
+- a leader removing itself keeps leading only under the joint and final configurations whose
+  quorums it needs anyway, never counting itself where it is not a voter, and steps down when the
+  final configuration commits.
+
+A write is still answered only at commit-and-apply in its term, and a read only after a quorum of
+the current configuration echoed the leader's heartbeat. Nothing in §3 or §5 names a node count.
+
+### 16.2 What was checked
+
+- **Simulator** (`internal/raftsim`): the `kv-membership` profile (crashes, partitions, power
+  loss with torn writes, snapshots every 10 entries) and the `kv-membership-messages` profile
+  (drop, duplicate, delay, pause), 200 seeds each, run session clients — writes, reads, retries
+  under one identity, concurrent duplicates — while spares join, learners are promoted and voters,
+  the leader included, are removed. Every history is linearizable, INV-X5..X8 hold at every
+  completion and the INV-MB checks at every event, and at the end every member's session table
+  equals the model's.
+  `TestKVSimRetryIsADuplicateAcrossMembershipSnapshotAndFullRestart` pins the hardest case: a
+  retry sent before an addition, a leader removal, snapshots, compaction and a restart of every
+  node is still a duplicate of the original index.
+- **Multi-group simulator**: `multi-2x3` and `multi-4x5` run session clients in every group
+  (groups sharing nodes; node-level crashes, crash points and partitions fanned out to every group;
+  membership changes in each): every group's history is linearizable on its own. (`multi-8x5`
+  runs raw proposals, no clients.)
+- **Real processes** (`tests/integration/membership_test.go`): two groups on three `dkvd`
+  processes under concurrent session workloads, each group's history checked
+  (`TestRealTwoGroupsOnThreeNodes`); a workload over both groups while group 0 gains a learner, promotes it, loses its leader to
+  SIGKILL and removes a voter (`TestRealMembershipChangesUnderASessionWorkload`); a crashed node replaced while
+  clients write (`TestRealReplaceACrashedNode`).
+
+The checker did not change: a group's history is exactly the Phase 13 logical history, and
+identities are per group, so the harness scopes each client's identity by its group before
+checking.
+
+### 16.3 Found and fixed
+
+No recorded history was non-linearizable. One harness bug was found on real processes: the
+workload built an operation's identity from `(ClientID, RequestID)` alone, and two groups
+legitimately hand out the same ClientID, so two unrelated operations collided in the checker. It
+now includes the group, which is what CLIENT_SEMANTICS §2 says an identity is. The membership bugs
+of Phase 15 (`docs/MEMBERSHIP.md` §8) were liveness bugs and one wrongly retired joiner; none
+produced a non-linearizable history.
+
+### 16.4 What is and is not claimed
+
+**Verified on finite recorded histories, per group:** linearizability of the logical history and
+at most one execution per identity through learner additions, promotions, voter removals —
+including the leader's — and replacements, combined with crashes, partitions, message faults,
+snapshots and restarts.
+
+**Not claimed:** any ordering or atomicity across groups; linearizability of an operation that a
+client routed with a routing configuration different from the cluster's (it is refused, not
+served); membership changes other than one member at a time through joint consensus.
