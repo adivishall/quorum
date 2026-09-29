@@ -319,6 +319,7 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	start := time.Now()
 	rec.start = start
 	measureFrom, end := start.Add(cfg.Warmup), start.Add(total)
+	rec.end = end
 	var wg sync.WaitGroup
 	if cfg.Rate > 0 {
 		tasks := make(chan task)
@@ -415,11 +416,16 @@ func register(ctx context.Context, clients []*client, groups []replication.Group
 // only its own record: no lock on the hot path), and the timeline, in atomic
 // buckets.
 type recorder struct {
-	cfg     *Config
-	start   time.Time
-	issued  atomic.Int64
-	perCli  []*clientRecord
-	buckets []bucket
+	cfg    *Config
+	start  time.Time
+	end    time.Time // the measured window's end
+	issued atomic.Int64
+	// inWindow counts successes that completed inside the measured window —
+	// the achieved throughput; late counts operations due in the window that
+	// completed after it (a backlog the cluster did not keep up with).
+	inWindow, late atomic.Int64
+	perCli         []*clientRecord
+	buckets        []bucket
 }
 
 type bucket struct{ ok, failed atomic.Int64 }
@@ -451,8 +457,15 @@ func (r *recorder) record(id int, t task, class string, done time.Time, measureF
 			r.buckets[i].failed.Add(1)
 		}
 	}
+	success := class == ClassOK || class == ClassNotFound
+	if success && !done.Before(measureFrom) && done.Before(r.end) {
+		r.inWindow.Add(1)
+	}
 	if t.intended.Before(measureFrom) {
 		return // warmup
+	}
+	if !done.Before(r.end) {
+		r.late.Add(1)
 	}
 	c := r.perCli[id]
 	c.classes[class]++
@@ -514,15 +527,21 @@ type Point struct {
 
 // Result is what a run observed.
 type Result struct {
-	Config    Config              `json:"config"`
-	Start     time.Time           `json:"start"`
-	Elapsed   time.Duration       `json:"elapsed"`
-	Issued    int64               `json:"issued"`
-	Classes   map[string]int64    `json:"classes"`
-	Ops       map[string]OpResult `json:"ops"`
-	All       Latency             `json:"all"`
-	OKPerSec  float64             `json:"ok_per_sec"`
-	OfferedPS float64             `json:"offered_per_sec"` // open loop: the target
+	Config  Config              `json:"config"`
+	Start   time.Time           `json:"start"`
+	Elapsed time.Duration       `json:"elapsed"`
+	Issued  int64               `json:"issued"`
+	Classes map[string]int64    `json:"classes"`
+	Ops     map[string]OpResult `json:"ops"`
+	All     Latency             `json:"all"`
+	// OKPerSec is the achieved throughput: successes that completed inside
+	// the measured window, per second of it. Classes and the latencies count
+	// the operations DUE in the window, whenever they completed.
+	OKPerSec  float64 `json:"ok_per_sec"`
+	OfferedPS float64 `json:"offered_per_sec"` // open loop: the target
+	// Late counts operations due in the window that completed after it: an
+	// open-loop rate above what the cluster sustained.
+	Late int64 `json:"late"`
 	// LongestOutage is the longest run of timeline buckets, inside the
 	// measured window, in which no operation completed successfully.
 	LongestOutage time.Duration `json:"longest_outage"`
@@ -556,8 +575,9 @@ func (r *recorder) result(cfg *Config, start, finished time.Time, cpu time.Durat
 		}
 	}
 	res.All = Summarize(all)
-	res.OKPerSec = float64(res.Classes[ClassOK]+res.Classes[ClassNotFound]) / cfg.Duration.Seconds()
+	res.OKPerSec = float64(r.inWindow.Load()) / cfg.Duration.Seconds()
 	res.OfferedPS = cfg.Rate
+	res.Late = r.late.Load()
 	last := int(finished.Sub(start)/cfg.Bucket) + 1
 	if last > len(r.buckets) {
 		last = len(r.buckets)
@@ -602,8 +622,11 @@ func PrintSummary(w io.Writer, r *Result) {
 	}
 	fmt.Fprintf(w, "%d clients, %s, %s measured after %s warmup; %d keys (%s), %d%% get, %d%% delete, %d-byte values\n",
 		r.Config.Clients, loop, r.Config.Duration, r.Config.Warmup, r.Config.Keys, r.Config.KeyDist, r.Config.ReadPct, r.Config.DeletePct, r.Config.ValueSize)
-	fmt.Fprintf(w, "completed %.0f ops/s; outcomes %v; longest outage %s; generator CPU %s\n",
-		r.OKPerSec, r.Classes, r.LongestOutage, r.GeneratorCPU.Round(time.Millisecond))
+	fmt.Fprintf(w, "completed %.0f ops/s in the window; outcomes %v; late %d; longest outage %s; generator CPU %s\n",
+		r.OKPerSec, r.Classes, r.Late, r.LongestOutage, r.GeneratorCPU.Round(time.Millisecond))
+	if r.Late > 0 {
+		fmt.Fprintf(w, "WARNING: %d operations due in the window completed after it: the offered rate exceeded what the cluster sustained, and latencies include the backlog\n", r.Late)
+	}
 	fmt.Fprintf(w, "%-7s %9s %9s %9s %9s %9s %9s %9s\n", "op", "count", "p50 µs", "p90", "p95", "p99", "p99.9", "max")
 	for _, op := range []string{"get", "put", "delete"} {
 		o, ok := r.Ops[op]

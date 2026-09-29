@@ -208,3 +208,23 @@ func TestClosedLoopRunsAgainstARealProtocolServer(t *testing.T) {
 		t.Fatal("no generator CPU reported")
 	}
 }
+
+// TestOverloadReportsAchievedThroughput: an open-loop rate five times what the
+// server sustains. Throughput is what completed inside the window — about the
+// server's capacity, never the offered rate — and the operations that fell due
+// in the window but completed after it are reported late.
+func TestOverloadReportsAchievedThroughput(t *testing.T) {
+	f, ep := startFake(t)
+	f.delay.Store(int64(10 * time.Millisecond)) // one client: at most 100 ops/s
+	res, err := Run(context.Background(), Config{Endpoints: []Endpoint{ep}, Clients: 1, Duration: time.Second,
+		Rate: 500, Keys: 10, Anonymous: true, AttemptTimeout: 10 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.OKPerSec > 110 || res.OKPerSec < 50 {
+		t.Fatalf("achieved %.0f ops/s against a server that sustains 100", res.OKPerSec)
+	}
+	if res.Late < 300 {
+		t.Fatalf("%d late operations; about 400 of the 500 due could not complete in the window", res.Late)
+	}
+}

@@ -10,8 +10,12 @@ the numbers measured with it; this document is how they are measured and what th
 
 For each run, from the clients' side:
 
-- **Throughput:** operations completed with a definite answer (OK, or NOT_FOUND for a GET) per
-  second of the measured window.
+- **Throughput (achieved):** successes (OK, or NOT_FOUND for a GET) that *completed inside* the
+  measured window, per second of it. An open-loop rate the cluster cannot sustain therefore shows
+  as its real throughput, not the offered rate.
+- **Late operations:** those due in the window that completed after it. Any at all means the
+  offered rate exceeded what the cluster sustained, and the latencies include the backlog. The
+  summary prints a warning.
 - **Latency per operation:** exact nearest-rank percentiles (p50, p90, p95, p99, p99.9, max) over
   every completed operation of the window. No histogram, no sampling, no interpolation.
 - **Outcomes, by the class a client must act on** (`docs/CLIENT_SEMANTICS.md` §6):
