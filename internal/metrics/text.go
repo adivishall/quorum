@@ -48,7 +48,10 @@ func (r *Registry) WriteText(w io.Writer) error {
 					if i > 0 {
 						bw.WriteByte(',')
 					}
-					fmt.Fprintf(bw, "%s=\"%s\"", s.labels[i], escapeLabel(s.labels[i+1]))
+					bw.WriteString(s.labels[i])
+					bw.WriteString(`="`)
+					bw.WriteString(escapeLabel(s.labels[i+1]))
+					bw.WriteByte('"')
 				}
 				bw.WriteByte('}')
 			}
@@ -154,12 +157,18 @@ func formatValue(v float64) string {
 	return strconv.FormatFloat(v, 'g', -1, 64)
 }
 
-func escapeHelp(s string) string {
-	return strings.NewReplacer(`\`, `\\`, "\n", `\n`).Replace(s)
-}
+var (
+	helpEscaper  = strings.NewReplacer(`\`, `\\`, "\n", `\n`)
+	labelEscaper = strings.NewReplacer(`\`, `\\`, "\n", `\n`, `"`, `\"`)
+)
+
+func escapeHelp(s string) string { return helpEscaper.Replace(s) }
 
 func escapeLabel(s string) string {
-	return strings.NewReplacer(`\`, `\\`, "\n", `\n`, `"`, `\"`).Replace(s)
+	if !strings.ContainsAny(s, "\\\n\"") {
+		return s
+	}
+	return labelEscaper.Replace(s)
 }
 
 // Handler serves the registry at any path it is mounted on (GET or HEAD).

@@ -258,7 +258,7 @@ func TestProcessCollectors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"go_goroutines", "go_memstats_heap_alloc_bytes", "go_memstats_heap_inuse_bytes", "go_memstats_sys_bytes", "process_start_time_seconds"} {
+	for _, name := range []string{"go_goroutines", "go_heap_objects_bytes", "go_heap_inuse_bytes", "go_memory_total_bytes", "process_start_time_seconds"} {
 		if v, ok := ss.Get(name); !ok || v <= 0 {
 			t.Errorf("%s = %v (present %v)", name, v, ok)
 		}

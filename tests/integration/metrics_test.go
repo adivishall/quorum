@@ -207,7 +207,7 @@ func realMetricsScenario(t *testing.T) bool {
 				if cpu, _ := ss.Get("process_cpu_seconds_total"); cpu <= 0 {
 					t.Fatalf("%s reports %v CPU seconds", id, cpu)
 				}
-				if h, _ := ss.Get("go_memstats_heap_inuse_bytes"); h <= 0 {
+				if h, _ := ss.Get("go_heap_inuse_bytes"); h <= 0 {
 					t.Fatalf("%s reports %v heap bytes", id, h)
 				}
 				break
