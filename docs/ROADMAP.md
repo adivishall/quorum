@@ -44,6 +44,11 @@ Legend: ☐ not started · ◐ in progress · ☑ complete and verified
 | 24 | Interview prep | `docs/INTERVIEW.md` | Answers derived from this implementation, not from generic theory | ☐ |
 | 25 | Resume material | `docs/RESUME.md` | Bullets cite measured results that exist in `docs/BENCHMARKS.md` | ☐ |
 
+**After Phase 15.** `docs/ENGINEERING_ROADMAP.md` is the audit of the system as built and the ranked
+engineering tasks that follow from it. The first wave — observability (#1), a load generator (#2)
+and cluster experiments with a performance report (#3) — is Phase 16 and the first half of Phase
+19; the LSM-backed state machine comes after it, measured against its baseline.
+
 ---
 
 ## Dependency reasoning (why this order)
