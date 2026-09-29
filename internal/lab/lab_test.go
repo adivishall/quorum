@@ -47,6 +47,9 @@ func TestScenariosAndSuite(t *testing.T) {
 		if name == "membership" && e.Cluster.Spares != 1 {
 			t.Fatal("membership has no spare to add")
 		}
+		if name == "snapshots" && e.Cluster.SnapshotEvery == 0 {
+			t.Fatal("the snapshots scenario takes no snapshots")
+		}
 	}
 	if _, err := Scenario("nonsense", base); err == nil {
 		t.Fatal("an unknown scenario was accepted")
@@ -76,9 +79,11 @@ func TestUsageFromScrapes(t *testing.T) {
 		{Name: "dkv_raft_persist_seconds_sum", Labels: map[string]string{"group": "0"}, Value: 0.01}}
 	after := metrics.Samples{{Name: "process_cpu_seconds_total", Labels: map[string]string{}, Value: 6},
 		{Name: "dkv_raft_persist_seconds_count", Labels: map[string]string{"group": "0"}, Value: 110},
-		{Name: "dkv_raft_persist_seconds_sum", Labels: map[string]string{"group": "0"}, Value: 0.21}}
+		{Name: "dkv_raft_persist_seconds_sum", Labels: map[string]string{"group": "0"}, Value: 0.21},
+		{Name: "dkv_raft_snapshots_created_total", Labels: map[string]string{"group": "0", "trigger": "periodic"}, Value: 4},
+		{Name: "dkv_raft_snapshots_created_total", Labels: map[string]string{"group": "1", "trigger": "periodic"}, Value: 2}}
 	u := usage(before, after, 2*time.Second, false)
-	if u.CPUPerSec != 2 || u.Persists != 100 || u.PersistMeanUs < 1999 || u.PersistMeanUs > 2001 {
+	if u.CPUPerSec != 2 || u.Persists != 100 || u.PersistMeanUs < 1999 || u.PersistMeanUs > 2001 || u.SnapshotsCreated != 6 {
 		t.Fatalf("%+v", u)
 	}
 	u = usage(before, after, 2*time.Second, true)

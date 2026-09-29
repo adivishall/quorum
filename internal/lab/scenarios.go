@@ -16,7 +16,9 @@ import (
 //	                 each caught up before the next
 //	membership       one spare node; at 30% it joins group 0 as a learner, catches up
 //	                 and is promoted by joint consensus
-//	snapshots        the load with a snapshot every 1,000 entries
+//	snapshots        the load with a snapshot every 100 entries (a run at 50 ops/s
+//	                 with half writes appends about 600 — a coarser interval
+//	                 would take none)
 func Scenario(name string, base Experiment) (Experiment, error) {
 	e := base
 	e.Name = name
@@ -33,7 +35,7 @@ func Scenario(name string, base Experiment) (Experiment, error) {
 		e.Cluster.Spares = 1
 		e.Actions = []Action{{At: at(0.3), Kind: "add-member", Group: 0}}
 	case "snapshots":
-		e.Cluster.SnapshotEvery = 1000
+		e.Cluster.SnapshotEvery = 100
 	default:
 		return e, fmt.Errorf("lab: unknown scenario %q", name)
 	}

@@ -55,10 +55,14 @@ type NodeUsage struct {
 	Goroutines     float64 `json:"goroutines"`
 	LogBytes       float64 `json:"log_bytes"`
 	ElectionsWon   float64 `json:"elections_won"`
-	Persists       float64 `json:"persists"`
-	PersistMeanUs  float64 `json:"persist_mean_us"`
-	CommitMeanUs   float64 `json:"commit_mean_us"`
-	Restarted      bool    `json:"restarted"` // counters restarted with the process: deltas are from zero
+	// SnapshotsCreated and SnapshotsInstalled count what the node did over
+	// the run: a snapshot scenario that took none measured nothing.
+	SnapshotsCreated   float64 `json:"snapshots_created"`
+	SnapshotsInstalled float64 `json:"snapshots_installed"`
+	Persists           float64 `json:"persists"`
+	PersistMeanUs      float64 `json:"persist_mean_us"`
+	CommitMeanUs       float64 `json:"commit_mean_us"`
+	Restarted          bool    `json:"restarted"` // counters restarted with the process: deltas are from zero
 }
 
 // RunResult is one run of an experiment.
@@ -335,6 +339,8 @@ func usage(before, after metrics.Samples, elapsed time.Duration, restarted bool)
 	u.Goroutines, _ = after.Get("go_goroutines")
 	u.LogBytes = after.Sum("dkv_raft_log_bytes")
 	u.ElectionsWon = delta("dkv_raft_elections_won_total")
+	u.SnapshotsCreated = delta("dkv_raft_snapshots_created_total")
+	u.SnapshotsInstalled = delta("dkv_raft_snapshots_installed_total")
 	u.Persists = delta("dkv_raft_persist_seconds_count")
 	if u.Persists > 0 {
 		u.PersistMeanUs = delta("dkv_raft_persist_seconds_sum") / u.Persists * 1e6
