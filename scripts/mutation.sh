@@ -1502,6 +1502,13 @@ mutant "the-log-size-counts-every-record" internal/raftlog/raftlog.go \
   '	l.size += int64(n) * 0' \
   ./internal/raftlog 'TestSizeIsTheFileLength'
 
+# 165. A write completes inside the apply loop again, before the cycle's
+#      Status covers it (what the observability branch's race gate found).
+mutant "a-write-completes-after-its-status" internal/raftnode/node.go \
+  '	n.completed = append(n.completed, appliedEntry{index: e.Index, term: e.Term, result: result})' \
+  '	n.waiters.Applied(e.Index, e.Term, result)' \
+  ./internal/raftnode 'TestWriteCompletionFollowsItsStatus'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
 if [ "$FAIL" -ne 0 ]; then
