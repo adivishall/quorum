@@ -117,9 +117,10 @@ mutant "mandatory-election-no-op" internal/raft/raft.go \
   ./internal/raft 'TestNoOpAppendedOnElection'
 
 # 3. Allow a second vote to a different candidate in the same term.
+#    (Phase 15: any node grants — one vote per term — and only voters' votes count.)
 mutant "one-vote-per-term" internal/raft/raft.go \
-  'if r.conf.IsVoter(r.id) && (r.votedFor == "" || r.votedFor == m.From) && r.candidateUpToDate(' \
-  'if r.conf.IsVoter(r.id) && (true || r.votedFor == m.From) && r.candidateUpToDate(' \
+  'if (r.votedFor == "" || r.votedFor == m.From) && r.candidateUpToDate(' \
+  'if (true || r.votedFor == m.From) && r.candidateUpToDate(' \
   ./internal/raft 'TestVoteGrantedOncePerTerm|TestVoteAgainstReferenceModel'
 
 # 4. Permit overwriting a committed suffix (the Phase 8 log guard).
@@ -218,19 +219,33 @@ mutant "propose-honours-deadline" internal/raftnode/node.go \
   ./internal/raftnode 'TestProposeHonoursContextDuringSlowFsync'
 
 # 15. dkvd keeps running after its Raft node fail-stops.
+#     (Phase 15: the host's supervisor closes fatal when group 0 fails.)
 mutant "dkvd-exits-on-fail-stop" cmd/dkvd/main.go \
   '	case <-ctx.Done():
-	case <-n.Done():
-		if err := n.Err(); err != nil {' \
+	case <-fatal:
+		code = 1' \
   '	case <-ctx.Done():
 	case <-make(chan struct{}):
-		if err := n.Err(); err != nil {' \
+		code = 1' \
   ./cmd/dkvd 'TestRaftModeExitsNonZeroWhenTheLogFails'
 
 # 16. Duplicated vote responses from one voter are counted as separate votes.
+#     (Phase 15: votes are a set over the configuration's voters, so the
+#     Phase 10 form — a fresh map key per copy — counts nothing at all; a
+#     repeated grant now credits a voter that has not voted.)
 mutant "duplicate-votes-idempotent" internal/raft/raft.go \
-  'r.votesGranted[m.From] = true' \
-  'r.votesGranted[m.From+NodeID(rune(48+len(r.votesGranted)))] = true' \
+  '		r.votesGranted[m.From] = true
+		r.maybeBecomeLeader()' \
+  '		if r.votesGranted[m.From] {
+			for _, id := range r.conf.VoterIDs() {
+				if !r.votesGranted[id] {
+					r.votesGranted[id] = true
+					break
+				}
+			}
+		}
+		r.votesGranted[m.From] = true
+		r.maybeBecomeLeader()' \
   ./internal/raftsim 'TestDuplicatedVoteDoesNotCountTwice'
 
 # 17. A reordered, older AppendEntries success moves a follower's progress backward.
@@ -264,8 +279,8 @@ mutant "sim-delay-enforced" internal/raftsim/chaos.go \
 
 # 20. A simulated restart ignores the node's disk.
 mutant "sim-restart-from-disk" internal/raftsim/cluster.go \
-  '		ID: n.id, Peers: c.ids, LogPath: logPath, FS: n.inj,' \
-  '		ID: n.id, Peers: c.ids, LogPath: logPath, FS: fault.NewMemFS(),' \
+  '		ID: n.id, Peers: peers, Join: peers == nil, LogPath: logPath, FS: n.inj,' \
+  '		ID: n.id, Peers: peers, Join: peers == nil, LogPath: logPath, FS: fault.NewMemFS(),' \
   ./internal/raftsim 'TestFollowerCrashAndCatchUp'
 
 # 21. The power-loss model keeps bytes that were never fsynced.
@@ -496,9 +511,10 @@ mutant "server-get-goes-through-readindex" internal/kv/server.go \
 
 # 44. dkvd serves clients from a store that is not the node's state machine:
 #     committed state vanishes from the client-visible view.
+#     (Phase 15: every group's server is attached to the front with its store.)
 mutant "dkvd-serves-the-replicated-state-machine" cmd/dkvd/main.go \
-  'kv.NewServer(id, n, store)' \
-  'kv.NewServer(id, n, kv.NewStore())' \
+  'front.Attach(g, node, sm.(*kv.Store))' \
+  'front.Attach(g, node, kv.NewStore())' \
   ./tests/integration 'TestRealSequentialBaselineMatchesTheModel'
 
 # 45. DELETE does not remove the key from the state machine.
@@ -732,9 +748,10 @@ mutant "the-watermark-waits-for-requests-in-flight" internal/kv/session.go \
   ./internal/kv 'TestConcurrentRequestsFromOneSession'
 
 # 76. dkvd ignores -session-max / -session-max-unacked.
+#     (Phase 15: the host builds every group's state machine.)
 mutant "dkvd-applies-the-configured-session-limits" cmd/dkvd/main.go \
-  '	store := kv.NewStoreWithLimits(limits)' \
-  '	store := kv.NewStore()' \
+  'return kv.NewStoreWithLimits(limits) },' \
+  'return kv.NewStore() },' \
   ./tests/integration 'TestRealSessionContractSurvivesFullClusterRestart'
 
 # 87. Request validation drops the watermark bound: a request with AckedBelow

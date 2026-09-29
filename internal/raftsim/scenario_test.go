@@ -350,7 +350,10 @@ func TestMessageLoss(t *testing.T) {
 func TestDuplicatedVoteDoesNotCountTwice(t *testing.T) {
 	s := newSim(t, 5, 7)
 	s.campaign("n1")
-	s.dropAll(func(m raft.Message) bool { return m.Type == raft.MsgVoteRequest && m.To != "n2" })
+	// n3's request is held back, n4's and n5's are lost.
+	s.dropAll(func(m raft.Message) bool {
+		return m.Type == raft.MsgVoteRequest && m.To != "n2" && m.To != "n3"
+	})
 	s.do(Event{Kind: Deliver, From: "n1", To: "n2", Pos: 0}) // n2 grants
 	if s.inFlight(func(m raft.Message) bool { return m.From == "n2" && m.VoteGranted }) != 1 {
 		t.Fatal("n2 did not grant")
@@ -361,6 +364,14 @@ func TestDuplicatedVoteDoesNotCountTwice(t *testing.T) {
 	s.deliverFrom("n2")
 	if st := s.State("n1"); st.Role == raft.Leader {
 		t.Fatalf("six copies of one vote elected n1 in a 5-node group: %+v", st)
+	}
+	// The control: votes are counted at all — one more distinct vote, n3's,
+	// makes n1, n2 and n3 a majority of five, and n1 wins. (Without it, a
+	// candidate that counted no vote would pass the check above.)
+	s.do(Event{Kind: Deliver, From: "n1", To: "n3", Pos: 0})
+	s.deliverFrom("n3")
+	if st := s.State("n1"); st.Role != raft.Leader {
+		t.Fatalf("n1 holds the distinct votes of n1, n2 and n3 of five and did not win: %+v", st)
 	}
 	if s.Stats().Duplicated != 5 {
 		t.Fatalf("duplicated %d, want 5", s.Stats().Duplicated)
