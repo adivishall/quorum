@@ -14,8 +14,9 @@ snapshots of the replicated state (session table included) with log compaction a
 installation over the InstallSnapshot transport kind (`docs/SNAPSHOTS.md`), and — Phase 15 —
 dynamic membership by joint consensus with learners and one Raft group per hosted shard: a node
 host running many independent groups over one transport, key → shard → group routing with
-group-local sessions, over wire protocol v3 (`docs/MEMBERSHIP.md`, `docs/MULTI_RAFT.md`). The
-HTTP client API, the LSM engine as the state machine and the dashboard are still design.
+group-local sessions, over wire protocol v3 (`docs/MEMBERSHIP.md`, `docs/MULTI_RAFT.md`), and —
+Phase 16 — metrics from every layer on `-metrics-listen` (`docs/OBSERVABILITY.md`). The HTTP client
+API, the LSM engine as the state machine and the dashboard are still design.
 `docs/LIMITATIONS.md` and the per-phase reports record what is actually true of the code at any
 point in time.
 
@@ -107,7 +108,7 @@ without changing it (ADR-017).
 | `internal/raftsim` | the deterministic fault-injection simulator (tests only) | wall-clock time, goroutines, real I/O |
 | `internal/multiraft` | the node host (Phase 15): the registry of groups, their lifecycle and directories, the group-envelope demultiplexer, the transport's peer set, the admin protocol, the shard → group assignment | any group's state (it reads configurations, never holds one) |
 | `internal/kv` | the replicated key-value state machine and session table, the per-group server, the front that picks a request's group, the wire protocol, the session and sharded clients | Raft's rules, other groups' state |
-| `internal/metrics` | counters, histograms | business logic |
+| `internal/metrics` | counters, gauges, histograms, scrape-time collectors, the Prometheus text format (Phase 16, `docs/OBSERVABILITY.md`) | business logic; it is a leaf every layer may import |
 
 The rule that matters most: **`internal/raft` performs no I/O and reads no clock.**
 See §5.
@@ -292,7 +293,8 @@ One OS process per node (`cmd/dkvd`). Ports per node:
 | Port | Protocol | Purpose |
 |---|---|---|
 | 7001+ | framed TCP | internal: Raft RPC, request forwarding, control |
-| 8080+ | HTTP/JSON | client API, `/health`, `/cluster`, `/metrics` |
+| 8080+ | HTTP/JSON | client API, `/health`, `/cluster` (design; as built the client port speaks the framed protocol, `docs/API.md`) |
+| `-metrics-listen` | HTTP | `GET /metrics` (Phase 16, as built, `docs/OBSERVABILITY.md`) |
 
 `docker compose up` starts 3 (or 5) such processes in separate containers plus the
 dashboard. The demo kills *containers/processes*, not simulated in-memory nodes.

@@ -245,13 +245,17 @@ and — as carefully — what it does not: [docs/RAFT.md](docs/RAFT.md). Run a r
 
 ```bash
 dkvd -id n1 -listen 127.0.0.1:7001 -peers n2=127.0.0.1:7002,n3=127.0.0.1:7003 -data-dir d1 \
-     -cluster -shards 4 -rf 3 -client-listen 127.0.0.1:8001 -admin-listen 127.0.0.1:9001
+     -cluster -shards 4 -rf 3 -client-listen 127.0.0.1:8001 -admin-listen 127.0.0.1:9001 \
+     -metrics-listen 127.0.0.1:9101
 echo '{"op":"add-learner","group":0,"id":"n4","addr":"127.0.0.1:7004"}' | nc 127.0.0.1 9001
+curl -s http://127.0.0.1:9101/metrics | grep dkv_raft_role
 ```
 
 The membership protocol, its quorum rules and every case it handles:
 [docs/MEMBERSHIP.md](docs/MEMBERSHIP.md); the node host, message routing and client routing:
-[docs/MULTI_RAFT.md](docs/MULTI_RAFT.md).
+[docs/MULTI_RAFT.md](docs/MULTI_RAFT.md). Every metric a node exports — client requests and
+latency, elections, replication lag, persistence and snapshot cost, dropped frames, membership
+transitions — and how each is tied to ground truth: [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md).
 
 Phase 10 injects **faults** at the system's real boundaries, never inside the Raft core. The durable
 log does its file I/O through a small filesystem seam (`internal/vfs`), under which
@@ -434,6 +438,7 @@ it is being answered out of memory.
 | [LINEARIZABILITY.md](docs/LINEARIZABILITY.md) | The client-visible contract: the object model, write completion, ReadIndex and its safety argument, incomplete operations and retries, the checker and how it was validated, every real-process and simulator scenario, the mutants, and exactly what is and is not verified; §15: logical operations under retries and deduplication |
 | [CLIENT_SEMANTICS.md](docs/CLIENT_SEMANTICS.md) | The Phase 13 contract: logical requests, ClientID and RequestID, what happens to an identified write, reads, the eleven statuses, unknown outcomes, bounds, forwarding, and what the guarantee is and is not |
 | [DEDUP.md](docs/DEDUP.md) | How the server keeps it: the session table inside the replicated state machine, the decision at apply, recovery by replay and every crash window, concurrency, bounds and eviction, verification, measured cost, mutants, limitations |
+| [OBSERVABILITY.md](docs/OBSERVABILITY.md) | Every metric a node exports on `-metrics-listen`: where it is produced, what it means and does not mean, its measured cost, and how each is verified against ground truth |
 | [API.md](docs/API.md) | The client wire protocol v3: framing, messages, the request's group, operations, validation, status codes, forwarding and redirect-only mode, the session and sharded client libraries |
 | [SNAPSHOTS.md](docs/SNAPSHOTS.md) | Snapshot state and format, creation and compaction order, recovery's reconciliation, crash windows, follower installation, chunking, dedup preservation, corruption policy, measurements, and snapshots with membership |
 | [MEMBERSHIP.md](docs/MEMBERSHIP.md) | Joint-consensus membership with learners: the configuration as replicated state, the three configurations a node distinguishes, quorum rules, the operations, every role and case, snapshots, the bugs found, the INV-MB invariants and their evidence |
