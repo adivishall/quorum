@@ -171,8 +171,9 @@ The instrumented request path is within the run-to-run noise of the uninstrument
     restore mid-count.
   - `TestHostMetrics` and `TestTransportMetrics` check dropped frames, groups, frames and bytes by
     kind, and connections.
-- **Mutants 160–164** break the series key, the front's count of every answer, the decision
-  observer, the counting of role transitions by difference and the log's size; each is killed by
+- **Mutants 160–165** break the series key, the front's count of every answer, the decision
+  observer, the counting of role transitions by difference, the log's size and the order of a write's
+  completion after its Status; each is killed by
   the test above written for it. `FuzzParse` fuzzes the parser, and this package's own output must
   always parse back.
 - **Real processes:** `TestRealProcessesServeTruthfulMetrics` runs three `dkvd` processes and
@@ -197,4 +198,14 @@ The instrumented request path is within the run-to-run noise of the uninstrument
 4. **A metric that would have lied:** the store's own decision counters reset on every snapshot
    restore. The exported counts come from an observer outside the replicated state instead
    (`TestDecisionCountsSurviveARestore`, mutant 162).
+5. **A write could complete before the node's Status covered it** (found by this branch's race
+   gate: `TestWriteCompletesOnlyAfterApply`, a Phase 12 test). The waiter completed inside the
+   apply loop, and the Status that covers the write was published at the end of the same cycle, so
+   a client that saw its write complete could read an older applied index. The race existed on
+   `main`, failing 1 run in 60 under `-race`. The instrumentation's extra end-of-cycle work widened
+   it to 3 in 60. The node now completes a cycle's applied writes when the cycle ends, after its
+   Status is published: 0 in 60. `TestWriteCompletionFollowsItsStatus` holds the actor between the
+   apply and the Status and makes the old order fail every write (mutant 165). No client-visible
+   response changed: a completion was never early relative to the apply, only relative to
+   `Status`.
 
