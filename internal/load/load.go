@@ -539,8 +539,9 @@ type Result struct {
 	// the operations DUE in the window, whenever they completed.
 	OKPerSec  float64 `json:"ok_per_sec"`
 	OfferedPS float64 `json:"offered_per_sec"` // open loop: the target
-	// Late counts operations due in the window that completed after it: an
-	// open-loop rate above what the cluster sustained.
+	// Late counts operations due in the window that completed after it: in
+	// open loop, a rate above what the cluster sustained; in closed loop, at
+	// most one in flight per client when the window closed.
 	Late int64 `json:"late"`
 	// LongestOutage is the longest run of timeline buckets, inside the
 	// measured window, in which no operation completed successfully.
@@ -624,7 +625,7 @@ func PrintSummary(w io.Writer, r *Result) {
 		r.Config.Clients, loop, r.Config.Duration, r.Config.Warmup, r.Config.Keys, r.Config.KeyDist, r.Config.ReadPct, r.Config.DeletePct, r.Config.ValueSize)
 	fmt.Fprintf(w, "completed %.0f ops/s in the window; outcomes %v; late %d; longest outage %s; generator CPU %s\n",
 		r.OKPerSec, r.Classes, r.Late, r.LongestOutage, r.GeneratorCPU.Round(time.Millisecond))
-	if r.Late > 0 {
+	if r.Late > 0 && r.Config.Rate > 0 {
 		fmt.Fprintf(w, "WARNING: %d operations due in the window completed after it: the offered rate exceeded what the cluster sustained, and latencies include the backlog\n", r.Late)
 	}
 	fmt.Fprintf(w, "%-7s %9s %9s %9s %9s %9s %9s %9s\n", "op", "count", "p50 µs", "p90", "p95", "p99", "p99.9", "max")
