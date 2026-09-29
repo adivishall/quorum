@@ -170,6 +170,13 @@ func TestOpenLoopCountsAStallAsLatency(t *testing.T) {
 	if res.All.Max < 300e3 {
 		t.Fatalf("max latency %.0f µs: a 400 ms stall did not show as latency", res.All.Max)
 	}
+	// About 80 of the 300 operations fell due during the stall and queued
+	// behind it: measured from when they were due, well over a tenth of all
+	// operations waited 100 ms or more. Measured from when a client took them
+	// (coordinated omission), only the few in flight would.
+	if res.All.P90 < 100e3 {
+		t.Fatalf("p90 %.0f µs: the operations queued behind the stall were measured from when a client took them", res.All.P90)
+	}
 	if res.All.P50 > 50e3 {
 		t.Fatalf("p50 %.0f µs: most operations never met the stall", res.All.P50)
 	}
