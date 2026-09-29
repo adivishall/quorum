@@ -48,7 +48,11 @@ jobs:
       # durable logs replayed against the session model) and the Phase 14
       # snapshot tests (a leader's snapshot, a follower's install, SIGKILL after
       # publication and mid-install, full-cluster restart from snapshots, a retry
-      # after compaction answered as a duplicate). No prebuilt binaries.
+      # after compaction answered as a duplicate) and the Phase 15 membership and
+      # multi-Raft tests in -cluster mode (a node added, the leader removed, a
+      # crashed node replaced, a joint configuration through a leader SIGKILL,
+      # two groups on the same processes with one broken, workloads across
+      # changes checked for linearizability). No prebuilt binaries.
       - name: integration tests (real processes, race detector)
         run: make integration
 
@@ -70,7 +74,10 @@ jobs:
       # linearizability) and the Phase 13 session workloads (retries and
       # duplicates checked as logical operations; every replica's apply-time
       # decision checked against the session model) and the Phase 14 snapshot
-      # profiles and snapshot crash matrix (INV-SN1..SN3 checked throughout). Any
+      # profiles and snapshot crash matrix (INV-SN1..SN3 checked throughout), and
+      # Phase 15: the membership profiles, the membership crash matrix, the
+      # multi-group schedules with their replay and isolation checks, and the
+      # bounded membership model (INV-MB1..MB10 checked throughout). Any
       # failure prints its seed, the exact reproduction command, and a minimized
       # script (or the exact crashat event).
       - name: deterministic fault schedules (200 seeds per profile) and the crash matrix
@@ -90,7 +97,8 @@ jobs:
       # handling and fault-model fidelity, Phase 11 crash-recovery rules, Phase 12
       # ReadIndex / completion / client / checker rules, Phase 13 deduplication /
       # forwarding / session-client / logical-checker rules, Phase 14 snapshot and
-      # compaction rules) must be caught by the tests named for it; a surviving
+      # compaction rules, Phase 15 membership and multi-Raft rules) must be caught
+      # by the tests named for it; a surviving
       # mutant — or one that does not compile — fails the build.
       - name: mutation testing
         run: make mutation
