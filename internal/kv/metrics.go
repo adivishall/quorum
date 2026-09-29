@@ -3,6 +3,7 @@ package kv
 import (
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/adivishall/quorum/internal/metrics"
@@ -20,6 +21,44 @@ type Metrics struct {
 	forwarded  *metrics.CounterVec
 	inflight   *metrics.Gauge
 	decisions  *metrics.CounterVec
+
+	// The request path's series, resolved once per label set so a request
+	// only increments (no label strings built per request).
+	mu     sync.RWMutex
+	reqs   map[reqKey]reqSeries
+	fwd    map[fwdKey]*metrics.Counter
+	served map[reqKey]*metrics.Counter
+}
+
+type fwdKey struct {
+	g      replication.GroupID
+	result string
+}
+
+type reqKey struct {
+	g  replication.GroupID
+	op ReqOp
+	st Status
+}
+
+type reqSeries struct {
+	count, dup *metrics.Counter
+	dur        *metrics.Histogram
+}
+
+func (m *Metrics) series(k reqKey) reqSeries {
+	m.mu.RLock()
+	s, ok := m.reqs[k]
+	m.mu.RUnlock()
+	if ok {
+		return s
+	}
+	g := groupOf(k.g)
+	s = reqSeries{count: m.requests.With(g, opLabel(k.op), statusLabel(k.st)), dup: m.duplicates.With(g), dur: m.duration.With(opLabel(k.op))}
+	m.mu.Lock()
+	m.reqs[k] = s
+	m.mu.Unlock()
+	return s
 }
 
 // NewMetrics registers the client API's families in r (nil: a nil Metrics).
@@ -28,6 +67,7 @@ func NewMetrics(r *metrics.Registry) *Metrics {
 		return nil
 	}
 	return &Metrics{
+		reqs: map[reqKey]reqSeries{}, fwd: map[fwdKey]*metrics.Counter{}, served: map[reqKey]*metrics.Counter{},
 		requests: r.CounterVec("dkv_kv_requests_total",
 			"Client requests this node's front answered, by the group the request named, the operation and the status returned. A request relayed from a forward is counted here with the leader's status.", "group", "op", "status"),
 		duration: r.HistogramVec("dkv_kv_request_seconds",
@@ -54,24 +94,46 @@ func (m *Metrics) request(req Request, resp Response, start time.Time) {
 	if m == nil {
 		return
 	}
-	g := groupOf(req.Group)
-	m.requests.With(g, opLabel(req.Op), statusLabel(resp.Status)).Inc()
-	m.duration.With(opLabel(req.Op)).Since(start)
+	s := m.series(reqKey{req.Group, req.Op, resp.Status})
+	s.count.Inc()
+	s.dur.Since(start)
 	if resp.Duplicate {
-		m.duplicates.With(g).Inc()
+		s.dup.Inc()
 	}
 }
 
 func (m *Metrics) forward(g replication.GroupID, result string) {
-	if m != nil {
-		m.forwards.With(groupOf(g), result).Inc()
+	if m == nil {
+		return
 	}
+	k := fwdKey{g, result}
+	m.mu.RLock()
+	c, ok := m.fwd[k]
+	m.mu.RUnlock()
+	if !ok {
+		c = m.forwards.With(groupOf(g), result)
+		m.mu.Lock()
+		m.fwd[k] = c
+		m.mu.Unlock()
+	}
+	c.Inc()
 }
 
 func (m *Metrics) servedForward(req Request, resp Response) {
-	if m != nil {
-		m.forwarded.With(groupOf(req.Group), opLabel(req.Op), statusLabel(resp.Status)).Inc()
+	if m == nil {
+		return
 	}
+	k := reqKey{req.Group, req.Op, resp.Status}
+	m.mu.RLock()
+	c, ok := m.served[k]
+	m.mu.RUnlock()
+	if !ok {
+		c = m.forwarded.With(groupOf(req.Group), opLabel(req.Op), statusLabel(resp.Status))
+		m.mu.Lock()
+		m.served[k] = c
+		m.mu.Unlock()
+	}
+	c.Inc()
 }
 
 // Observe makes store count its decisions into m under group g.
