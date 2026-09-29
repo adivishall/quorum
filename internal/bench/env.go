@@ -14,6 +14,7 @@
 package bench
 
 import (
+	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
@@ -28,6 +29,7 @@ import (
 type Environment struct {
 	Hostname     string    `json:"hostname,omitempty"`
 	OS           string    `json:"os"`
+	OSVersion    string    `json:"os_version,omitempty"`
 	Arch         string    `json:"arch"`
 	CPUModel     string    `json:"cpu_model,omitempty"`
 	CPUsLogical  int       `json:"cpus_logical"`
@@ -61,8 +63,90 @@ func CaptureEnvironment(dir string) Environment {
 	if n := sysctlInt("hw.memsize"); n > 0 {
 		e.RAMBytes = int64(n)
 	}
+	if v, err := exec.Command("sw_vers", "-productVersion").Output(); err == nil {
+		e.OSVersion = "macOS " + strings.TrimSpace(string(v))
+	}
+	if runtime.GOOS == "linux" {
+		linuxEnvironment(&e)
+	}
 	e.GitCommit, e.GitDirty = gitState(dir)
 	return e
+}
+
+// linuxEnvironment fills what sysctl gives on Darwin from /proc and
+// /etc/os-release: the CPU model, physical cores, memory, and the
+// distribution with the kernel release. A field it cannot read stays empty.
+func linuxEnvironment(e *Environment) {
+	if b, err := os.ReadFile("/proc/cpuinfo"); err == nil {
+		model, cores := parseCPUInfo(string(b))
+		if e.CPUModel == "" {
+			e.CPUModel = model
+		}
+		if cores > 0 {
+			e.CPUsPhysical = cores
+		}
+	}
+	if b, err := os.ReadFile("/proc/meminfo"); err == nil {
+		if n := parseMemTotal(string(b)); n > 0 {
+			e.RAMBytes = n
+		}
+	}
+	if b, err := os.ReadFile("/etc/os-release"); err == nil {
+		e.OSVersion = parseOSRelease(string(b))
+	}
+	if r, err := exec.Command("uname", "-r").Output(); err == nil {
+		if e.OSVersion != "" {
+			e.OSVersion += ", "
+		}
+		e.OSVersion += "kernel " + strings.TrimSpace(string(r))
+	}
+}
+
+// parseCPUInfo returns /proc/cpuinfo's first model name and the number of
+// distinct (physical id, core id) pairs: physical cores across sockets.
+func parseCPUInfo(s string) (model string, cores int) {
+	seen := map[string]bool{}
+	var phys string
+	for _, line := range strings.Split(s, "\n") {
+		k, v, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		switch k {
+		case "model name":
+			if model == "" {
+				model = v
+			}
+		case "physical id":
+			phys = v
+		case "core id":
+			seen[phys+"/"+v] = true
+		}
+	}
+	return model, len(seen)
+}
+
+// parseMemTotal returns /proc/meminfo's MemTotal in bytes (0 if absent).
+func parseMemTotal(s string) int64 {
+	for _, line := range strings.Split(s, "\n") {
+		if f := strings.Fields(line); len(f) >= 2 && f[0] == "MemTotal:" {
+			if kb, err := strconv.ParseInt(f[1], 10, 64); err == nil {
+				return kb * 1024
+			}
+		}
+	}
+	return 0
+}
+
+// parseOSRelease returns /etc/os-release's PRETTY_NAME, unquoted.
+func parseOSRelease(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if v, ok := strings.CutPrefix(line, "PRETTY_NAME="); ok {
+			return strings.Trim(v, `"`)
+		}
+	}
+	return ""
 }
 
 // sysctlString returns a sysctl string value, or "" if sysctl is unavailable
