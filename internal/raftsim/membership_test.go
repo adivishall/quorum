@@ -11,7 +11,7 @@ import (
 
 // Phase 15 scripted membership scenarios (docs/MEMBERSHIP.md): each drives the
 // real cores, durable logs and driver orderings through one membership story
-// while every continuous invariant — the INV-M series included — is checked
+// while every continuous invariant — the INV-MB series included — is checked
 // after every event.
 
 func memberCfg(nodes, genesis int, seed int64) Config {
@@ -370,11 +370,19 @@ func (s *sim) deliverWhereNot(skip func(*flight) bool, limit ...int) {
 // runs that found the vote deadlock (a learner that missed its promotion, and
 // a joiner with no configuration, refused the vote their election needed):
 // every one now converges.
+//
+// The second set are seeds on which the INV-MB3 check itself was wrong: it
+// judged a commit under the joint configuration although the leader had, in
+// the same event, committed the joint entry, appended the final one and
+// committed further entries under it — which Raft §6 allows, a configuration
+// taking effect when appended. They pass only if the check applies the
+// leader's current configuration and verifies the joint entry's commit.
 func TestMembershipRegressionSeeds(t *testing.T) {
 	for name, seeds := range map[string][]int64{
-		"membership":            {9, 18, 41},
-		"membership-partitions": {36, 45, 71},
-		"membership-snapshots":  {1, 25, 37},
+		"membership":             {9, 18, 41, 170},
+		"membership-partitions":  {36, 45, 71, 148},
+		"membership-snapshots":   {1, 25, 37, 115},
+		"membership-crashpoints": {134},
 	} {
 		p, _ := ProfileByName(name)
 		for _, seed := range seeds {
@@ -382,6 +390,21 @@ func TestMembershipRegressionSeeds(t *testing.T) {
 				t.Fatalf("%s seed %d: %s", name, seed, r.Report(reproCommand(p, seed)))
 			}
 		}
+	}
+	for name, seeds := range map[string][]int64{
+		"kv-membership":          {64},
+		"kv-membership-messages": {166},
+	} {
+		p, _ := KVProfileByName(name)
+		for _, seed := range seeds {
+			if r := RunKV(p, seed); r.Violation != nil {
+				t.Fatalf("%s seed %d: %v", name, seed, r.Violation)
+			}
+		}
+	}
+	p, _ := MultiProfileByName("multi-4x5")
+	if r := RunMulti(p, 196); r.Violation != nil {
+		t.Fatalf("multi-4x5 seed 196: group %d: %v", r.Group, r.Violation)
 	}
 }
 

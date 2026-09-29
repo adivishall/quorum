@@ -116,7 +116,7 @@ func lostChangeScenario(t *testing.T, cfg Config) []Event {
 // proposal, persistence, replication, commit, application, snapshot,
 // installation and finalization of configuration entries, in every crash
 // mode; each crashed node restarts at once, the run stabilizes, every
-// invariant (the INV-M series included) holds throughout, and the group
+// invariant (the INV-MB series included) holds throughout, and the group
 // converges with no change left under way. Each row records the group, the
 // transition under way, the configuration before, the one reached and the
 // one the crashed node recovered (-raftsim.membership-matrix.out writes the

@@ -656,19 +656,27 @@ func (c *Cluster) derivedConf(n *node) replication.Configuration {
 // confThrough is the configuration in n's log at index bound (>= its
 // boundary): the latest configuration entry at or below it, else the base.
 func (c *Cluster) confThrough(n *node, bound uint64) replication.Configuration {
+	conf, _, _ := c.confEntryThrough(n, bound)
+	return conf
+}
+
+// confEntryThrough is confThrough with where the configuration comes from:
+// the index of its entry when it is in n's log (inLog), else the index its
+// base holds at — the published snapshot's, or 0 for the genesis.
+func (c *Cluster) confEntryThrough(n *node, bound uint64) (conf replication.Configuration, index uint64, inLog bool) {
 	for i := len(n.entries) - 1; i >= 0; i-- {
 		if e := n.entries[i]; e.Index <= bound && e.Type == replication.EntryConfig {
 			conf, _ := replication.DecodeConfiguration(e.Data)
-			return conf
+			return conf, e.Index, true
 		}
 	}
 	if p := n.dur.Snap.Published(); p.Index > 0 {
-		return p.Conf
+		return p.Conf, p.Index, false
 	}
 	if c.isGenesis(n.id) {
-		return replication.VotersOf(c.cfg.genesis(c.ids))
+		return replication.VotersOf(c.cfg.genesis(c.ids)), 0, false
 	}
-	return replication.Configuration{}
+	return replication.Configuration{}, 0, false
 }
 
 // campaignConfs derives, from n's log alone, the configuration it campaigns
@@ -719,9 +727,15 @@ func holdsDurably(x *node, i, t uint64) bool {
 //     and snapshot give — the core holds no membership of its own.
 //   - INV-MB3: a leader that advanced its commit index did so with the entry
 //     durable on a majority of its configuration's voters AND, when joint, of
-//     its outgoing voters — its configuration being the one in effect when it
-//     decided (its log through the new commit and all it held before the
-//     event: a final entry appended by that very commit does not count).
+//     its outgoing voters — its configuration being its current one after the
+//     event: a configuration takes effect when it is appended (Raft §6), a
+//     final entry the leader appended in this very event included. A final
+//     entry is appended only once the joint configuration it ends is
+//     committed under the joint rule: when a leader appends one, its commit
+//     covers the joint entry, and that entry is durable on a majority of both
+//     of the joint configuration's voter sets. A leader that removed itself
+//     in this event (its final configuration committed, it stepped down) is
+//     checked the same way.
 //   - INV-MB5: a node that became leader is a voter of its configuration.
 //   - INV-MB4: a leader whose committed configuration excludes it has stepped
 //     down, and a node a committed configuration removed never becomes leader
@@ -732,45 +746,86 @@ func (c *Cluster) checkMembership(n *node, role raft.Role, lastBefore uint64) {
 		c.violate("INV-MB2", "%s holds configuration %s; its log and snapshot give %s", n.id, conf, want)
 		return
 	}
-	if role != raft.Leader {
-		return
-	}
 	term, commit := n.core.Term(), n.core.CommitIndex()
-	if n.role != raft.Leader || n.term != term {
-		if _, prev := c.campaignConfs(n); !conf.IsVoter(n.id) && prev == nil {
-			c.violate("INV-MB5", "%s became leader of term %d while no voter of its configuration %s", n.id, term, conf)
+	if role == raft.Leader {
+		if n.role != raft.Leader || n.term != term {
+			if _, prev := c.campaignConfs(n); !conf.IsVoter(n.id) && prev == nil {
+				c.violate("INV-MB5", "%s became leader of term %d while no voter of its configuration %s", n.id, term, conf)
+				return
+			}
+			if at, ok := c.chk.removedAt[n.id]; ok && term > at {
+				c.violate("INV-MB4", "%s became leader of term %d after a configuration committed in term %d removed it", n.id, term, at)
+				return
+			}
+		}
+		if !conf.IsVoter(n.id) && !n.core.ConfPending() {
+			c.violate("INV-MB4", "%s still leads term %d under a committed configuration %s without it", n.id, term, conf)
 			return
 		}
-		if at, ok := c.chk.removedAt[n.id]; ok && term > at {
-			c.violate("INV-MB4", "%s became leader of term %d after a configuration committed in term %d removed it", n.id, term, at)
-			return
-		}
+	} else if n.role != raft.Leader || n.term != term {
+		return // not a leader's decision: a follower learns its commit
 	}
-	if !conf.IsVoter(n.id) && !n.core.ConfPending() {
-		c.violate("INV-MB4", "%s still leads term %d under a committed configuration %s without it", n.id, term, conf)
+	if c.checkFinalAppends(n, term, commit, lastBefore); c.viol != nil {
 		return
 	}
 	if commit <= n.commit {
 		return // no commit decided in this event
 	}
-	decided := c.confThrough(n, max(commit, lastBefore))
+	decided := c.derivedConf(n)
 	t := n.termAt(commit)
-	has := func(ids []NodeID) int {
-		k := 0
-		for _, id := range ids {
-			if x := c.nodes[id]; x != nil && holdsDurably(x, commit, t) {
-				k++
-			}
-		}
-		return k
-	}
-	if v := decided.VoterIDs(); has(v) <= len(v)/2 {
-		c.violate("INV-MB3", "leader %s committed index %d (term %d) held durably by %d of the voters %v", n.id, commit, t, has(v), v)
+	if v := decided.VoterIDs(); countDurable(c, v, commit, t) <= len(v)/2 {
+		c.violate("INV-MB3", "leader %s committed index %d (term %d) held durably by %d of the voters %v", n.id, commit, t, countDurable(c, v, commit, t), v)
 		return
 	}
 	if decided.Joint() {
-		if o := decided.OutgoingIDs(); has(o) <= len(o)/2 {
-			c.violate("INV-MB3", "leader %s committed index %d (term %d) in joint configuration %s held durably by only %d of the outgoing voters %v", n.id, commit, t, decided, has(o), o)
+		if o := decided.OutgoingIDs(); countDurable(c, o, commit, t) <= len(o)/2 {
+			c.violate("INV-MB3", "leader %s committed index %d (term %d) in joint configuration %s held durably by only %d of the outgoing voters %v", n.id, commit, t, decided, countDurable(c, o, commit, t), o)
 		}
 	}
+}
+
+// checkFinalAppends is INV-MB3's precondition for the final configuration:
+// every final entry the leader appended in this event (its term, above what
+// its log held before) follows a joint configuration the leader's commit
+// covers, and that joint entry is durable on a majority of the joint voters
+// and a majority of the outgoing voters — it was committed under the joint
+// rule before the leader switched to the final one. (A joint configuration
+// that a snapshot carries is committed: the snapshot is of applied state.)
+func (c *Cluster) checkFinalAppends(n *node, term, commit, lastBefore uint64) {
+	for i := len(n.entries) - 1; i >= 0 && n.entries[i].Index > lastBefore; i-- {
+		e := n.entries[i]
+		if e.Type != replication.EntryConfig || e.Term != term {
+			continue
+		}
+		final, _ := replication.DecodeConfiguration(e.Data)
+		joint, j, inLog := c.confEntryThrough(n, e.Index-1)
+		if !joint.Joint() || !raft.Final(joint).Equal(final) {
+			continue
+		}
+		if commit < j {
+			c.violate("INV-MB3", "leader %s appended the final configuration %s at %d while the joint entry at %d was uncommitted (commit %d)", n.id, final, e.Index, j, commit)
+			return
+		}
+		if !inLog {
+			continue
+		}
+		jt := n.termAt(j)
+		for _, ids := range [][]NodeID{joint.VoterIDs(), joint.OutgoingIDs()} {
+			if k := countDurable(c, ids, j, jt); k <= len(ids)/2 {
+				c.violate("INV-MB3", "leader %s appended the final configuration %s at %d though the joint entry at %d (term %d) is durable on only %d of %v", n.id, final, e.Index, j, jt, k, ids)
+				return
+			}
+		}
+	}
+}
+
+// countDurable counts the nodes among ids whose durable state holds (i, t).
+func countDurable(c *Cluster, ids []NodeID, i, t uint64) int {
+	k := 0
+	for _, id := range ids {
+		if x := c.nodes[id]; x != nil && holdsDurably(x, i, t) {
+			k++
+		}
+	}
+	return k
 }

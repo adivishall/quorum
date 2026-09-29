@@ -15,7 +15,7 @@ var flagModelDepth = flag.Int("raftsim.model-depth", 3, "sequence length of the 
 // over a small alphabet of membership changes and faults, on four nodes of
 // which three are the genesis voters. Each step is applied, then the group
 // runs a few rounds; every continuous invariant — the INV-R, INV-F, INV-SN and
-// INV-M series — is checked after every event; at the end the group is
+// INV-MB series — is checked after every event; at the end the group is
 // stabilized and must converge with no change under way. A step that does not
 // apply in the state it meets (no leader to ask, a change already under way,
 // nothing to promote) is a no-op, exactly as the Member event is refused.
