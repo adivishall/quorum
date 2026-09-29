@@ -37,6 +37,7 @@ type confOutcome struct {
 // at since, appended in term.
 type confWait struct {
 	since, term uint64
+	typ         raft.ConfChangeType // for the membership-change metric
 	result      chan confOutcome
 }
 
@@ -99,10 +100,12 @@ func (n *Node) settleChanges() {
 		// whose log conflicts with ours at or below it does not hold it.
 		switch {
 		case !ours:
+			n.m.confChange(w.typ, "lost")
 			w.result <- confOutcome{err: fmt.Errorf("%w: index %d", ErrConfLost, w.since)}
 		case !n.core.ConfPending() && (idx >= w.since || w.since <= boundary):
 			// Complete: the change's entry is committed and so is every entry
 			// it led to. (The configuration may include later changes.)
+			n.m.confChange(w.typ, "completed")
 			w.result <- confOutcome{conf: conf, index: idx}
 		default:
 			kept = append(kept, w)
@@ -127,6 +130,16 @@ func (n *Node) settleChanges() {
 func (n *Node) noteConf() bool {
 	conf, idx := n.core.Conf()
 	changed := !n.confLogged || idx != n.confSeenIdx || !conf.Equal(n.confSeen)
+	if changed && n.confLogged && idx > 0 {
+		// A configuration entry adopted since the node started (a
+		// configuration takes effect when appended; a truncated one reverts
+		// to an earlier entry, which counts as adopted again).
+		if conf.Joint() {
+			n.m.confJoint.Inc()
+		} else {
+			n.m.confStable.Inc()
+		}
+	}
 	if changed {
 		n.confSeen, n.confSeenIdx, n.confLogged = conf, idx, true
 		n.logf("event=raft_conf node=%s group=%d index=%d pending=%v voter=%v conf=%q", n.cfg.ID, n.cfg.Group, idx, n.core.ConfPending(), conf.IsVoter(n.cfg.ID), conf.String())
