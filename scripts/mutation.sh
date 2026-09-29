@@ -1509,6 +1509,26 @@ mutant "a-write-completes-after-its-status" internal/raftnode/node.go \
   '	n.waiters.Applied(e.Index, e.Term, result)' \
   ./internal/raftnode 'TestWriteCompletionFollowsItsStatus'
 
+echo "== #2: the load generator (docs/LOAD_TESTING.md) =="
+
+# 166. Open loop measures an operation from when a client takes it, not from
+#      when it was due: a stall hides the queue behind it (coordinated
+#      omission).
+mutant "open-loop-latency-counts-from-the-due-time" internal/load/load.go \
+  '				for t := range tasks {
+					class := c.do(runCtx, t)' \
+  '				for t := range tasks {
+					t.intended = time.Now()
+					class := c.do(runCtx, t)' \
+  ./internal/load 'TestOpenLoopCountsAStallAsLatency'
+
+# 167. Throughput counts the operations due in the window, however late they
+#      completed: an overloaded open-loop run reports the offered rate.
+mutant "throughput-counts-completions-in-the-window" internal/load/load.go \
+  '	res.OKPerSec = float64(r.inWindow.Load()) / cfg.Duration.Seconds()' \
+  '	res.OKPerSec = float64(res.Classes[ClassOK]+res.Classes[ClassNotFound]) / cfg.Duration.Seconds()' \
+  ./internal/load 'TestOverloadReportsAchievedThroughput'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
 if [ "$FAIL" -ne 0 ]; then
