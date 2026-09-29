@@ -1,24 +1,24 @@
-// Command dkvd is a Quorum node process (Phase 7).
+// Command dkvd is a Quorum node process.
 //
 // It is a real OS process representing one node. It builds the internal TCP
-// transport (internal/transport), listens, maintains connections to its
-// configured peers, answers Probe messages with ProbeResponse, and periodically
-// probes its peers to prove bidirectional connectivity. It runs until SIGINT or
-// SIGTERM, then shuts the transport down cleanly and exits 0.
+// transport (internal/transport), listens and maintains connections to its
+// peers. It runs until SIGINT or SIGTERM, then shuts down cleanly and exits 0.
 //
-// By default it runs the Phase 7 probe demo (no Raft, no storage, no client
-// serving). With -raft it instead runs a single Phase 9 Raft group over the same
-// transport (docs/RAFT.md): it elects a leader, appends the mandatory no-op,
-// replicates, and persists its log under -data-dir. Its state machine is the
-// Phase 12 key-value store (internal/kv), and with -client-listen it serves the
-// minimal Phase 12 operation protocol — PUT/GET/DELETE, writes completed when
-// committed and applied, reads through ReadIndex — which exists so real
-// processes can be driven by history-recording test clients
-// (docs/LINEARIZABILITY.md). It is not the client API: no request ids, no
-// forwarding, no deduplication (Phase 13), no HTTP (Phase 15).
+// By default it runs the Phase 7 probe demo: it answers Probe messages and
+// probes its peers. With -raft it runs one Raft group, group 0, over the
+// transport (docs/RAFT.md); with -cluster it runs one Raft group per shard of
+// the routing that names it (docs/MULTI_RAFT.md). Each group persists its log
+// and snapshots under -data-dir and its state machine is the key-value store
+// (internal/kv). With -client-listen it serves the client protocol
+// (docs/API.md): PUT/GET/DELETE/REGISTER with request identity and
+// deduplication, linearizable reads, one-hop forwarding to the group's leader.
+// With -admin-listen it serves the admin protocol (membership changes,
+// snapshots, status); with -metrics-listen, Prometheus metrics over HTTP at
+// GET /metrics (docs/OBSERVABILITY.md). There is no HTTP client API.
 //
 //	dkvd -id node-1 -listen 127.0.0.1:7001 \
-//	     -peers node-2=127.0.0.1:7002,node-3=127.0.0.1:7003 [-raft -data-dir DIR] [-client-listen ADDR]
+//	     -peers node-2=127.0.0.1:7002,node-3=127.0.0.1:7003 [-raft | -cluster] -data-dir DIR \
+//	     [-client-listen ADDR] [-admin-listen ADDR] [-metrics-listen ADDR]
 //
 // Output is machine-readable "event=... key=value" lines on stdout, so a test or
 // an operator can observe startup, connectivity, elections, replication, and
@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -49,6 +50,7 @@ import (
 
 	"github.com/adivishall/quorum/internal/fault"
 	"github.com/adivishall/quorum/internal/kv"
+	"github.com/adivishall/quorum/internal/metrics"
 	"github.com/adivishall/quorum/internal/multiraft"
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftnode"
@@ -70,27 +72,28 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("dkvd", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		id       = fs.String("id", "", "this node's id (required)")
-		listen   = fs.String("listen", "", "listen address host:port (required)")
-		peersArg = fs.String("peers", "", "comma-separated peers as id=host:port")
-		probeIvl = fs.Duration("probe-interval", 100*time.Millisecond, "how often to probe each peer")
-		raftMode = fs.Bool("raft", false, "run a single Raft group over the transport (Phase 9) instead of the probe demo")
-		dataDir  = fs.String("data-dir", "", "directory for the durable Raft log (raft mode; a temp dir if empty)")
-		tickIvl  = fs.Duration("tick-interval", 50*time.Millisecond, "raft logical tick duration")
-		crashAt  = fs.String("crash-at", "", "TEST SEAM (raft mode): kill this process with SIGKILL at a crash point, e.g. after-save:2 (the 2nd time it is reached), fsync:3 (before the 3rd fsync of any of the node's files — its Raft log and snapshot files), rename:1, syncdir:2, after-snapshot-publish:1 or before-reply:1 (before the 1st client response is written); see docs/CRASH_RECOVERY.md and docs/SNAPSHOTS.md")
-		crashArm = fs.Bool("crash-armed-by-signal", false, "TEST SEAM: count -crash-at occurrences only after this process receives SIGUSR1 (it logs event=crash_armed), so a test can crash at the Nth occurrence after a point of its choosing; driver and reply points only")
-		clientAt = fs.String("client-listen", "", "raft mode: serve the key-value client protocol (internal/kv, docs/API.md: PUT/GET/DELETE, REGISTER, request identity) on this host:port")
-		sessMax  = fs.Int("session-max", kv.DefaultLimits.MaxSessions, "raft mode: the most client sessions the state machine keeps; the least recently used is evicted beyond it (docs/DEDUP.md). Part of the replicated state machine: every node of a group MUST use the same value")
-		sessUnk  = fs.Int("session-max-unacked", kv.DefaultLimits.MaxUnacked, "raft mode: the most unacknowledged results one session may hold (docs/DEDUP.md). Every node of a group MUST use the same value")
-		forward  = fs.Bool("client-forwarding", true, "raft mode: a node that is not the leader forwards a client request one hop to the leader; false is redirect-only (NOT_LEADER with a leader hint)")
-		snapEv   = fs.Uint64("snapshot-every", 10000, "raft mode: snapshot the state machine every N applied entries and compact the Raft log behind the snapshot (docs/SNAPSHOTS.md); 0 never snapshots (the log then grows without bound). Each node decides on its own; values may differ")
-		snapKeep = fs.Uint64("snapshot-retain", 1000, "raft mode: entries kept in the Raft log below each new snapshot, so a follower slightly behind catches up by entries rather than a snapshot transfer")
-		cluster  = fs.Bool("cluster", false, "run one Raft group per shard of the routing (Phase 15, docs/MULTI_RAFT.md): this node hosts the groups whose genesis replica group names it, under -data-dir/groups/, plus every group found there and every -join group; clients are routed key -> shard -> group")
-		shards   = fs.Int("shards", 4, "cluster mode: the routing's shard count = the number of groups; identical on every node")
-		rf       = fs.Int("rf", 3, "cluster mode: the routing's replication factor = each group's genesis size; identical on every node")
-		nodesArg = fs.String("nodes", "", "cluster mode: comma-separated node ids of the routing (the genesis cluster); default this node and its -peers. Identical on every node, including one that joins later")
-		joinArg  = fs.String("join", "", "raft/cluster mode: comma-separated group ids this node hosts as a JOINER — it starts with no configuration and its group's leader adds it (admin add-learner); -raft takes only 0")
-		adminAt  = fs.String("admin-listen", "", "raft/cluster mode: serve the admin protocol (docs/MULTI_RAFT.md §7: status, add-learner, promote, remove-voter, remove-learner, create-group, stop-group, snapshot) on this host:port — separate from the client port")
+		id        = fs.String("id", "", "this node's id (required)")
+		listen    = fs.String("listen", "", "listen address host:port (required)")
+		peersArg  = fs.String("peers", "", "comma-separated peers as id=host:port")
+		probeIvl  = fs.Duration("probe-interval", 100*time.Millisecond, "how often to probe each peer")
+		raftMode  = fs.Bool("raft", false, "run a single Raft group over the transport (Phase 9) instead of the probe demo")
+		dataDir   = fs.String("data-dir", "", "directory for the durable Raft log (raft mode; a temp dir if empty)")
+		tickIvl   = fs.Duration("tick-interval", 50*time.Millisecond, "raft logical tick duration")
+		crashAt   = fs.String("crash-at", "", "TEST SEAM (raft mode): kill this process with SIGKILL at a crash point, e.g. after-save:2 (the 2nd time it is reached), fsync:3 (before the 3rd fsync of any of the node's files — its Raft log and snapshot files), rename:1, syncdir:2, after-snapshot-publish:1 or before-reply:1 (before the 1st client response is written); see docs/CRASH_RECOVERY.md and docs/SNAPSHOTS.md")
+		crashArm  = fs.Bool("crash-armed-by-signal", false, "TEST SEAM: count -crash-at occurrences only after this process receives SIGUSR1 (it logs event=crash_armed), so a test can crash at the Nth occurrence after a point of its choosing; driver and reply points only")
+		clientAt  = fs.String("client-listen", "", "raft mode: serve the key-value client protocol (internal/kv, docs/API.md: PUT/GET/DELETE, REGISTER, request identity) on this host:port")
+		sessMax   = fs.Int("session-max", kv.DefaultLimits.MaxSessions, "raft mode: the most client sessions the state machine keeps; the least recently used is evicted beyond it (docs/DEDUP.md). Part of the replicated state machine: every node of a group MUST use the same value")
+		sessUnk   = fs.Int("session-max-unacked", kv.DefaultLimits.MaxUnacked, "raft mode: the most unacknowledged results one session may hold (docs/DEDUP.md). Every node of a group MUST use the same value")
+		forward   = fs.Bool("client-forwarding", true, "raft mode: a node that is not the leader forwards a client request one hop to the leader; false is redirect-only (NOT_LEADER with a leader hint)")
+		snapEv    = fs.Uint64("snapshot-every", 10000, "raft mode: snapshot the state machine every N applied entries and compact the Raft log behind the snapshot (docs/SNAPSHOTS.md); 0 never snapshots (the log then grows without bound). Each node decides on its own; values may differ")
+		snapKeep  = fs.Uint64("snapshot-retain", 1000, "raft mode: entries kept in the Raft log below each new snapshot, so a follower slightly behind catches up by entries rather than a snapshot transfer")
+		cluster   = fs.Bool("cluster", false, "run one Raft group per shard of the routing (Phase 15, docs/MULTI_RAFT.md): this node hosts the groups whose genesis replica group names it, under -data-dir/groups/, plus every group found there and every -join group; clients are routed key -> shard -> group")
+		shards    = fs.Int("shards", 4, "cluster mode: the routing's shard count = the number of groups; identical on every node")
+		rf        = fs.Int("rf", 3, "cluster mode: the routing's replication factor = each group's genesis size; identical on every node")
+		nodesArg  = fs.String("nodes", "", "cluster mode: comma-separated node ids of the routing (the genesis cluster); default this node and its -peers. Identical on every node, including one that joins later")
+		joinArg   = fs.String("join", "", "raft/cluster mode: comma-separated group ids this node hosts as a JOINER — it starts with no configuration and its group's leader adds it (admin add-learner); -raft takes only 0")
+		metricsAt = fs.String("metrics-listen", "", "serve Prometheus metrics over HTTP (GET /metrics, docs/OBSERVABILITY.md) on this host:port — separate from the client and admin ports")
+		adminAt   = fs.String("admin-listen", "", "raft/cluster mode: serve the admin protocol (docs/MULTI_RAFT.md §7: status, add-learner, promote, remove-voter, remove-learner, create-group, stop-group, snapshot) on this host:port — separate from the client port")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -133,12 +136,24 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	// is torn down and immediately redialled; that reconnect is harmless.
 	readIdle := 120 * *tickIvl
 	lg := &logger{w: stdout}
+	var reg *metrics.Registry
+	if *metricsAt != "" {
+		reg = metrics.NewRegistry()
+		metrics.RegisterProcess(reg)
+		stopMetrics, err := serveMetrics(*metricsAt, reg, *id, lg)
+		if err != nil {
+			fmt.Fprintf(stderr, "dkvd: -metrics-listen: %v\n", err)
+			return 2
+		}
+		defer stopMetrics()
+	}
 	tr, err := transport.NewTCPTransport(transport.Config{
 		NodeID:          transport.NodeID(*id),
 		ListenAddr:      *listen,
 		Peers:           peers,
 		Logf:            lg.logf,
 		ReadIdleTimeout: readIdle,
+		Metrics:         reg,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "dkvd: %v\n", err)
@@ -190,7 +205,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if *raftMode || *cluster {
 		r := raftRun{id: *id, listen: *listen, peers: peers, tr: tr, dataDir: *dataDir, tick: *tickIvl, lg: lg, stderr: stderr, clientAddr: *clientAt, crash: crash,
 			limits: limits, redirectOnly: !*forward, snapshotEvery: *snapEv, snapshotRetain: *snapKeep,
-			assign: assign, join: join, adminAddr: *adminAt}
+			assign: assign, join: join, adminAddr: *adminAt, metrics: reg}
 		if crash != nil {
 			r.hook, r.fs = crash.install(ctx, lg, *id, *crashArm)
 		}
@@ -348,6 +363,8 @@ type raftRun struct {
 	assign    *multiraft.Assignment
 	join      []multiraft.GroupID
 	adminAddr string
+	// Phase 16: the process's metrics registry (nil: -metrics-listen unset).
+	metrics *metrics.Registry
 }
 
 // groupWatch is what the event loop last reported for one group.
@@ -394,13 +411,19 @@ func runRaft(ctx context.Context, r raftRun) int {
 	}
 	front := kv.NewFront(id, route)
 	front.SetForwarding(!r.redirectOnly)
+	km := kv.NewMetrics(r.metrics)
+	front.SetMetrics(km)
 	static := map[multiraft.NodeID]string{}
 	for p, addr := range r.peers {
 		static[multiraft.NodeID(p)] = addr
 	}
 	hc := multiraft.Config{
 		ID: raftnode.NodeID(id), DataDir: dataDir, Transport: r.tr, StaticPeers: static,
-		NewStateMachine: func(multiraft.GroupID) raftnode.StateMachine { return kv.NewStoreWithLimits(limits) },
+		NewStateMachine: func(g multiraft.GroupID) raftnode.StateMachine {
+			store := kv.NewStoreWithLimits(limits)
+			km.Observe(store, g)
+			return store
+		},
 		OnGroup: func(g multiraft.GroupID, node *raftnode.Node, sm raftnode.StateMachine) {
 			if node == nil {
 				front.Detach(g)
@@ -410,7 +433,7 @@ func runRaft(ctx context.Context, r raftRun) int {
 		},
 		TickInterval: r.tick, FS: r.fs, Hook: r.hook, // durable by default (DisableSync left false)
 		SnapshotEvery: r.snapshotEvery, SnapshotRetain: r.snapshotRetain,
-		Logf: lg.logf,
+		Logf: lg.logf, Metrics: r.metrics,
 	}
 	if r.assign == nil {
 		hc.LogPathFor = func(multiraft.GroupID) string { return filepath.Join(dataDir, "raft-"+id+".log") }
@@ -832,4 +855,20 @@ func (l *logger) logf(format string, args ...any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	fmt.Fprintf(l.w, format+"\n", args...)
+}
+
+// serveMetrics serves reg at GET /metrics on addr (Phase 16,
+// docs/OBSERVABILITY.md) and returns the function that stops it. The listener is
+// bound before it returns, so a bad address is a startup error.
+func serveMetrics(addr string, reg *metrics.Registry, id string, lg *logger) (func(), error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", metrics.Handler(reg))
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() { _ = srv.Serve(ln) }()
+	lg.logf("event=metrics_ready node=%s addr=%s", id, ln.Addr())
+	return func() { _ = srv.Close() }, nil
 }

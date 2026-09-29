@@ -750,8 +750,8 @@ mutant "the-watermark-waits-for-requests-in-flight" internal/kv/session.go \
 # 76. dkvd ignores -session-max / -session-max-unacked.
 #     (Phase 15: the host builds every group's state machine.)
 mutant "dkvd-applies-the-configured-session-limits" cmd/dkvd/main.go \
-  'return kv.NewStoreWithLimits(limits) },' \
-  'return kv.NewStore() },' \
+  '			store := kv.NewStoreWithLimits(limits)' \
+  '			store := kv.NewStore()' \
   ./tests/integration 'TestRealSessionContractSurvivesFullClusterRestart'
 
 # 87. Request validation drops the watermark bound: a request with AckedBelow
@@ -1461,6 +1461,53 @@ mutant "the-final-entry-waits-for-the-joint-commit" internal/raft/membership.go 
   '	if r.role != Leader || r.confIndex > r.log.CommitIndex() {' \
   '	if r.role != Leader || (r.confIndex > r.log.CommitIndex() && !r.conf.Joint()) {' \
   './internal/raft ./internal/raftsim' 'TestFinalEntryWaitsForTheJointCommit|TestMembershipRegressionSeeds'
+
+echo "== Phase 16: observability (docs/OBSERVABILITY.md) =="
+
+# 160. A series is keyed by its label values joined with a separator: a value
+#      holding the separator makes two label sets one series (found by
+#      FuzzParse).
+mutant "series-keys-are-unambiguous" internal/metrics/metrics.go \
+  '	return b.String()' \
+  '	return strings.Join(values, "\xff")' \
+  ./internal/metrics 'TestLabelValuesAreNeverAmbiguous'
+
+# 161. The front answers a request without counting it.
+mutant "the-front-counts-every-answer" internal/kv/front.go \
+  '	m.request(req, resp, start)' \
+  '	_ = start' \
+  ./internal/kv 'TestKVMetricsMatchTheResponses'
+
+# 162. The state machine's decisions are not observed (the metric would have
+#      to fall back on kv.Store.Stats, which a restore resets).
+mutant "every-apply-decision-is-observed" internal/kv/store.go \
+  '	if s.observe != nil {
+		s.observe(r.Decision)
+	}' \
+  '	_ = s.observe' \
+  ./internal/kv 'TestKVMetricsMatchTheResponses|TestDecisionCountsSurviveARestore'
+
+# 163. The core's cumulative role transitions are added whole at every
+#      published status instead of by difference: each election counted many
+#      times.
+mutant "role-transitions-are-counted-by-difference" internal/raftnode/metrics.go \
+  '	n.m.electionsWon.Add(d.ElectionsWon - n.lastCounters.ElectionsWon)' \
+  '	n.m.electionsWon.Add(d.ElectionsWon)' \
+  ./internal/raftnode 'TestMetricsMatchWhatTheClusterDid'
+
+# 164. The durable log forgets the bytes it appends: its size stays at what
+#      Open found.
+mutant "the-log-size-counts-every-record" internal/raftlog/raftlog.go \
+  '	l.size += int64(n)' \
+  '	l.size += int64(n) * 0' \
+  ./internal/raftlog 'TestSizeIsTheFileLength'
+
+# 165. A write completes inside the apply loop again, before the cycle's
+#      Status covers it (what the observability branch's race gate found).
+mutant "a-write-completes-after-its-status" internal/raftnode/node.go \
+  '	n.completed = append(n.completed, appliedEntry{index: e.Index, term: e.Term, result: result})' \
+  '	n.waiters.Applied(e.Index, e.Term, result)' \
+  ./internal/raftnode 'TestWriteCompletionFollowsItsStatus'
 
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log

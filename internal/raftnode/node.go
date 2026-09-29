@@ -130,6 +130,9 @@ type Config struct {
 	// SnapshotRetain is how many entries below a new snapshot's index the
 	// compaction keeps, so a follower slightly behind catches up by entries.
 	SnapshotRetain uint64
+	// Metrics, if set, receives this node's instrumentation (Phase 16,
+	// docs/OBSERVABILITY.md); nil instruments nothing.
+	Metrics *Metrics
 }
 
 // snapshotFiles are the node's snapshot files, beside its log.
@@ -428,6 +431,19 @@ type Node struct {
 	sending map[NodeID]bool // peers a snapshot is being streamed to (Phase 14)
 
 	app atomic.Pointer[AppHandler] // Phase 13: application messages (forwarding)
+
+	// Phase 16 (docs/OBSERVABILITY.md). m's fields are nil when the node has
+	// no Metrics; the rest is actor-owned.
+	m              *nodeMetrics
+	store          Storage // what the Ready cycle persists through (timed if m is enabled)
+	inflight       map[uint64]inflightWrite
+	lastCounters   raft.Counters
+	lastLeader     NodeID
+	lastLeaderTerm uint64
+
+	// completed are this cycle's applied entries, their waiters completed
+	// once the cycle's Status is published (actor-owned).
+	completed []appliedEntry
 }
 
 // AppHandler receives the application messages this node's peers send it —
@@ -517,6 +533,14 @@ type Status struct {
 	// Removed: a committed configuration without this node was seen — it is
 	// no longer a member of its group (docs/MEMBERSHIP.md §5).
 	Removed bool
+	// Phase 16 (docs/OBSERVABILITY.md): the core's role transitions since the
+	// node started; the writes and reads waiting on this node; the durable
+	// log's length; on a leader, each other member's match index.
+	Counters      raft.Counters
+	PendingWrites int
+	PendingReads  int
+	LogBytes      int64
+	FollowerMatch map[NodeID]uint64
 }
 
 // Start recovers durable state, constructs the core, and launches the actor,
@@ -549,6 +573,13 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		outboxes:  map[NodeID]*outbox{},
 		waiters:   NewWaiters(),
 		reads:     NewReads(),
+		m:         cfg.Metrics.forGroup(cfg.Group),
+		inflight:  map[uint64]inflightWrite{},
+	}
+	n.store = n.dur
+	if n.m.enabled() {
+		n.dur.Log = timedLog{LogStore: n.dur.Log, m: n.m}
+		n.store = timedStorage{Durable: n.dur, m: n.m}
 	}
 	n.dur.Snap.Installed = n.waiters.Installed
 	n.wasMember = rc.Identity.Genesis.IsMember(cfg.ID)
@@ -557,6 +588,8 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 	if rc.Snapshot != nil {
 		n.logf("event=raft_snapshot_restored node=%s index=%d term=%d repaired=%v group=%d", cfg.ID, rc.Snapshot.Index, rc.Snapshot.Term, rc.Repaired, cfg.Group)
 	}
+
+	cfg.Metrics.add(n) // its gauges read the Status published above
 
 	// Read what the start line reports while this goroutine still owns the
 	// core: once the actor runs, only it may touch the core (it may be
@@ -710,6 +743,13 @@ func (n *Node) Status() Status {
 	st := n.status
 	n.mu.Unlock()
 	st.Conf = st.Conf.Clone() // the caller's own copy
+	if st.FollowerMatch != nil {
+		fm := make(map[NodeID]uint64, len(st.FollowerMatch))
+		for id, m := range st.FollowerMatch {
+			fm[id] = m
+		}
+		st.FollowerMatch = fm
+	}
 	return st
 }
 
@@ -746,6 +786,7 @@ func (n *Node) actorLoop() {
 		// Whoever is still waiting learns nothing more from this incarnation.
 		n.waiters.FailAll(raft.ErrStopped)
 		n.reads.FailAll(raft.ErrStopped)
+		n.cfg.Metrics.remove(n)
 	}()
 	ticker := time.NewTicker(n.cfg.TickInterval)
 	defer ticker.Stop()
@@ -770,11 +811,14 @@ func (n *Node) actorLoop() {
 			}
 		case w := <-n.writeCh:
 			if err := n.core.Propose(w.data); err != nil {
+				n.m.refused.Inc()
 				w.result <- writeAccepted{err: err}
 			} else {
 				// The entry is the log's tail, in the current term; it completes
 				// when that index is applied — with this term, or as ErrLost.
 				idx, term := n.core.LastIndex(), n.core.Term()
+				n.m.accepted.Inc()
+				n.trackAccepted(idx, term)
 				w.result <- writeAccepted{index: idx, term: term, done: n.waiters.Add(idx, term, n.core.AppliedIndex())}
 			}
 		case r := <-n.readCh:
@@ -786,9 +830,10 @@ func (n *Node) actorLoop() {
 			}
 		case c := <-n.confCh:
 			if err := n.core.ProposeConfChange(c.cc); err != nil {
+				n.m.confChange(c.cc.Type, "refused")
 				c.result <- confOutcome{err: err}
 			} else {
-				n.changes = append(n.changes, &confWait{since: n.core.LastIndex(), term: n.core.Term(), result: c.result})
+				n.changes = append(n.changes, &confWait{since: n.core.LastIndex(), term: n.core.Term(), typ: c.cc.Type, result: c.result})
 			}
 		case r := <-n.snapCh:
 			if n.dur.Snap.SM == nil {
@@ -796,6 +841,7 @@ func (n *Node) actorLoop() {
 				break
 			}
 			before := n.dur.Snap.Published().Index
+			start := time.Now()
 			err := n.dur.Snapshot(n.core, n.cfg.Hook)
 			if err != nil && !errors.Is(err, snapshot.ErrTooLarge) && !errors.Is(err, raft.ErrConfUnknown) {
 				r <- err
@@ -804,6 +850,8 @@ func (n *Node) actorLoop() {
 			}
 			snapReply, snapErr = r, err
 			if after := n.dur.Snap.Published(); after.Index != before {
+				n.m.snapRequest.Inc()
+				n.m.snapCreate.Since(start)
 				b, _ := n.core.Boundary()
 				n.logf("event=raft_snapshot node=%s index=%d term=%d boundary=%d group=%d trigger=request", n.cfg.ID, after.Index, after.Term, b, n.cfg.Group)
 			}
@@ -835,19 +883,28 @@ func (n *Node) actorLoop() {
 // the next cycle: appliedIndex does not advance past it, and the node keeps running.
 func (n *Node) processReady() error {
 	defer n.dur.Snap.Unstage() // a staged snapshot lives for one cycle at most
-	if err := DrainReadyAt(n.core, n.dur, n.enqueue, n.confirmRead, n.cfg.Hook); err != nil {
+	// Writes applied in this cycle complete when it ends — after the Status
+	// that covers them is published (snapshotStatus, below), so no client that
+	// has seen its write complete reads a Status that has not applied it. On
+	// an early return the completions are delivered all the same: the entries
+	// were applied.
+	defer n.completeApplied()
+	if err := DrainReadyAt(n.core, n.store, n.enqueue, n.confirmRead, n.cfg.Hook); err != nil {
 		return err
 	}
+	n.trackCommitted()
 	if err := ApplyCommitted(n.core, n.sm, n.cfg.Hook, n.applied); err != nil {
 		if !errors.Is(err, ErrApply) {
 			return err // a crash point fired
 		}
-		n.logf("event=raft_apply_failed node=%s err=%v", n.cfg.ID, err)
+		n.logf("event=raft_apply_failed node=%s group=%d err=%v", n.cfg.ID, n.cfg.Group, err)
 	}
+	n.trackApplied()
 	// Phase 14: snapshot and compact when the trigger says so. A state too
 	// large to snapshot is reported and skipped; any other failure is a
 	// durability failure and stops the node, as a failed Save does.
 	before := n.dur.Snap.Published().Index
+	snapStart := time.Now()
 	if err := n.dur.MaybeSnapshot(n.core, n.cfg.Hook); err != nil {
 		if !errors.Is(err, snapshot.ErrTooLarge) && !errors.Is(err, raft.ErrConfUnknown) {
 			return err
@@ -855,8 +912,10 @@ func (n *Node) processReady() error {
 		n.logf("event=raft_snapshot_skipped node=%s applied=%d group=%d err=%v", n.cfg.ID, n.core.AppliedIndex(), n.cfg.Group, err)
 	}
 	if after := n.dur.Snap.Published(); after.Index != before {
+		n.m.snapPeriodic.Inc()
+		n.m.snapCreate.Since(snapStart)
 		b, _ := n.core.Boundary()
-		n.logf("event=raft_snapshot node=%s index=%d term=%d boundary=%d", n.cfg.ID, after.Index, after.Term, b)
+		n.logf("event=raft_snapshot node=%s index=%d term=%d boundary=%d group=%d trigger=periodic", n.cfg.ID, after.Index, after.Term, b, n.cfg.Group)
 	}
 	// A read registered in a term this node no longer leads will never be
 	// confirmed (the core dropped it): tell its client to go elsewhere.
@@ -876,10 +935,26 @@ func (n *Node) confirmRead(rs raft.ReadState) {
 }
 
 // applied is ApplyCommitted's hand-off after an entry is applied and recorded:
-// the write that proposed it (or a read barrier at its index) completes now,
-// with the state machine's result.
+// the write that proposed it (or a read barrier at its index) completes, with
+// the state machine's result, when the cycle ends (completeApplied).
 func (n *Node) applied(e raft.Entry, result any) {
-	n.waiters.Applied(e.Index, e.Term, result)
+	n.completed = append(n.completed, appliedEntry{index: e.Index, term: e.Term, result: result})
+}
+
+// appliedEntry is an applied entry whose waiters complete at the end of the
+// cycle (processReady).
+type appliedEntry struct {
+	index, term uint64
+	result      any
+}
+
+// completeApplied completes the waiters of every entry applied this cycle.
+func (n *Node) completeApplied() {
+	for i, a := range n.completed {
+		n.waiters.Applied(a.index, a.term, a.result)
+		n.completed[i] = appliedEntry{}
+	}
+	n.completed = n.completed[:0]
 }
 
 // fail records a persistence failure and stops every goroutine of the node. The
@@ -891,7 +966,7 @@ func (n *Node) fail(err error) {
 		n.err = err
 	}
 	n.mu.Unlock()
-	n.logf("event=raft_persist_failed node=%s err=%v", n.cfg.ID, err)
+	n.logf("event=raft_persist_failed node=%s group=%d err=%v", n.cfg.ID, n.cfg.Group, err)
 	n.waiters.FailAll(err)
 	n.reads.FailAll(err)
 	n.cancel()
@@ -946,14 +1021,15 @@ func (n *Node) enqueue(m raft.Message) {
 		return
 	}
 	if m.To == "" || m.To == n.cfg.ID {
-		n.logf("event=raft_send_dropped node=%s to=%s type=%s reason=unknown_peer", n.cfg.ID, m.To, m.Type)
+		n.logf("event=raft_send_dropped node=%s to=%s type=%s reason=unknown_peer group=%d", n.cfg.ID, m.To, m.Type, n.cfg.Group)
 		return
 	}
 	ob := n.outboxFor(m.To)
 	select {
 	case ob.ch <- m:
 	default:
-		n.logf("event=raft_send_dropped node=%s to=%s type=%s reason=outbox_full", n.cfg.ID, m.To, m.Type)
+		n.m.outboxFull.Inc()
+		n.logf("event=raft_send_dropped node=%s to=%s type=%s reason=outbox_full group=%d", n.cfg.ID, m.To, m.Type, n.cfg.Group)
 	}
 }
 
@@ -984,7 +1060,8 @@ func (n *Node) sendMessage(m raft.Message) {
 	}
 	if err := n.tr.Send(n.ctx, transport.NodeID(m.To), kind, WrapGroup(n.cfg.Group, m.Marshal())); err != nil {
 		// ErrPeerNotConnected / a write error: fine, Raft is retransmission-based.
-		n.logf("event=raft_send_failed node=%s to=%s type=%s err=%v", n.cfg.ID, m.To, m.Type, err)
+		n.m.sendFailed.Inc()
+		n.logf("event=raft_send_failed node=%s to=%s type=%s group=%d err=%v", n.cfg.ID, m.To, m.Type, n.cfg.Group, err)
 	}
 }
 
@@ -1010,6 +1087,7 @@ func (n *Node) receiveLoop() {
 			if unwrap {
 				g, payload, err := UnwrapGroup(env.Payload)
 				if err != nil || g != n.cfg.Group {
+					n.m.wrongGroup.Inc()
 					n.logf("event=raft_frame_dropped node=%s group=%d from=%s kind=%d frame_group=%d err=%v", n.cfg.ID, n.cfg.Group, env.Peer, env.Kind, g, err)
 					continue
 				}
@@ -1035,7 +1113,8 @@ func (n *Node) receiveLoop() {
 			}
 			m, err := raft.Unmarshal(env.Payload)
 			if err != nil {
-				n.logf("event=raft_decode_failed node=%s from=%s err=%v", n.cfg.ID, env.Peer, err)
+				n.m.decode.Inc()
+				n.logf("event=raft_decode_failed node=%s from=%s group=%d err=%v", n.cfg.ID, env.Peer, n.cfg.Group, err)
 				continue
 			}
 			m.Type = mt                    // trust the frame kind for the type
@@ -1058,8 +1137,11 @@ func (n *Node) snapshotStatus() {
 		Commit: n.core.CommitIndex(), LastIndex: n.core.LastIndex(), Applied: n.core.AppliedIndex(),
 		Boundary: b, Snapshot: n.dur.Snap.Published().Index,
 		Conf: n.confSeen, ConfIndex: n.confSeenIdx, ConfPending: n.core.ConfPending(), Voter: n.core.IsVoter(),
-		Removed: n.removed,
+		Removed:  n.removed,
+		Counters: n.core.Counters(), PendingWrites: n.waiters.Len(), PendingReads: n.reads.Len(),
+		LogBytes: n.log.Size(), FollowerMatch: n.core.Progress(),
 	}
+	n.observeStatus(st)
 	n.mu.Lock()
 	n.status = st
 	n.mu.Unlock()
@@ -1078,7 +1160,8 @@ func (n *Node) startTransfer(m raft.Message) {
 		err = fmt.Errorf("%w: published snapshot %d is below the log's boundary %d", ErrSnapshot, meta.Index, m.SnapshotIndex)
 	}
 	if err != nil {
-		n.logf("event=raft_snapshot_send_failed node=%s to=%s err=%v", n.cfg.ID, m.To, err)
+		n.m.snapFailed.Inc()
+		n.logf("event=raft_snapshot_send_failed node=%s to=%s group=%d err=%v", n.cfg.ID, m.To, n.cfg.Group, err)
 		return
 	}
 	n.mu.Lock()
@@ -1103,11 +1186,13 @@ func (n *Node) transfer(peer NodeID, term uint64, meta snapshot.Meta, file []byt
 	chunks := snapshot.Split(term, meta, file)
 	for _, c := range chunks {
 		if err := n.tr.Send(n.ctx, transport.NodeID(peer), transport.MsgInstallSnapshot, WrapGroup(n.cfg.Group, c.Marshal())); err != nil {
-			n.logf("event=raft_snapshot_send_failed node=%s to=%s index=%d offset=%d err=%v", n.cfg.ID, peer, meta.Index, c.Offset, err)
+			n.m.snapFailed.Inc()
+			n.logf("event=raft_snapshot_send_failed node=%s to=%s index=%d offset=%d group=%d err=%v", n.cfg.ID, peer, meta.Index, c.Offset, n.cfg.Group, err)
 			return
 		}
 	}
-	n.logf("event=raft_snapshot_sent node=%s to=%s index=%d term=%d bytes=%d chunks=%d", n.cfg.ID, peer, meta.Index, meta.Term, len(file), len(chunks))
+	n.m.snapSent.Inc()
+	n.logf("event=raft_snapshot_sent node=%s to=%s index=%d term=%d bytes=%d chunks=%d group=%d", n.cfg.ID, peer, meta.Index, meta.Term, len(file), len(chunks), n.cfg.Group)
 }
 
 // receiveChunk takes one chunk of a snapshot a peer is sending. A complete,
@@ -1116,14 +1201,14 @@ func (n *Node) transfer(peer NodeID, term uint64, meta snapshot.Meta, file []byt
 func (n *Node) receiveChunk(c inChunk) {
 	m, err := n.dur.Snap.Receive(c.from, c.payload)
 	if err != nil {
-		n.logf("event=raft_snapshot_refused node=%s from=%s err=%v", n.cfg.ID, c.from, err)
+		n.logf("event=raft_snapshot_refused node=%s from=%s group=%d err=%v", n.cfg.ID, c.from, n.cfg.Group, err)
 		return
 	}
 	if m == nil {
 		return
 	}
 	m.To = n.cfg.ID
-	n.logf("event=raft_snapshot_received node=%s from=%s index=%d term=%d", n.cfg.ID, c.from, m.SnapshotIndex, m.SnapshotTerm)
+	n.logf("event=raft_snapshot_received node=%s from=%s index=%d term=%d group=%d", n.cfg.ID, c.from, m.SnapshotIndex, m.SnapshotTerm, n.cfg.Group)
 	_ = n.core.Step(*m)
 }
 

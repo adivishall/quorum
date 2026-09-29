@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/adivishall/quorum/internal/kv"
+	"github.com/adivishall/quorum/internal/metrics"
 	"github.com/adivishall/quorum/internal/multiraft"
 	"github.com/adivishall/quorum/internal/raftnode"
 	"github.com/adivishall/quorum/internal/replication"
@@ -25,10 +26,18 @@ type multiCluster struct {
 	fronts map[multiraft.NodeID]*kv.Front
 	hosts  map[multiraft.NodeID]*multiraft.Host
 	stores map[multiraft.NodeID]map[replication.GroupID]*kv.Store
+	regs   map[multiraft.NodeID]*metrics.Registry // metered clusters only
 	mu     sync.Mutex
 }
 
-func startMultiCluster(t *testing.T, shards int) *multiCluster {
+func startMultiCluster(t testing.TB, shards int) *multiCluster {
+	t.Helper()
+	return startMulti(t, shards, false)
+}
+
+// startMulti is startMultiCluster; metered, every node runs with a registry of
+// its own wired through every layer, as dkvd -metrics-listen does.
+func startMulti(t testing.TB, shards int, metered bool) *multiCluster {
 	t.Helper()
 	ids := []routing.NodeID{"n1", "n2", "n3"}
 	a, err := multiraft.NewAssignment(routing.Config{ShardCount: shards, ReplicationFactor: 3, Nodes: ids})
@@ -36,13 +45,16 @@ func startMultiCluster(t *testing.T, shards int) *multiCluster {
 		t.Fatal(err)
 	}
 	c := &multiCluster{assign: a, fronts: map[multiraft.NodeID]*kv.Front{}, hosts: map[multiraft.NodeID]*multiraft.Host{},
-		stores: map[multiraft.NodeID]map[replication.GroupID]*kv.Store{}}
+		stores: map[multiraft.NodeID]map[replication.GroupID]*kv.Store{}, regs: map[multiraft.NodeID]*metrics.Registry{}}
 	trs := map[multiraft.NodeID]*transport.TCPTransport{}
 	addrs := map[multiraft.NodeID]string{}
 	for _, rid := range ids {
 		id := multiraft.NodeID(rid)
 		c.ids = append(c.ids, id)
-		tr, err := transport.NewTCPTransport(transport.Config{NodeID: transport.NodeID(id), ListenAddr: "127.0.0.1:0", DialRetryInterval: 20 * time.Millisecond})
+		if metered {
+			c.regs[id] = metrics.NewRegistry()
+		}
+		tr, err := transport.NewTCPTransport(transport.Config{NodeID: transport.NodeID(id), ListenAddr: "127.0.0.1:0", DialRetryInterval: 20 * time.Millisecond, Metrics: c.regs[id]})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -52,6 +64,8 @@ func startMultiCluster(t *testing.T, shards int) *multiCluster {
 	for _, id := range c.ids {
 		id := id
 		front := kv.NewFront(string(id), a.GroupOf)
+		km := kv.NewMetrics(c.regs[id])
+		front.SetMetrics(km)
 		c.fronts[id] = front
 		c.stores[id] = map[replication.GroupID]*kv.Store{}
 		static := map[multiraft.NodeID]string{}
@@ -64,6 +78,7 @@ func startMultiCluster(t *testing.T, shards int) *multiCluster {
 			ID: id, DataDir: t.TempDir(), Transport: trs[id], StaticPeers: static,
 			NewStateMachine: func(g replication.GroupID) raftnode.StateMachine {
 				s := kv.NewStore()
+				km.Observe(s, g)
 				c.mu.Lock()
 				c.stores[id][g] = s
 				c.mu.Unlock()
@@ -76,7 +91,7 @@ func startMultiCluster(t *testing.T, shards int) *multiCluster {
 				}
 				front.Attach(g, node, sm.(*kv.Store))
 			},
-			TickInterval: 15 * time.Millisecond, DisableSync: true,
+			TickInterval: 15 * time.Millisecond, DisableSync: true, Metrics: c.regs[id],
 		})
 		if err != nil {
 			t.Fatal(err)

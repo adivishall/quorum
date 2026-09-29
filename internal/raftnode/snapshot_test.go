@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/adivishall/quorum/internal/fault"
+	"github.com/adivishall/quorum/internal/metrics"
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftlog"
 	"github.com/adivishall/quorum/internal/replication"
@@ -297,6 +298,27 @@ type snapCluster struct {
 	genesis     []NodeID
 	joiners     map[NodeID]bool
 	genesisless bool
+	// Phase 16: when set, each node runs with its own registry (a process
+	// each, as in production), kept across restarts.
+	regs map[NodeID]*metrics.Registry
+	mets map[NodeID]*Metrics
+}
+
+// withMetrics gives every node started from now on a registry of its own.
+func (c *snapCluster) withMetrics() {
+	c.regs, c.mets = map[NodeID]*metrics.Registry{}, map[NodeID]*Metrics{}
+}
+
+// metricsFor returns id's Metrics (nil without withMetrics).
+func (c *snapCluster) metricsFor(id NodeID) *Metrics {
+	if c.regs == nil {
+		return nil
+	}
+	if c.mets[id] == nil {
+		c.regs[id] = metrics.NewRegistry()
+		c.mets[id] = NewMetrics(c.regs[id])
+	}
+	return c.mets[id]
 }
 
 func startSnapCluster(t *testing.T, ctx context.Context, n int, every, retain uint64) *snapCluster {
@@ -344,7 +366,7 @@ func (c *snapCluster) start(id NodeID, hook Hook) {
 	node, err := Start(c.ctx, Config{
 		ID: id, Peers: peers, Join: c.joiners[id], Transport: c.trs[id], LogPath: filepath.Join(c.dir, string(id)+".log"),
 		StateMachine: sm, TickInterval: 15 * time.Millisecond, DisableSync: true, Hook: hook,
-		SnapshotEvery: c.every, SnapshotRetain: c.retain,
+		SnapshotEvery: c.every, SnapshotRetain: c.retain, Metrics: c.metricsFor(id),
 		Logf: func(f string, a ...any) {
 			c.mu.Lock()
 			defer c.mu.Unlock()

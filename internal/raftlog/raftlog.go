@@ -128,6 +128,7 @@ type Log struct {
 	failed   error     // the first write/fsync failure; sticky
 	hs       HardState // the last HardState durably written (recovered at Open)
 	boundary Boundary  // the durable boundary (recovered at Open)
+	size     int64     // the file's length: the end of its last whole record
 }
 
 // Options configures a Log.
@@ -188,11 +189,12 @@ func Open(path string, opts Options) (*Log, *Recovered, error) {
 		return nil, nil, err
 	}
 	// Position at the end of the last good record for appending.
-	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+	end, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
 		_ = f.Close()
 		return nil, nil, err
 	}
-	l := &Log{path: path, fs: fsys, f: f, w: record.NewWriter(f), sync: opts.Sync, hs: rec.HardState, boundary: rec.Boundary}
+	l := &Log{path: path, fs: fsys, f: f, w: record.NewWriter(f), sync: opts.Sync, hs: rec.HardState, boundary: rec.Boundary, size: end}
 	return l, rec, nil
 }
 
@@ -365,17 +367,17 @@ func (l *Log) Save(hs *HardState, entries []Entry) error {
 	}
 	lead, trail := SavePlan(l.hs, hs, entries)
 	if lead != nil {
-		if _, err := l.w.Append(kindHardState, encodeHardState(*lead)); err != nil {
+		if err := l.append(kindHardState, encodeHardState(*lead)); err != nil {
 			return l.fail(err)
 		}
 	}
 	for _, e := range entries {
-		if _, err := l.w.Append(entryKind(e), encodeAnyEntry(e)); err != nil {
+		if err := l.append(entryKind(e), encodeAnyEntry(e)); err != nil {
 			return l.fail(err)
 		}
 	}
 	if trail != nil {
-		if _, err := l.w.Append(kindHardState, encodeHardState(*trail)); err != nil {
+		if err := l.append(kindHardState, encodeHardState(*trail)); err != nil {
 			return l.fail(err)
 		}
 	}
@@ -446,7 +448,7 @@ func (l *Log) Install(index, term uint64) error {
 	case index <= l.hs.Commit:
 		return fmt.Errorf("%w: install at %d, durable commit already %d", ErrBoundary, index, l.hs.Commit)
 	}
-	if _, err := l.w.Append(kindBoundary, encodeBoundary(Boundary{index, term})); err != nil {
+	if err := l.append(kindBoundary, encodeBoundary(Boundary{index, term})); err != nil {
 		return l.fail(err)
 	}
 	if l.sync {
@@ -498,8 +500,10 @@ func (l *Log) Compact(index, term uint64) error {
 		return l.fail(err)
 	}
 	w := record.NewWriter(f)
+	var size int64
 	write := func(k record.Kind, p []byte) error {
-		_, err := w.Append(k, p)
+		n, err := w.Append(k, p)
+		size += int64(n)
 		return err
 	}
 	err = write(kindBoundary, encodeBoundary(Boundary{index, term}))
@@ -525,9 +529,21 @@ func (l *Log) Compact(index, term uint64) error {
 		return l.fail(err)
 	}
 	_ = l.f.Close()
-	l.f, l.w, l.boundary = f, w, Boundary{index, term}
+	l.f, l.w, l.boundary, l.size = f, w, Boundary{index, term}, size
 	return nil
 }
+
+// append writes one record and accounts for its bytes.
+func (l *Log) append(kind record.Kind, payload []byte) error {
+	n, err := l.w.Append(kind, payload)
+	l.size += int64(n)
+	return err
+}
+
+// Size is the length of the log's file in bytes: what Open recovered, plus
+// every record appended since, or what a compaction rewrote it to (Phase 16,
+// docs/OBSERVABILITY.md). It is the log's growth between compactions.
+func (l *Log) Size() int64 { return l.size }
 
 // reread replays the log's own file (every record in it is whole: Open
 // truncated any torn tail and every append since succeeded) and leaves the file

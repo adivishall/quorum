@@ -28,6 +28,11 @@ type Store struct {
 	limits   Limits
 	sessions map[uint64]*session
 	stats    ApplyStats
+
+	// Phase 16: counters outside the replicated state (Metrics.Observe); a
+	// restore does not reset them. Nil: none.
+	observe        func(Decision)
+	observeEvicted func()
 }
 
 // Limits bound the session table (docs/CLIENT_SEMANTICS.md §8). They are part
@@ -146,6 +151,9 @@ func (s *Store) ApplyResult(index uint64, command []byte) (any, error) {
 	}
 	s.applied = index
 	r := s.decide(index, c)
+	if s.observe != nil {
+		s.observe(r.Decision)
+	}
 	switch r.Decision {
 	case Executed:
 		s.stats.Executed++
@@ -177,6 +185,9 @@ func (s *Store) decide(index uint64, c Command) Result {
 			}
 			delete(s.sessions, lru)
 			s.stats.Evicted++
+			if s.observeEvicted != nil {
+				s.observeEvicted()
+			}
 		}
 		return Result{Decision: Registered, Index: index}
 	}

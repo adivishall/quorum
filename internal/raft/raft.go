@@ -75,6 +75,20 @@ type Raft struct {
 	nextReadID uint64
 	pending    []pendingRead // registered reads awaiting a quorum of post-registration acks, FIFO
 	readStates []ReadState   // confirmed reads, drained by Ready/Advance
+
+	// counters record what this core did, for observability (Phase 16): plain
+	// integers nothing in the core reads.
+	counters Counters
+}
+
+// Counters are the core's cumulative role transitions since it was
+// constructed (Phase 16, docs/OBSERVABILITY.md). They are incremented where the
+// transition happens, so none is missed between two observations of the core,
+// and no rule of the core ever reads them.
+type Counters struct {
+	Campaigns    uint64 // elections this node started (it became a candidate)
+	ElectionsWon uint64 // terms this node became leader of
+	StepDowns    uint64 // times this node left the leader role
 }
 
 // pendingRead is a ReadIndex request waiting for confirmation: it is confirmed
@@ -158,6 +172,25 @@ func (r *Raft) checkLogConfs() error {
 }
 
 // --- observability (read-only) ---
+
+// Counters returns the core's cumulative role transitions.
+func (r *Raft) Counters() Counters { return r.counters }
+
+// Progress returns, on a leader, the highest index each other member of its
+// configuration is known to hold (its matchIndex); nil on any other role.
+// The map is a copy.
+func (r *Raft) Progress() map[NodeID]uint64 {
+	if r.role != Leader {
+		return nil
+	}
+	out := make(map[NodeID]uint64, len(r.matchIndex))
+	for id, m := range r.matchIndex {
+		if id != r.id {
+			out[id] = m
+		}
+	}
+	return out
+}
 
 func (r *Raft) ID() NodeID          { return r.id }
 func (r *Raft) Role() Role          { return r.role }
@@ -370,6 +403,7 @@ func (r *Raft) becomeFollower(term uint64, leader NodeID) {
 	}
 	if r.role == Leader {
 		r.pending = nil // unconfirmed reads die with the leadership
+		r.counters.StepDowns++
 	}
 	r.role = Follower
 	r.leaderID = leader
@@ -381,6 +415,7 @@ func (r *Raft) becomeFollower(term uint64, leader NodeID) {
 // here (Tick), and it asks only the voters whose votes count — a learner is
 // never asked.
 func (r *Raft) becomeCandidate() {
+	r.counters.Campaigns++
 	r.currentTerm++
 	r.votedFor = r.id
 	r.hsDirty = true
@@ -406,6 +441,7 @@ func (r *Raft) becomeCandidate() {
 }
 
 func (r *Raft) becomeLeader() {
+	r.counters.ElectionsWon++
 	r.role = Leader
 	r.leaderID = r.id
 	r.campaignPrev = nil
