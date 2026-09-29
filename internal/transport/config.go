@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	"github.com/adivishall/quorum/internal/metrics"
 )
 
 // NodeID is a node's protocol-level identity. It is opaque, compared bytewise,
@@ -51,6 +53,9 @@ type Config struct {
 	// observability hook (docs/TRANSPORT.md); nil disables logging. It must be
 	// safe for concurrent use.
 	Logf func(format string, args ...any)
+	// Metrics, if set, receives the transport's instrumentation (Phase 16,
+	// docs/OBSERVABILITY.md).
+	Metrics *metrics.Registry
 }
 
 // withDefaults returns a copy of c with zero timeout fields filled in.

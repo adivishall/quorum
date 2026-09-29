@@ -34,6 +34,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/adivishall/quorum/internal/metrics"
 	"github.com/adivishall/quorum/internal/raftnode"
 	"github.com/adivishall/quorum/internal/replication"
 	"github.com/adivishall/quorum/internal/transport"
@@ -91,6 +92,9 @@ type Config struct {
 	// OnGroup, if set, is told when a group starts (node non-nil) and when it
 	// stops (node nil) — the client front's registry follows it.
 	OnGroup func(g GroupID, node *raftnode.Node, sm raftnode.StateMachine)
+	// Metrics, if set, receives the host's and every group's instrumentation
+	// (Phase 16, docs/OBSERVABILITY.md).
+	Metrics *metrics.Registry
 }
 
 // Group is one hosted group.
@@ -118,6 +122,10 @@ type Host struct {
 	added   map[NodeID]string // transport peers the host added
 	dropped map[string]uint64 // frames dropped, by reason (observability)
 	closed  bool
+
+	nodeMetrics *raftnode.Metrics // shared by every group's node (nil: none)
+	retired     *metrics.Counter
+	failures    *metrics.Counter
 }
 
 // GroupDir is where group g lives under dataDir.
@@ -145,6 +153,7 @@ func Start(ctx context.Context, cfg Config) (*Host, error) {
 	hctx, cancel := context.WithCancel(ctx)
 	h := &Host{cfg: cfg, ctx: hctx, cancel: cancel, groups: map[GroupID]*hosted{}, failed: map[GroupID]error{},
 		added: map[NodeID]string{}, dropped: map[string]uint64{}}
+	h.instrument(cfg.Metrics)
 	for id, addr := range cfg.StaticPeers {
 		if ps, ok := cfg.Transport.(transport.PeerSet); ok && id != cfg.ID {
 			if err := ps.AddPeer(transport.NodeID(id), addr); err != nil {
@@ -164,6 +173,7 @@ func Start(ctx context.Context, cfg Config) (*Host, error) {
 	for _, g := range ids {
 		if _, err := h.start(g, raftnode.Config{}); err != nil {
 			h.failed[g] = err
+			h.failures.Inc()
 			h.logf("event=group_failed node=%s group=%d err=%v", cfg.ID, g, err)
 		}
 	}
@@ -269,6 +279,7 @@ func (h *Host) start(g GroupID, nc raftnode.Config) (*Group, error) {
 	nc.SnapshotEvery, nc.SnapshotRetain = h.cfg.SnapshotEvery, h.cfg.SnapshotRetain
 	nc.ElectionTicks, nc.HeartbeatTicks = h.cfg.ElectionTicks, h.cfg.HeartbeatTicks
 	nc.Logf = h.cfg.Logf
+	nc.Metrics = h.nodeMetrics
 	node, err := raftnode.Start(h.ctx, nc)
 	if err != nil {
 		return nil, err
@@ -462,6 +473,7 @@ func (h *Host) retireRemoved() {
 		// The decision is logged before it takes effect, so an observer that
 		// sees the group gone also sees why.
 		h.logf("event=group_retired node=%s group=%d reason=removed", h.cfg.ID, g)
+		h.retired.Inc()
 		_ = h.Stop(g)
 	}
 }
@@ -526,4 +538,28 @@ func (h *Host) logf(format string, args ...any) {
 	if h.cfg.Logf != nil {
 		h.cfg.Logf(format, args...)
 	}
+}
+
+// instrument registers the host's metrics and the driver's, which every group
+// shares (Phase 16, docs/OBSERVABILITY.md).
+func (h *Host) instrument(r *metrics.Registry) {
+	if r == nil {
+		return
+	}
+	h.nodeMetrics = raftnode.NewMetrics(r)
+	h.retired = r.Counter("dkv_host_groups_retired_total", "Groups this host stopped because their node saw a committed configuration without it.")
+	h.failures = r.Counter("dkv_host_group_failures_total", "Groups found on disk that failed to recover when the host started.")
+	r.CollectGauge("dkv_host_groups", "Groups on this host: running, or failed (on disk, did not recover).", []string{"state"}, func(emit func(float64, ...string)) {
+		h.mu.Lock()
+		running, failed := len(h.groups), len(h.failed)
+		h.mu.Unlock()
+		emit(float64(running), "running")
+		emit(float64(failed), "failed")
+	})
+	r.CollectCounter("dkv_host_frames_dropped_total", "Inbound frames the host did not deliver to any group, by reason: malformed (the group envelope did not decode), unknown_group (no such group runs here), inbox_full (the group's inbox was full). Raft retransmits.", []string{"reason"}, func(emit func(float64, ...string)) {
+		dropped := h.Dropped()
+		for _, reason := range []string{"malformed", "unknown_group", "inbox_full"} {
+			emit(float64(dropped[reason]), reason)
+		}
+	})
 }

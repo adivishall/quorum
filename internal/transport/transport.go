@@ -70,6 +70,8 @@ type TCPTransport struct {
 	conns  map[NodeID]*conn
 	peers  map[NodeID]*peer // the peers it accepts and (smaller id) dials
 	closed bool
+
+	m *transportMetrics // Phase 16; its counters are nil (inert) without Config.Metrics
 }
 
 // peer is a known peer: its address and the cancellation of its dial loop.
@@ -108,6 +110,7 @@ func NewTCPTransport(cfg Config) (*TCPTransport, error) {
 		conns:  make(map[NodeID]*conn),
 		peers:  make(map[NodeID]*peer),
 	}
+	t.m = newTransportMetrics(cfg.Metrics, t)
 
 	t.wg.Add(1)
 	go t.acceptLoop()
@@ -220,14 +223,21 @@ func (t *TCPTransport) Send(ctx context.Context, peer NodeID, kind MsgKind, payl
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
+		t.m.closed.Inc()
 		return ErrClosed
 	}
 	c := t.conns[peer]
 	t.mu.Unlock()
 	if c == nil {
+		t.m.notConnected.Inc()
 		return ErrPeerNotConnected
 	}
-	return c.send(ctx, kind, payload)
+	if err := c.send(ctx, kind, payload); err != nil {
+		t.m.writeFailed.Inc()
+		return err
+	}
+	t.m.frameSent(kind, len(payload))
+	return nil
 }
 
 // Close shuts the transport down. Idempotent (INV-T6).
@@ -313,6 +323,9 @@ func (t *TCPTransport) dialLoop(ctx context.Context, peer NodeID, addr string) {
 		}
 		nc, err := d.DialContext(ctx, "tcp", addr)
 		if err != nil {
+			if ctx.Err() == nil {
+				t.m.dialFailed.Inc()
+			}
 			if sleepCtx(ctx, t.cfg.DialRetryInterval) {
 				return
 			}
@@ -320,6 +333,7 @@ func (t *TCPTransport) dialLoop(ctx context.Context, peer NodeID, addr string) {
 		}
 		_ = nc.SetWriteDeadline(time.Now().Add(t.cfg.HandshakeTimeout))
 		if err := writeHandshake(nc, t.cfg.NodeID); err != nil {
+			t.m.dialFailed.Inc()
 			t.logf("event=handshake_failed dir=outbound peer=%s err=%v", peer, mapTimeout(err))
 			_ = nc.Close()
 			if sleepCtx(ctx, t.cfg.DialRetryInterval) {
@@ -364,6 +378,11 @@ func (t *TCPTransport) serve(peer NodeID, nc net.Conn, dir string) {
 	}
 	t.conns[peer] = c
 	t.mu.Unlock()
+	if dir == "inbound" {
+		t.m.inbound.Inc()
+	} else {
+		t.m.outbound.Inc()
+	}
 	t.logf("event=peer_connected peer=%s dir=%s", peer, dir)
 
 	t.readLoop(c)
@@ -389,6 +408,7 @@ func (t *TCPTransport) readLoop(c *conn) {
 		if err != nil {
 			return // io.EOF (clean) or a protocol error — either way the conn is done
 		}
+		t.m.frameReceived(kind, len(payload))
 		select {
 		case t.recv <- Envelope{Peer: c.peer, Kind: kind, Payload: payload}:
 		case <-t.ctx.Done():
