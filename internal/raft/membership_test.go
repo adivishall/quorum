@@ -1228,3 +1228,41 @@ func TestFinalEntryCommitsAtOnceWhenTheLeaderAloneIsItsQuorum(t *testing.T) {
 		t.Fatalf("the final entry %s at %d is not committed (commit %d): nothing will ever commit it", c, idx, n1.CommitIndex())
 	}
 }
+
+// TestFinalEntryWaitsForTheJointCommit (INV-MB3): the leader appends the final
+// configuration only once the joint entry is committed. An ordinary entry
+// proposed just before a promotion commits first — its acknowledgements arrive
+// while the joint entry is still in flight — and the leader stays joint
+// through that commit; the final entry follows the joint entry's own commit.
+// Appending it earlier would switch the leader to the final configuration's
+// quorum before the joint one was ever satisfied.
+func TestFinalEntryWaitsForTheJointCommit(t *testing.T) {
+	nw := newNetworkWith(t, []NodeID{"n1", "n2", "n3", "n4"}, voters("n1", "n2", "n3"), 2)
+	nw.electLeader("n1")
+	nw.change("n1", ConfChange{Type: AddLearner, Member: Member{ID: "n4"}})
+	nw.heartbeatRounds()
+	nw.proposeNoDeliver("n1", "before")
+	before := nw.logs["n1"].LastIndex()
+	if err := nw.nodes["n1"].ProposeConfChange(ConfChange{Type: Promote, Member: Member{ID: "n4"}}); err != nil {
+		t.Fatal(err)
+	}
+	nw.drain("n1")
+	_, jointIdx := nw.nodes["n1"].Conf()
+	earlier := false
+	for i := 0; i < 10000 && nw.deliverOne(); i++ {
+		c, idx := nw.nodes["n1"].Conf()
+		commit := nw.nodes["n1"].CommitIndex()
+		if commit >= before && commit < jointIdx {
+			earlier = true
+		}
+		if !c.Joint() && idx > jointIdx && commit < jointIdx {
+			t.Fatalf("the final configuration %s was appended at %d while the joint entry at %d was uncommitted (commit %d)", c, idx, jointIdx, commit)
+		}
+	}
+	if !earlier {
+		t.Fatalf("premise: the entry at %d never committed before the joint entry at %d", before, jointIdx)
+	}
+	if c, _ := nw.nodes["n1"].Conf(); c.Joint() || !c.IsVoter("n4") || nw.nodes["n1"].ConfPending() {
+		t.Fatalf("the promotion did not complete: %s", c)
+	}
+}
