@@ -440,6 +440,10 @@ type Node struct {
 	lastCounters   raft.Counters
 	lastLeader     NodeID
 	lastLeaderTerm uint64
+
+	// completed are this cycle's applied entries, their waiters completed
+	// once the cycle's Status is published (actor-owned).
+	completed []appliedEntry
 }
 
 // AppHandler receives the application messages this node's peers send it —
@@ -879,6 +883,12 @@ func (n *Node) actorLoop() {
 // the next cycle: appliedIndex does not advance past it, and the node keeps running.
 func (n *Node) processReady() error {
 	defer n.dur.Snap.Unstage() // a staged snapshot lives for one cycle at most
+	// Writes applied in this cycle complete when it ends — after the Status
+	// that covers them is published (snapshotStatus, below), so no client that
+	// has seen its write complete reads a Status that has not applied it. On
+	// an early return the completions are delivered all the same: the entries
+	// were applied.
+	defer n.completeApplied()
 	if err := DrainReadyAt(n.core, n.store, n.enqueue, n.confirmRead, n.cfg.Hook); err != nil {
 		return err
 	}
@@ -925,10 +935,26 @@ func (n *Node) confirmRead(rs raft.ReadState) {
 }
 
 // applied is ApplyCommitted's hand-off after an entry is applied and recorded:
-// the write that proposed it (or a read barrier at its index) completes now,
-// with the state machine's result.
+// the write that proposed it (or a read barrier at its index) completes, with
+// the state machine's result, when the cycle ends (completeApplied).
 func (n *Node) applied(e raft.Entry, result any) {
-	n.waiters.Applied(e.Index, e.Term, result)
+	n.completed = append(n.completed, appliedEntry{index: e.Index, term: e.Term, result: result})
+}
+
+// appliedEntry is an applied entry whose waiters complete at the end of the
+// cycle (processReady).
+type appliedEntry struct {
+	index, term uint64
+	result      any
+}
+
+// completeApplied completes the waiters of every entry applied this cycle.
+func (n *Node) completeApplied() {
+	for i, a := range n.completed {
+		n.waiters.Applied(a.index, a.term, a.result)
+		n.completed[i] = appliedEntry{}
+	}
+	n.completed = n.completed[:0]
 }
 
 // fail records a persistence failure and stops every goroutine of the node. The

@@ -3,6 +3,7 @@ package raftnode
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -206,6 +207,39 @@ func TestWriteReportsLostWhenItsEntryIsOverwritten(t *testing.T) {
 			if cmd == "orphan" {
 				t.Fatalf("%s applied the write that was reported lost", id)
 			}
+		}
+	}
+}
+
+// TestWriteCompletionFollowsItsStatus: a write completes only after the node
+// has published the Status that covers it, so a client that saw its write
+// complete never reads an older applied index. The race the gate found
+// (TestWriteCompletesOnlyAfterApply, 1 run in 60 before the fix) is made
+// certain here: every cycle snapshots, and the hook holds the actor at the
+// snapshot — after the apply, before the Status. Completing waiters inside the
+// apply, as the driver once did, fails every write.
+func TestWriteCompletionFollowsItsStatus(t *testing.T) {
+	ctx := context.Background()
+	hold := func(p Point, _ uint64) error {
+		if p == BeforeSnapshotPublish {
+			time.Sleep(30 * time.Millisecond)
+		}
+		return nil
+	}
+	n, tr := startSnapSingle(t, ctx, filepath.Join(t.TempDir(), "raft.log"), &snapSM{}, 1, 0, hold, nil)
+	defer tr.Close()
+	defer n.Close()
+	deadline := time.Now().Add(10 * time.Second)
+	for n.Role() != raft.Leader && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	for i := 0; i < 5; i++ {
+		idx, _, err := writeWithin(n, []byte{byte('a' + i)}, 5*time.Second)
+		if err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		if st := n.Status(); st.Applied < idx {
+			t.Fatalf("write %d completed at index %d while the node's Status says applied %d", i, idx, st.Applied)
 		}
 	}
 }
