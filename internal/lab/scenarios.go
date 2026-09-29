@@ -52,10 +52,11 @@ func Scenario(name string, base Experiment) (Experiment, error) {
 //
 //	report  the matrix docs/CLUSTER_BENCHMARKS.md reports: 1, 3 and 5 nodes
 //	        (one group) under read-heavy, mixed and write-heavy closed-loop
-//	        load; 3 nodes with 1, 4 and 16 groups; and on 3 nodes under a
-//	        fixed open-loop rate, a leader kill, a rolling restart, a
+//	        load; 3 nodes with 1, 4 and 16 groups; and on 3 nodes under an
+//	        open-loop faultRate (below the cluster's capacity, so latency is
+//	        service time, not a backlog), a leader kill, a rolling restart, a
 //	        membership change and frequent snapshots.
-func Suite(name string, base Experiment) ([]Experiment, error) {
+func Suite(name string, base Experiment, faultRate float64) ([]Experiment, error) {
 	if name != "report" {
 		return nil, fmt.Errorf("lab: unknown suite %q", name)
 	}
@@ -88,9 +89,12 @@ func Suite(name string, base Experiment) ([]Experiment, error) {
 			return nil, err
 		}
 	}
-	for _, scenario := range []string{"leader-kill", "rolling-restart", "membership", "snapshots"} {
+	if faultRate <= 0 {
+		return nil, fmt.Errorf("lab: the report suite needs a positive fault rate")
+	}
+	for _, scenario := range []string{"steady", "leader-kill", "rolling-restart", "membership", "snapshots"} {
 		if err := add(scenario, func(e *Experiment) {
-			e.Cluster.Mode, e.Cluster.Nodes, e.Load.ReadPct, e.Load.Rate = "raft", 3, 50, 1000
+			e.Cluster.Mode, e.Cluster.Nodes, e.Load.ReadPct, e.Load.Rate = "raft", 3, 50, faultRate
 		}); err != nil {
 			return nil, err
 		}

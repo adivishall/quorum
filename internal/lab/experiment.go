@@ -266,7 +266,9 @@ func (c *Cluster) restartAndCatchUp(ctx context.Context, id string, g multiraft.
 // caughtUp waits until node id has applied group g's leader's commit index as
 // it stood when the wait began.
 func (c *Cluster) caughtUp(ctx context.Context, id string, g multiraft.GroupID, timeout time.Duration) error {
-	leader, _, err := c.Leader(ctx, g)
+	// Restarting a node can start an election (it may have led): wait for
+	// the group to have a leader again rather than read a transient absence.
+	leader, _, err := c.WaitLeader(ctx, g, "", timeout)
 	if err != nil {
 		return err
 	}

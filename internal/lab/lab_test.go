@@ -51,11 +51,11 @@ func TestScenariosAndSuite(t *testing.T) {
 	if _, err := Scenario("nonsense", base); err == nil {
 		t.Fatal("an unknown scenario was accepted")
 	}
-	exps, err := Suite("report", base)
+	exps, err := Suite("report", base, 50)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(exps) != 9+3+4 {
+	if len(exps) != 9+3+5 {
 		t.Fatalf("%d experiments in the report suite", len(exps))
 	}
 	names := map[string]bool{}

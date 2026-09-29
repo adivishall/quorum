@@ -37,26 +37,28 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("dkvlab", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		scenario = fs.String("scenario", "steady", "steady, leader-kill, rolling-restart, membership or snapshots")
-		suite    = fs.String("suite", "", "run a named matrix instead of one scenario: report")
-		mode     = fs.String("mode", "raft", "raft (one group) or cluster (one group per shard)")
-		nodes    = fs.Int("nodes", 3, "genesis nodes")
-		shards   = fs.Int("shards", 4, "cluster mode: shards (= groups)")
-		rf       = fs.Int("rf", 3, "cluster mode: replication factor")
-		tick     = fs.Duration("tick", 50*time.Millisecond, "dkvd -tick-interval")
-		snapEv   = fs.Uint64("snapshot-every", 0, "dkvd -snapshot-every (0: dkvd's default)")
-		clients  = fs.Int("clients", 16, "load: concurrent clients")
-		duration = fs.Duration("duration", 20*time.Second, "load: measured window")
-		warmup   = fs.Duration("warmup", 3*time.Second, "load: warmup")
-		rate     = fs.Float64("rate", 0, "load: open-loop rate (0: closed loop)")
-		read     = fs.Int("read", 50, "load: percentage of GETs")
-		keys     = fs.Int("keys", 10000, "load: distinct keys")
-		value    = fs.Int("value", 100, "load: value bytes")
-		seed     = fs.Int64("seed", 1, "load: seed")
-		runs     = fs.Int("runs", 3, "runs per configuration")
-		out      = fs.String("out", "", "write every run and the summaries as JSON")
-		repo     = fs.String("repo", ".", "the repository to build dkvd from and record the commit of")
-		data     = fs.String("data", "", "where the nodes' data directories go (default: a temporary directory)")
+		scenario  = fs.String("scenario", "steady", "steady, leader-kill, rolling-restart, membership or snapshots")
+		suite     = fs.String("suite", "", "run a named matrix instead of one scenario: report")
+		mode      = fs.String("mode", "raft", "raft (one group) or cluster (one group per shard)")
+		nodes     = fs.Int("nodes", 3, "genesis nodes")
+		shards    = fs.Int("shards", 4, "cluster mode: shards (= groups)")
+		rf        = fs.Int("rf", 3, "cluster mode: replication factor")
+		tick      = fs.Duration("tick", 50*time.Millisecond, "dkvd -tick-interval")
+		snapEv    = fs.Uint64("snapshot-every", 0, "dkvd -snapshot-every (0: dkvd's default)")
+		clients   = fs.Int("clients", 16, "load: concurrent clients")
+		duration  = fs.Duration("duration", 20*time.Second, "load: measured window")
+		warmup    = fs.Duration("warmup", 3*time.Second, "load: warmup")
+		rate      = fs.Float64("rate", 0, "load: open-loop rate (0: closed loop)")
+		faultRate = fs.Float64("fault-rate", 50, "the report suite: the open-loop rate of its fault scenarios (keep it below the cluster's capacity)")
+		read      = fs.Int("read", 50, "load: percentage of GETs")
+		keys      = fs.Int("keys", 10000, "load: distinct keys")
+		value     = fs.Int("value", 100, "load: value bytes")
+		seed      = fs.Int64("seed", 1, "load: seed")
+		attempt   = fs.Duration("attempt-timeout", 2*time.Second, "load: one attempt's budget (a request stuck at a dead node waits this long before it is retried elsewhere)")
+		runs      = fs.Int("runs", 3, "runs per configuration")
+		out       = fs.String("out", "", "write every run and the summaries as JSON")
+		repo      = fs.String("repo", ".", "the repository to build dkvd from and record the commit of")
+		data      = fs.String("data", "", "where the nodes' data directories go (default: a temporary directory)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -79,11 +81,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	base := lab.Experiment{
 		Cluster: lab.ClusterConfig{Bin: bin, Mode: *mode, Nodes: *nodes, Shards: *shards, RF: *rf, Tick: *tick, SnapshotEvery: *snapEv},
 		Load: load.Config{Clients: *clients, Duration: *duration, Warmup: *warmup, Rate: *rate, ReadPct: *read,
-			Keys: *keys, ValueSize: *value, Seed: *seed},
+			Keys: *keys, ValueSize: *value, Seed: *seed, AttemptTimeout: *attempt},
 	}
 	var exps []lab.Experiment
 	if *suite != "" {
-		if exps, err = lab.Suite(*suite, base); err != nil {
+		if exps, err = lab.Suite(*suite, base, *faultRate); err != nil {
 			fmt.Fprintf(stderr, "dkvlab: %v\n", err)
 			return 2
 		}
