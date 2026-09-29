@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/adivishall/quorum/internal/raftnode"
 	"github.com/adivishall/quorum/internal/replication"
@@ -31,6 +32,18 @@ type Front struct {
 	mu        sync.RWMutex
 	servers   map[replication.GroupID]*Server
 	noForward bool
+	m         *Metrics // Phase 16; nil: not instrumented
+}
+
+// SetMetrics instruments the front and every server attached to it, current
+// and future (nil stops instrumenting new ones).
+func (f *Front) SetMetrics(m *Metrics) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.m = m
+	for _, s := range f.servers {
+		s.setMetrics(m)
+	}
 }
 
 // NewFront returns a Front for node id with the given routing (nil: every key
@@ -48,6 +61,7 @@ func (f *Front) Attach(g replication.GroupID, node *raftnode.Node, store *Store)
 	srv := NewServer(f.id, node, store)
 	f.mu.Lock()
 	srv.SetForwarding(!f.noForward)
+	srv.setMetrics(f.m)
 	f.servers[g] = srv
 	f.mu.Unlock()
 	return srv
@@ -97,8 +111,23 @@ func (f *Front) Name() string { return f.id }
 // Route returns the group a key belongs to.
 func (f *Front) Route(key []byte) replication.GroupID { return f.route(key) }
 
-// Do serves one client request (Doer).
+// Do serves one client request (Doer), counting it as answered.
 func (f *Front) Do(ctx context.Context, req Request) (Response, error) {
+	f.mu.RLock()
+	m := f.m
+	f.mu.RUnlock()
+	if m == nil {
+		return f.do(ctx, req)
+	}
+	start := time.Now()
+	m.inflight.Inc()
+	resp, err := f.do(ctx, req)
+	m.inflight.Dec()
+	m.request(req, resp, start)
+	return resp, err
+}
+
+func (f *Front) do(ctx context.Context, req Request) (Response, error) {
 	if err := req.validate(); err != nil {
 		return Response{Status: StatusInvalid, Node: f.id, Message: err.Error()}, nil
 	}

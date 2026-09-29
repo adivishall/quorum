@@ -48,7 +48,20 @@ type Server struct {
 	mu        sync.Mutex
 	nextFwd   uint64 // forward ids; random start per incarnation (see NewServer)
 	pending   map[uint64]chan Response
-	noForward bool // redirect-only mode (SetForwarding(false))
+	noForward bool     // redirect-only mode (SetForwarding(false))
+	m         *Metrics // Phase 16; nil: not instrumented
+}
+
+func (s *Server) setMetrics(m *Metrics) {
+	s.mu.Lock()
+	s.m = m
+	s.mu.Unlock()
+}
+
+func (s *Server) metrics() *Metrics {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.m
 }
 
 // SetForwarding turns forwarding on (the default) or off. Off, the server is in
@@ -194,18 +207,22 @@ func (s *Server) forward(ctx context.Context, leader string, req Request) Respon
 	}()
 	budget := time.Until(deadlineOf(ctx))
 	payload := encodeForward(fid, budget, req)
+	m := s.metrics()
 	if err := s.node.SendApp(ctx, raftnode.NodeID(leader), transport.MsgForward, payload); err != nil {
-		st := StatusUnknown
+		st, result := StatusUnknown, "send_unknown"
 		if errors.Is(err, transport.ErrPeerNotConnected) || errors.Is(err, transport.ErrClosed) {
-			st = StatusUnavailable // not handed to any connection: nothing was sent
+			st, result = StatusUnavailable, "not_sent" // not handed to any connection: nothing was sent
 		}
+		m.forward(req.Group, result)
 		return Response{Status: st, Node: s.id, Leader: leader, Message: "forward to " + leader + ": " + err.Error()}
 	}
 	select {
 	case resp := <-ch:
+		m.forward(req.Group, "answered")
 		resp.Via = s.id
 		return resp
 	case <-ctx.Done():
+		m.forward(req.Group, "timeout")
 		return Response{Status: StatusUnknown, Node: s.id, Leader: leader, Message: "forwarded to " + leader + "; no answer before the deadline"}
 	}
 }
@@ -231,6 +248,7 @@ func (s *Server) onApp(peer raftnode.NodeID, kind transport.MsgKind, payload []b
 		go func() {
 			req.Timeout = budget
 			resp := s.handle(context.Background(), req, string(peer))
+			s.metrics().servedForward(req, resp)
 			_ = s.node.SendApp(context.Background(), peer, transport.MsgForwardResponse, encodeForwardResponse(fid, resp))
 		}()
 	case transport.MsgForwardResponse:
