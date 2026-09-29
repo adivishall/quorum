@@ -1468,14 +1468,8 @@ echo "== Phase 16: observability (docs/OBSERVABILITY.md) =="
 #      holding the separator makes two label sets one series (found by
 #      FuzzParse).
 mutant "series-keys-are-unambiguous" internal/metrics/metrics.go \
-  '	var b strings.Builder
-	for _, v := range values {
-		b.WriteString(strconv.Itoa(len(v)))
-		b.WriteByte(':')
-		b.WriteString(v)
-	}
-	return b.String()' \
-  '	return strings.Join(values, "\xff") + strconv.Itoa(0)[:0]' \
+  '	return b.String()' \
+  '	return strings.Join(values, "\xff")' \
   ./internal/metrics 'TestLabelValuesAreNeverAmbiguous'
 
 # 161. The front answers a request without counting it.
