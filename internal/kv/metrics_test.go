@@ -34,6 +34,22 @@ func scrapeKV(t *testing.T, r *metrics.Registry) metrics.Samples {
 // every forward a follower counted answered was served — once — by a peer;
 // and every replica counted the decisions it applied.
 func TestKVMetricsMatchTheResponses(t *testing.T) {
+	for attempt := 1; ; attempt++ {
+		if kvMetricsScenario(t) {
+			return
+		}
+		if attempt == 3 {
+			t.Fatal("premise: the group's term changed during every attempt")
+		}
+		t.Logf("attempt %d: an election ran during the scenario (premise voided); starting over on a fresh cluster", attempt)
+	}
+}
+
+// kvMetricsScenario runs the scenario once. Its premise is that no election
+// runs while it does — the retry of request 5 is a duplicate only if the
+// original executed, which a leader change can prevent — read from every
+// node's term; it reports false, asserting nothing, if the premise failed.
+func kvMetricsScenario(t *testing.T) bool {
 	c := startMultiCluster(t, 1)
 	regs := map[multiraft.NodeID]*metrics.Registry{}
 	for _, id := range c.ids {
@@ -55,6 +71,15 @@ func TestKVMetricsMatchTheResponses(t *testing.T) {
 	}
 	if leader == "" {
 		t.Fatal("no leader")
+	}
+	term := c.fronts[leader].Server(0).Node().Term()
+	stable := func() bool {
+		for _, id := range c.ids {
+			if c.fronts[id].Server(0).Node().Term() != term {
+				return false
+			}
+		}
+		return true
 	}
 	var follower multiraft.NodeID
 	for _, id := range c.ids {
@@ -102,6 +127,9 @@ func TestKVMetricsMatchTheResponses(t *testing.T) {
 		}
 	}
 	dup := send(leader, kv.Request{Op: kv.ReqPut, Group: 0, ClientID: id, RequestID: 5, AckedBelow: 1, Key: []byte("k5"), Value: []byte("v")})
+	if !stable() {
+		return false
+	}
 	if dup.Status != kv.StatusOK || !dup.Duplicate {
 		t.Fatalf("the retry of request 5 was not answered as a duplicate: %+v", dup)
 	}
@@ -160,6 +188,7 @@ func TestKVMetricsMatchTheResponses(t *testing.T) {
 			time.Sleep(5 * time.Millisecond)
 		}
 	}
+	return true
 }
 
 func lower(s string) string {
