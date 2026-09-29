@@ -171,8 +171,30 @@ The instrumented request path is within the run-to-run noise of the uninstrument
     restore mid-count.
   - `TestHostMetrics` and `TestTransportMetrics` check dropped frames, groups, frames and bytes by
     kind, and connections.
+- **Mutants 160–164** break the series key, the front's count of every answer, the decision
+  observer, the counting of role transitions by difference and the log's size; each is killed by
+  the test above written for it. `FuzzParse` fuzzes the parser, and this package's own output must
+  always parse back.
 - **Real processes:** `TestRealProcessesServeTruthfulMetrics` runs three `dkvd` processes and
   scrapes `/metrics` over HTTP. Each write sent through a follower is counted once at the answering
   front, forwarded by the follower, served by the leader and executed on every replica. It also
   checks peers, CPU and heap, and that a survivor counts the election it wins after a SIGKILL. Its
   premise, that no election ran during the writes, is read from the metrics.
+
+## 7. Found and fixed while building it
+
+1. **Two label sets could be one series** (found by `FuzzParse`, minimized to one line). A series
+   was keyed by its label values joined with a `\xff` byte, and the exposition split the key back
+   apart. A value holding that byte panicked the scrape, and `("a\xff", "b")` and `("a", "\xffb")`
+   collided. Each series now keeps its own values, and the key length-prefixes each one
+   (`TestLabelValuesAreNeverAmbiguous`, mutant 160). No label this system produces holds that
+   byte, but a tool parsing arbitrary scrapes would have hit it.
+2. **A scrape cost 705 µs.** Two causes: five stop-the-world `runtime.ReadMemStats` calls, and a
+   `strings.Replacer` rebuilt for every label value. After moving to `runtime/metrics` and a
+   package-level escaper it costs 96 µs.
+3. **The instrumented front allocated four times per request,** building label strings. Its series
+   are now cached by a struct key, and it allocates exactly as the bare front does.
+4. **A metric that would have lied:** the store's own decision counters reset on every snapshot
+   restore. The exported counts come from an observer outside the replicated state instead
+   (`TestDecisionCountsSurviveARestore`, mutant 162).
+
