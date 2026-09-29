@@ -45,10 +45,13 @@ slice returns a copy, so a caller can neither reorder nor mutate a group in plac
 are `Equal` iff they have the same shard and the same replicas in the same order — deterministic
 identity with no map iteration involved.
 
-**Membership stays static** (ADR-005). A `ReplicaGroup` has no join, leave, promote, demote,
-replace, or rebalance. A "membership change" remains what Phase 6 made it: a *new* configuration
-built from a new routing `Config`, compared against the old one — never a mutation of a live
-group.
+**Membership stays static** (ADR-005) — in Phase 8. A `ReplicaGroup` has no join, leave, promote,
+demote, replace, or rebalance. A "membership change" remains what Phase 6 made it: a *new*
+configuration built from a new routing `Config`, compared against the old one — never a mutation
+of a live group. *Phase 15:* a Raft group's membership is now its replicated `Configuration`
+(voters, learners, and outgoing voters while joint), changed by joint consensus
+(`docs/MEMBERSHIP.md`, ADR-022); a `ReplicaGroup` still describes only where a group started — its
+genesis.
 
 **Validation rejects, it never repairs.** `NewReplicaGroup` refuses, rather than silently
 fixing, every one of:
@@ -291,7 +294,7 @@ model and a replica-group abstraction. It does **not** provide:
 - commit quorums, failover, or fault tolerance;
 - cross-node consistency, linearizability, or any distributed consistency guarantee;
 - request forwarding, client serving, an HTTP API, or a dashboard;
-- snapshots, log truncation from the front, or dynamic membership;
+- snapshots, log truncation from the front, or dynamic membership (Phases 14 and 15 added them);
 - persistence of the log (the Phase 8 log is in-memory).
 
 **No distributed consistency guarantee is added by Phase 8**, anywhere in the repository. Phase 9

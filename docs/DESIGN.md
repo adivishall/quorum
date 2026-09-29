@@ -1,7 +1,7 @@
 # DESIGN — formats, protocols, state machines
 
 Status: **Phase 0 specification, with each later phase's implementation notes inline (latest:
-Phase 10).**
+Phase 15).**
 Formats defined here are v1 and are versioned on disk so they can change without silent
 misinterpretation of old data.
 
@@ -351,6 +351,14 @@ Consensus Algorithm"), sections 5.1–5.4 plus §7 snapshots.
 > without the prefix, streams it in ≤ 1 MiB chunks over the InstallSnapshot kind, and installs a
 > received one in the order term → publication → boundary record → restore; recovery reconciles
 > the snapshot with the log (docs/SNAPSHOTS.md §6).
+>
+> **Phase 15 update (ADR-022, ADR-023, docs/MEMBERSHIP.md, docs/MULTI_RAFT.md).** Raft §6
+> membership changes are **implemented**, with a learner stage, one member at a time: a
+> configuration entry is a typed log entry (durable record kind 4), a node's configuration is the
+> latest one in its log — committed or not — or its snapshot's or genesis's, and every quorum (vote,
+> commit, ReadIndex) is a majority of the current voters and, while joint, of the outgoing voters
+> too. The snapshot file carries the group id and the configuration at its index (format v2). A
+> node runs one core and one driver per group it hosts; the core never sees a group id.
 
 ### 8.1 Persistent state (fsynced before any RPC reply that depends on it)
 
@@ -462,6 +470,12 @@ application's handler (`docs/API.md` §6, ADR-020). `InstallSnapshot` and its re
 `internal/snapshot`), kind 21 the core's `MsgSnapshotResponse` (codec in `internal/raft`) —
 ADR-021, `docs/SNAPSHOTS.md` §9.
 
+**Phase 15: the group envelope.** Every payload a group's driver sends — Raft messages, snapshot
+chunks, forwards — is prefixed once with `uvarint(GroupID)` (canonical, at most 32 bits) inside the
+frame's payload; the frame kind is unchanged. The receiving node host strips it and delivers the
+payload to that group only, or drops the frame: an unknown, stopped or retired group, a malformed
+or non-canonical envelope, a full inbox (`docs/MULTI_RAFT.md` §4). The transport never parses it.
+
 Payloads use a hand-written binary codec (explicit `Marshal`/`Unmarshal`, varints, no
 reflection). Not gob, not JSON, not protobuf. Reasons, in order of weight:
 1. Owning the transport is what makes Phase 10 fault injection *real*. We can drop, delay,
@@ -474,8 +488,9 @@ reflection). Not gob, not JSON, not protobuf. Reasons, in order of weight:
 `transport.Transport` is an interface, so a gRPC implementation could be added later without
 touching `internal/raft`.
 
-Client-facing traffic is plain HTTP/JSON (`docs/API.md`), because clients should be
-inspectable with `curl` during a demo.
+Client-facing traffic was designed as plain HTTP/JSON, so that clients are inspectable with
+`curl` during a demo. As built (Phases 12–15) it is a framed binary protocol on its own port, wire
+protocol v3 (`docs/API.md`); there is no HTTP API.
 
 ---
 
@@ -495,6 +510,12 @@ inspectable with `curl` during a demo.
 4a. (Phase 14) Remove snapshot temporaries; load and validate the published snapshot;
         reconcile it with the log — recover, complete an interrupted install, or refuse
         (docs/SNAPSHOTS.md §6); restore the state machine from it.
+4b. (Phase 15) Before 4: read the group identity file beside the log (group id and genesis
+        configuration; written once, before the log exists) — refuse durable state without it,
+        or a file naming another group or genesis; the snapshot must be of the same group. The
+        core's configuration is then the latest configuration entry in the recovered log, else
+        the snapshot's, else the genesis (docs/MEMBERSHIP.md §2). A node host runs this
+        sequence once per group directory, each group independently (docs/MULTI_RAFT.md §3).
 5.  Reconcile: engine.appliedIndex must be <= raft.lastIndex.
         If engine.appliedIndex > raft.lastIndex → ErrInconsistent, refuse to start.
         (This means the state machine is ahead of its own log: impossible unless the
@@ -545,5 +566,7 @@ on-ring encodings.
   Ties at equal tokens break by `(token, ownerID, vnodeIndex)`, so collisions are deterministic
   rather than errors.
 - Two rings: `key → shard` (fixed `ShardCount`, default 16) and `shard → replica group` (over
-  the node set, declarative metadata only). ADR-012 is the rationale; `docs/ROUTING.md` §9 is
+  the node set). Since Phase 15 the shard is the key's Raft group (group id = shard id) and the
+  replica group is that group's **genesis** voter set (`multiraft.Assignment`); the group's later
+  members are its own replicated configuration, which the routing never follows. ADR-012 is the rationale; `docs/ROUTING.md` §9 is
   the explicit list of what this phase does not build.

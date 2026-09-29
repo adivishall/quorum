@@ -3,8 +3,8 @@
 Status: **unchanged since Phase 1.** The CLI constructs an in-process, in-memory store, so
 nothing survives process exit. The storage layer underneath it has been durable since Phase 2
 and LSM-backed since Phase 3 (`docs/LSM.md`), but the CLI is not wired to a data directory
-yet — that and a `--data-dir` flag belong to Phase 15, and Phase 7 turns `dkv` into a network
-client. The command surface below is intended to survive both changes.
+yet — that and a `--data-dir` flag belong to the API + CLI phase, which Phase 15 displaced and
+which is not scheduled (`docs/ROADMAP.md`), as does turning `dkv` into a network client. The command surface below is intended to survive both changes.
 
 ---
 

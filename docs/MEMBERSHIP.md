@@ -139,9 +139,11 @@ Only a leader accepts an operation, and at most one change is under way per grou
 refused (`ErrConfChangeInProgress`) while an uncommitted configuration entry exists or the
 configuration is joint (`TestOneConfigurationChangeAtATime`). The leader appends the joint entry;
 when it commits — both majorities — the leader appends the final entry itself, **and tries to commit
-it at once** (when the leader alone is the final configuration's quorum no acknowledgement would
-ever come — §8, bug 3); when the final entry commits the change is settled
-(`TestConfChangeTransitions`). A **replacement** of a failed node `A` by `D` is the documented
+at once** under the final configuration, which is now its own (when the leader alone is the final
+configuration's quorum no acknowledgement would ever come — §8, bug 3; entries a majority of the
+new voters already holds commit with it — §8, bug 5); the final entry is never appended before the
+joint entry commits (`TestFinalEntryWaitsForTheJointCommit`); when the final entry commits the
+change is settled (`TestConfChangeTransitions`). A **replacement** of a failed node `A` by `D` is the documented
 sequence: start `D` as a joiner → `AddLearner(D)` → `Promote(D)` → `RemoveVoter(A)`, each settled
 before the next. There is no composite operation: each step is individually safe and individually
 recoverable. No other protocol exists — in particular no "remove the old member, then add the new
@@ -248,6 +250,20 @@ retires the group on that node, keeping its files (`docs/MULTI_RAFT.md` §3).
    predated its addition — a committed configuration without itself — was reported removed, and its
    host retired the group before the entries that added it arrived. Fix: only a former member is
    removed. Regression: `TestJoinerInstallingASnapshotThatPredatesItIsNotRemoved`; mutants 150, 158.
+5. **A checker stricter than the rule, and a rule no core test pinned** (the 200-seed gate, after
+   bug 3's fix: 24 runs across every membership profile). One acknowledgement commits the joint
+   entry; the leader appends the final entry and, with bug 3's fix, tries to commit at once —
+   under the final configuration, which a majority of the new voters already satisfies for later
+   entries. Raft §6 allows this: a configuration takes effect when appended, and once the joint
+   entry is committed every later leader needs a majority of the new voters too. The simulator's
+   INV-MB3 check excluded a final entry appended in the same event and judged the whole advance
+   by the joint rule, so it reported a violation where there was none (seed 170 of the
+   `membership` profile passes before bug 3's fix and fails after it). Fix: the check takes the
+   leader's current configuration, and adds the precondition that makes that sound — a final
+   entry follows a joint entry already committed under the joint rule. Probing that precondition
+   with a mutant (the leader finalizing on any commit while joint) showed no core test caught it:
+   `TestFinalEntryWaitsForTheJointCommit` now does. Regression: `TestMembershipRegressionSeeds`
+   (the gate's seeds); mutant 159. No execution of the implementation was unsafe.
 
 ## 9. Invariants and evidence
 
@@ -258,7 +274,7 @@ of the rule it checks, at the instant it must hold, and has a mutant its tests k
 |---|---|---|---|
 | INV-MB1 | Every committed configuration follows the previous committed one by exactly one transition of §4: a learner added or removed with the voters unchanged; a joint configuration whose outgoing set is the previous voters and whose voters differ by one member (a promoted learner, or a removed voter); a final configuration equal to the joint one's voters and learners. | the simulator's committed record (`commitConf`, an independent statement of the rules), every event of every run | 129, 130 |
 | INV-MB2 | A node's configuration is exactly the one its own log and snapshot give — the core holds no membership of its own — and a configuration is known at an index only with evidence. | the simulator after every event (`derivedConf`); `TestConfAtAnswersOnlyWithEvidence` | 131, 134, 135, 136 |
-| INV-MB3 | A leader advances its commit index only when the entry is durable on a majority of its configuration's voters and, when joint, of its outgoing voters; a candidate wins only with the quorum of every configuration its campaign must win. | the simulator at every commit advance, against the nodes' **durable** logs; `TestQuorumRules` | 126, 127 |
+| INV-MB3 | A leader advances its commit index only when the entry is durable on a majority of its current configuration's voters and, when joint, of its outgoing voters; it appends a final configuration only once the joint entry it ends is committed — durable on majorities of both voter sets; a candidate wins only with the quorum of every configuration its campaign must win. | the simulator at every commit advance and every final append, against the nodes' **durable** logs; `TestQuorumRules`, `TestFinalEntryWaitsForTheJointCommit` | 126, 127, 159 |
 | INV-MB4 | A leader is a voter of its configuration or is leading its own removal; once a configuration excluding node X is committed, X never becomes leader of a later term. | the simulator after every event | 137, 142, 157 |
 | INV-MB5 | Only a node allowed by the campaign rule campaigns, and only the voters whose votes count are asked; learners, joiners and removed nodes never lead, and a leader replicates only to its configuration's members. (Any node may grant a vote.) | the simulator at every send and every election; `TestSimRemoveAFollower` | 128, 140, 143 |
 | INV-MB6 | Every frame a node host receives is delivered to the group its envelope names, or dropped — never to another group. | `TestFramesReachExactlyTheirGroup`, `TestNodeDropsFramesOfOtherGroups` | 152, 153, 154 |
@@ -314,7 +330,9 @@ of the rule it checks, at the instant it must hold, and has a mutant its tests k
   follower, whose leader stops replicating to it once the final entry is appended — keeps
   campaigning with ever higher terms, refused by the group; the operator stops it. A removed
   *leader* learns it (it commits its own removal) and its host retires the group. A node that
-  learns its removal keeps its files; re-adding it later means a new join with fresh files.
+  learns its removal keeps its files. Re-adding the same id with fresh files is not claimed safe: a
+  wiped node has forgotten the votes it cast, and a vote request delayed from an old term could
+  collect a second one (`docs/SNAPSHOTS.md` §16). A returning machine joins under a new id.
 - **No PreVote, no check-quorum.** A node that still counts a removed node as a member (it lags on
   configurations) can be made to adopt that node's inflated term during a transition, costing an
   election; an isolated leader keeps believing it leads until it hears a higher term.

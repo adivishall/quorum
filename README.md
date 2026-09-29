@@ -6,7 +6,7 @@ Quorum is currently implementing its durable storage engine. No Raft library, no
 database, no consensus service — the storage engine and the consensus implementation are
 the project, and they are being built in that order.
 
-> **Status: Phase 14 of 25 — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, a working Raft consensus core, deterministic fault injection, a proven crash-recovery model for the Raft node, client-visible linearizability of single-key operations on one Raft group, safe client retries (request identity, deduplication at apply and request forwarding), and snapshots with log compaction and follower installation, checked on real client histories.**
+> **Status: Phase 15 of 25 — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, a working Raft consensus core, deterministic fault injection, a proven crash-recovery model for the Raft node, client-visible linearizability of single-key operations per Raft group, safe client retries (request identity, deduplication at apply and request forwarding), snapshots with log compaction and follower installation, and dynamic membership by joint consensus with one Raft group per shard, checked on real client histories.**
 >
 > **Implemented:** a write-ahead log, an ordered memtable, immutable on-disk SSTables, Bloom
 > filters, size-tiered compaction, crash-safe MANIFEST-based file publication, and restart
@@ -71,13 +71,23 @@ the project, and they are being built in that order.
 > 100,000 writes: a restart replays 1 entry instead of 100,001. 32 more mutants are killed; the
 > 200-seed schedules found a latent core liveness bug that compaction made reachable (a stale
 > rejection stranding a follower), now fixed.
+> Phase 15 adds **dynamic membership and multi-Raft** (`docs/MEMBERSHIP.md`, `docs/MULTI_RAFT.md`):
+> a group adds a learner, promotes it and removes voters — the leader included — one member at a
+> time by Raft §6 joint consensus, with the configuration as replicated state carried by the log
+> and the snapshot; a node hosts one Raft group per shard it serves, each with its own log,
+> snapshot, identity file and state machine, every frame tagged with its group; clients are routed
+> key → shard → group with one session per group. Checked by the membership invariants at every
+> event of 200-seed schedules, a bounded model of every four-step sequence, a 6,660-crash
+> membership matrix (0 failures) and ten real-process tests. 34 more mutants are killed; the
+> schedules found a vote deadlock and a removal that could never finish, now fixed.
 >
-> **What that claim is, exactly:** single-key PUT/GET/DELETE on **one** Raft group; every
-> recorded finite history linearizable, plus an argument with named assumptions — not a proof
-> over every execution; retries are inside the claim for identified writes (at most one execution
-> per request — exactly one if it executes; not exactly-once delivery), and anonymous writes keep
-> Phase 12's semantics. **Not implemented:** the HTTP API, multi-group routing, dynamic membership,
-> a dashboard, the LSM engine as the replicated state machine. See
+> **What that claim is, exactly:** single-key PUT/GET/DELETE, each in its key's Raft group; every
+> recorded finite history linearizable per group, plus an argument with named assumptions — not a
+> proof over every execution; retries are inside the claim for identified writes (at most one
+> execution per request — exactly one if it executes; not exactly-once delivery), and anonymous
+> writes keep Phase 12's semantics. Nothing is claimed across groups. **Not implemented:** the
+> HTTP API, rebalancing or moving shards between groups, a dashboard, the LSM engine as the
+> replicated state machine. See
 > [docs/ROADMAP.md](docs/ROADMAP.md) for exactly what is done and what is not.
 >
 > The binary is still called `dkv`; that is the command name, not the project name.
@@ -157,8 +167,14 @@ log growth ────────▶│  snapshot + atomic publish · log comp
                     │  session table in the snapshot · crash matrix      │
                     └────────────────────────────────────────────────────┘
 
+                    ┌──────── implemented, Phase 15 (membership) ────────┐
+membership ────────▶│  joint consensus · learners · one change at a time │
+many groups ───────▶│  node host · group envelope · group identity file  │
+                    │  key → shard → group · wire v3 · group sessions    │
+                    └────────────────────────────────────────────────────┘
+
                     ┌──────────────── not implemented ───────────────────┐
-                    │  HTTP API · dashboard                              │ Phases 15+
+                    │  HTTP API · dashboard · rebalancing                │ later phases
                     └────────────────────────────────────────────────────┘
 ```
 
@@ -224,7 +240,18 @@ persists before it replies, sends over the transport, ticks, and applies. A whol
 cluster runs in one goroutine, replayable from a seed, so the paper's figures (including Figure 8)
 are deterministic tests and the safety invariants are checked after every step. What Phase 9 proves
 and — as carefully — what it does not: [docs/RAFT.md](docs/RAFT.md). Run a real 3-node group with
-`dkvd -raft`.
+`dkvd -raft`, or, since Phase 15, one group per shard with `dkvd -cluster` (identical `-shards`,
+`-rf` and `-nodes` on every node) and change a group's members through its JSON-line admin port:
+
+```bash
+dkvd -id n1 -listen 127.0.0.1:7001 -peers n2=127.0.0.1:7002,n3=127.0.0.1:7003 -data-dir d1 \
+     -cluster -shards 4 -rf 3 -client-listen 127.0.0.1:8001 -admin-listen 127.0.0.1:9001
+echo '{"op":"add-learner","group":0,"id":"n4","addr":"127.0.0.1:7004"}' | nc 127.0.0.1 9001
+```
+
+The membership protocol, its quorum rules and every case it handles:
+[docs/MEMBERSHIP.md](docs/MEMBERSHIP.md); the node host, message routing and client routing:
+[docs/MULTI_RAFT.md](docs/MULTI_RAFT.md).
 
 Phase 10 injects **faults** at the system's real boundaries, never inside the Raft core. The durable
 log does its file I/O through a small filesystem seam (`internal/vfs`), under which
@@ -250,7 +277,7 @@ Claim a guarantee it has not verified. Specifically:
   marked `PLANNED` and may not be cited as a guarantee anywhere else.
 - The things it cannot do are enumerated in [docs/LIMITATIONS.md](docs/LIMITATIONS.md) —
   including the ones that are inherent (no Byzantine tolerance, no liveness under full
-  asynchrony) and the ones that are a choice (no dynamic membership, no transactions).
+  asynchrony) and the ones that are a choice (no rebalancing, no transactions).
 
 ## Quickstart
 
@@ -284,7 +311,7 @@ One-shot form, with exit codes a script can branch on
 
 **The CLI is in-memory**: each invocation gets a fresh store, so state does not survive
 process exit. The CLI says so on every mutating command. The storage layer is durable; the
-CLI is not wired to it until Phase 15. Full CLI contract: [docs/CLI.md](docs/CLI.md).
+CLI is not wired to it yet (the API + CLI phase is not scheduled, `docs/ROADMAP.md`). Full CLI contract: [docs/CLI.md](docs/CLI.md).
 
 ## Durability, stated exactly
 
@@ -318,7 +345,7 @@ durability, and it is why `batch` is the default.
 
 > **The CLI is not wired to a data directory yet** — it still constructs an in-memory store,
 > so `dkv` remains ephemeral even though the storage layer is not. That wiring belongs to
-> Phase 15.
+> the API + CLI phase, which is not scheduled.
 
 ### The storage engine, stated exactly
 
@@ -407,7 +434,10 @@ it is being answered out of memory.
 | [LINEARIZABILITY.md](docs/LINEARIZABILITY.md) | The client-visible contract: the object model, write completion, ReadIndex and its safety argument, incomplete operations and retries, the checker and how it was validated, every real-process and simulator scenario, the mutants, and exactly what is and is not verified; §15: logical operations under retries and deduplication |
 | [CLIENT_SEMANTICS.md](docs/CLIENT_SEMANTICS.md) | The Phase 13 contract: logical requests, ClientID and RequestID, what happens to an identified write, reads, the eleven statuses, unknown outcomes, bounds, forwarding, and what the guarantee is and is not |
 | [DEDUP.md](docs/DEDUP.md) | How the server keeps it: the session table inside the replicated state machine, the decision at apply, recovery by replay and every crash window, concurrency, bounds and eviction, verification, measured cost, mutants, limitations |
-| [API.md](docs/API.md) | The client wire protocol v2: framing, messages, operations, validation, status codes, forwarding and redirect-only mode, the session client library |
+| [API.md](docs/API.md) | The client wire protocol v3: framing, messages, the request's group, operations, validation, status codes, forwarding and redirect-only mode, the session and sharded client libraries |
+| [SNAPSHOTS.md](docs/SNAPSHOTS.md) | Snapshot state and format, creation and compaction order, recovery's reconciliation, crash windows, follower installation, chunking, dedup preservation, corruption policy, measurements, and snapshots with membership |
+| [MEMBERSHIP.md](docs/MEMBERSHIP.md) | Joint-consensus membership with learners: the configuration as replicated state, the three configurations a node distinguishes, quorum rules, the operations, every role and case, snapshots, the bugs found, the INV-MB invariants and their evidence |
+| [MULTI_RAFT.md](docs/MULTI_RAFT.md) | Many Raft groups per node: identities, the node host, the group envelope, the persistence layout, client routing and group-local sessions, the admin protocol, evidence, measured costs |
 
 ## Development
 
@@ -418,7 +448,7 @@ make check        # gofmt + gitignore guard + go vet + go test -race — the pha
 make build
 make test
 make race
-make integration  # real-process tests: SIGKILL recovery, Raft over TCP, kill/stop/partition faults, linearizability
+make integration  # real-process tests: SIGKILL recovery, Raft over TCP, kill/stop/partition faults, linearizability, membership
 make faults       # the deterministic fault schedules and client workloads at a large seed budget (FAULT_SEEDS=200)
 make mutation     # mutation testing: every rule-violating edit must be caught
 make fuzz         # every fuzz target in the repository (FUZZTIME=10s each)

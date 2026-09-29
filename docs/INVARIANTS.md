@@ -250,6 +250,11 @@ cannot commit the term-2 entry, failing the `commit >= 3` assertion), and the co
 checks would fire if a committed entry were ever overwritten. Power-loss durability is untested throughout (SIGKILL only), as everywhere in
 this project (`docs/FAILURE_MODEL.md`).
 
+**Phase 15.** INV-R1..R10 stay in force with membership changes: the simulator checks them after
+every event of every membership profile, the membership crash matrix and the bounded model. Their
+statements need no change — R4 already speaks of every later leader, whatever configuration elected
+it; what makes it hold across a change is the quorum intersection INV-MB3 checks.
+
 ## Fault injection (Phase 10)
 
 Enforced by `internal/raftlog`, `internal/raftnode` and `cmd/dkvd`; exercised by `internal/fault`,
@@ -319,7 +324,7 @@ introduced by ADR-012.
 | INV-C1 | Key routing is a pure function of (key, membership configuration). Same inputs → same shard, on every node, forever. | `internal/routing`: `TestGoldenTokenVectors`, `TestGoldenKeyToShard`, `TestGoldenReplicaGroups` (values from an independent Python reference, not self-checked), `TestRouteIsDeterministicAcrossManyCalls`, `TestEquivalentConfigsRouteIdentically`, `TestNodeOrderDoesNotAffectRouting`, `TestConfigRoundTripThroughSerializationRoutesIdentically`, `FuzzRouteIsDeterministicAndValid` | VERIFIED |
 | INV-C2 | Every shard has exactly one replica group, and every key maps to exactly one shard. No key is unowned; no key is doubly owned. | `internal/routing`: `TestEveryTokenIntervalHasExactlyOneOwner` (arc lengths sum to 2⁶⁴ — no gap, no overlap — plus per-arc boundary/interior ownership), `TestRingIsSorted`, `TestSuccessorBoundaryAndWrap`, `TestTokenCollisionIsDeterministic`, `TestRouteAlwaysReturnsAValidShard`, `TestEveryShardIsRepresentedExactlyOnce`, `TestEveryShardHasOneReplicaGroup` | VERIFIED |
 | INV-C3 | A membership change of one node moves only the keys it must (≈ 1/N of the space), not a reshuffle. | `internal/routing`: `TestKeyToShardIsStableAcrossNodeMembershipChange` (0 key→shard changes), `TestOwnerMovesOnlyWhereItsShardPrimaryMoved` (movement fully attributed to shard reassignment), `TestConsistentHashingBeatsModuloOnRedistribution`, `TestRedistributionGoldenCounts` (fixed 141/141/68 ring vs 383/383/425 modulo shards of 512) | VERIFIED |
-| INV-C4 | A client request for key k is never served by a node that does not host k's shard, except as an explicit forward or redirect. | Phase 8+ (request serving) — Phase 7 has no server to violate it | PLANNED |
+| INV-C4 | A client request for key k is never served by a node that does not host k's shard, except as an explicit forward or redirect. | Phase 15: a node's front hands a keyed request only to the server of the group it names, and refuses one naming another group than its key's (`INVALID_REQUEST`); a node hosting no replica of the group answers `NOT_LEADER` with no hint and executes nothing; a group's server forwards only within the group. `TestFrontRefusesAMisroutedRequest` (nothing executed on any replica of any group), `TestShardedClientRoutesEachKeyToItsGroup`, `TestRealTwoGroupsOnThreeNodes`; mutant 156 | VERIFIED (in-process over real TCP; real processes) |
 
 ## Transport / node process (Phase 7)
 
@@ -356,7 +361,7 @@ consistency guarantee — Phase 8 adds no such claim anywhere.
 | INV-P8 | `appliedIndex` never exceeds `commitIndex`: applying an uncommitted index is rejected. | `TestApplyInitialAndMonotonic`, `TestCommittedRangeEnumeration`, `TestAgainstReferenceModel` (asserted after every step), `FuzzLogOperations` | VERIFIED |
 | INV-P9 | No entry is applied twice through the interface: application is a watermark, so a re-issued apply applies nothing and a state machine driven from `Unapplied` sees each index exactly once. | `TestNoDoubleApplication`, `TestCommittedRangeEnumeration` | VERIFIED |
 
-## Client semantics (Phase 12: linearizability; Phase 13: identity, dedup, forwarding; Phase 15: API)
+## Client semantics (Phase 12: linearizability; Phase 13: identity, dedup, forwarding; Phase 15: per group, through membership changes)
 
 Phase 12 rows are enforced by `internal/raft` (ReadIndex), `internal/raftnode` (write and read
 completion), `internal/kv` (state machine, server, wire protocol) and `cmd/dkvd`; checked by
@@ -371,7 +376,7 @@ bounded result, not a proof over all executions (LINEARIZABILITY §12).
 | INV-X1 | A write acknowledged to a client is readable by a subsequent linearizable read from *any* client. | `lincheck` on every recorded history; explicitly: `TestRealCompletedWriteIsSeenByEveryLaterRead` (every node contacted first), `TestRealReadsAcrossLeaderChanges`, `TestRealWriteCrashWindows` (a committed write stays visible across the leader's SIGKILL, acknowledged or not); simulator: INV-X5 + INV-X7; mutants 40, 41, 43, 44 | VERIFIED (recorded histories; one Raft group) |
 | INV-X2 | **At most once per identity.** An identified write — `(ClientID, RequestID)` — changes the key-value state at most once, however many log entries carry it; every other entry carrying it is answered with that execution's index (or refused). | `internal/raftsim`: checked at every apply of every replica (no identity executes at two indexes) across the six session profiles × 200 seeds and the scripted cases; every real-process Phase 13 test replays the durable committed logs (`dedupEvidence`); `TestUnknownWriteRetriedAfterLeaderCrashIsOneRequest`, `TestRetryAtEveryCrashPointOfAWrite`, `TestConcurrentDuplicatesAtTwoNodes`, `TestRealSessionRetryAcrossCrashWindows`, `TestRealConcurrentDuplicatesThroughEveryNode`; the logical history is linearizable (LINEARIZABILITY §15); mutants 61–75, 83–86, 88, 89. Anonymous writes (ClientID 0) are outside it — Phase 12's `TestRealIncompleteWriteThenRetry` still shows one applied twice | VERIFIED (recorded histories and replayed logs; one Raft group) |
 | INV-X3 | A read in `linearizable` mode never returns a value older than any completed write that preceded the read's invocation in real time. (The only read mode that exists.) | `lincheck` on every recorded history; `TestRealStaleLeaderNeverServesARead`, `TestRealMinorityLeaderWithAFollowerNeverServesARead` (five real processes), `TestKVStaleLeaderReadIsNeverServed`, `TestKVMinorityLeaderWithAFollowerNeverServesARead`, `TestKVNewLeaderReadWaitsForItsNoop`; INV-X7; the ReadIndex argument (LINEARIZABILITY §5.2); mutants 34–39, 42, 43, 54–57, 59 | VERIFIED (recorded histories; one Raft group) |
-| INV-X4 | A read in `stale` mode is never *presented* as linearizable — the API response carries the mode it was served under. | Phase 15 API test (no `stale` mode exists yet) | PLANNED |
+| INV-X4 | A read in `stale` mode is never *presented* as linearizable — the API response carries the mode it was served under. | none: no `stale` mode exists | PLANNED |
 | INV-X5 | **Acknowledged means committed.** A write reported OK at (index *i*, term *t*) is the entry committed at *i*: its term is *t* and its bytes are the command proposed. | `internal/raftsim`: checked at the completion instant of every simulated write (`kvPoll`); `TestWaitersCompleteWritesOnlyInTheirTerm`, `TestKVWriteIsNotAcknowledgedBeforeCommit`; mutants 40, 41 | VERIFIED (simulation; driver unit) |
 | INV-X6 | **Lost means no effect.** A write reported lost (`ErrLost`) is not committed at its index — a different entry is. | `internal/raftsim`: checked at every lost completion; `TestKVWriteIsNotAcknowledgedBeforeCommit`; `TestWaitersCompleteWritesOnlyInTheirTerm` | VERIFIED (simulation; driver unit) |
 | INV-X7 | **ReadIndex freshness.** A read is served at a read index — and from a state machine applied through at least — the highest index committed **anywhere** in the cluster when the read was registered. | `internal/raftsim`: checked at every read completion across 1,400 seeded runs and the scripted attacks (it is what catches the no-quorum mutant in the seeded `kv-splits` runs); `TestAcksFromBeforeTheReadDoNotConfirmIt`, `TestNewLeaderReadIndexIsAtLeastItsNoop`, `TestIsolatedLeaderNeverConfirmsARead`; mutants 35–37, 42, 55 | VERIFIED (simulation; core unit) |
@@ -388,8 +393,9 @@ bounded result, not a proof over all executions (LINEARIZABILITY §12).
 "Verified" for INV-X1/X3 is a statement about recorded, finite histories from one Raft group of
 three nodes — real processes, the real driver, and seeded simulations — plus an argument
 (LINEARIZABILITY §3, §5.2) whose assumptions are named. It is not a proof over every execution,
-and it does not cover routed multi-group deployments, membership change, or hidden retries of
-**anonymous** writes (identified writes: INV-X2, Phase 13). Since Phase 14 it covers histories with
+and it does not cover hidden retries of **anonymous** writes (identified writes: INV-X2, Phase 13).
+Since Phase 15 it covers each group of a multi-group deployment on its own, and histories with
+membership changes (INV-MB10, LINEARIZABILITY §16); nothing is claimed across groups. Since Phase 14 it covers histories with
 snapshots, compaction and installs: the `kv-snapshots-*` profiles and the real-process snapshot
 tests (INV-SN5). INV-X5..X8 and INV-X11 are
 implementation invariants checked at the instant they must hold in the simulator, independently of
@@ -420,5 +426,41 @@ INV-SN3's crash half is proven against a process crash on real processes and fil
 **modeled** power loss in the simulator — real power loss is untested, as everywhere. INV-SN1's
 model comparison runs in the simulator (where every snapshot's state is compared); real processes
 compare the nodes' durable states with each other and with every acknowledged write. None of the
-series says anything about a state beyond the 512 MiB snapshot bound (it is not snapshotted), about
-membership change, or about more than one group (`docs/SNAPSHOTS.md` §16).
+series says anything about a state beyond the 512 MiB snapshot bound (it is not snapshotted). Since
+Phase 15 the snapshot also carries the group id and the configuration at its index; that half is
+INV-MB7 and INV-MB8 below.
+
+## Membership and multi-Raft (Phase 15)
+
+Enforced by `internal/replication` (the configuration and its canonical form), `internal/raft`
+(joint consensus, the quorum function, the campaign and vote rules, `ConfAt`), `internal/raftlog`
+(typed configuration records), `internal/snapshot` (format v2: group and configuration),
+`internal/raftnode` (the group identity file, the envelope, `ChangeMembership`),
+`internal/multiraft` (the node host) and `internal/kv` (the front); specified in
+`docs/MEMBERSHIP.md` and `docs/MULTI_RAFT.md` and introduced by ADR-022 and ADR-023. `M` is the
+manifest's series, so these are `MB`. Each is checked by code independent of the rule it checks, at
+the instant it must hold, and has mutants its tests kill (mutation script numbers).
+
+| ID | Invariant | Checked by | Status |
+|---|---|---|---|
+| INV-MB1 | **Committed configurations change by one legal step.** Every committed configuration follows the previous committed one by exactly one transition: a learner added or removed with the voters unchanged; a joint configuration whose outgoing voters are the previous voters and whose voters differ by one member (a promoted learner, or a removed voter); a final configuration equal to the joint one's voters and learners. | `internal/raftsim`: the committed record (`commitConf`, an independent statement of the rules) at every event of every run; `internal/raft`: `TestConfChangeTransitions`, `TestOneConfigurationChangeAtATime`; mutants 129, 130 | VERIFIED (simulation; core unit) |
+| INV-MB2 | **The configuration is derived, never held.** A node's configuration is exactly the one its own log and snapshot give, and a configuration is known at an index only with evidence. | `internal/raftsim`: `derivedConf` after every event; `TestConfAtAnswersOnlyWithEvidence` (twelve cases); mutants 131, 134, 135, 136 | VERIFIED (simulation; core unit) |
+| INV-MB3 | **Quorums intersect across a change.** A leader advances its commit index only when the entry is durable on a majority of its current configuration's voters and, when joint, of its outgoing voters (a configuration takes effect when appended); it appends a final configuration only once the joint entry it ends is committed — durable on majorities of both voter sets; a candidate wins only with the quorum of every configuration its campaign must win. | `internal/raftsim`: at every commit advance and every final append, against the nodes' **durable** logs, including a leader that removed itself in the same event; `TestQuorumRules`, `TestPromoteNeedsTheNewMajority`, `TestRemoveVoterNeedsTheOldMajority`, `TestFinalEntryWaitsForTheJointCommit`; mutants 126, 127, 159 | VERIFIED (simulation; core unit) |
+| INV-MB4 | **A removed node never regains authority.** A leader is a voter of its configuration or is leading its own removal; once a configuration excluding node X is committed, X never becomes leader of a later term. | `internal/raftsim` after every event; `TestSimRemovedNodeRestartsAndStaysOut`, `TestRealRemoveAFollowerAndRestartIt`, `TestRealReplaceACrashedNode`; mutants 137, 142, 157 | VERIFIED (simulation; real processes) |
+| INV-MB5 | **Only members take part.** Only a node allowed by the campaign rule campaigns, and only the voters whose votes count are asked; learners, joiners and removed nodes never lead, and a leader replicates only to its configuration's members. (Any node may grant a vote.) | `internal/raftsim` at every send and every election; `TestLearnerReplicatesButNeverCampaignsOrCounts`, `TestSimRemoveAFollower`; mutants 128, 140, 143 | VERIFIED (simulation; core unit) |
+| INV-MB6 | **A frame reaches its group or nothing.** Every frame a node receives is delivered to the group its envelope names, or dropped — never to another group. | `TestFramesReachExactlyTheirGroup`, `TestNodeDropsFramesOfOtherGroups`, `TestEnvelopeRoundTripAndRefusals`, `FuzzUnwrapGroup`; mutants 152, 153, 154 | VERIFIED (real TCP; unit; fuzz) |
+| INV-MB7 | **Recovery preserves membership.** A node's crash or restart changes no group's membership: every group recovers its configuration from its own files alone, and the recovered configuration is the one the node held. | `internal/raftsim`: the derivation after every boot; the membership crash matrix (6,660 crashes, 0 failures); `TestMembershipSurvivesRestarts`, `TestRealNewMemberCatchesUpBySnapshotAndTheClusterRestarts`, `TestRealJointConfigurationSurvivesALeaderCrash`; mutants 132, 146–148 | VERIFIED (simulation incl. modeled power loss; process kill) |
+| INV-MB8 | **A snapshot carries its configuration.** Snapshot + suffix reproduces the configuration exactly, and a snapshot records the configuration at its index — joint included. | `internal/raftsim` after every install and boot; `TestSimSnapshotDuringJointConfiguration`, `TestSimRemovedNodeReceivesAStaleSnapshot`, `TestSimNewMemberCatchesUpBySnapshot`; the snapshot corpus's configuration cases; mutants 131, 133 | VERIFIED |
+| INV-MB9 | **Groups are isolated.** Groups on one node share no consensus state: a group's trace is a function of its own inputs alone, and one group's failure leaves the others running. | `TestMultiGroupIsolation` (each group's trace reproduced by replaying its own events on a lone cluster), `TestMultiBreakOneGroupTheOtherContinues`, `TestGroupsSnapshotAndCompactIndependently`, `TestBreakingOneGroupLeavesTheOtherRunning`, `TestRealOneGroupBrokenTheOtherContinues`; mutants 153, 155 | VERIFIED (simulation; real TCP; real processes) |
+| INV-MB10 | **Client guarantees survive membership changes.** Client-visible histories stay linearizable through membership changes, per group, and a request's identity survives them; a keyed request executes only in its key's group. | the `kv-membership` profiles (200 seeds each); `TestKVSimRetryIsADuplicateAcrossMembershipSnapshotAndFullRestart`; `TestRealReplaceACrashedNode`, `TestRealMembershipChangesUnderASessionWorkload`, `TestRealTwoGroupsOnThreeNodes`; `TestFrontRefusesAMisroutedRequest`; mutants 149, 151, 156 | VERIFIED (recorded histories; simulation; real processes) |
+
+### Note on the MB series and what it does not cover
+
+"Verified" is bounded as everywhere: seeded schedules (four membership chaos profiles and two
+client profiles × 200 seeds, three multi-group profiles × 200 seeds), a bounded model of every
+four-step sequence over eleven actions (14,641 sequences), a crash matrix over three membership
+scenarios, and real processes. It is not a proof over every execution. The operations covered are
+the four of `docs/MEMBERSHIP.md` §4, one at a time; nothing is claimed for several simultaneous
+changes (they are refused), for groups beyond 128 per node, or for real power loss. INV-MB9 says a
+group's behaviour depends only on its own inputs; the node-level faults every group on a node
+suffers together — a crash, a partition — are such inputs.

@@ -11,9 +11,11 @@ commit-and-apply, and — Phase 13 — request identity (cluster-assigned sessio
 apply from a replicated session table, one-hop request forwarding and a retrying session client,
 over a framed client protocol (wire v2) on each node's `-client-listen` port, and — Phase 14 —
 snapshots of the replicated state (session table included) with log compaction and follower
-installation over the InstallSnapshot transport kind (`docs/SNAPSHOTS.md`). The HTTP client API,
-one Raft group per hosted shard, the LSM engine as the state machine and the dashboard are still
-design.
+installation over the InstallSnapshot transport kind (`docs/SNAPSHOTS.md`), and — Phase 15 —
+dynamic membership by joint consensus with learners and one Raft group per hosted shard: a node
+host running many independent groups over one transport, key → shard → group routing with
+group-local sessions, over wire protocol v3 (`docs/MEMBERSHIP.md`, `docs/MULTI_RAFT.md`). The
+HTTP client API, the LSM engine as the state machine and the dashboard are still design.
 `docs/LIMITATIONS.md` and the per-phase reports record what is actually true of the code at any
 point in time.
 
@@ -79,8 +81,10 @@ As of Phase 7 the internal transport is **implemented** (`internal/transport`, `
 `docs/TRANSPORT.md`): real node processes, a checksummed framed-TCP protocol, a version
 handshake, one bidirectional connection per peer pair, and `Probe`/`ProbeResponse` liveness.
 It carries bytes tagged with a message kind and knows nothing of what they mean. Since Phase 9
-it carries Raft traffic (`RequestVote`/`AppendEntries`, codec in `internal/raft`, ADR-016); it
-still forwards no client requests and hosts no storage engine. Phase 10 injects network faults
+it carries Raft traffic (`RequestVote`/`AppendEntries`, codec in `internal/raft`, ADR-016); since
+Phase 13 forwarded client requests; since Phase 14 snapshots; since Phase 15 every group's payloads
+inside a group envelope it does not interpret, to a peer set that changes at runtime
+(`docs/MULTI_RAFT.md` §4). It hosts no storage engine. Phase 10 injects network faults
 *around* it — a `transport.Transport` decorator in-process, TCP proxies between real processes —
 without changing it (ADR-017).
 
@@ -101,6 +105,8 @@ without changing it (ADR-017).
 | `internal/vfs` | the filesystem seam the durable log does I/O through | everything else |
 | `internal/fault` | drop/delay/duplicate/partition injection (a transport decorator), a crash-consistent disk model, I/O fault injection | Raft (it is a set of decorators and models) |
 | `internal/raftsim` | the deterministic fault-injection simulator (tests only) | wall-clock time, goroutines, real I/O |
+| `internal/multiraft` | the node host (Phase 15): the registry of groups, their lifecycle and directories, the group-envelope demultiplexer, the transport's peer set, the admin protocol, the shard → group assignment | any group's state (it reads configurations, never holds one) |
+| `internal/kv` | the replicated key-value state machine and session table, the per-group server, the front that picks a request's group, the wire protocol, the session and sharded clients | Raft's rules, other groups' state |
 | `internal/metrics` | counters, histograms | business logic |
 
 The rule that matters most: **`internal/raft` performs no I/O and reads no clock.**
@@ -177,6 +183,16 @@ independent record of what was persisted), in-process on the real driver, and on
 processes that SIGKILL themselves at the point. What a crash leaves and what recovery makes of it
 is stated per boundary; the one window that bricked a node (a Save's record order) was found and
 fixed. The core is still untouched.
+
+As of Phase 15 (`docs/MEMBERSHIP.md`, `docs/MULTI_RAFT.md`, ADR-022, ADR-023) this is real.
+`dkvd -cluster` hosts one Raft group per shard whose genesis replica group names the node —
+group id = shard id — through `internal/multiraft`'s node host: one driver, log, snapshot, identity
+file and state machine per group, a group envelope on every frame, bounded per-group inboxes, and
+nothing mutable shared between groups. A group's members change at runtime by Raft §6 joint
+consensus with a learner stage, one member at a time, and the configuration is replicated state
+the core derives from its log and snapshot. Clients route key → shard → group and hold one session
+per group. What is shared is the process, the transport and the data directory, so a node crash is
+a correlated failure of every group on it; each recovers from its own files.
 
 Each shard is an **independent Raft group** with its own log, its own leader, and its own
 storage directory. A 3-node cluster with 16 shards runs 16 Raft groups; every node is a
@@ -261,6 +277,12 @@ entries, HardStates and boundary records — the HardState is not a separate fil
 `raft-<id>.log.tmp` (a compaction's rewrite), `.snap.tmp` (a snapshot being published) and
 `.snap.recv` (a snapshot being received), all removed at startup (`docs/SNAPSHOTS.md` §12).
 
+**As built (Phase 15), one directory per group:** `dkvd -cluster` keeps each group under
+`<data-dir>/groups/<gid>/` — `raft.log`, `raft.log.group` (the write-once group identity: group
+id and genesis configuration) and `raft.log.snap`, with the same temporaries — and nothing shared
+between groups (`docs/MULTI_RAFT.md` §5). `dkvd -raft` is group 0 at the Phase 14 paths above,
+plus `raft-<id>.log.group`. The engine's files below are still design.
+
 ---
 
 ## 7. Process and deployment topology
@@ -298,9 +320,13 @@ as the multi-node demo.
 Step 8 is what lets us talk about linearizability. Answering at step 6 would be faster and
 would be a lie about read-your-writes.
 
-**Phases 12–13 — what is implemented of this path.** Steps 3–8 are real for one group, with the
-in-memory `kv.Store` in place of the engine (step 7) and the `-client-listen` protocol in place of
-HTTP (steps 1–2: one group, no routing). Step 3 (Phase 13): a non-leader forwards the request one
+**Phases 12–15 — what is implemented of this path.** Steps 2–8 are real, with the in-memory
+`kv.Store` in place of the engine (step 7) and the `-client-listen` protocol in place of HTTP
+(step 1). Step 2 (Phase 15): the client computes the key's group with the cluster's routing and
+names it in the request; the node's front refuses a key of another group and hands the request to
+that group's server, or answers `NOT_LEADER` with no hint if it hosts no replica of the group
+(`docs/MULTI_RAFT.md` §6). The replica group of step 2 is the group's genesis; its current members
+are its own replicated configuration. Step 3 (Phase 13): a non-leader forwards the request one
 hop to the leader it believes in and relays the answer — or, in redirect-only mode, answers "not
 leader" with a hint. Step 4 carries `clientID/requestID/ackedBelow` for identified writes, and the
 state machine decides at step 7 whether the entry executes or is a duplicate of an earlier one
@@ -315,8 +341,9 @@ once applied through the read index (§5 there).
 
 ## 9. What is explicitly out of scope for v1
 
-- Dynamic cluster membership (adding/removing nodes at runtime) and shard rebalancing.
-  The hash ring *algorithm* handles membership change; the *cluster* does not migrate data.
+- Shard rebalancing and data movement between groups. Since Phase 15 a group's membership
+  changes at runtime, one member at a time by joint consensus (`docs/MEMBERSHIP.md`); which shard a
+  key belongs to, and which group serves a shard, never change, and no data migrates.
 - Cross-shard transactions.
 - Authentication, authorization, TLS.
 - Range scans / iterators over the client API.

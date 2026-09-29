@@ -251,8 +251,17 @@ sends from one goroutine per peer (bounded outboxes), so a peer whose writes blo
 own messages (INV-F5); per-connection frame order is unaffected.
 
 **Built on top of the transport since:** Raft (Phase 9), client request forwarding (Phase 13,
-kinds 32/33), snapshot installation (Phase 14, kinds 20/21). **Still not built:** shard serving, an
-HTTP API, a dashboard and dynamic membership. `Probe` is a liveness probe, not a Raft heartbeat.
+kinds 32/33), snapshot installation (Phase 14, kinds 20/21), and many Raft groups per node with a
+peer set that changes at runtime (Phase 15, below). **Still not built:** an HTTP API and a
+dashboard.
+
+**Phase 15.** Every payload a group sends travels inside a group envelope, `uvarint(group) ‖
+payload`, added by the group's driver and removed by the node host; the transport carries it as
+opaque bytes, frame kinds unchanged, one connection per peer pair for every group the two nodes
+share (`docs/MULTI_RAFT.md` §4). `transport.PeerSet` (`AddPeer`, `RemovePeer`) lets the host keep
+the peer set equal to the members of every hosted group's configuration plus the static peers:
+adding a peer starts dialing it (the lower id dials, as before), removing one closes its
+connection (`TestAddPeerConnectsAndRemovePeerDisconnects`). `Probe` is a liveness probe, not a Raft heartbeat.
 
 ## 12. Invariants
 
@@ -265,6 +274,6 @@ HTTP API, a dashboard and dynamic membership. `Probe` is a liveness probe, not a
 | INV-T5 | Frames on a single connection are delivered in send order, and a frame is written in full (even across short writes) so its bytes never interleave or truncate. | `TestPerConnectionOrderPreserved`, `TestConcurrentSendersDoNotInterleave`, `TestFrameSurvivesPartialWrites`, `TestWriteErrorAfterPartialWriteIsReturned`, `TestZeroProgressWriterDoesNotLoopForever` |
 | INV-T6 | Node shutdown terminates all transport resources: accept loop, dial loops, reader and writer paths, and connections; repeated shutdown is safe; no goroutine leak. | `TestCloseIsIdempotent`, `TestNoGoroutineLeakAfterClose`, `TestSendAfterCloseFails`, and the three-process `TestThreeNodeClusterProbesAndShutsDownCleanly` |
 
-INV-C4 (Phase 6) remains **PLANNED**: routing is not yet integrated into request serving. Phase 7
-added no Raft invariant; INV-R1..R10 were established in Phase 9 (`docs/RAFT.md`) and re-verified
+INV-C4 (Phase 6) is **VERIFIED** since Phase 15, when routing was integrated into request serving
+(`docs/INVARIANTS.md`, `docs/MULTI_RAFT.md` §6). Phase 7 added no Raft invariant; INV-R1..R10 were established in Phase 9 (`docs/RAFT.md`) and re-verified
 under injected faults in Phase 10 (`docs/FAULTS.md`).

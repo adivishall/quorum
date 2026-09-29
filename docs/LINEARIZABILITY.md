@@ -952,8 +952,8 @@ No recorded history was non-linearizable. One harness bug was found on real proc
 workload built an operation's identity from `(ClientID, RequestID)` alone, and two groups
 legitimately hand out the same ClientID, so two unrelated operations collided in the checker. It
 now includes the group, which is what CLIENT_SEMANTICS §2 says an identity is. The membership bugs
-of Phase 15 (`docs/MEMBERSHIP.md` §8) were liveness bugs and one wrongly retired joiner; none
-produced a non-linearizable history.
+of Phase 15 (`docs/MEMBERSHIP.md` §8) were liveness bugs, one wrongly retired joiner and one
+simulator check stricter than its rule; none produced a non-linearizable history.
 
 ### 16.4 What is and is not claimed
 

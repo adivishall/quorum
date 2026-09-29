@@ -292,5 +292,12 @@ that Phase 8 has a correct assignment to build on.
 | INV-C2 | Every key maps to exactly one shard, and every shard has exactly one replica group; no arc is unowned or doubly owned. | `TestEveryTokenIntervalHasExactlyOneOwner`, `TestRingIsSorted`, `TestSuccessorBoundaryAndWrap`, `TestTokenCollisionIsDeterministic`, `TestEveryShardIsRepresentedExactlyOnce`, `TestEveryShardHasOneReplicaGroup`, `TestRouteAlwaysReturnsAValidShard` |
 | INV-C3 | A one-node membership change moves only ≈ 1/N of keys, not a reshuffle. | `TestKeyToShardIsStableAcrossNodeMembershipChange`, `TestOwnerMovesOnlyWhereItsShardPrimaryMoved`, `TestConsistentHashingBeatsModuloOnRedistribution`, `TestRedistributionGoldenCounts` |
 
-INV-C4 ("a request is never served by a node that does not host the key's shard") is a Phase 7
-property and remains PLANNED — Phase 6 has no server to violate it.
+INV-C4 ("a request is never served by a node that does not host the key's shard") had no server
+to violate it in Phase 6; since Phase 15 it is VERIFIED — a node's front serves a key only in its
+group, and a node that does not host the group executes nothing (`docs/INVARIANTS.md`,
+`docs/MULTI_RAFT.md` §6).
+
+**Phase 15.** The replica group this library computes is now the genesis voter set of each
+shard's Raft group, and a key's shard is its group (`multiraft.Assignment`, ADR-023). The routing
+configuration stays static and identical on every process; after genesis a group's membership is
+its own replicated configuration (`docs/MEMBERSHIP.md`), and no key, shard or data ever moves.

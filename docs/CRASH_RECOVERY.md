@@ -14,6 +14,9 @@ process can die, what is on disk, what recovery makes of it, and what the protoc
 > checking, no snapshots, no dynamic membership, and no storage engine hosted by the node. Every
 > conclusion about "the state machine" below is about the seam and the recording state machines
 > the tests drive; the LSM engine is not yet behind that seam.
+>
+> **Phase 15** crashes membership changes at the same windows (§15): no new crash point was needed,
+> because a configuration entry travels through exactly the cycle every entry does.
 
 ---
 
@@ -375,3 +378,53 @@ interrupted install). At every restart the simulator checks the recovered log ag
 (INV-F2, now boundary-aware, including a candidate plus the repair's boundary record), that no log
 is compacted past its snapshot and that a completed publication survived (INV-SN3), and that the
 restored state is the reference model's at the snapshot's index (INV-SN1).
+
+## 15. Membership crash windows (Phase 15)
+
+A configuration entry is an ordinary log entry with a type (`docs/RAFT.md` §10): it is proposed,
+persisted, replicated, committed and applied through the same Save, send and apply boundaries as
+every entry, and a snapshot carries the configuration inside the file it already published
+atomically (`docs/SNAPSHOTS.md` §19). So Phase 15 adds no crash point. What it adds is **states in
+which to crash**: a change proposed but not durable, a joint entry durable on some nodes, a joint
+entry committed with the final entry not yet appended, a joiner with no configuration, a leader
+removing itself, a snapshot taken while joint.
+
+What recovery does with each:
+
+- **The configuration is recomputed, never stored separately.** A restarting node's configuration
+  is the latest configuration entry in its recovered log, or its snapshot's, or its genesis — so
+  a torn configuration entry, truncated like any torn record, simply was never proposed, and an
+  uncommitted one a new leader overwrites reverts the node's configuration when the suffix is
+  replaced (`docs/MEMBERSHIP.md` §2).
+- **A joint configuration survives a crash of anyone.** Any node that restarts with the joint
+  entry is joint, needs both majorities, and — once it leads — appends the final entry itself.
+  No operator step completes a transition.
+- **A change whose entry is lost is reported lost.** `ChangeMembership` answers `ErrConfLost`
+  when the entry at its index is overwritten, and never success (`TestChangeMembershipReportsALostChange`,
+  mutant 149).
+- **The group identity file** is published once, before the log is created, by temporary file,
+  fsync, rename and directory fsync; a crash before the rename leaves a temporary that the next
+  start removes; durable state without the file is refused, as is a file naming another group or
+  genesis (`TestIdentityFileRules`, `TestIdentityFileCorruptionIsRefused`, `FuzzDecodeIdentity`;
+  mutants 146–148).
+
+Evidence: the **membership crash matrix** (`TestMembershipCrashMatrix`) runs three scenarios — a
+spare added by snapshot, promoted, and the leader removing itself, with snapshots every five
+entries; an old member partitioned and replaced, then healed; a configuration entry torn by a
+short write and a change overwritten by a new leader — and crashes every node at every driver
+point and I/O boundary its run reaches, in every crash mode: **6,660 crashes, 0 failures**, every
+driver point and every I/O point reached, crashes in every transition state (stable, change
+proposed, joint proposed, joint committed with the final pending) and on every node. Each row
+records the group, the transition under way, the committed configuration before, the one reached
+and the one the crashed node recovered (`-raftsim.membership-matrix.out` writes them as JSON). At
+every restart the simulator checks INV-F2, INV-CR1..CR4 and INV-SN3 as before, and INV-MB2 and
+INV-MB7: the recovered configuration is the one the node's own durable files give. The
+`membership-crashpoints` profile arms random crash points during seeded membership schedules (200
+seeds). On real processes, a leader is SIGKILLed while a promotion is held in its joint
+configuration, and a whole two-group cluster is SIGKILLed and restarted
+(`TestRealJointConfigurationSurvivesALeaderCrash`,
+`TestRealNewMemberCatchesUpBySnapshotAndTheClusterRestarts`).
+
+**Not crashed:** the identity file's creation at each of its own I/O boundaries (its outcomes are
+tested, and its order is argued above); a node host's registry, which holds nothing durable of its
+own — every group's state is in its own directory.

@@ -8,7 +8,7 @@ architecture that injects it, what was proven — and, as carefully, what was no
 > **Scope boundary, stated once.** Phase 10 proves how the existing Raft core, durable log, driver
 > and transport behave under **controlled, injected** failures. It does **not** add end-to-end
 > linearizability (Phase 12), a client API, dedup or forwarding (Phases 13/15), snapshots (14),
-> dynamic membership (never, ADR-005), or a systematic crash-window harness for the storage engine
+> dynamic membership (Phase 15, §16), or a systematic crash-window harness for the storage engine
 > (Phase 11). It proves nothing about real power loss or real hardware.
 
 ---
@@ -431,3 +431,65 @@ driver's own functions (`docs/SNAPSHOTS.md`, ADR-021).
   153). Both are fixed, replayed by `TestSnapshotRegressionSeeds` and pinned by mutants
   (`docs/SNAPSHOTS.md` §17).
 - **Still modeled only:** real power loss; a real disk error during a snapshot on a real process.
+
+## 16. Membership and multiple groups under faults (Phase 15)
+
+The simulator drives membership changes through the real core and driver functions, and runs
+several groups over one set of simulated nodes (`docs/MEMBERSHIP.md`, `docs/MULTI_RAFT.md`).
+
+- **New event.** `member N op M` asks node `N` to change member `M` — `addlearner`, `promote`,
+  `removevoter` or `removelearner`. The core refuses it unless `N` leads and no change is under
+  way; a refusal is traced, never an error. A cluster can start with spares: `Genesis` voters of
+  `Nodes`, the others joiners with no configuration until a change adds them.
+- **New profiles**, each 3,000 steps over five nodes (four for crash points) with three genesis
+  voters: `membership` (message faults, partitions, crashes, power loss), `membership-partitions`
+  (partitions and splits), `membership-snapshots` (snapshots every 8 entries, corrupted chunks,
+  crashes with power loss), `membership-crashpoints` (a crash on an exact boundary, snapshot points
+  included, half with a power loss); and the client profiles `kv-membership` and
+  `kv-membership-messages`, whose histories must be linearizable (LINEARIZABILITY §16). The
+  generator removes the leader as readily as a follower, and a removed node keeps running with its
+  stale log.
+- **Multiple groups.** `raftsim.Multi` runs several groups over the same nodes, placed by the
+  Phase 6 routing. A node-level fault — a crash, a crash point, a restart, a partition, a pause, a
+  power loss — is fanned out to every group on that node, as a process crash takes every group of
+  a real process; everything else stays within its group. Profiles `multi-2x3`, `multi-4x5` (with
+  snapshots) and `multi-8x5`: every group keeps every invariant, converges and commits; with
+  clients, every group's history is linearizable on its own. A multi-group run is a pure function
+  of its seed and replays from its script (`TestMultiSameSeedSameTrace`), and each group's trace is
+  reproduced exactly by replaying only the events it received on a lone cluster
+  (`TestMultiGroupIsolation`, INV-MB9). `TestMultiBreakOneGroupTheOtherContinues` breaks one
+  group's durable log on two of three nodes: that group stops committing, the other, on the same
+  nodes, does not notice.
+- **Checks added**, each at the instant it is defined: INV-MB1 (every committed configuration one
+  legal step from the previous), INV-MB2 (every node's configuration equals the one its own log
+  and snapshot derive), INV-MB3 (every commit advance durable on the quorum of every configuration
+  involved), INV-MB4 and MB5 (who may lead, campaign, be asked for a vote and be replicated to),
+  INV-MB7 and MB8 at every boot and install. Every earlier check is membership-aware: the
+  stores compared at the end are the members'.
+- **A bounded model.** `TestMembershipBoundedModel` runs every sequence of `-raftsim.model-depth`
+  steps (3 in every run, 4 in `make faults`: 14,641 sequences) over eleven actions — add, promote,
+  remove the leader, remove a follower, crash the leader with power loss, crash a follower,
+  restart, snapshot, partition the leader, heal, propose — with every invariant after every event
+  and convergence at the end.
+- **A crash matrix**, `TestMembershipCrashMatrix`: `docs/CRASH_RECOVERY.md` §15.
+- **What the schedules found.** At 200 seeds the membership profiles found a vote deadlock: a node
+  whose log did not yet hold its own promotion, or a joiner with no configuration, refused the
+  vote its group's election needed (`membership` seeds 9, 18, 41 and others; fixed by letting any
+  node grant a vote while only voters' votes count). The multi-group runs found a removal that
+  could never finish: a leader that lost its leadership while removing itself was no longer
+  allowed to campaign, and the other voter, still joint, could not win without its vote (multi-group
+  seed 83; fixed by the removal campaign rule). The bounded model found a final configuration never committed when the leader
+  alone was its quorum. Each is replayed by a regression test (`TestMembershipRegressionSeeds`,
+  `TestRemovedLeaderThatLostItsLeadershipFinishesItsRemoval`,
+  `TestFinalEntryCommitsAtOnceWhenTheLeaderAloneIsItsQuorum`) and pinned by mutants
+  (`docs/MEMBERSHIP.md` §8). The gate itself then found the checker at fault: after the last fix,
+  24 runs reported an INV-MB3 violation where the leader had legitimately committed under the final
+  configuration it had just appended; the check was corrected and strengthened, and the rule it
+  now also checks — the final entry waits for the joint commit — was given a core test and mutant
+  159 (`docs/MEMBERSHIP.md` §8, bug 5).
+- **On real processes** (`tests/integration/membership_test.go`): a member removed while
+  partitioned, a leader SIGKILLed during a joint configuration, a crashed node replaced and then
+  returned with its stale state, one group's replicas stopped while another group keeps serving
+  on the same processes, and a whole two-group cluster SIGKILLed and restarted.
+- **Still modeled only:** real power loss; a real disk error during a membership change on a real
+  process.

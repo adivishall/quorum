@@ -1,7 +1,9 @@
-# SNAPSHOTS — state snapshots and log compaction (Phase 14)
+# SNAPSHOTS — state snapshots and log compaction (Phase 14; membership in Phase 15)
 
 Status: **implemented and verified** (Phase 14). Every claim below names its evidence; §15 states
-exactly what is guaranteed and §16 what is not.
+exactly what is guaranteed and §16 what is not. **Phase 15** changed the snapshot's identity from
+a member list to the group id, and made the snapshot carry the group's configuration at its index
+(format version 2, §3); §19 is how snapshots and membership changes interact.
 
 The problem: the Raft log grew without bound, and every restart replayed all of it. A snapshot
 captures the replicated state at an applied index so the log prefix it covers can be discarded —
@@ -36,7 +38,9 @@ empty value stays present); the applied index the snapshot represents; the snaps
 entry at that index, in the file's metadata); the session table — every session's id, `last` (the
 LRU key), `ackedBelow` (the watermark), and every remembered result `(requestID, SHA-256
 fingerprint, index)`; the session limits the table was built under (they change decisions, so a
-state built under other limits is refused); the group identity (the sorted member ids).
+state built under other limits is refused); the group id (Phase 15; Phase 14 used the sorted member
+ids); the group's configuration at the snapshot's index — voters, learners and, if joint, the
+outgoing voters (Phase 15).
 
 **Excluded**, each with its reason: `currentTerm` / `votedFor` (the durable log's HardState owns
 them); leader identity, `nextIndex` / `matchIndex`, election timers, votes received (volatile Raft
@@ -50,19 +54,23 @@ A snapshot file is a sequence of records in the shared framing (`internal/record
 record), in the snapshot file's own kind namespace:
 
 ```
-Header (kind 1): magic "QSNP" | version=1 | members | index | term | dataLen | SHA-256(data)
+Header (kind 1): magic "QSNP" | version=2 | group | configuration | index | term | dataLen | SHA-256(data)
 Data   (kind 2): up to 1 MiB of state bytes each, in order        (zero or more)
 Footer (kind 3): index | term                                       (repeated, cross-checked)
 EOF
 ```
 
-Integers are canonical uvarints; members are length-prefixed, non-empty, strictly ascending
-(`snapshot.Group`). A file is valid only if it is exactly: one header, data records whose
+Integers are canonical uvarints. The group is a 32-bit group id; the configuration is
+length-prefixed, in the membership codec (`replication.EncodeConfiguration`), canonical
+(`docs/MEMBERSHIP.md` §2) and with voters. Version 1 (Phase 14: a member list where the group and
+configuration now are) is retired and refused as `ErrVersion`; nothing outside this repository
+wrote one. A file is valid only if it is exactly: one header, data records whose
 concatenation is `dataLen` bytes hashing to the header's SHA-256, one footer repeating the header's
 index and term, then end of file — nothing after (a single stray byte is refused; FuzzDecode found
 the framing's clean-EOF rule accepting fewer than 9 trailing bytes, §17). **Metadata**
-(`snapshot.Meta`): the members, the index (> 0) and the term (> 0). Bounds: `MaxData` = 512 MiB of
-state, `MaxDataRecord` = 1 MiB, 64 members of ≤ 256 bytes; a header declaring more is `ErrTooLarge`.
+(`snapshot.Meta`): the group, the configuration, the index (> 0) and the term (> 0). Bounds:
+`MaxData` = 512 MiB of state, `MaxDataRecord` = 1 MiB, 64 members and the configuration codec's
+own bound; a header declaring more is refused.
 
 The **state bytes** are the state machine's canonical encoding (`kv.Store.EncodeSnapshot`, version
 1): applied index, limits, `nKeys` keys strictly ascending with their values, `nSessions` sessions
@@ -93,7 +101,11 @@ more entries — and the log then keeps growing (§16).
 
 `raftnode.Durable.Snapshot`, at applied index `S`:
 
-1. encode the state (memory only) — crash point `before-snapshot-publish` follows;
+1. encode the state (memory only), and ask the core for the term and the **configuration** at `S`
+   (`ConfAt`, Phase 15). If the core does not know the configuration there — only a joiner that has
+   not yet applied its group's first configuration entry — nothing is written and the node tries
+   again at the next applied entry; it never guesses (§19). Crash point `before-snapshot-publish`
+   follows;
 2. write `<log>.snap.tmp`, fsync it;
 3. rename it over `<log>.snap`, fsync the directory — **publication**: the snapshot is now the
    durable record of `[1, S]` — crash point `after-snapshot-publish`;
@@ -112,7 +124,8 @@ does (INV-F1): after a failed directory fsync the log's own name is no longer kn
 ## 6. Recovery
 
 `raftnode.Recover`: remove the temporaries (`.snap.tmp`, `.snap.recv`, `log.tmp`); load and fully
-validate the published snapshot `S` (if any) — its format, its group; open the log (boundary `B`),
+validate the published snapshot `S` (if any) — its format, its group (against the group identity
+file, Phase 15: another group's snapshot is `ErrWrongGroup`); open the log (boundary `B`),
 fsyncing the directory; reconcile:
 
 | Durable state | Decision |
@@ -127,7 +140,9 @@ fsyncing the directory; reconcile:
 | snapshot invalid (torn, checksum, version, group, index/term, malformed or impossible state) | **reject** |
 
 Then the in-memory log starts at `B`; `commit = max(clamped persisted commit, S)`; the state
-machine is restored from the snapshot and `applied = S`; the core validates `currentTerm ≥` the last
+machine is restored from the snapshot and `applied = S`; the core's base configuration is the
+snapshot's, holding at `S` (without a snapshot, the genesis in the identity file, at 0), and any
+configuration entry after it in the log overrides it (Phase 15); the core validates `currentTerm ≥` the last
 log term (which after a snapshot may be the snapshot's term — so an install makes the new term
 durable before the snapshot, §8).
 
@@ -190,7 +205,8 @@ killed at `after-snapshot-publish` and `after-install-publish` (real tests 4 and
 - **Follower (core):** term rules as for AppendEntries; a snapshot at or below the commit index is
   already covered — answered success at the commit, nothing changed; otherwise the log is reset to
   the snapshot (keeping the entries after it only if the log holds its index with its term),
-  commit = applied = `S`, and the Ready carries the snapshot.
+  commit = applied = `S`, the snapshot's configuration becomes the base at `S` — a configuration
+  entry among the kept entries still overrides it — and the Ready carries the snapshot.
 - **Follower (driver, `Durable.InstallSnapshot`), in order:** a changed term and vote, alone,
   carrying the previous commit (the durable term must never be below the snapshot's); publication
   of the staged file; the log's boundary record (`raftlog.Log.Install`); the state machine's
@@ -243,10 +259,15 @@ Loud and total, as for the log (`docs/CRASH_RECOVERY.md` §9): an invalid publis
 snapshot that contradicts the log, refuses to start (`ErrSnapshot`), never a silent fallback. A
 received snapshot that does not validate is discarded (`event=raft_snapshot_refused`) and the
 leader offers again. Evidence: the file-format corpus (`internal/snapshot/testdata/corpus`: 5
-known-good — empty state, multi-record, large index/terms, single member, a state — and 28
-known-bad — truncations, a corrupted CRC, a checksum mismatch, a future version, wrong magic, zero
-index/term, unsorted or duplicate members, missing or repeated records, bytes after the footer,
-oversized lengths, non-canonical integers); the state corpus (`internal/kv/testdata/snapshots`: 9
+known-good in Phase 14, 10 since Phase 15 (re-encoded as version 2) — empty state, multi-record,
+large index/terms, a single voter, a state, group 7, the largest group id, a joint configuration,
+learners, members without addresses — and 39 known-bad — truncations, a corrupted CRC, a checksum
+mismatch, a future version, a Phase 14 version-1 file, wrong magic, zero index/term, missing or
+repeated records, bytes after the footer, oversized lengths, non-canonical integers, a group over
+32 bits, and twelve configuration defects: absent, empty, voterless, undecodable, a future codec
+version, a trailing byte, unsorted or duplicate voters, a learner that is a voter, a joint
+configuration whose outgoing set equals its voters, a member with two addresses, a length over the
+bound); the state corpus (`internal/kv/testdata/snapshots`: 9
 known-good — empty store, keys, deleted keys, empty values, sessions, evicted sessions, a session
 at its limit, an advanced watermark, a >1 MiB state — and 22 known-bad, each refused by the rule it
 breaks); every truncation and every bit flip of a file refused; `FuzzDecode`,
@@ -327,15 +348,16 @@ most `every` replayed, independent of how long the node has run — are asserted
 - **A transfer can be retried while running.** If a transfer outlasts `SnapshotRetryTicks`, the
   leader re-offers; the second transfer waits for the first (one per peer) and then repeats it.
 - **Power loss is modeled, not tested** — as everywhere in this project (`docs/FAILURE_MODEL.md`).
-- **One group, fixed membership.** The group identity is the member list; no membership change, no
-  multiple groups (Phase 15+ scope was not started).
+- **Membership (Phase 15).** A snapshot carries the configuration at its index and nothing about
+  changes in flight beyond it; a change after the index is in the log's suffix (§19).
 - **Configuration consistency is not checked across nodes.** A follower refuses a snapshot built
   under other session limits (and cannot then catch up); nothing prevents the misconfiguration.
 - **No snapshot of the LSM engine.** The replicated state machine is the in-memory `kv.Store`; the
   storage engine is not hosted by the Raft node yet.
 - **A wiped node is not a safe replacement.** A node started on an empty data directory catches up
   by snapshot, but it has forgotten its term and vote; rejoining under the same id is not proven
-  safe without membership change (`docs/FAILURE_MODEL.md`). Recovery refuses a snapshot whose log
+  safe (`docs/FAILURE_MODEL.md`). The safe replacement is a new id: add it as a learner, promote it,
+  remove the wiped one (`docs/MEMBERSHIP.md` §4; `TestRealReplaceACrashedNode`). Recovery refuses a snapshot whose log
   is gone (case C) for this reason; an empty directory has neither, and starts fresh.
 
 ## 17. Bugs found by this phase's tests
@@ -415,3 +437,41 @@ the simulator's duplication of a chunk with its payload. Two are killed by real 
 alone (the session table; the interrupted install). `DRY=1 scripts/mutation.sh` checks that every
 mutant's pattern still applies; a mutant that does not compile is reported as a failure of the
 runner, never as a kill.
+
+## 19. Snapshots and membership (Phase 15)
+
+A group has three configurations that must not be confused (`docs/MEMBERSHIP.md` §2): the one a
+snapshot **represents** (the configuration at its index, in its header), the one **known at a log
+index** (`ConfAt(i)`: the latest configuration entry at or below `i`, or the base when the base
+holds there, or "unknown"), and the one **currently active** (the latest in the log, committed or
+not). A snapshot records only the first; the current one is recomputed from the snapshot and the
+log's suffix at every start and every install.
+
+- **Creation needs evidence.** The configuration written into a snapshot at `S` is `ConfAt(S)`. A
+  joiner starts with no configuration at all, and one that has applied entries but not yet a
+  configuration entry does not know its configuration at `S`: it skips the snapshot rather than
+  write a guess, and snapshots at a later applied entry (`TestConfAtAnswersOnlyWithEvidence`,
+  mutants 134 and 135).
+- **The order is unchanged.** The configuration is known before publication and travels inside the
+  file, so the single publication rename makes the state and its configuration durable together;
+  the log is still compacted only behind a durable snapshot, and the core only after the durable
+  log. There is no separate membership file to order against (ADR-022).
+- **A joint configuration survives.** A snapshot taken while a change is joint records the joint
+  configuration; a node restarting from it, or installing it, is joint and needs both majorities
+  until the final entry — which the leader appends after the joint one commits — arrives
+  (`TestSimSnapshotDuringJointConfiguration`, INV-MB8; `TestRealJointConfigurationSurvivesALeaderCrash`).
+- **A new member catches up by snapshot.** A learner added after the prefix was compacted installs
+  the leader's snapshot and adopts its configuration, which already names it; a snapshot that
+  predates its addition does not name it, and it is still not reported removed — only a node that
+  was a member of a configuration it has seen is (`TestSimNewMemberCatchesUpBySnapshot`,
+  `TestJoinerInstallingASnapshotThatPredatesItIsNotRemoved`, mutant 150).
+- **An old snapshot never resurrects an old configuration.** A snapshot at or below a node's commit
+  index is covered and ignored, so a stale snapshot delivered to a node — a removed one included —
+  changes nothing (`TestSimRemovedNodeReceivesAStaleSnapshot`); a snapshot above it replaces the
+  log below it and the configuration with it, which is the replicated configuration at that index.
+- **Another group's snapshot is refused** by its group id at receive, at install and at recovery
+  (`ErrWrongGroup`), independently of the transport envelope.
+
+Evidence beyond the tests named: the `membership-snapshots` chaos profile (snapshots every few
+entries while members change, 200 seeds) and the membership crash matrix's snapshot rows
+(`docs/CRASH_RECOVERY.md` §15).
