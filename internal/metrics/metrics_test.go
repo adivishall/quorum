@@ -273,3 +273,27 @@ func TestProcessCollectors(t *testing.T) {
 		t.Errorf("process_max_rss_bytes = %v: below a megabyte, a unit error", v)
 	}
 }
+
+// TestLabelValuesAreNeverAmbiguous (found by FuzzParse): label values may hold
+// any bytes, including the one the series key once joined them with; two
+// label sets never share a series, and every value is written back intact.
+func TestLabelValuesAreNeverAmbiguous(t *testing.T) {
+	r := NewRegistry()
+	v := r.CounterVec("dkv_amb_total", "a", "x", "y")
+	v.With("a\xff", "b").Add(1)
+	v.With("a", "\xffb").Add(2)
+	r.GaugeVec("dkv_one", "o", "x").With("\xff").Set(3)
+	ss, err := Parse(strings.NewReader(text(t, r)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := ss.Get("dkv_amb_total", "x", "a\xff", "y", "b"); got != 1 {
+		t.Fatalf("first label set: %v", got)
+	}
+	if got, _ := ss.Get("dkv_amb_total", "x", "a", "y", "\xffb"); got != 2 {
+		t.Fatalf("second label set: %v", got)
+	}
+	if got, _ := ss.Get("dkv_one", "x", "\xff"); got != 3 {
+		t.Fatalf("a value that is the old separator: %v", got)
+	}
+}

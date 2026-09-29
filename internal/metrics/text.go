@@ -72,12 +72,8 @@ func (f *family) samples() []sample {
 	}
 	f.mu.RLock()
 	kids := make([]keyed, 0, len(f.children))
-	for k, m := range f.children {
-		var values []string
-		if len(f.labels) > 0 {
-			values = strings.Split(k, sep)
-		}
-		kids = append(kids, keyed{values, m})
+	for _, c := range f.children {
+		kids = append(kids, keyed{c.values, c.m})
 	}
 	f.mu.RUnlock()
 	sort.Slice(kids, func(i, j int) bool { return lessStrings(kids[i].values, kids[j].values) })

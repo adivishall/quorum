@@ -237,6 +237,18 @@ func TestMetricsMatchWhatTheClusterDid(t *testing.T) {
 			t.Fatalf("the survivor won: elections won %v -> %v", wonBefore, v)
 		}
 	}
+	// The survivor never restarted: its counts are exactly its core's, which
+	// counted each transition as it happened — published many times, counted
+	// once.
+	cc := c.nodes[survivor].Status().Counters
+	for name, want := range map[string]uint64{
+		"dkv_raft_campaigns_total": cc.Campaigns, "dkv_raft_elections_won_total": cc.ElectionsWon,
+		"dkv_raft_leader_stepdowns_total": cc.StepDowns,
+	} {
+		if v := metricOf(t, reg(survivor), name, "group", "0"); v != float64(want) {
+			t.Fatalf("%s: %s %v, its core counted %d", survivor, name, v, want)
+		}
+	}
 	// The returning follower was behind the compaction: it installed a
 	// snapshot, counted and timed once per install, and some node counted
 	// the transfer sent.

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,14 +53,31 @@ type family struct {
 	buckets []float64 // histograms: upper bounds, ascending, without +Inf
 
 	mu       sync.RWMutex
-	children map[string]any // label values joined by sep → *Counter | *Gauge | *Histogram
+	children map[string]child // by seriesKey(label values)
 
 	// A collected family's samples come from these functions at scrape time.
 	cmu        sync.Mutex
 	collectors []func(emit func(v float64, labelValues ...string))
 }
 
-const sep = "\xff"
+// child is one series: its label values and its metric (*Counter, *Gauge or
+// *Histogram).
+type child struct {
+	values []string
+	m      any
+}
+
+// seriesKey encodes label values without ambiguity: each is length-prefixed,
+// so no value — whatever bytes it holds — can make two label sets collide.
+func seriesKey(values []string) string {
+	var b strings.Builder
+	for _, v := range values {
+		b.WriteString(strconv.Itoa(len(v)))
+		b.WriteByte(':')
+		b.WriteString(v)
+	}
+	return b.String()
+}
 
 // register returns the family named name, creating it; registering a name
 // again with another type, help, label set or buckets is a programming error.
@@ -84,7 +102,7 @@ func (r *Registry) register(name, help string, typ Type, labels []string, bucket
 		return f
 	}
 	f := &family{name: name, help: help, typ: typ, labels: append([]string(nil), labels...),
-		buckets: append([]float64(nil), buckets...), children: map[string]any{}}
+		buckets: append([]float64(nil), buckets...), children: map[string]child{}}
 	r.families[name] = f
 	return f
 }
@@ -131,21 +149,21 @@ func (f *family) child(labelValues []string, mk func() any) any {
 	if len(labelValues) != len(f.labels) {
 		panic(fmt.Sprintf("metrics: %s takes %d label values, got %d", f.name, len(f.labels), len(labelValues)))
 	}
-	key := strings.Join(labelValues, sep)
+	key := seriesKey(labelValues)
 	f.mu.RLock()
 	c, ok := f.children[key]
 	f.mu.RUnlock()
 	if ok {
-		return c
+		return c.m
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if c, ok := f.children[key]; ok {
-		return c
+		return c.m
 	}
-	c = mk()
+	c = child{values: append([]string(nil), labelValues...), m: mk()}
 	f.children[key] = c
-	return c
+	return c.m
 }
 
 // --- counters ---
