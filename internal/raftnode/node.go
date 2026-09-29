@@ -886,7 +886,7 @@ func (n *Node) processReady() error {
 		if !errors.Is(err, ErrApply) {
 			return err // a crash point fired
 		}
-		n.logf("event=raft_apply_failed node=%s err=%v", n.cfg.ID, err)
+		n.logf("event=raft_apply_failed node=%s group=%d err=%v", n.cfg.ID, n.cfg.Group, err)
 	}
 	n.trackApplied()
 	// Phase 14: snapshot and compact when the trigger says so. A state too
@@ -939,7 +939,7 @@ func (n *Node) fail(err error) {
 		n.err = err
 	}
 	n.mu.Unlock()
-	n.logf("event=raft_persist_failed node=%s err=%v", n.cfg.ID, err)
+	n.logf("event=raft_persist_failed node=%s group=%d err=%v", n.cfg.ID, n.cfg.Group, err)
 	n.waiters.FailAll(err)
 	n.reads.FailAll(err)
 	n.cancel()
@@ -994,7 +994,7 @@ func (n *Node) enqueue(m raft.Message) {
 		return
 	}
 	if m.To == "" || m.To == n.cfg.ID {
-		n.logf("event=raft_send_dropped node=%s to=%s type=%s reason=unknown_peer", n.cfg.ID, m.To, m.Type)
+		n.logf("event=raft_send_dropped node=%s to=%s type=%s reason=unknown_peer group=%d", n.cfg.ID, m.To, m.Type, n.cfg.Group)
 		return
 	}
 	ob := n.outboxFor(m.To)
@@ -1174,14 +1174,14 @@ func (n *Node) transfer(peer NodeID, term uint64, meta snapshot.Meta, file []byt
 func (n *Node) receiveChunk(c inChunk) {
 	m, err := n.dur.Snap.Receive(c.from, c.payload)
 	if err != nil {
-		n.logf("event=raft_snapshot_refused node=%s from=%s err=%v", n.cfg.ID, c.from, err)
+		n.logf("event=raft_snapshot_refused node=%s from=%s group=%d err=%v", n.cfg.ID, c.from, n.cfg.Group, err)
 		return
 	}
 	if m == nil {
 		return
 	}
 	m.To = n.cfg.ID
-	n.logf("event=raft_snapshot_received node=%s from=%s index=%d term=%d", n.cfg.ID, c.from, m.SnapshotIndex, m.SnapshotTerm)
+	n.logf("event=raft_snapshot_received node=%s from=%s index=%d term=%d group=%d", n.cfg.ID, c.from, m.SnapshotIndex, m.SnapshotTerm, n.cfg.Group)
 	_ = n.core.Step(*m)
 }
 
