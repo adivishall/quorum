@@ -49,13 +49,21 @@ func (c *snapCluster) join(id NodeID) {
 // leadership, until it completes.
 func (c *snapCluster) change(among []NodeID, cc raft.ConfChange) replication.Configuration {
 	c.t.Helper()
+	conf, _ := c.changeAt(among, cc)
+	return conf
+}
+
+// changeAt is change that also returns the index of the entry the change
+// reached (ChangeMembership's).
+func (c *snapCluster) changeAt(among []NodeID, cc raft.ConfChange) (replication.Configuration, uint64) {
+	c.t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		ctx, cancel := context.WithTimeout(c.ctx, 5*time.Second)
-		conf, _, err := c.nodes[c.leader(among)].ChangeMembership(ctx, cc)
+		conf, idx, err := c.nodes[c.leader(among)].ChangeMembership(ctx, cc)
 		cancel()
 		if err == nil {
-			return conf
+			return conf, idx
 		}
 		if time.Now().After(deadline) || !(errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrConfChangeInProgress)) {
 			c.t.Fatalf("%s: %v", cc, err)
@@ -443,32 +451,35 @@ func FuzzDecodeIdentity(f *testing.F) {
 
 // TestJoinerInstallingASnapshotThatPredatesItIsNotRemoved pins the bug the
 // real-process tests found: the only snapshot the leader can offer a joiner
-// predates the joiner's addition (snapshots every 20 entries; the addition is
-// entry ~32), so the joiner installs a committed configuration that does not
-// name it — a joiner not yet reached by its addition, NOT a removed member.
-// Reporting it removed made the host retire the group under it, and the
-// joiner never caught up. It is never reported removed; it learns it is a
-// learner from the entries after the snapshot, and catches up.
+// predates the joiner's addition (snapshots every 20 entries; the addition
+// follows some 31 entries, and the next snapshot would need 20 more), so the
+// joiner installs a committed configuration that does not name it — a joiner
+// not yet reached by its addition, NOT a removed member. Reporting it removed
+// made the host retire the group under it, and the joiner never caught up. It
+// is never reported removed; it learns it is a learner from the entries after
+// the snapshot, and catches up.
+//
+// The premise is checked against the addition's actual index, never an
+// assumed one: how many entries a node applies at once — and so the index of
+// its first snapshot, 20 or up to the last entry — and how many elections put
+// a no-op in the log both depend on timing (a race run in a clean clone
+// snapshotted at 31, below an addition at 32, and a check against a fixed 30
+// failed a schedule the test is about).
 func TestJoinerInstallingASnapshotThatPredatesItIsNotRemoved(t *testing.T) {
 	ctx := context.Background()
 	c := startSnapCluster(t, ctx, 3, 20, 2)
 	c.propose(c.ids, cmds("a", 30))
 	c.converged(c.ids)
 	c.compactedPast(c.ids, 10)
-	for _, id := range c.ids {
-		if s := c.nodes[id].Status().Snapshot; s >= 30 {
-			t.Fatalf("premise: %s's snapshot %d is not below the addition", id, s)
-		}
-	}
 	c.join("n3")
-	c.change(c.ids, raft.ConfChange{Type: raft.AddLearner, Member: raft.Member{ID: "n3"}})
+	_, added := c.changeAt(c.ids, raft.ConfChange{Type: raft.AddLearner, Member: raft.Member{ID: "n3"}})
 	c.propose(c.ids, cmds("b", 3))
 	c.converged(c.ids)
 	st := c.waitStatus("n3", "installed a snapshot and learned it is a learner", func(st Status) bool {
 		return st.Snapshot > 0 && st.Conf.IsLearner("n3")
 	})
-	if st.Snapshot >= 30 {
-		t.Fatalf("premise: the joiner installed snapshot %d, which names it already", st.Snapshot)
+	if st.Snapshot >= added {
+		t.Fatalf("premise: the joiner installed snapshot %d, at or after its addition at %d: it names it already", st.Snapshot, added)
 	}
 	if st.Removed || strings.Contains(c.log("n3"), "event=raft_removed") {
 		t.Fatalf("a joiner was reported removed: %+v\n%s", st, c.log("n3"))
