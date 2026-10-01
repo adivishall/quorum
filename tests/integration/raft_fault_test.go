@@ -34,6 +34,7 @@ var (
 	reLeader   = regexp.MustCompile(`event=raft_leader node=(\S+) term=(\d+)`)
 	reFollower = regexp.MustCompile(`event=raft_follower node=(\S+) term=(\d+) leader=(\S+)`)
 	reCommit   = regexp.MustCompile(`event=raft_commit node=(\S+) index=(\d+)`)
+	reConn     = regexp.MustCompile(`event=peer_(connected|disconnected) peer=(\S+)`)
 )
 
 // rcluster is a group of real dkvd -raft processes whose links run through proxies.
@@ -312,6 +313,66 @@ func (c *rcluster) waitFollows(id, leader string, term uint64, d time.Duration) 
 		time.Sleep(20 * time.Millisecond)
 	}
 	c.t.Fatalf("%s never followed %s at term >= %d within %s\nps: %s\n%s", id, leader, term, d, c.postMortem(), c.outputs())
+}
+
+// connectedPeers reads which peers id's current process has a live connection
+// to, from the process's own log. Every registered connection logs one
+// peer_connected and, when it ends, one peer_disconnected, but the two lines of
+// consecutive connections are written outside the lock that orders them, so
+// the peers are those with more connects than disconnects — not those whose
+// latest line is a connect.
+func (c *rcluster) connectedPeers(id string) map[string]bool {
+	open := map[string]int{}
+	for _, m := range reConn.FindAllStringSubmatch(c.procs[id].out.String(), -1) {
+		if m[1] == "connected" {
+			open[m[2]]++
+		} else {
+			open[m[2]]--
+		}
+	}
+	out := map[string]bool{}
+	for peer, n := range open {
+		if n > 0 {
+			out[peer] = true
+		}
+	}
+	return out
+}
+
+// waitSettled waits for the state a healthy-cluster scenario starts from, and
+// returns the leader and term it settled on: the highest term any running
+// node has seen is led, every other running node reports following that leader
+// in that term, and every running node has a live connection to every other.
+// A leader is elected as soon as a majority is connected, while the transport
+// retries a failed dial only every 500 ms; a scenario that starts at the first
+// leader can start before the last link is up — and a node still cut off keeps
+// campaigning, at terms that depose the leader once it connects.
+func (c *rcluster) waitSettled(d time.Duration) (string, uint64) {
+	c.t.Helper()
+	running := c.running()
+	deadline := time.Now().Add(d)
+	for {
+		leader, term, ok := c.latestLeader(running)
+		settled := ok
+		for _, id := range running {
+			if settled && id != leader && !strings.Contains(c.procs[id].out.String(), fmt.Sprintf("event=raft_follower node=%s term=%d leader=%s", id, term, leader)) {
+				settled = false
+			}
+			conns := c.connectedPeers(id)
+			for _, other := range running {
+				if other != id && !conns[other] {
+					settled = false
+				}
+			}
+		}
+		if settled {
+			return leader, term
+		}
+		if time.Now().After(deadline) {
+			c.t.Fatalf("the running nodes did not settle on one leader with every link up within %s\nps: %s\n%s", d, c.postMortem(), c.outputs())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // liveLog reads a node's durable log (read-only; safe while the process runs).
