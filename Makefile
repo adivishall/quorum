@@ -33,7 +33,7 @@ integration:
 ## fault-model fidelity, Phase 11 crash-recovery rules, Phase 12 client-visible
 ## consistency and the checker itself, Phase 13 request identity, deduplication,
 ## forwarding and the session client, Phase 14 snapshots and log compaction,
-## Phase 15 membership and multi-Raft, Phase 16 observability, the load generator;
+## Phase 15 membership and multi-Raft, Phase 16 observability, the load generator, the lab;
 ## ONLY='a|b' runs the mutants whose names match the regex alone, and fails if none does).
 ## DRY=1 checks every mutant still applies without running tests. Applies deliberate rule-violating edits to the source,
 ## runs the tests that must catch each, and requires every mutant to be killed
