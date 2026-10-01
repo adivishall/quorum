@@ -3,8 +3,10 @@ package integration
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -101,18 +103,19 @@ func meteredLeader(t *testing.T, c *rcluster, at map[string]string) string {
 // TestRealProcessesServeTruthfulMetrics: a three-process -raft group with
 // -metrics-listen. Writes sent through a follower are counted once each, at
 // the follower's front, as forwarded by it and as served by the leader; every
-// replica counts their execution; each process reports two connected peers and
-// its own CPU and heap. When the leader is SIGKILLed, a survivor counts the
-// election it wins.
+// replica counts their execution; each process reports exactly the peers its
+// own log shows connected, and its own CPU and heap. When the leader is
+// SIGKILLed, a survivor counts the election it wins.
 func TestRealProcessesServeTruthfulMetrics(t *testing.T) {
 	for attempt := 1; ; attempt++ {
-		if realMetricsScenario(t) {
+		ok, why := realMetricsScenario(t)
+		if ok {
 			return
 		}
 		if attempt == 3 {
-			t.Fatal("premise: an election ran during the writes on three fresh clusters")
+			t.Fatalf("premise failed on three fresh clusters, last: %s", why)
 		}
-		t.Logf("attempt %d: an election ran during the writes (premise voided); starting over on a fresh cluster", attempt)
+		t.Logf("attempt %d: %s (premise voided); starting over on a fresh cluster", attempt, why)
 	}
 }
 
@@ -133,12 +136,17 @@ func termsOf(t *testing.T, c *rcluster, at map[string]string) map[string]float64
 	return out
 }
 
-// realMetricsScenario runs the scenario once; it reports false (and asserts
-// nothing) if its premise — no election while the writes go through the
-// follower — did not hold.
-func realMetricsScenario(t *testing.T) bool {
+// realMetricsScenario runs the scenario once on a settled cluster; it reports
+// false, with the reason, and asserts nothing, if a premise did not hold: an
+// election while the writes went through the follower, or a link that
+// changed around the scrape its connected-peers gauge is compared with.
+func realMetricsScenario(t *testing.T) (bool, string) {
 	c, at := newMeteredRCluster(t, 3)
+	settled, _ := c.waitSettled(20 * time.Second)
 	leader := meteredLeader(t, c, at)
+	if leader != settled {
+		return false, fmt.Sprintf("the role gauges name %s leader; the logs had settled on %s", leader, settled)
+	}
 	termsBefore := termsOf(t, c, at)
 	var follower string
 	for _, id := range c.ids {
@@ -170,7 +178,7 @@ func realMetricsScenario(t *testing.T) bool {
 	}
 	for id, term := range termsOf(t, c, at) {
 		if term != termsBefore[id] {
-			return false
+			return false, fmt.Sprintf("an election ran during the writes (%s: term %v -> %v)", id, termsBefore[id], term)
 		}
 	}
 	scrapes := map[string]metrics.Samples{}
@@ -196,13 +204,22 @@ func realMetricsScenario(t *testing.T) bool {
 	for _, id := range c.ids {
 		deadline := time.Now().Add(10 * time.Second)
 		for {
+			// The connected-peers gauge is compared with the node's own log,
+			// read on both sides of the scrape: a link that came or went
+			// meanwhile (the transport tears down a link idle for 120 ticks
+			// and redials it) leaves the comparison undefined.
+			before := c.connectedPeers(id)
 			ss, err := scrapeHTTP(t, at[id])
 			if err != nil {
 				t.Fatal(err)
 			}
 			if v, _ := ss.Get("dkv_kv_apply_decisions_total", "group", "0", "decision", "executed"); v == puts {
-				if p, _ := ss.Get("dkv_transport_peers", "state", "connected"); p != 2 {
-					t.Fatalf("%s reports %v connected peers, want 2", id, p)
+				after := c.connectedPeers(id)
+				if !maps.Equal(before, after) {
+					return false, fmt.Sprintf("%s's connections changed around the scrape: %v -> %v", id, before, after)
+				}
+				if p, _ := ss.Get("dkv_transport_peers", "state", "connected"); p != float64(len(after)) {
+					t.Fatalf("%s reports %v connected peers; its log shows %d connected (%v)", id, p, len(after), after)
 				}
 				if cpu, _ := ss.Get("process_cpu_seconds_total"); cpu <= 0 {
 					t.Fatalf("%s reports %v CPU seconds", id, cpu)
@@ -234,5 +251,31 @@ func realMetricsScenario(t *testing.T) bool {
 	if won := ss.Sum("dkv_raft_elections_won_total", "group", "0"); won < wonBefore[next]+1 {
 		t.Fatalf("%s leads after %s was killed, but its elections won went %v -> %v", next, leader, wonBefore[next], won)
 	}
-	return true
+	return true, ""
+}
+
+// TestSettledStartWaitsForEveryLink: the settled-cluster premise is real. Two
+// of three nodes elect a leader while the third is not running; once it
+// starts, waitSettled returns only when every node follows one leader in the
+// highest term seen and every pair of processes has logged a connection —
+// including the pair of followers, which Raft never makes talk to each other.
+// Whether the late node forced an election on its way in is logged, not
+// asserted: that is the liveness hazard PreVote would remove.
+func TestSettledStartWaitsForEveryLink(t *testing.T) {
+	c := newRCluster(t, 3)
+	c.kill("n3")
+	first, firstTerm := c.waitLeader([]string{"n1", "n2"}, 0, 20*time.Second)
+	c.start("n3")
+	leader, term := c.waitSettled(20 * time.Second)
+	for _, id := range c.ids {
+		if conns := c.connectedPeers(id); len(conns) != 2 || conns[id] {
+			t.Fatalf("%s is connected to %v after the cluster settled", id, conns)
+		}
+		if id != leader && !strings.Contains(c.procs[id].out.String(), fmt.Sprintf("event=raft_follower node=%s term=%d leader=%s", id, term, leader)) {
+			t.Fatalf("%s does not follow %s in term %d after the cluster settled\n%s", id, leader, term, c.outputs())
+		}
+	}
+	if leader != first || term != firstTerm {
+		t.Logf("the late node forced an election: %s led term %d before it started; the cluster settled on %s at term %d", first, firstTerm, leader, term)
+	}
 }

@@ -370,7 +370,7 @@ func TestRealConcurrentClientsAreLinearizable(t *testing.T) {
 	for _, clients := range []int{2, 4, 8} {
 		t.Run(fmt.Sprintf("%d-clients", clients), func(t *testing.T) {
 			c := newRCluster(t, 3)
-			c.waitLeader(c.ids, 0, 20*time.Second)
+			c.waitSettled(20 * time.Second)
 			c.waitClientReady(20 * time.Second)
 			r := newLinRun(t, c)
 			r.workload(workload.Options{Clients: clients, OpsPerClient: 60, Keys: 3, Timeout: 10 * time.Second, Seed: int64(clients), GetPct: 40, DeletePct: 10}, nil)
@@ -385,7 +385,7 @@ func TestRealConcurrentClientsAreLinearizable(t *testing.T) {
 // must be explained by one order of the writes around it.
 func TestRealSameKeyWritesReadsAndDeletes(t *testing.T) {
 	c := newRCluster(t, 3)
-	c.waitLeader(c.ids, 0, 20*time.Second)
+	c.waitSettled(20 * time.Second) // started at the first leader, the workload can run into the last node's election
 	c.waitClientReady(20 * time.Second)
 	r := newLinRun(t, c)
 	st := r.workload(workload.Options{Clients: 8, OpsPerClient: 50, Keys: 1, Timeout: 10 * time.Second, Seed: 77, GetPct: 40, DeletePct: 25}, nil)
