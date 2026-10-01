@@ -1,0 +1,8148 @@
+{
+  "env": {
+    "hostname": "Adis-MacBook-Air.local",
+    "os": "darwin",
+    "os_version": "macOS 26.5.2",
+    "arch": "arm64",
+    "cpu_model": "Apple M4",
+    "cpus_logical": 10,
+    "cpus_physical": 10,
+    "ram_bytes": 17179869184,
+    "go_version": "go1.27.1",
+    "git_commit": "b2515271a43e38e86aedf7f3275a6321caaf8043",
+    "git_dirty": false,
+    "captured_at": "2026-09-29T07:43:03.257985Z"
+  },
+  "runs_per_configuration": 10,
+  "summaries": [
+    {
+      "name": "leader-kill/raft-3n/r50-rate50",
+      "runs": 10,
+      "failed_runs": 0,
+      "ok_per_sec": {
+        "n": 10,
+        "median": 50,
+        "p95": 50,
+        "min": 50,
+        "max": 50,
+        "spread": 0
+      },
+      "get_p50_us": {
+        "n": 10,
+        "median": 2517.167,
+        "p95": 4087.334,
+        "min": 1617.917,
+        "max": 4087.334,
+        "spread": 0.9810302614010116
+      },
+      "get_p99_us": {
+        "n": 10,
+        "median": 651602.3335,
+        "p95": 710491.209,
+        "min": 341011.459,
+        "max": 710491.209,
+        "spread": 0.5670325764725029
+      },
+      "put_p50_us": {
+        "n": 10,
+        "median": 13955.4375,
+        "p95": 15301.792,
+        "min": 13423.334,
+        "max": 15301.792,
+        "spread": 0.13460402083417297
+      },
+      "put_p99_us": {
+        "n": 10,
+        "median": 680796.271,
+        "p95": 756417.667,
+        "min": 642533.167,
+        "max": 756417.667,
+        "spread": 0.16728132166869641
+      },
+      "unknown_ops": {
+        "n": 10,
+        "median": 0,
+        "min": 0,
+        "max": 0,
+        "spread": 0
+      },
+      "refused_ops": {
+        "n": 10,
+        "median": 0,
+        "min": 0,
+        "max": 0,
+        "spread": 0
+      },
+      "longest_outage_ms": {
+        "n": 10,
+        "median": 450,
+        "p95": 600,
+        "min": 400,
+        "max": 600,
+        "spread": 0.4444444444444444
+      },
+      "settle_ms": {
+        "kill-leader": {
+          "n": 10,
+          "median": 520.9110000000001,
+          "p95": 617.418,
+          "min": 452.94,
+          "max": 617.418,
+          "spread": 0.31575067525930534
+        },
+        "restart": {
+          "n": 10,
+          "median": 251.22199999999998,
+          "p95": 465.482,
+          "min": 46.026,
+          "max": 465.482,
+          "spread": 1.669662688777257
+        }
+      },
+      "node_cpu_per_sec": {
+        "n": 10,
+        "median": 0.026910999267341314,
+        "p95": 0.02910704486741224,
+        "min": 0.018514310501189117,
+        "max": 0.02910704486741224,
+        "spread": 0.39362099716149407
+      },
+      "node_max_rss_mib": {
+        "n": 10,
+        "median": 20.2109375,
+        "p95": 20.390625,
+        "min": 20.015625,
+        "max": 20.390625,
+        "spread": 0.018554310011596443
+      },
+      "generator_cpu_per_sec": {
+        "n": 10,
+        "median": 0.029148229999585093,
+        "p95": 0.033040291706912646,
+        "min": 0.022322341463909184,
+        "max": 0.033040291706912646,
+        "spread": 0.36770501135595623
+      },
+      "max_follower_lag": {
+        "n": 10,
+        "median": 252.5,
+        "p95": 260,
+        "min": 245,
+        "max": 260,
+        "spread": 0.0594059405940594
+      }
+    }
+  ],
+  "results": [
+    {
+      "experiment": {
+        "name": "leader-kill/raft-3n/r50-rate50",
+        "cluster": {
+          "mode": "raft",
+          "nodes": 3,
+          "spares": 0,
+          "shards": 4,
+          "rf": 3,
+          "tick": 50000000,
+          "snapshot_every": 0
+        },
+        "load": {
+          "endpoints": null,
+          "route": "",
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 0,
+          "bucket": 0
+        },
+        "actions": [
+          {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          }
+        ]
+      },
+      "load": {
+        "config": {
+          "endpoints": [
+            {
+              "name": "n1",
+              "addr": "127.0.0.1:31001"
+            },
+            {
+              "name": "n2",
+              "addr": "127.0.0.1:31005"
+            },
+            {
+              "name": "n3",
+              "addr": "127.0.0.1:31009"
+            }
+          ],
+          "route": "group 0",
+          "groups": [
+            0
+          ],
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "uniform",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 8,
+          "bucket": 100000000
+        },
+        "start": "2026-09-29T13:13:04.875018+05:30",
+        "elapsed": 11981583042,
+        "issued": 600,
+        "classes": {
+          "not_found": 246,
+          "ok": 254
+        },
+        "ops": {
+          "get": {
+            "classes": {
+              "not_found": 246,
+              "ok": 2
+            },
+            "latency": {
+              "count": 248,
+              "min_us": 471,
+              "mean_us": 23836.305774193548,
+              "p50_us": 3498.75,
+              "p90_us": 5742.125,
+              "p95_us": 153950.25,
+              "p99_us": 694220.917,
+              "p999_us": 697974.875,
+              "max_us": 697974.875
+            }
+          },
+          "put": {
+            "classes": {
+              "ok": 252
+            },
+            "latency": {
+              "count": 252,
+              "min_us": 9410.792,
+              "mean_us": 53323.2456984127,
+              "p50_us": 13752.083,
+              "p90_us": 137988.75,
+              "p95_us": 207810.875,
+              "p99_us": 726228.917,
+              "p999_us": 733955.958,
+              "max_us": 733955.958
+            }
+          }
+        },
+        "all": {
+          "count": 500,
+          "min_us": 471,
+          "mean_us": 38697.723496,
+          "p50_us": 11422.875,
+          "p90_us": 19417.792,
+          "p95_us": 197825.458,
+          "p99_us": 700851.583,
+          "p999_us": 733955.958,
+          "max_us": 733955.958
+        },
+        "ok_per_sec": 50,
+        "offered_per_sec": 50,
+        "late": 0,
+        "longest_outage": 500000000,
+        "timeline": [
+          {
+            "offset_ms": 0,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5800,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5900,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6000,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6100,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6200,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6400,
+            "ok": 8,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6500,
+            "ok": 10,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6600,
+            "ok": 11,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6700,
+            "ok": 16,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11400,
+            "ok": 4,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11500,
+            "ok": 6,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11900,
+            "ok": 5,
+            "failed": 0
+          }
+        ],
+        "generator_cpu": 319216000
+      },
+      "actions": [
+        {
+          "action": {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          },
+          "node": "n3",
+          "start": 6000376375,
+          "settle": 591382292,
+          "detail": "new leader n2"
+        },
+        {
+          "action": {
+            "at": 0,
+            "kind": "restart",
+            "group": 0
+          },
+          "node": "n3",
+          "start": 9592451250,
+          "settle": 436631917
+        }
+      ],
+      "nodes": {
+        "n1": {
+          "cpu_per_sec": 0.027663539854302335,
+          "max_rss_bytes": 20578304,
+          "heap_inuse_bytes": 4530176,
+          "goroutines": 37,
+          "log_bytes": 43994,
+          "elections_won": 0,
+          "persists": 486,
+          "persist_mean_us": 5081.66857201646,
+          "commit_mean_us": 0,
+          "restarted": false
+        },
+        "n2": {
+          "cpu_per_sec": 0.03880280246527377,
+          "max_rss_bytes": 21250048,
+          "heap_inuse_bytes": 2818048,
+          "goroutines": 37,
+          "log_bytes": 44129,
+          "elections_won": 1,
+          "persists": 573,
+          "persist_mean_us": 4759.0574642233805,
+          "commit_mean_us": 19974.486530487797,
+          "restarted": false
+        },
+        "n3": {
+          "cpu_per_sec": 0.007551506314552654,
+          "max_rss_bytes": 17596416,
+          "heap_inuse_bytes": 2785280,
+          "goroutines": 37,
+          "log_bytes": 42544,
+          "elections_won": 0,
+          "persists": 85,
+          "persist_mean_us": 4379.34365882353,
+          "commit_mean_us": 0,
+          "restarted": true
+        }
+      },
+      "max_follower_lag": 260
+    },
+    {
+      "experiment": {
+        "name": "leader-kill/raft-3n/r50-rate50",
+        "cluster": {
+          "mode": "raft",
+          "nodes": 3,
+          "spares": 0,
+          "shards": 4,
+          "rf": 3,
+          "tick": 50000000,
+          "snapshot_every": 0
+        },
+        "load": {
+          "endpoints": null,
+          "route": "",
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 0,
+          "bucket": 0
+        },
+        "actions": [
+          {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          }
+        ]
+      },
+      "load": {
+        "config": {
+          "endpoints": [
+            {
+              "name": "n1",
+              "addr": "127.0.0.1:31001"
+            },
+            {
+              "name": "n2",
+              "addr": "127.0.0.1:31005"
+            },
+            {
+              "name": "n3",
+              "addr": "127.0.0.1:31009"
+            }
+          ],
+          "route": "group 0",
+          "groups": [
+            0
+          ],
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "uniform",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 8,
+          "bucket": 100000000
+        },
+        "start": "2026-09-29T13:13:17.701927+05:30",
+        "elapsed": 11981639042,
+        "issued": 600,
+        "classes": {
+          "not_found": 246,
+          "ok": 254
+        },
+        "ops": {
+          "get": {
+            "classes": {
+              "not_found": 246,
+              "ok": 2
+            },
+            "latency": {
+              "count": 248,
+              "min_us": 337.75,
+              "mean_us": 18321.85300403226,
+              "p50_us": 1639.875,
+              "p90_us": 5353.209,
+              "p95_us": 53094.792,
+              "p99_us": 640933.667,
+              "p999_us": 673098.042,
+              "max_us": 673098.042
+            }
+          },
+          "put": {
+            "classes": {
+              "ok": 252
+            },
+            "latency": {
+              "count": 252,
+              "min_us": 9876.5,
+              "mean_us": 40011.12449603175,
+              "p50_us": 14959.792,
+              "p90_us": 20924.292,
+              "p95_us": 106058.917,
+              "p99_us": 652158.375,
+              "p999_us": 681015.917,
+              "max_us": 681015.917
+            }
+          }
+        },
+        "all": {
+          "count": 500,
+          "min_us": 337.75,
+          "mean_us": 29253.245836,
+          "p50_us": 11655.959,
+          "p90_us": 18112.959,
+          "p95_us": 98091.375,
+          "p99_us": 651123.042,
+          "p999_us": 681015.917,
+          "max_us": 681015.917
+        },
+        "ok_per_sec": 50,
+        "offered_per_sec": 50,
+        "late": 0,
+        "longest_outage": 400000000,
+        "timeline": [
+          {
+            "offset_ms": 0,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5700,
+            "ok": 2,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5800,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5900,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6000,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6100,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6200,
+            "ok": 9,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6300,
+            "ok": 9,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6400,
+            "ok": 15,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6500,
+            "ok": 10,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11900,
+            "ok": 5,
+            "failed": 0
+          }
+        ],
+        "generator_cpu": 327435000
+      },
+      "actions": [
+        {
+          "action": {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          },
+          "node": "n3",
+          "start": 6000063125,
+          "settle": 477087000,
+          "detail": "new leader n2"
+        },
+        {
+          "action": {
+            "at": 0,
+            "kind": "restart",
+            "group": 0
+          },
+          "node": "n3",
+          "start": 9477878000,
+          "settle": 46026417
+        }
+      ],
+      "nodes": {
+        "n1": {
+          "cpu_per_sec": 0.030582627194453923,
+          "max_rss_bytes": 20316160,
+          "heap_inuse_bytes": 3792896,
+          "goroutines": 37,
+          "log_bytes": 44198,
+          "elections_won": 0,
+          "persists": 495,
+          "persist_mean_us": 5320.722905050511,
+          "commit_mean_us": 0,
+          "restarted": false
+        },
+        "n2": {
+          "cpu_per_sec": 0.03991724323554364,
+          "max_rss_bytes": 21331968,
+          "heap_inuse_bytes": 4177920,
+          "goroutines": 37,
+          "log_bytes": 44288,
+          "elections_won": 1,
+          "persists": 570,
+          "persist_mean_us": 4692.185459649126,
+          "commit_mean_us": 15088.804787878782,
+          "restarted": false
+        },
+        "n3": {
+          "cpu_per_sec": 0.0062017391560142115,
+          "max_rss_bytes": 16203776,
+          "heap_inuse_bytes": 3801088,
+          "goroutines": 27,
+          "log_bytes": 42855,
+          "elections_won": 0,
+          "persists": 116,
+          "persist_mean_us": 4240.378956896552,
+          "commit_mean_us": 0,
+          "restarted": true
+        }
+      },
+      "max_follower_lag": 246
+    },
+    {
+      "experiment": {
+        "name": "leader-kill/raft-3n/r50-rate50",
+        "cluster": {
+          "mode": "raft",
+          "nodes": 3,
+          "spares": 0,
+          "shards": 4,
+          "rf": 3,
+          "tick": 50000000,
+          "snapshot_every": 0
+        },
+        "load": {
+          "endpoints": null,
+          "route": "",
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 0,
+          "bucket": 0
+        },
+        "actions": [
+          {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          }
+        ]
+      },
+      "load": {
+        "config": {
+          "endpoints": [
+            {
+              "name": "n1",
+              "addr": "127.0.0.1:31001"
+            },
+            {
+              "name": "n2",
+              "addr": "127.0.0.1:31005"
+            },
+            {
+              "name": "n3",
+              "addr": "127.0.0.1:31009"
+            }
+          ],
+          "route": "group 0",
+          "groups": [
+            0
+          ],
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "uniform",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 8,
+          "bucket": 100000000
+        },
+        "start": "2026-09-29T13:13:30.536779+05:30",
+        "elapsed": 11981536083,
+        "issued": 600,
+        "classes": {
+          "not_found": 246,
+          "ok": 254
+        },
+        "ops": {
+          "get": {
+            "classes": {
+              "not_found": 246,
+              "ok": 2
+            },
+            "latency": {
+              "count": 248,
+              "min_us": 287.042,
+              "mean_us": 15753.192540322581,
+              "p50_us": 2213.125,
+              "p90_us": 5817.292,
+              "p95_us": 15564.208,
+              "p99_us": 343694.375,
+              "p999_us": 632546.292,
+              "max_us": 632546.292
+            }
+          },
+          "put": {
+            "classes": {
+              "ok": 252
+            },
+            "latency": {
+              "count": 252,
+              "min_us": 10505.542,
+              "mean_us": 36416.06367063492,
+              "p50_us": 13738.667,
+              "p90_us": 17782.958,
+              "p95_us": 75775.167,
+              "p99_us": 642533.167,
+              "p999_us": 643462,
+              "max_us": 643462
+            }
+          }
+        },
+        "all": {
+          "count": 500,
+          "min_us": 287.042,
+          "mean_us": 26167.27959,
+          "p50_us": 11608.083,
+          "p90_us": 17555.458,
+          "p95_us": 67545.708,
+          "p99_us": 635451.5,
+          "p999_us": 643462,
+          "max_us": 643462
+        },
+        "ok_per_sec": 50,
+        "offered_per_sec": 50,
+        "late": 0,
+        "longest_outage": 400000000,
+        "timeline": [
+          {
+            "offset_ms": 0,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5700,
+            "ok": 4,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5800,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5900,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6000,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6100,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6200,
+            "ok": 10,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6300,
+            "ok": 13,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6400,
+            "ok": 10,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6500,
+            "ok": 8,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11900,
+            "ok": 5,
+            "failed": 0
+          }
+        ],
+        "generator_cpu": 361703000
+      },
+      "actions": [
+        {
+          "action": {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          },
+          "node": "n3",
+          "start": 6000798459,
+          "settle": 461833625,
+          "detail": "new leader n2"
+        },
+        {
+          "action": {
+            "at": 0,
+            "kind": "restart",
+            "group": 0
+          },
+          "node": "n3",
+          "start": 9462910168,
+          "settle": 83676042
+        }
+      ],
+      "nodes": {
+        "n1": {
+          "cpu_per_sec": 0.03260675403334259,
+          "max_rss_bytes": 20463616,
+          "heap_inuse_bytes": 3899392,
+          "goroutines": 37,
+          "log_bytes": 44024,
+          "elections_won": 0,
+          "persists": 483,
+          "persist_mean_us": 5194.262238095236,
+          "commit_mean_us": 0,
+          "restarted": false
+        },
+        "n2": {
+          "cpu_per_sec": 0.042997074534620844,
+          "max_rss_bytes": 20987904,
+          "heap_inuse_bytes": 3948544,
+          "goroutines": 37,
+          "log_bytes": 44129,
+          "elections_won": 1,
+          "persists": 573,
+          "persist_mean_us": 4698.364600349032,
+          "commit_mean_us": 14270.880097560974,
+          "restarted": false
+        },
+        "n3": {
+          "cpu_per_sec": 0.00869546269178481,
+          "max_rss_bytes": 16154624,
+          "heap_inuse_bytes": 3850240,
+          "goroutines": 27,
+          "log_bytes": 42726,
+          "elections_won": 0,
+          "persists": 105,
+          "persist_mean_us": 4318.67222857143,
+          "commit_mean_us": 0,
+          "restarted": true
+        }
+      },
+      "max_follower_lag": 246
+    },
+    {
+      "experiment": {
+        "name": "leader-kill/raft-3n/r50-rate50",
+        "cluster": {
+          "mode": "raft",
+          "nodes": 3,
+          "spares": 0,
+          "shards": 4,
+          "rf": 3,
+          "tick": 50000000,
+          "snapshot_every": 0
+        },
+        "load": {
+          "endpoints": null,
+          "route": "",
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 0,
+          "bucket": 0
+        },
+        "actions": [
+          {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          }
+        ]
+      },
+      "load": {
+        "config": {
+          "endpoints": [
+            {
+              "name": "n1",
+              "addr": "127.0.0.1:31001"
+            },
+            {
+              "name": "n2",
+              "addr": "127.0.0.1:31005"
+            },
+            {
+              "name": "n3",
+              "addr": "127.0.0.1:31009"
+            }
+          ],
+          "route": "group 0",
+          "groups": [
+            0
+          ],
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "uniform",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 8,
+          "bucket": 100000000
+        },
+        "start": "2026-09-29T13:13:43.326075+05:30",
+        "elapsed": 11981280417,
+        "issued": 600,
+        "classes": {
+          "not_found": 246,
+          "ok": 254
+        },
+        "ops": {
+          "get": {
+            "classes": {
+              "not_found": 246,
+              "ok": 2
+            },
+            "latency": {
+              "count": 248,
+              "min_us": 483.5,
+              "mean_us": 23630.22358467742,
+              "p50_us": 3623.542,
+              "p90_us": 5295.417,
+              "p95_us": 138991.459,
+              "p99_us": 710491.209,
+              "p999_us": 758872.084,
+              "max_us": 758872.084
+            }
+          },
+          "put": {
+            "classes": {
+              "ok": 252
+            },
+            "latency": {
+              "count": 252,
+              "min_us": 8902.042,
+              "mean_us": 54488.13593650793,
+              "p50_us": 14581.625,
+              "p90_us": 158950.625,
+              "p95_us": 207338.709,
+              "p99_us": 756417.667,
+              "p999_us": 768498.584,
+              "max_us": 768498.584
+            }
+          }
+        },
+        "all": {
+          "count": 500,
+          "min_us": 483.5,
+          "mean_us": 39182.61141,
+          "p50_us": 11151.667,
+          "p90_us": 22607.667,
+          "p95_us": 191419.417,
+          "p99_us": 728568.792,
+          "p999_us": 768498.584,
+          "max_us": 768498.584
+        },
+        "ok_per_sec": 50,
+        "offered_per_sec": 50,
+        "late": 0,
+        "longest_outage": 500000000,
+        "timeline": [
+          {
+            "offset_ms": 0,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5800,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5900,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6000,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6100,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6200,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6300,
+            "ok": 2,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6400,
+            "ok": 13,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6500,
+            "ok": 8,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6600,
+            "ok": 9,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6700,
+            "ok": 18,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11900,
+            "ok": 5,
+            "failed": 0
+          }
+        ],
+        "generator_cpu": 395865000
+      },
+      "actions": [
+        {
+          "action": {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          },
+          "node": "n3",
+          "start": 6000779708,
+          "settle": 601097291,
+          "detail": "new leader n2"
+        },
+        {
+          "action": {
+            "at": 0,
+            "kind": "restart",
+            "group": 0
+          },
+          "node": "n3",
+          "start": 9602106124,
+          "settle": 425128875
+        }
+      ],
+      "nodes": {
+        "n1": {
+          "cpu_per_sec": 0.035138314549641,
+          "max_rss_bytes": 19988480,
+          "heap_inuse_bytes": 4055040,
+          "goroutines": 37,
+          "log_bytes": 43937,
+          "elections_won": 0,
+          "persists": 485,
+          "persist_mean_us": 5139.590962886594,
+          "commit_mean_us": 0,
+          "restarted": false
+        },
+        "n2": {
+          "cpu_per_sec": 0.04417466093599067,
+          "max_rss_bytes": 21282816,
+          "heap_inuse_bytes": 3563520,
+          "goroutines": 37,
+          "log_bytes": 44087,
+          "elections_won": 1,
+          "persists": 573,
+          "persist_mean_us": 4826.603397905764,
+          "commit_mean_us": 21625.714993902442,
+          "restarted": false
+        },
+        "n3": {
+          "cpu_per_sec": 0.00800815911660504,
+          "max_rss_bytes": 16236544,
+          "heap_inuse_bytes": 3809280,
+          "goroutines": 27,
+          "log_bytes": 42544,
+          "elections_won": 0,
+          "persists": 85,
+          "persist_mean_us": 5259.296035294119,
+          "commit_mean_us": 0,
+          "restarted": true
+        }
+      },
+      "max_follower_lag": 260
+    },
+    {
+      "experiment": {
+        "name": "leader-kill/raft-3n/r50-rate50",
+        "cluster": {
+          "mode": "raft",
+          "nodes": 3,
+          "spares": 0,
+          "shards": 4,
+          "rf": 3,
+          "tick": 50000000,
+          "snapshot_every": 0
+        },
+        "load": {
+          "endpoints": null,
+          "route": "",
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 0,
+          "bucket": 0
+        },
+        "actions": [
+          {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          }
+        ]
+      },
+      "load": {
+        "config": {
+          "endpoints": [
+            {
+              "name": "n1",
+              "addr": "127.0.0.1:31001"
+            },
+            {
+              "name": "n2",
+              "addr": "127.0.0.1:31005"
+            },
+            {
+              "name": "n3",
+              "addr": "127.0.0.1:31009"
+            }
+          ],
+          "route": "group 0",
+          "groups": [
+            0
+          ],
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "uniform",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 8,
+          "bucket": 100000000
+        },
+        "start": "2026-09-29T13:13:56.119929+05:30",
+        "elapsed": 11981602292,
+        "issued": 600,
+        "classes": {
+          "not_found": 246,
+          "ok": 254
+        },
+        "ops": {
+          "get": {
+            "classes": {
+              "not_found": 246,
+              "ok": 2
+            },
+            "latency": {
+              "count": 248,
+              "min_us": 294.084,
+              "mean_us": 15723.902237903227,
+              "p50_us": 1803.167,
+              "p90_us": 5897.625,
+              "p95_us": 17025.292,
+              "p99_us": 341011.459,
+              "p999_us": 633005.25,
+              "max_us": 633005.25
+            }
+          },
+          "put": {
+            "classes": {
+              "ok": 252
+            },
+            "latency": {
+              "count": 252,
+              "min_us": 10496.042,
+              "mean_us": 38763.53354365079,
+              "p50_us": 15301.792,
+              "p90_us": 19924.584,
+              "p95_us": 85961.042,
+              "p99_us": 655908.584,
+              "p999_us": 662958.584,
+              "max_us": 662958.584
+            }
+          }
+        },
+        "all": {
+          "count": 500,
+          "min_us": 294.084,
+          "mean_us": 27335.876416000003,
+          "p50_us": 11452.75,
+          "p90_us": 17728.917,
+          "p95_us": 73895.459,
+          "p99_us": 646863.875,
+          "p999_us": 662958.584,
+          "max_us": 662958.584
+        },
+        "ok_per_sec": 50,
+        "offered_per_sec": 50,
+        "late": 0,
+        "longest_outage": 400000000,
+        "timeline": [
+          {
+            "offset_ms": 0,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5700,
+            "ok": 4,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5800,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5900,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6000,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6100,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6200,
+            "ok": 8,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6300,
+            "ok": 13,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6400,
+            "ok": 10,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6500,
+            "ok": 8,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6600,
+            "ok": 7,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8700,
+            "ok": 4,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8800,
+            "ok": 6,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11900,
+            "ok": 5,
+            "failed": 0
+          }
+        ],
+        "generator_cpu": 336780000
+      },
+      "actions": [
+        {
+          "action": {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          },
+          "node": "n3",
+          "start": 6000594709,
+          "settle": 466110834,
+          "detail": "new leader n2"
+        },
+        {
+          "action": {
+            "at": 0,
+            "kind": "restart",
+            "group": 0
+          },
+          "node": "n3",
+          "start": 9467042459,
+          "settle": 80017417
+        }
+      ],
+      "nodes": {
+        "n1": {
+          "cpu_per_sec": 0.030098144739855465,
+          "max_rss_bytes": 20447232,
+          "heap_inuse_bytes": 3670016,
+          "goroutines": 37,
+          "log_bytes": 44069,
+          "elections_won": 0,
+          "persists": 487,
+          "persist_mean_us": 5326.756944558529,
+          "commit_mean_us": 0,
+          "restarted": false
+        },
+        "n2": {
+          "cpu_per_sec": 0.041926779720890435,
+          "max_rss_bytes": 21200896,
+          "heap_inuse_bytes": 3063808,
+          "goroutines": 37,
+          "log_bytes": 44129,
+          "elections_won": 1,
+          "persists": 560,
+          "persist_mean_us": 4647.660962499997,
+          "commit_mean_us": 14659.50482926829,
+          "restarted": false
+        },
+        "n3": {
+          "cpu_per_sec": 0.008003186690984185,
+          "max_rss_bytes": 15958016,
+          "heap_inuse_bytes": 3391488,
+          "goroutines": 27,
+          "log_bytes": 42726,
+          "elections_won": 0,
+          "persists": 112,
+          "persist_mean_us": 4652.142473214285,
+          "commit_mean_us": 0,
+          "restarted": true
+        }
+      },
+      "max_follower_lag": 246
+    },
+    {
+      "experiment": {
+        "name": "leader-kill/raft-3n/r50-rate50",
+        "cluster": {
+          "mode": "raft",
+          "nodes": 3,
+          "spares": 0,
+          "shards": 4,
+          "rf": 3,
+          "tick": 50000000,
+          "snapshot_every": 0
+        },
+        "load": {
+          "endpoints": null,
+          "route": "",
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 0,
+          "bucket": 0
+        },
+        "actions": [
+          {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          }
+        ]
+      },
+      "load": {
+        "config": {
+          "endpoints": [
+            {
+              "name": "n1",
+              "addr": "127.0.0.1:31001"
+            },
+            {
+              "name": "n2",
+              "addr": "127.0.0.1:31005"
+            },
+            {
+              "name": "n3",
+              "addr": "127.0.0.1:31009"
+            }
+          ],
+          "route": "group 0",
+          "groups": [
+            0
+          ],
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "uniform",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 8,
+          "bucket": 100000000
+        },
+        "start": "2026-09-29T13:14:08.952093+05:30",
+        "elapsed": 11981057791,
+        "issued": 600,
+        "classes": {
+          "not_found": 246,
+          "ok": 254
+        },
+        "ops": {
+          "get": {
+            "classes": {
+              "not_found": 246,
+              "ok": 2
+            },
+            "latency": {
+              "count": 248,
+              "min_us": 390.875,
+              "mean_us": 27459.174725806453,
+              "p50_us": 3194.208,
+              "p90_us": 5893.666,
+              "p95_us": 217617.708,
+              "p99_us": 708753.166,
+              "p999_us": 717577.333,
+              "max_us": 717577.333
+            }
+          },
+          "put": {
+            "classes": {
+              "ok": 252
+            },
+            "latency": {
+              "count": 252,
+              "min_us": 9534.083,
+              "mean_us": 56582.18486111111,
+              "p50_us": 14064.541,
+              "p90_us": 168686.166,
+              "p95_us": 249661.708,
+              "p99_us": 705683.958,
+              "p999_us": 732630.916,
+              "max_us": 732630.916
+            }
+          }
+        },
+        "all": {
+          "count": 500,
+          "min_us": 390.875,
+          "mean_us": 42137.171834,
+          "p50_us": 11443.083,
+          "p90_us": 21295.916,
+          "p95_us": 246629.458,
+          "p99_us": 705683.958,
+          "p999_us": 732630.916,
+          "max_us": 732630.916
+        },
+        "ok_per_sec": 50,
+        "offered_per_sec": 50,
+        "late": 0,
+        "longest_outage": 600000000,
+        "timeline": [
+          {
+            "offset_ms": 0,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5800,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5900,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6000,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6100,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6200,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6300,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6400,
+            "ok": 10,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6500,
+            "ok": 10,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6600,
+            "ok": 10,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6700,
+            "ok": 20,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10100,
+            "ok": 4,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10200,
+            "ok": 6,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10800,
+            "ok": 4,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11200,
+            "ok": 6,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11900,
+            "ok": 5,
+            "failed": 0
+          }
+        ],
+        "generator_cpu": 374323000
+      },
+      "actions": [
+        {
+          "action": {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          },
+          "node": "n3",
+          "start": 6000721541,
+          "settle": 617418625,
+          "detail": "new leader n2"
+        },
+        {
+          "action": {
+            "at": 0,
+            "kind": "restart",
+            "group": 0
+          },
+          "node": "n3",
+          "start": 9619183916,
+          "settle": 418768584
+        }
+      ],
+      "nodes": {
+        "n1": {
+          "cpu_per_sec": 0.031964873776644656,
+          "max_rss_bytes": 20430848,
+          "heap_inuse_bytes": 4218880,
+          "goroutines": 37,
+          "log_bytes": 43964,
+          "elections_won": 0,
+          "persists": 495,
+          "persist_mean_us": 4886.667765656564,
+          "commit_mean_us": 0,
+          "restarted": false
+        },
+        "n2": {
+          "cpu_per_sec": 0.042153122771795504,
+          "max_rss_bytes": 21102592,
+          "heap_inuse_bytes": 3923968,
+          "goroutines": 37,
+          "log_bytes": 44129,
+          "elections_won": 1,
+          "persists": 573,
+          "persist_mean_us": 4932.766713787082,
+          "commit_mean_us": 22101.909530487792,
+          "restarted": false
+        },
+        "n3": {
+          "cpu_per_sec": 0.007319887903877652,
+          "max_rss_bytes": 16220160,
+          "heap_inuse_bytes": 3809280,
+          "goroutines": 27,
+          "log_bytes": 42544,
+          "elections_won": 0,
+          "persists": 93,
+          "persist_mean_us": 4502.71765591398,
+          "commit_mean_us": 0,
+          "restarted": true
+        }
+      },
+      "max_follower_lag": 259
+    },
+    {
+      "experiment": {
+        "name": "leader-kill/raft-3n/r50-rate50",
+        "cluster": {
+          "mode": "raft",
+          "nodes": 3,
+          "spares": 0,
+          "shards": 4,
+          "rf": 3,
+          "tick": 50000000,
+          "snapshot_every": 0
+        },
+        "load": {
+          "endpoints": null,
+          "route": "",
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 0,
+          "bucket": 0
+        },
+        "actions": [
+          {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          }
+        ]
+      },
+      "load": {
+        "config": {
+          "endpoints": [
+            {
+              "name": "n1",
+              "addr": "127.0.0.1:31001"
+            },
+            {
+              "name": "n2",
+              "addr": "127.0.0.1:31005"
+            },
+            {
+              "name": "n3",
+              "addr": "127.0.0.1:31009"
+            }
+          ],
+          "route": "group 0",
+          "groups": [
+            0
+          ],
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "uniform",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 8,
+          "bucket": 100000000
+        },
+        "start": "2026-09-29T13:14:21.782538+05:30",
+        "elapsed": 11980957083,
+        "issued": 600,
+        "classes": {
+          "not_found": 246,
+          "ok": 254
+        },
+        "ops": {
+          "get": {
+            "classes": {
+              "not_found": 246,
+              "ok": 2
+            },
+            "latency": {
+              "count": 248,
+              "min_us": 388.083,
+              "mean_us": 20415.30931854839,
+              "p50_us": 1677.083,
+              "p90_us": 5900.167,
+              "p95_us": 94148.417,
+              "p99_us": 662271,
+              "p999_us": 690247.625,
+              "max_us": 690247.625
+            }
+          },
+          "put": {
+            "classes": {
+              "ok": 252
+            },
+            "latency": {
+              "count": 252,
+              "min_us": 9141.375,
+              "mean_us": 49354.1628452381,
+              "p50_us": 13825.083,
+              "p90_us": 94295.208,
+              "p95_us": 186101,
+              "p99_us": 722190,
+              "p999_us": 742163.208,
+              "max_us": 742163.208
+            }
+          }
+        },
+        "all": {
+          "count": 500,
+          "min_us": 388.083,
+          "mean_us": 35000.491496,
+          "p50_us": 10704.917,
+          "p90_us": 19628.875,
+          "p95_us": 158135.125,
+          "p99_us": 702271.25,
+          "p999_us": 742163.208,
+          "max_us": 742163.208
+        },
+        "ok_per_sec": 50,
+        "offered_per_sec": 50,
+        "late": 0,
+        "longest_outage": 500000000,
+        "timeline": [
+          {
+            "offset_ms": 0,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5800,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5900,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6000,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6100,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6200,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6300,
+            "ok": 8,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6400,
+            "ok": 9,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6500,
+            "ok": 10,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6600,
+            "ok": 12,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6700,
+            "ok": 11,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11900,
+            "ok": 5,
+            "failed": 0
+          }
+        ],
+        "generator_cpu": 372052000
+      },
+      "actions": [
+        {
+          "action": {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          },
+          "node": "n3",
+          "start": 6000712500,
+          "settle": 559996042,
+          "detail": "new leader n2"
+        },
+        {
+          "action": {
+            "at": 0,
+            "kind": "restart",
+            "group": 0
+          },
+          "node": "n3",
+          "start": 9561754375,
+          "settle": 465482583
+        }
+      ],
+      "nodes": {
+        "n1": {
+          "cpu_per_sec": 0.032860980744070664,
+          "max_rss_bytes": 20135936,
+          "heap_inuse_bytes": 4030464,
+          "goroutines": 37,
+          "log_bytes": 43980,
+          "elections_won": 0,
+          "persists": 500,
+          "persist_mean_us": 5013.659506000002,
+          "commit_mean_us": 0,
+          "restarted": false
+        },
+        "n2": {
+          "cpu_per_sec": 0.04216023782580142,
+          "max_rss_bytes": 21184512,
+          "heap_inuse_bytes": 3317760,
+          "goroutines": 37,
+          "log_bytes": 44115,
+          "elections_won": 1,
+          "persists": 573,
+          "persist_mean_us": 4806.62985165794,
+          "commit_mean_us": 17403.163597560953,
+          "restarted": false
+        },
+        "n3": {
+          "cpu_per_sec": 0.007878502472388834,
+          "max_rss_bytes": 16252928,
+          "heap_inuse_bytes": 3883008,
+          "goroutines": 27,
+          "log_bytes": 42544,
+          "elections_won": 0,
+          "persists": 91,
+          "persist_mean_us": 4172.642417582417,
+          "commit_mean_us": 0,
+          "restarted": true
+        }
+      },
+      "max_follower_lag": 260
+    },
+    {
+      "experiment": {
+        "name": "leader-kill/raft-3n/r50-rate50",
+        "cluster": {
+          "mode": "raft",
+          "nodes": 3,
+          "spares": 0,
+          "shards": 4,
+          "rf": 3,
+          "tick": 50000000,
+          "snapshot_every": 0
+        },
+        "load": {
+          "endpoints": null,
+          "route": "",
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 0,
+          "bucket": 0
+        },
+        "actions": [
+          {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          }
+        ]
+      },
+      "load": {
+        "config": {
+          "endpoints": [
+            {
+              "name": "n1",
+              "addr": "127.0.0.1:31001"
+            },
+            {
+              "name": "n2",
+              "addr": "127.0.0.1:31005"
+            },
+            {
+              "name": "n3",
+              "addr": "127.0.0.1:31009"
+            }
+          ],
+          "route": "group 0",
+          "groups": [
+            0
+          ],
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "uniform",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 8,
+          "bucket": 100000000
+        },
+        "start": "2026-09-29T13:14:34.579168+05:30",
+        "elapsed": 11980732417,
+        "issued": 600,
+        "classes": {
+          "not_found": 246,
+          "ok": 254
+        },
+        "ops": {
+          "get": {
+            "classes": {
+              "not_found": 246,
+              "ok": 2
+            },
+            "latency": {
+              "count": 248,
+              "min_us": 178.417,
+              "mean_us": 21966.755693548388,
+              "p50_us": 2821.209,
+              "p90_us": 5711.834,
+              "p95_us": 134906.959,
+              "p99_us": 663020.292,
+              "p999_us": 716994.084,
+              "max_us": 716994.084
+            }
+          },
+          "put": {
+            "classes": {
+              "ok": 252
+            },
+            "latency": {
+              "count": 252,
+              "min_us": 8418.959,
+              "mean_us": 48835.59245238095,
+              "p50_us": 13423.334,
+              "p90_us": 102119.834,
+              "p95_us": 193169.834,
+              "p99_us": 729116,
+              "p999_us": 731906.417,
+              "max_us": 731906.417
+            }
+          }
+        },
+        "all": {
+          "count": 500,
+          "min_us": 178.417,
+          "mean_us": 35508.64942,
+          "p50_us": 10675.584,
+          "p90_us": 17162.417,
+          "p95_us": 165130.375,
+          "p99_us": 716994.084,
+          "p999_us": 731906.417,
+          "max_us": 731906.417
+        },
+        "ok_per_sec": 50,
+        "offered_per_sec": 50,
+        "late": 0,
+        "longest_outage": 500000000,
+        "timeline": [
+          {
+            "offset_ms": 0,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5800,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5900,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6000,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6100,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6200,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6300,
+            "ok": 6,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6400,
+            "ok": 12,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6500,
+            "ok": 6,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6600,
+            "ok": 17,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6700,
+            "ok": 9,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11900,
+            "ok": 5,
+            "failed": 0
+          }
+        ],
+        "generator_cpu": 267438000
+      },
+      "actions": [
+        {
+          "action": {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          },
+          "node": "n3",
+          "start": 6000431625,
+          "settle": 574040167,
+          "detail": "new leader n2"
+        },
+        {
+          "action": {
+            "at": 0,
+            "kind": "restart",
+            "group": 0
+          },
+          "node": "n3",
+          "start": 9575344000,
+          "settle": 453953833
+        }
+      ],
+      "nodes": {
+        "n1": {
+          "cpu_per_sec": 0.022624660209870036,
+          "max_rss_bytes": 20267008,
+          "heap_inuse_bytes": 4104192,
+          "goroutines": 37,
+          "log_bytes": 43936,
+          "elections_won": 0,
+          "persists": 467,
+          "persist_mean_us": 4842.18405353319,
+          "commit_mean_us": 0,
+          "restarted": false
+        },
+        "n2": {
+          "cpu_per_sec": 0.029133444254604283,
+          "max_rss_bytes": 21151744,
+          "heap_inuse_bytes": 4194304,
+          "goroutines": 37,
+          "log_bytes": 44101,
+          "elections_won": 1,
+          "persists": 561,
+          "persist_mean_us": 4635.200509803922,
+          "commit_mean_us": 19077.383158536584,
+          "restarted": false
+        },
+        "n3": {
+          "cpu_per_sec": 0.003784827039093031,
+          "max_rss_bytes": 16318464,
+          "heap_inuse_bytes": 3956736,
+          "goroutines": 27,
+          "log_bytes": 42544,
+          "elections_won": 0,
+          "persists": 85,
+          "persist_mean_us": 4394.407870588235,
+          "commit_mean_us": 0,
+          "restarted": true
+        }
+      },
+      "max_follower_lag": 260
+    },
+    {
+      "experiment": {
+        "name": "leader-kill/raft-3n/r50-rate50",
+        "cluster": {
+          "mode": "raft",
+          "nodes": 3,
+          "spares": 0,
+          "shards": 4,
+          "rf": 3,
+          "tick": 50000000,
+          "snapshot_every": 0
+        },
+        "load": {
+          "endpoints": null,
+          "route": "",
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 0,
+          "bucket": 0
+        },
+        "actions": [
+          {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          }
+        ]
+      },
+      "load": {
+        "config": {
+          "endpoints": [
+            {
+              "name": "n1",
+              "addr": "127.0.0.1:31001"
+            },
+            {
+              "name": "n2",
+              "addr": "127.0.0.1:31005"
+            },
+            {
+              "name": "n3",
+              "addr": "127.0.0.1:31009"
+            }
+          ],
+          "route": "group 0",
+          "groups": [
+            0
+          ],
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "uniform",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 8,
+          "bucket": 100000000
+        },
+        "start": "2026-09-29T13:14:47.442589+05:30",
+        "elapsed": 11981672042,
+        "issued": 600,
+        "classes": {
+          "not_found": 246,
+          "ok": 254
+        },
+        "ops": {
+          "get": {
+            "classes": {
+              "not_found": 246,
+              "ok": 2
+            },
+            "latency": {
+              "count": 248,
+              "min_us": 346.542,
+              "mean_us": 16481.285616935485,
+              "p50_us": 1617.917,
+              "p90_us": 5007.209,
+              "p95_us": 15226.625,
+              "p99_us": 624112.125,
+              "p999_us": 632187.792,
+              "max_us": 632187.792
+            }
+          },
+          "put": {
+            "classes": {
+              "ok": 252
+            },
+            "latency": {
+              "count": 252,
+              "min_us": 8917.625,
+              "mean_us": 34110.458670634915,
+              "p50_us": 13846.334,
+              "p90_us": 18050.75,
+              "p95_us": 63066.334,
+              "p99_us": 643203.167,
+              "p999_us": 647262,
+              "max_us": 647262
+            }
+          }
+        },
+        "all": {
+          "count": 500,
+          "min_us": 346.542,
+          "mean_us": 25366.388836,
+          "p50_us": 11457.625,
+          "p90_us": 16765.709,
+          "p95_us": 50079.084,
+          "p99_us": 632187.792,
+          "p999_us": 647262,
+          "max_us": 647262
+        },
+        "ok_per_sec": 50,
+        "offered_per_sec": 50,
+        "late": 0,
+        "longest_outage": 400000000,
+        "timeline": [
+          {
+            "offset_ms": 0,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5700,
+            "ok": 3,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5800,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5900,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6000,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6100,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6200,
+            "ok": 11,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6300,
+            "ok": 14,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6400,
+            "ok": 10,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6500,
+            "ok": 7,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11900,
+            "ok": 5,
+            "failed": 0
+          }
+        ],
+        "generator_cpu": 304260000
+      },
+      "actions": [
+        {
+          "action": {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          },
+          "node": "n3",
+          "start": 6000174792,
+          "settle": 452940167,
+          "detail": "new leader n2"
+        },
+        {
+          "action": {
+            "at": 0,
+            "kind": "restart",
+            "group": 0
+          },
+          "node": "n3",
+          "start": 9454195751,
+          "settle": 69349959
+        }
+      ],
+      "nodes": {
+        "n1": {
+          "cpu_per_sec": 0.028962568728602495,
+          "max_rss_bytes": 20070400,
+          "heap_inuse_bytes": 3719168,
+          "goroutines": 37,
+          "log_bytes": 44025,
+          "elections_won": 0,
+          "persists": 482,
+          "persist_mean_us": 4836.104309128631,
+          "commit_mean_us": 0,
+          "restarted": false
+        },
+        "n2": {
+          "cpu_per_sec": 0.03844296508745987,
+          "max_rss_bytes": 21381120,
+          "heap_inuse_bytes": 3555328,
+          "goroutines": 37,
+          "log_bytes": 44100,
+          "elections_won": 1,
+          "persists": 560,
+          "persist_mean_us": 4759.4193839285745,
+          "commit_mean_us": 13596.619390243904,
+          "restarted": false
+        },
+        "n3": {
+          "cpu_per_sec": 0.009088464416175347,
+          "max_rss_bytes": 16171008,
+          "heap_inuse_bytes": 3751936,
+          "goroutines": 27,
+          "log_bytes": 42739,
+          "elections_won": 0,
+          "persists": 113,
+          "persist_mean_us": 4866.716805309735,
+          "commit_mean_us": 0,
+          "restarted": true
+        }
+      },
+      "max_follower_lag": 245
+    },
+    {
+      "experiment": {
+        "name": "leader-kill/raft-3n/r50-rate50",
+        "cluster": {
+          "mode": "raft",
+          "nodes": 3,
+          "spares": 0,
+          "shards": 4,
+          "rf": 3,
+          "tick": 50000000,
+          "snapshot_every": 0
+        },
+        "load": {
+          "endpoints": null,
+          "route": "",
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 0,
+          "bucket": 0
+        },
+        "actions": [
+          {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          }
+        ]
+      },
+      "load": {
+        "config": {
+          "endpoints": [
+            {
+              "name": "n1",
+              "addr": "127.0.0.1:31001"
+            },
+            {
+              "name": "n2",
+              "addr": "127.0.0.1:31005"
+            },
+            {
+              "name": "n3",
+              "addr": "127.0.0.1:31009"
+            }
+          ],
+          "route": "group 0",
+          "groups": [
+            0
+          ],
+          "clients": 16,
+          "duration": 10000000000,
+          "warmup": 2000000000,
+          "rate": 50,
+          "read_pct": 50,
+          "delete_pct": 0,
+          "keys": 10000,
+          "key_dist": "uniform",
+          "zipf_s": 0,
+          "value_size": 100,
+          "seed": 1,
+          "anonymous": false,
+          "attempt_timeout": 2000000000,
+          "max_attempts": 8,
+          "bucket": 100000000
+        },
+        "start": "2026-09-29T13:15:00.280222+05:30",
+        "elapsed": 11981277250,
+        "issued": 600,
+        "classes": {
+          "not_found": 246,
+          "ok": 254
+        },
+        "ops": {
+          "get": {
+            "classes": {
+              "not_found": 246,
+              "ok": 2
+            },
+            "latency": {
+              "count": 248,
+              "min_us": 511.167,
+              "mean_us": 17482.17139516129,
+              "p50_us": 4087.334,
+              "p90_us": 5763.667,
+              "p95_us": 17345.209,
+              "p99_us": 632306.792,
+              "p999_us": 636370.792,
+              "max_us": 636370.792
+            }
+          },
+          "put": {
+            "classes": {
+              "ok": 252
+            },
+            "latency": {
+              "count": 252,
+              "min_us": 9418.417,
+              "mean_us": 36569.63975,
+              "p50_us": 14682.417,
+              "p90_us": 17828.792,
+              "p95_us": 74327.875,
+              "p99_us": 644304.042,
+              "p999_us": 646338.584,
+              "max_us": 646338.584
+            }
+          }
+        },
+        "all": {
+          "count": 500,
+          "min_us": 511.167,
+          "mean_us": 27102.255446,
+          "p50_us": 11741.792,
+          "p90_us": 17618.959,
+          "p95_us": 62256.667,
+          "p99_us": 640249.792,
+          "p999_us": 646338.584,
+          "max_us": 646338.584
+        },
+        "ok_per_sec": 50,
+        "offered_per_sec": 50,
+        "late": 0,
+        "longest_outage": 400000000,
+        "timeline": [
+          {
+            "offset_ms": 0,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 1900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 2900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 3900,
+            "ok": 4,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4000,
+            "ok": 6,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 4900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5700,
+            "ok": 3,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5800,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 5900,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6000,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6100,
+            "ok": 0,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6200,
+            "ok": 11,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6300,
+            "ok": 13,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6400,
+            "ok": 9,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6500,
+            "ok": 9,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 6900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 7900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 8900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 9900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 10900,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11000,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11100,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11200,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11300,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11400,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11500,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11600,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11700,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11800,
+            "ok": 5,
+            "failed": 0
+          },
+          {
+            "offset_ms": 11900,
+            "ok": 5,
+            "failed": 0
+          }
+        ],
+        "generator_cpu": 378247000
+      },
+      "actions": [
+        {
+          "action": {
+            "at": 6000000000,
+            "kind": "kill-leader",
+            "group": 0,
+            "restart_after": 3000000000
+          },
+          "node": "n3",
+          "start": 6000192459,
+          "settle": 481826875,
+          "detail": "new leader n2"
+        },
+        {
+          "action": {
+            "at": 0,
+            "kind": "restart",
+            "group": 0
+          },
+          "node": "n3",
+          "start": 9482076501,
+          "settle": 51194000
+        }
+      ],
+      "nodes": {
+        "n1": {
+          "cpu_per_sec": 0.03251840282721109,
+          "max_rss_bytes": 20168704,
+          "heap_inuse_bytes": 3866624,
+          "goroutines": 37,
+          "log_bytes": 43952,
+          "elections_won": 0,
+          "persists": 472,
+          "persist_mean_us": 5264.080423728811,
+          "commit_mean_us": 0,
+          "restarted": false
+        },
+        "n2": {
+          "cpu_per_sec": 0.04518967291237668,
+          "max_rss_bytes": 21184512,
+          "heap_inuse_bytes": 3235840,
+          "goroutines": 37,
+          "log_bytes": 44087,
+          "elections_won": 1,
+          "persists": 562,
+          "persist_mean_us": 4859.166747330957,
+          "commit_mean_us": 14118.944341463408,
+          "restarted": false
+        },
+        "n3": {
+          "cpu_per_sec": 0.008259970780661135,
+          "max_rss_bytes": 16138240,
+          "heap_inuse_bytes": 3678208,
+          "goroutines": 27,
+          "log_bytes": 42726,
+          "elections_won": 0,
+          "persists": 106,
+          "persist_mean_us": 4272.799905660378,
+          "commit_mean_us": 0,
+          "restarted": true
+        }
+      },
+      "max_follower_lag": 245
+    }
+  ]
+}
