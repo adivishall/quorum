@@ -166,7 +166,10 @@ The instrumented request path is within the run-to-run noise of the uninstrument
     published, a stopped follower's lag, a leader stopped and replaced, and an install by snapshot.
   - `TestRoleGaugesShowOneLeader` checks that exactly one node reports leader, under a no-election
     premise.
-  - `TestMembershipMetrics` covers membership changes and configurations.
+  - `TestMembershipMetrics` covers membership changes and configurations: the joint configuration
+    is counted adopted by the quorum that committed it (a member outside that quorum can receive the
+    joint and the final entry in one batch, and adopts only the final), and every member ends in
+    the final one.
   - `TestKVMetricsMatchTheResponses` checks every front's counts against the test's own tally of
     responses; forwards answered equal forwards served, and each replica's decisions match what it
     applied.
@@ -182,8 +185,14 @@ The instrumented request path is within the run-to-run noise of the uninstrument
 - **Real processes:** `TestRealProcessesServeTruthfulMetrics` runs three `dkvd` processes and
   scrapes `/metrics` over HTTP. Each write sent through a follower is counted once at the answering
   front, forwarded by the follower, served by the leader and executed on every replica. It also
-  checks peers, CPU and heap, and that a survivor counts the election it wins after a SIGKILL. Its
-  premise, that no election ran during the writes, is read from the metrics.
+  checks CPU and heap, that the connected-peers gauge matches the connections the process's own log
+  shows, and that a survivor counts the election it wins after a SIGKILL. Its premises are read from
+  the processes' logs and metrics, and a run that violates one starts over on a fresh cluster: the
+  cluster has settled before the writes (every node follows one leader, every link is up — a leader
+  exists as soon as a majority is connected, while the last link may still be waiting on the
+  transport's 500 ms redial), no election ran during the writes, and no link changed around the
+  scrape the gauge is compared with (`TestSettledStartWaitsForEveryLink` checks the settling itself,
+  on a cluster whose third node starts after the other two elected a leader).
 
 ## 7. Found and fixed while building it
 

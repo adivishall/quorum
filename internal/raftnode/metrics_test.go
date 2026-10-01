@@ -262,8 +262,9 @@ func TestMetricsMatchWhatTheClusterDid(t *testing.T) {
 }
 
 // TestMembershipMetrics: a learner added and promoted — each change counted
-// completed once, by type; every member adopts the joint and the final
-// configurations and ends with four voters.
+// completed once, by type; the joint configuration is counted adopted by the
+// quorum that committed it, and every member ends in the final one with four
+// voters.
 func TestMembershipMetrics(t *testing.T) {
 	c := startMetered(t, context.Background(), 3, 0, 0)
 	genesis := append([]NodeID(nil), c.ids...)
@@ -281,9 +282,30 @@ func TestMembershipMetrics(t *testing.T) {
 		t.Fatalf("completed changes counted: add_learner %v, promote %v; want 1 each", count("add_learner"), count("promote"))
 	}
 	for _, id := range c.ids {
-		waitMetric(t, c.regs[id], string(id)+" adopted the joint configuration", "dkv_raft_configurations_total", func(v float64) bool { return v >= 1 }, "group", "0", "kind", "joint")
 		waitMetric(t, c.regs[id], string(id)+" has four voters", "dkv_raft_voters", func(v float64) bool { return v == 4 }, "group", "0")
 		waitMetric(t, c.regs[id], string(id)+" is out of the joint configuration", "dkv_raft_configuration_joint", func(v float64) bool { return v == 0 }, "group", "0")
+	}
+	// Three configuration entries were appended: the learner's addition
+	// (stable), the joint configuration and the final one (stable). A
+	// configuration takes effect when appended, and each entry is proposed
+	// only once the previous one is committed — the joint entry by a majority
+	// of the new configuration, three of its four voters, each counting it in
+	// the cycle that persisted it. A member outside a commit's majority can
+	// receive that entry and the next in one batch, and counts only the later
+	// one. So: at least three joint adoptions in all, at most one per member,
+	// and every member counted the final configuration and at most the two
+	// stable ones.
+	var joint float64
+	for _, id := range c.ids {
+		j := metricOf(t, c.regs[id], "dkv_raft_configurations_total", "group", "0", "kind", "joint")
+		s := metricOf(t, c.regs[id], "dkv_raft_configurations_total", "group", "0", "kind", "stable")
+		if j > 1 || s < 1 || s > 2 {
+			t.Fatalf("%s counted %v joint and %v stable configurations adopted; want at most 1 and 1 or 2", id, j, s)
+		}
+		joint += j
+	}
+	if joint < 3 {
+		t.Fatalf("%v joint adoptions counted across the four members; the quorum that committed the joint entry is three", joint)
 	}
 }
 

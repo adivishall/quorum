@@ -450,11 +450,11 @@ it is being answered out of memory.
 Requires Go 1.27+.
 
 ```bash
-make check        # gofmt + gitignore guard + go vet + go test -race — the phase gate
+make check        # gofmt + gitignore guard + go vet + the unit packages under -race — the phase gate
 make build
 make test
 make race
-make integration  # real-process tests: SIGKILL recovery, Raft over TCP, kill/stop/partition faults, linearizability, membership
+make integration  # real-process tests (tests/integration, -race): SIGKILL recovery, Raft over TCP, kill/stop/partition faults, linearizability, membership, metrics, load, the lab
 make faults       # the deterministic fault schedules and client workloads at a large seed budget (FAULT_SEEDS=200)
 make mutation     # mutation testing: every rule-violating edit must be caught
 make fuzz         # every fuzz target in the repository (FUZZTIME=10s each)

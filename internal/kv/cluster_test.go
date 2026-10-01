@@ -217,6 +217,41 @@ func (c *cluster) node(id raftnode.NodeID) *raftnode.Node {
 	return c.nodes[id]
 }
 
+// waitSettled waits until every running node agrees on the leader — one node
+// leads a term and every other reports following it in that term — and
+// returns both. A leader exists as soon as a majority has connected; a node
+// whose link is still being redialled has not heard from it, refuses what it
+// is asked as a follower would, and may depose it when it connects.
+func (c *cluster) waitSettled(d time.Duration) (raftnode.NodeID, uint64) {
+	c.t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		var leader raftnode.NodeID
+		var term uint64
+		agree := true
+		for _, id := range c.ids {
+			if n := c.node(id); n != nil {
+				if st := n.Status(); st.Role == raft.Leader {
+					agree = agree && leader == ""
+					leader, term = id, st.Term
+				}
+			}
+		}
+		for _, id := range c.ids {
+			if n := c.node(id); n != nil && id != leader {
+				st := n.Status()
+				agree = agree && st.Leader == leader && st.Term == term
+			}
+		}
+		if leader != "" && agree {
+			return leader, term
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	c.t.Fatalf("the nodes did not settle on one leader within %s", d)
+	return "", 0
+}
+
 // waitLeader waits for a node that reports leading in a term above minTerm.
 func (c *cluster) waitLeader(minTerm uint64, d time.Duration) raftnode.NodeID {
 	c.t.Helper()
