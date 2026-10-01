@@ -232,14 +232,15 @@ func (c *Cluster) act(ctx context.Context, a Action, at time.Duration, restarted
 				return []ActionResult{res}
 			}
 			if op == "add-learner" {
-				if err := c.caughtUp(ctx, spare, a.Group, 60*time.Second); err != nil {
+				target, err := c.caughtUp(ctx, spare, a.Group, 60*time.Second)
+				if err != nil {
 					res.Err = err.Error()
 					return []ActionResult{res}
 				}
+				res.Detail = fmt.Sprintf("added as learner, applied %d, promoted", target)
 			}
 		}
 		res.Settle = time.Since(start)
-		res.Detail = "added as learner, caught up, promoted"
 		return []ActionResult{res}
 	case "snapshot":
 		leader, _, err := c.Leader(ctx, a.Group)
@@ -272,8 +273,11 @@ func (c *Cluster) restartAndCatchUp(ctx context.Context, id string, g multiraft.
 		return r
 	}
 	restarted[id] = true
-	if err := c.caughtUp(ctx, id, g, 60*time.Second); err != nil {
+	target, err := c.caughtUp(ctx, id, g, 60*time.Second)
+	if err != nil {
 		r.Err = err.Error()
+	} else {
+		r.Detail = fmt.Sprintf("applied %d", target)
 	}
 	r.Settle = time.Since(start)
 	return r
@@ -281,36 +285,55 @@ func (c *Cluster) restartAndCatchUp(ctx context.Context, id string, g multiraft.
 
 // caughtUp waits until node id has applied group g's leader's commit index as
 // it stood when the wait began.
-func (c *Cluster) caughtUp(ctx context.Context, id string, g multiraft.GroupID, timeout time.Duration) error {
+func (c *Cluster) caughtUp(ctx context.Context, id string, g multiraft.GroupID, timeout time.Duration) (uint64, error) {
+	deadline := time.Now().Add(timeout)
 	// Restarting a node can start an election (it may have led): wait for
 	// the group to have a leader again rather than read a transient absence.
 	leader, _, err := c.WaitLeader(ctx, g, "", timeout)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	target := uint64(0)
-	if resp, err := c.Admin(ctx, leader, multiraft.AdminRequest{Op: "status"}); err == nil {
-		for _, gs := range resp.Groups {
-			if multiraft.GroupID(gs.Group) == g {
-				target = gs.Commit
-			}
+	// The target is read, never assumed: a failed read must not leave it at
+	// 0, which any started node has applied — the wait would end at once and
+	// report the process start as the catch-up.
+	target, ok := uint64(0), false
+	for !ok {
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("lab: could not read group %d's commit index from %s within %s", g, leader, timeout)
+		}
+		actx, cancel := context.WithTimeout(ctx, time.Second)
+		resp, err := c.Admin(actx, leader, multiraft.AdminRequest{Op: "status"})
+		cancel()
+		if err == nil {
+			target, ok = groupStatus(resp, g, func(gs multiraft.GroupStatus) uint64 { return gs.Commit })
+		}
+		if !ok {
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
-	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		actx, cancel := context.WithTimeout(ctx, time.Second)
 		resp, err := c.Admin(actx, id, multiraft.AdminRequest{Op: "status"})
 		cancel()
 		if err == nil {
-			for _, gs := range resp.Groups {
-				if multiraft.GroupID(gs.Group) == g && gs.Applied >= target {
-					return nil
-				}
+			if applied, ok := groupStatus(resp, g, func(gs multiraft.GroupStatus) uint64 { return gs.Applied }); ok && applied >= target {
+				return target, nil
 			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	return fmt.Errorf("lab: %s did not apply group %d's commit %d within %s", id, g, target, timeout)
+	return target, fmt.Errorf("lab: %s did not apply group %d's commit %d within %s", id, g, target, timeout)
+}
+
+// groupStatus reads one field of group g from a status response, and
+// whether the response reports g at all.
+func groupStatus(resp multiraft.AdminResponse, g multiraft.GroupID, field func(multiraft.GroupStatus) uint64) (uint64, bool) {
+	for _, gs := range resp.Groups {
+		if multiraft.GroupID(gs.Group) == g {
+			return field(gs), true
+		}
+	}
+	return 0, false
 }
 
 // change runs one membership operation at whichever node leads group g.
