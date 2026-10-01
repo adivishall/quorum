@@ -2,11 +2,10 @@
 
 A distributed key-value database built from scratch in Go.
 
-Quorum is currently implementing its durable storage engine. No Raft library, no embedded
-database, no consensus service — the storage engine and the consensus implementation are
-the project, and they are being built in that order.
+No Raft library, no embedded database, no consensus service — the storage engine and the
+consensus implementation are the project, and they were built in that order.
 
-> **Status: Phase 15 of 25 — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, a working Raft consensus core, deterministic fault injection, a proven crash-recovery model for the Raft node, client-visible linearizability of single-key operations per Raft group, safe client retries (request identity, deduplication at apply and request forwarding), snapshots with log compaction and follower installation, and dynamic membership by joint consensus with one Raft group per shard, checked on real client histories.**
+> **Status: Phase 16 of 25, with Phase 19's load generator and first cluster baseline — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, a working Raft consensus core, deterministic fault injection, a proven crash-recovery model for the Raft node, client-visible linearizability of single-key operations per Raft group, safe client retries (request identity, deduplication at apply and request forwarding), snapshots with log compaction and follower installation, dynamic membership by joint consensus with one Raft group per shard, checked on real client histories; metrics from every layer, a load generator for real clusters, and reproducible cluster experiments with a measured performance report.**
 >
 > **Implemented:** a write-ahead log, an ordered memtable, immutable on-disk SSTables, Bloom
 > filters, size-tiered compaction, crash-safe MANIFEST-based file publication, and restart
@@ -101,8 +100,10 @@ parts invisibly: which shard owns a key, which replica leads that shard, how the
 replicated, when it is committed, and where the bytes physically land.
 
 ```
-client ─▶ HTTP API ─▶ router ─▶ shard leader ─▶ Raft ─▶ LSM engine
-          └──────────── not built yet ────────────┘      └─ Phase 3 ─┘
+client ─▶ framed TCP protocol ─▶ front: key → shard → group ─▶ group leader ─▶ Raft log (fsync)
+                                                                   └─▶ in-memory kv state machine
+LSM engine (WAL · memtable · SSTables · compaction): durable and crash-tested, but standalone —
+no node uses it yet; hosting the replicated state machine on it is on the roadmap
 ```
 
 ## What exists today
@@ -439,6 +440,9 @@ it is being answered out of memory.
 | [CLIENT_SEMANTICS.md](docs/CLIENT_SEMANTICS.md) | The Phase 13 contract: logical requests, ClientID and RequestID, what happens to an identified write, reads, the eleven statuses, unknown outcomes, bounds, forwarding, and what the guarantee is and is not |
 | [DEDUP.md](docs/DEDUP.md) | How the server keeps it: the session table inside the replicated state machine, the decision at apply, recovery by replay and every crash window, concurrency, bounds and eviction, verification, measured cost, mutants, limitations |
 | [OBSERVABILITY.md](docs/OBSERVABILITY.md) | Every metric a node exports on `-metrics-listen`: where it is produced, what it means and does not mean, its measured cost, and how each is verified against ground truth |
+| [CLUSTER_BENCHMARKS.md](docs/CLUSTER_BENCHMARKS.md) | The first cluster baseline: real `dkvd` processes at 1, 3 and 5 nodes, 1–16 groups, three read/write mixes, a leader kill, a rolling restart, a membership change and snapshots — medians and ranges, the environment, the raw results, and where the time goes |
+| [BENCHMARKS.md](docs/BENCHMARKS.md) | The single-node storage engine's measurements (Phase 5): methodology, hardware, variance |
+| [ENGINEERING_ROADMAP.md](docs/ENGINEERING_ROADMAP.md) | The audit of the system as built, its verified defects, and the ranked engineering work that follows |
 | [LOAD_TESTING.md](docs/LOAD_TESTING.md) | How `dkvload` puts a real cluster under load: closed and open loop (coordinated omission accounted for), exact percentiles, outcome classes, the outage timeline, reproducibility, and the generator's measured ceiling |
 | [API.md](docs/API.md) | The client wire protocol v3: framing, messages, the request's group, operations, validation, status codes, forwarding and redirect-only mode, the session and sharded client libraries |
 | [SNAPSHOTS.md](docs/SNAPSHOTS.md) | Snapshot state and format, creation and compaction order, recovery's reconciliation, crash windows, follower installation, chunking, dedup preservation, corruption policy, measurements, and snapshots with membership |
@@ -459,6 +463,13 @@ make faults       # the deterministic fault schedules and client workloads at a 
 make mutation     # mutation testing: every rule-violating edit must be caught
 make fuzz         # every fuzz target in the repository (FUZZTIME=10s each)
 make bench        # indicative WAL measurements
+```
+
+Measure a real cluster (`docs/CLUSTER_BENCHMARKS.md`, `docs/LOAD_TESTING.md`):
+
+```bash
+go build -o bin/dkvlab ./cmd/dkvlab && bin/dkvlab -scenario leader-kill -nodes 3 -runs 5 -rate 50 -out lk.json
+go build -o bin/dkvload ./cmd/dkvload && bin/dkvload -endpoints n1=127.0.0.1:8001,n2=127.0.0.1:8002,n3=127.0.0.1:8003 -clients 16 -duration 30s
 ```
 
 Re-check a saved client history (a failing test's artifact, or a corpus file):

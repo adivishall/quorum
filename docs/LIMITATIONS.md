@@ -3,7 +3,7 @@
 The things this system does not do, cannot do, or has not proven. Kept current: an item may be
 removed only when a test exists showing it is no longer true.
 
-**Status: Phase 15.** A single-node key-value store with a durable write-ahead log and an
+**Status: Phase 16, and Phase 19's load generator and first cluster baseline (#2, #3).** A single-node key-value store with a durable write-ahead log and an
 LSM storage engine — memtable, immutable SSTables with Bloom filters, flush, size-tiered
 compaction, crash-safe MANIFEST-based file publication, restart recovery — exists and is
 benchmarked (`docs/BENCHMARKS.md`). Phase 6 added a **pure, deterministic routing library**
@@ -84,7 +84,9 @@ LSM engine behind Raft, and groups are never split, merged, moved or rebalanced.
 | **The replicated state machine is in memory** (`kv.Store`): a restart restores the latest snapshot and replays the log after it — fewer than `-snapshot-every` entries (Phase 14) — but the whole state must fit in memory, and a snapshot is held in memory while it is created, sent and received, bounded at 512 MiB of state (`docs/SNAPSHOTS.md` §16). Snapshot creation runs on the node's actor goroutine and pauses Raft processing while it encodes and publishes (≈ 50 ms at 100k keys on the measured machine). | engine wiring (the LSM engine as the state machine) |
 | **The durable Raft log is bounded only while snapshots are on.** With `-snapshot-every 0`, or a state beyond the 512 MiB snapshot bound (the node logs `event=raft_snapshot_skipped`), nothing compacts it and it grows without bound, as before Phase 14. | — (by configuration); a larger state needs streaming snapshots |
 | **A node's groups host no state machine of consequence.** Each group's state machine is the in-memory `kv.Store` (or, in driver tests, a minimal recording one); none is wired to the LSM engine. Since Phase 15 a node hosts one group per shard it serves (`dkvd -cluster`). **`appliedIndex` is volatile beyond the snapshot:** every restart restores the published snapshot (Phase 14) and re-applies the recovered committed entries after it, so the application of those entries is **at-least-once across restarts** and exactly-once only within an incarnation (Phase 11, INV-CR4). A state machine that needs idempotence must record its own applied index (the engine will, `docs/DESIGN.md` §10 step 7); nothing in the driver deduplicates. (Client-level deduplication, Phase 13, is a different thing: the snapshot and the replay after it rebuild the session table, and a retried request is recognized as a duplicate of an earlier *entry* — `docs/DEDUP.md` §4.) | per-shard node, engine wiring |
-| **Metrics are per node, pull-only and in memory** (Phase 16, `docs/OBSERVABILITY.md`). Each `dkvd` serves its own `/metrics`; nothing aggregates, stores, graphs or alerts on them, and counters restart with the process. Latencies are server-side: client-observed latency needs a load generator (#2). There are no storage-engine metrics, because the engine is not behind the node, and no tracing. | Phase 17 (dashboard); a load generator (#2) |
+| **A PUT near the 1 MiB value limit breaks the group** (found by the audit after #3; reproduced on an in-process three-node group). The client protocol accepts a key up to 4 KiB and a value up to 1 MiB, but the Raft log and the AppendEntries decoder accept an entry of at most 1 MiB, and the encoded command adds its key and a few bytes of framing. A PUT whose encoded command exceeds 1 MiB is appended and fsynced by the leader, which nothing checks. Every follower then refuses the AppendEntries carrying it, an election replaces the leader, and the write ends `LOST`. The old leader can never restart: its own log replay refuses the record (`raftlog: corrupt log: length … out of range`). Values a few bytes below the limit are affected, and so is any large value with a long key. | the next work unit (`docs/ENGINEERING_ROADMAP.md`): one entry budget enforced at the front, at proposal and at the durable log |
+| **Concurrent writes share nothing** (measured, `docs/CLUSTER_BENCHMARKS.md` §6). The driver persists each event's Ready before the next, so every write costs its own fsync; a leader fsyncs twice per committed entry, because the commit index is persisted before apply (INV-CR3). One group is bounded near one write per fsync whatever the concurrency, and a leader resends every unacknowledged entry with every AppendEntries, with no byte budget per message. | group commit and replication budgets (`docs/ENGINEERING_ROADMAP.md`) |
+| **Metrics are per node, pull-only and in memory** (Phase 16, `docs/OBSERVABILITY.md`). Each `dkvd` serves its own `/metrics`; nothing aggregates, stores, graphs or alerts on them, and counters restart with the process. Latencies are server-side; client-observed latency is what `dkvload` measures (#2, `docs/LOAD_TESTING.md`). There are no storage-engine metrics, because the engine is not behind the node, and no tracing. | Phase 17 (dashboard) |
 | No HTTP API, no stale-mode reads, no dashboard. (Phases 12–15 serve PUT/GET/DELETE with linearizable reads, request identity, deduplication and forwarding on the framed protocol, per group — see the rows above for its bounds.) | HTTP API: not scheduled; dashboard: Phase 17 |
 | **Real power loss is untested; Phase 10's power loss is a software model.** `fault.MemFS` assumes a successful fsync is honest and that lost un-synced data is a prefix (never holes, reordered sectors, or bit rot). It proves the code issues its writes and fsyncs in the right order, not what a device does. Kernel fsync-error semantics ("fsyncgate": pages dropped after a write-back error) are not modelled; fail-stop is the only defence. | not testable here — `docs/FAULTS.md` §14 |
 | **Real processes are partitioned by resetting connections, not by silently dropping packets**, and one-way partitions exist only in the simulator and the in-process decorator (TCP is bidirectional). A real disk error is never injected into a real process; the fail-stop path is proven in-process on the real driver and on `dkvd`'s raft-mode code. | a later phase, if kernel-level fault tooling is justified |
@@ -155,8 +157,20 @@ group replica on one node plus one sender per peer, ≈113 KiB of heap per idle 
 (≈215 KiB on three), ≈1 ms/s of idle CPU per replica at 128 groups; a membership change of one entry
 in ≈17 ms at the median with fsync, a promotion in ≈26 ms; a new member catching up 20,002 entries in
 ≈158 ms by entries and ≈23 ms by a snapshot. 128 groups per node is the largest configuration run.
-Leader election time and throughput under load remain *unmeasured* until Phase 19; they are left
-blank rather than estimated.
+
+The first cluster baseline (#3, `docs/CLUSTER_BENCHMARKS.md`) measured real `dkvd` processes on the
+same machine, all on one SSD. These are measurements under the stated configuration, not
+capacities:
+- **Closed-loop throughput, 16 clients, one group:**
+  - one node: 4,895 ops/s at 95% reads and 268 ops/s at 5% reads;
+  - three nodes: 1,046 and 65 ops/s;
+  - five nodes: 778 and 64 ops/s.
+- **Three nodes, 50% reads:** 119 ops/s, rising to 214 ops/s with 16 groups.
+- **A leader SIGKILL at 50 ops/s:** an election in 521 ms (median of 10; range 453–617 ms) and a
+  client-visible outage of 450 ms (400–600 ms).
+
+The limit in every configuration is persistence: one fsync per write, two at the leader, never
+batched.
 
 The scattered development measurements Phases 3 and 4 collected while building the engine
 (`docs/LSM.md` §10, `docs/BLOOM.md` §5, `docs/COMPACTION.md` §8, `docs/MANIFEST.md` §9) predate
