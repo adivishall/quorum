@@ -62,7 +62,15 @@ type NodeUsage struct {
 	Persists           float64 `json:"persists"`
 	PersistMeanUs      float64 `json:"persist_mean_us"`
 	CommitMeanUs       float64 `json:"commit_mean_us"`
-	Restarted          bool    `json:"restarted"` // counters restarted with the process: deltas are from zero
+	// CommitAdvance is how far the node's commit index (summed over its
+	// groups) moved over the run: the entries committed, no-ops and
+	// configuration entries included. AppendFramesSent and AppendBytesSent
+	// are the AppendEntries frames and bytes it wrote — a leader's
+	// replication traffic, heartbeats included, to every follower.
+	CommitAdvance    float64 `json:"commit_advance"`
+	AppendFramesSent float64 `json:"append_frames_sent"`
+	AppendBytesSent  float64 `json:"append_bytes_sent"`
+	Restarted        bool    `json:"restarted"` // counters restarted with the process: deltas are from zero
 }
 
 // RunResult is one run of an experiment.
@@ -348,6 +356,11 @@ func usage(before, after metrics.Samples, elapsed time.Duration, restarted bool)
 	if n := delta("dkv_raft_commit_seconds_count"); n > 0 {
 		u.CommitMeanUs = delta("dkv_raft_commit_seconds_sum") / n * 1e6
 	}
+	// The commit index is durable, so it is an index, not a counter: a
+	// restart does not reset it.
+	u.CommitAdvance = after.Sum("dkv_raft_commit_index") - before.Sum("dkv_raft_commit_index")
+	u.AppendFramesSent = delta("dkv_transport_frames_sent_total", "kind", "append_entries")
+	u.AppendBytesSent = delta("dkv_transport_bytes_sent_total", "kind", "append_entries")
 	return u
 }
 

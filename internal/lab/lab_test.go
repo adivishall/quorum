@@ -82,12 +82,24 @@ func TestUsageFromScrapes(t *testing.T) {
 		{Name: "dkv_raft_persist_seconds_sum", Labels: map[string]string{"group": "0"}, Value: 0.21},
 		{Name: "dkv_raft_snapshots_created_total", Labels: map[string]string{"group": "0", "trigger": "periodic"}, Value: 4},
 		{Name: "dkv_raft_snapshots_created_total", Labels: map[string]string{"group": "1", "trigger": "periodic"}, Value: 2}}
+	for _, ss := range []*metrics.Samples{&before, &after} {
+		commit, frames := 40.0, 7.0
+		if ss == &after {
+			commit, frames = 90, 57
+		}
+		*ss = append(*ss, metrics.Sample{Name: "dkv_raft_commit_index", Labels: map[string]string{"group": "0"}, Value: commit},
+			metrics.Sample{Name: "dkv_transport_frames_sent_total", Labels: map[string]string{"kind": "append_entries"}, Value: frames},
+			metrics.Sample{Name: "dkv_transport_frames_sent_total", Labels: map[string]string{"kind": "request_vote"}, Value: 1000})
+	}
 	u := usage(before, after, 2*time.Second, false)
 	if u.CPUPerSec != 2 || u.Persists != 100 || u.PersistMeanUs < 1999 || u.PersistMeanUs > 2001 || u.SnapshotsCreated != 6 {
 		t.Fatalf("%+v", u)
 	}
+	if u.CommitAdvance != 50 || u.AppendFramesSent != 50 {
+		t.Fatalf("commit advance %v, append frames %v; want 50 and 50 (other kinds excluded)", u.CommitAdvance, u.AppendFramesSent)
+	}
 	u = usage(before, after, 2*time.Second, true)
-	if u.CPUPerSec != 3 || u.Persists != 110 {
-		t.Fatalf("restarted: %+v", u)
+	if u.CPUPerSec != 3 || u.Persists != 110 || u.CommitAdvance != 50 {
+		t.Fatalf("restarted: %+v (the commit index is durable: its advance is a difference even across a restart)", u)
 	}
 }
