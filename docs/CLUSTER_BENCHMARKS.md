@@ -295,7 +295,7 @@ snapshot scenario takes snapshots. Mutants 168–172 break each of these and are
 2. **The leader resends every unacknowledged entry on every broadcast** (§6.3). Replication traffic
    per entry grows with the writes in flight, and no message has a byte budget.
 3. **A restarted node waits up to 500 ms for its peers' next redial** (§5.2).
-4. **A rolling restart leaves 11–15 operations per run unknown** (§5.3) — not yet explained.
+4. **A rolling restart leaves 10–15 operations per run unknown** (§5.3) — not yet explained.
 5. **The lab itself had two defects:**
    - the snapshot scenario's interval was too large, so it took no snapshot (found by checking the
      scenario's premise in its result);
