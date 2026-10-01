@@ -76,7 +76,7 @@ Ranked by what a single input can do.
     driver and the simulator;
   - snapshots (INV-SN), membership and group isolation (INV-MB);
   - metrics against ground truth;
-  - 167 mutants, all killed.
+  - 172 mutants, all killed (168–172, added with this audit, cover the lab's statistics and usage).
 - **Only argued, or modeled:**
   - power-loss durability (a software disk model; real power loss is untested);
   - histories are finite and small: at most five nodes and eight clients;
@@ -161,8 +161,8 @@ Phase 19 row, and LIMITATIONS' status, metrics and measurement statements.
   - macOS (`F_FULLFSYNC`) is never exercised in CI;
   - no job has a timeout;
   - the mutation runner has no baseline run of the killer tests, any non-build failure counts as a
-    kill, three mutants match more than one site, and the storage engine, routing and the lab have
-    no mutants;
+    kill, three mutants match more than one site, and the storage engine and routing have no
+    mutants;
   - harness logic is duplicated: four ways to launch `dkvd`, four leader waits, three percentile
     definitions.
 

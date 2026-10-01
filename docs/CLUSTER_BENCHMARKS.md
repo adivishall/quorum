@@ -250,6 +250,12 @@ result — the load generator's summary and timeline, every action, every node's
 per-configuration summaries. Timing differs between machines and between runs; the structure of the
 results (where the time goes) is what should reproduce.
 
+The lab's own arithmetic is tested, and has teeth: `internal/lab`'s tests check the medians, the
+p95, the per-node deltas (a restarted node's counters from zero, the commit index as a difference,
+AppendEntries frames by kind), and that every scenario acts inside the measured window and the
+snapshot scenario takes snapshots. Mutants 168–172 break each of these and are killed;
+`TestLabLeaderKillOnRealProcesses` runs a leader kill on real processes in `make integration`.
+
 ## 9. What these numbers do not show
 
 - **One machine.** Nodes and clients share CPU and one SSD; a multi-host cluster has independent
