@@ -18,7 +18,10 @@ import (
 func TestLabLeaderKillOnRealProcesses(t *testing.T) {
 	bin := buildDkvd(t)
 	e, err := lab.Scenario("leader-kill", lab.Experiment{
-		Cluster: lab.ClusterConfig{Bin: bin, Mode: "raft", Nodes: 3, Tick: 25 * time.Millisecond, DataRoot: t.TempDir(), PortBase: 29000},
+		// Ports from this binary's own range (testport.Integration, below every
+		// ephemeral range): 29000 and up belong to internal/raftnode's tests,
+		// which `go test ./...` runs concurrently with this package.
+		Cluster: lab.ClusterConfig{Bin: bin, Mode: "raft", Nodes: 3, Tick: 25 * time.Millisecond, DataRoot: t.TempDir(), PortBase: 25000},
 		Load:    load.Config{Clients: 4, Duration: 6 * time.Second, Warmup: time.Second, ReadPct: 50, Keys: 200, Seed: 3},
 	})
 	if err != nil {
