@@ -18,7 +18,7 @@ number comes from: `docs/OBSERVABILITY.md`.
 | Machine | Apple M4, 10 cores, 16 GiB, internal SSD |
 | OS | macOS 26.5.2 |
 | Go | go1.27.1 |
-| Commit | `b251527` (§3, §4, §5 except snapshots), `415c61c` (§5.3 snapshots), `86c8518` (§6.3); the `dkvd` source is identical at all three — they differ only in `internal/lab` |
+| Commit | `b251527` (§3, §4, §5.1, §5.2), `415c61c` (§5.3 snapshots), `86c8518` (§6.3), `f1b6e8f` (§5.3 rolling restart and membership); the `dkvd` source is identical at all four — they differ only in `internal/lab` |
 | Tree | clean at each (`git_dirty: false` in every file) |
 | Network | loopback; every node and the load generator on the one machine |
 | Persistence | every Raft persist is `os.File.Sync`, which on macOS issues `fcntl(F_FULLFSYNC)` (a drive-cache flush); all nodes share the one SSD |
@@ -132,23 +132,34 @@ interval with no backoff and no reset on an inbound attempt (a roadmap item, not
 
 | Scenario | ok/s | GET p50 / p99 | PUT p50 / p99 | Outage | Settle | Unknown outcomes |
 |---|---|---|---|---|---|---|
-| rolling restart (SIGTERM, restart, catch up — each node in turn) | 49 [49–49] | 1.9 / 190.4 ms | 15.2 / 212.3 ms | 400 ms | restart: 47 ms | 11, 15, 11 |
-| membership (a 4th node added as a learner, caught up, promoted) | 50 [50–50] | 2.0 / 9.5 ms | 15.8 / 21.7 ms | none | addition: 155 ms | 0 |
+| rolling restart (SIGTERM, restart, catch up — each node in turn) | 49 [49–50] | 2.5 / 208.5 ms | 15.4 / 280.7 ms | 500 ms [400–500] | followers: 24–37 ms; the leader: 529–594 ms | 10, 14, 14 |
+| membership (a 4th node added as a learner, caught up, promoted) | 50 [50–50] | 3.2 / 16.1 ms | 16.3 / 33.2 ms | none | addition: 148 ms [126–150] | 0 |
 | snapshots (one every 100 entries; 5 per node per run) | 50 [50–50] | 3.0 / 7.3 ms | 15.7 / 27.1 ms | none | — | 0 |
 
-- **Rolling restart** is the one scenario that lost outcomes: 11–15 operations per run ended
-  `unknown`, against 0 for a leader SIGKILL at the same rate. One of the three nodes restarted is
-  the leader, and its stop forces an election; the 400 ms outage is of that size. Why some
-  operations stayed unknown after every retry — rather than being settled by a retry under the same
-  identity — is **not yet explained**. An unknown outcome is allowed by the contract
-  (`docs/CLIENT_SEMANTICS.md` §6), but this many is a finding, and §10 lists it.
-- **A membership change** under load caused no outage and moved latency little (PUT p99 21.7 ms
-  against the steady 18.6 ms); the learner caught up and was promoted in 155 ms (median).
+- **Rolling restart** is the one scenario that lost outcomes: 10–14 operations per run ended
+  `unknown` (11–15 in the first suite run), against 0 for a leader SIGKILL at the same rate. Of the
+  three restarts in a run, the two followers' caught up in 24–37 ms: each had applied index 232–234
+  and had missed nothing while it was down. The leader's took 529–594 ms, because its stop forces
+  an election, and the 400–500 ms outage is of that size. Why some operations stayed unknown after
+  every retry, rather than being settled by a retry under the same identity, is **not yet
+  explained**. An unknown outcome is allowed by the contract (`docs/CLIENT_SEMANTICS.md` §6), but
+  this many is a finding, and §10 lists it.
+- **A membership change** under load caused no outage. The learner was added, caught up and
+  promoted in 148 ms (median; 126–150 ms). The change does move write latency: PUT p99 was 33.2 ms
+  in this series and 21.7 ms in the first suite run, against 18.6 ms with no change. Three runs
+  cannot say by how much.
 - **Snapshots** every 100 entries — five per node per run — raised PUT p99 from 18.6 to 27.1 ms
   (creation runs on the node's actor and pauses it, `docs/SNAPSHOTS.md`); nothing else moved.
   The first suite run of this scenario used an interval of 1,000 entries and took no snapshot at
   all (a run appends about 600); it measured nothing and is not reported. The lab now reports the
   snapshots each node created and installed, so a snapshot scenario that takes none is visible.
+- **The rolling-restart and membership rows are a rerun.** Reviewing the lab found that its
+  catch-up wait read the leader's commit index as its target and, if that read failed, kept 0. Any
+  started node has applied 0, so the wait would have ended at once and reported the process start
+  as the catch-up. The first suite run was taken with that code, so these rows come from a rerun
+  with the fix (`f1b6e8f`), in which every catch-up records the index it reached. The two series
+  agree: followers took 26–47 ms then and 24–37 ms now. The leader-kill catch-ups (§5.2) were
+  checked separately: all 20 fit the redial model, which a target of 0 could not produce.
 
 ## 6. What limits throughput — the evidence
 
@@ -235,6 +246,9 @@ configuration (§3, §4): the cluster is bound by persistence, not CPU or memory
 go build -o bin/dkvlab ./cmd/dkvlab
 bin/dkvlab -suite report -runs 3 -out report.json                     # §3, §4, §5.1, §5.3
 bin/dkvlab -scenario snapshots -nodes 3 -runs 3 -rate 50 -out snap.json # §5.3, snapshots
+for sc in rolling-restart membership; do
+  bin/dkvlab -scenario $sc -nodes 3 -runs 3 -rate 50 -out $sc.json      # §5.3
+done
 for at in 2s 500ms; do
   bin/dkvlab -scenario leader-kill -nodes 3 -runs 10 -duration 10s -warmup 2s -rate 50 \
              -attempt-timeout $at -out lk_$at.json                    # §5.2
@@ -282,5 +296,10 @@ snapshot scenario takes snapshots. Mutants 168–172 break each of these and are
    per entry grows with the writes in flight, and no message has a byte budget.
 3. **A restarted node waits up to 500 ms for its peers' next redial** (§5.2).
 4. **A rolling restart leaves 11–15 operations per run unknown** (§5.3) — not yet explained.
-5. **The snapshot scenario's interval was wrong and took no snapshot** — found by checking the
-   scenario's premise in its result; fixed, and now reported per node.
+5. **The lab itself had two defects:**
+   - the snapshot scenario's interval was too large, so it took no snapshot (found by checking the
+     scenario's premise in its result);
+   - a catch-up wait could silently measure a process start (found in review).
+
+   Both are fixed, and both now leave evidence in every result: snapshots per node, and the index
+   each catch-up reached. Mutants 168–172 guard the lab's arithmetic.

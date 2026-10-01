@@ -14,10 +14,13 @@ Each file is one `dkvlab` invocation, written with `-out`. It records:
 | `leader-kill-2s.json` | `bin/dkvlab -scenario leader-kill -nodes 3 -runs 10 -duration 10s -warmup 2s -rate 50 -attempt-timeout 2s` | `b251527` |
 | `leader-kill-500ms.json` | the same with `-attempt-timeout 500ms` | `b251527` |
 | `concurrency-c{1,4,16}.json` | `bin/dkvlab -scenario steady -nodes 3 -runs 3 -duration 10s -warmup 2s -read 50 -clients C` | `86c8518` |
+| `rolling-restart.json`, `membership.json` | `bin/dkvlab -scenario rolling-restart -nodes 3 -runs 3 -rate 50` (and `membership`) | `f1b6e8f` |
 
-The `dkvd` source is identical at the three commits; they differ only in `internal/lab`. Any configuration not named here is the default: 16 clients, 20 s window, 3 s warmup, 50% reads, 10,000 keys, 100-byte values, seed 1, tick 50 ms.
+The `dkvd` source is identical at the four commits; they differ only in `internal/lab`. Any configuration not named here is the default: 16 clients, 20 s window, 3 s warmup, 50% reads, 10,000 keys, 100-byte values, seed 1, tick 50 ms.
 
 **Not valid:** `report.json`'s `snapshots/raft-3n/r50-rate50`. It used a snapshot interval of 1,000 entries, and a run appends about 600, so it took no snapshot. `snapshots.json` is its replacement, at 100 entries; each node created 5 snapshots per run.
+
+**Superseded:** `report.json`'s `rolling-restart` and `membership` configurations. Their catch-up times were measured by a wait that would have reported the process start had the leader's status read failed (fixed in `f1b6e8f`). `rolling-restart.json` and `membership.json` replace them, and each of their actions records the index it caught up to.
 
 ## The restarted leader's catch-up, predicted from the redial interval
 
