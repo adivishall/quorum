@@ -16,7 +16,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -45,7 +44,7 @@ type ClusterConfig struct {
 	RF       int    `json:"rf"`     // cluster mode
 	DataRoot string `json:"-"`
 	// Tick is dkvd's -tick-interval; SnapshotEvery its -snapshot-every (0
-	// keeps dkvd's default); Fsync false passes nothing: dkvd always fsyncs.
+	// keeps dkvd's default, 10,000 entries). dkvd always fsyncs its log.
 	Tick          time.Duration `json:"tick"`
 	SnapshotEvery uint64        `json:"snapshot_every"`
 	PortBase      int           `json:"-"`
@@ -443,7 +442,7 @@ func (c *Cluster) ScrapeAll() map[string]metrics.Samples {
 	return out
 }
 
-// ids returns the running nodes' ids, sorted.
+// running returns the running nodes' ids, sorted.
 func (c *Cluster) running() []string {
 	var out []string
 	for _, n := range c.nodes {
@@ -454,5 +453,3 @@ func (c *Cluster) running() []string {
 	sort.Strings(out)
 	return out
 }
-
-var _ = io.Discard

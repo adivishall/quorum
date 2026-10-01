@@ -186,7 +186,11 @@ func (c *Cluster) act(ctx context.Context, a Action, at time.Duration, restarted
 		}
 		out := []ActionResult{res}
 		if a.RestartAfter > 0 {
-			time.Sleep(a.RestartAfter)
+			select {
+			case <-ctx.Done():
+				return out
+			case <-time.After(a.RestartAfter):
+			}
 			out = append(out, c.restartAndCatchUp(ctx, leader, a.Group, restarted, at+time.Since(start)))
 		}
 		return out
