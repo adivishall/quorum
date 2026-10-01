@@ -1531,6 +1531,10 @@ mutant "throughput-counts-completions-in-the-window" internal/load/load.go \
 
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
+if [ "$TOTAL" -eq 0 ]; then
+  echo "MUTATION TESTING FAILED: no mutant matched ONLY=${ONLY:-}; nothing was tested." >&2
+  exit 1
+fi
 if [ "$FAIL" -ne 0 ]; then
   echo "MUTATION TESTING FAILED: $FAIL mutant(s) survived or could not be applied." >&2
   exit 1

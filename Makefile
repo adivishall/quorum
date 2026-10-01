@@ -4,6 +4,9 @@
 
 GO      ?= go
 PKGS    := ./...
+# The unit packages: everything but tests/, whose real-process suites run
+# under `make integration` (with -race, -count=1 and -v) and nowhere else.
+UNIT    := ./internal/... ./cmd/...
 BIN     := bin
 
 .PHONY: all build test race vet fmt fmtcheck checkignore integration mutation faults fuzz bench benchsuite dkvbench tidy clean check
@@ -16,11 +19,11 @@ build:
 
 ## test — unit tests
 test:
-	$(GO) test $(PKGS)
+	$(GO) test $(UNIT)
 
 ## race — unit tests under the race detector (required before every phase commit)
 race:
-	$(GO) test -race $(PKGS)
+	$(GO) test -race $(UNIT)
 
 ## integration — multi-process tests, including real SIGKILL crash recovery
 integration:
@@ -30,7 +33,8 @@ integration:
 ## fault-model fidelity, Phase 11 crash-recovery rules, Phase 12 client-visible
 ## consistency and the checker itself, Phase 13 request identity, deduplication,
 ## forwarding and the session client, Phase 14 snapshots and log compaction,
-## Phase 15 membership and multi-Raft; ONLY=a,b runs the named mutants alone).
+## Phase 15 membership and multi-Raft, Phase 16 observability, the load generator;
+## ONLY='a|b' runs the mutants whose names match the regex alone, and fails if none does).
 ## DRY=1 checks every mutant still applies without running tests. Applies deliberate rule-violating edits to the source,
 ## runs the tests that must catch each, and requires every mutant to be killed
 ## (edits are reverted via git). Needs a clean working tree for the files it
