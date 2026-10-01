@@ -50,8 +50,7 @@ func wireClientAgainstRealNodes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := startCluster(t, ctx, 3, false)
-	l := c.waitLeader(0, 10*time.Second)
-	t1 := c.node(l).Status().Term
+	l, t1 := c.waitSettled(10 * time.Second) // every follower knows l: the forwarding below needs that
 	clients, _ := serveAll(t, c)
 	// Every assertion below names l as the leader: a failure is a verdict
 	// only if l still leads in the term it was found leading in; otherwise a
