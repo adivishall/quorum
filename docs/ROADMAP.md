@@ -36,7 +36,7 @@ Legend: ☐ not started · ◐ in progress · ☑ complete and verified
 | 16 | Observability | real metrics, structured logs | Every dashboard number traces to a counter incremented by real code | ☑ #1; `internal/metrics`, `dkvd -metrics-listen`, `docs/OBSERVABILITY.md`. A dependency-free registry and the Prometheus text format; 61 metric families from every layer — client requests by group, operation and status with server-side latency, duplicates, forwards; Raft role, term and indexes, campaigns and elections counted by the core at the transition, observed leader changes, follower lag, commit and apply latency of each write, Save (fsync) duration, log size, snapshots created and installed, transfers, dropped messages, membership changes and configurations; host groups and dropped frames; transport frames and bytes by kind, connections, failures; process CPU, heap, goroutines. Apply decisions counted outside the replicated state (the store's own counters reset on restore). Verified against ground truth on in-process TCP clusters and on real processes over HTTP; the instrumented request path is within noise of the bare one (median 45.2 vs 44.5 µs at the leader, identical allocations). Every raftnode event now carries its group. Scoped: pull-only, per node; no dashboard, alerting or tracing; no storage-engine metrics (the engine is not behind the node) |
 | 17 | Dashboard | cluster / raft / storage / perf views + fault controls | Fault buttons trigger real faults; no simulated state | ☐ |
 | 18 | Docker demo | `docker compose up` → 3 or 5 nodes + dashboard | Separate containers; demo workflow reproducible from a clean clone | ☐ |
-| 19 | Load testing | workload generator, 1/3/5-node runs, failure workloads | Reproducible throughput/latency/election-time numbers | ☐ |
+| 19 | Load testing | workload generator, 1/3/5-node runs, failure workloads | Reproducible throughput/latency/election-time numbers | ◐ #2, #3. `internal/load` and `dkvload`: closed and open loop, with coordinated omission accounted for (a stall counts as latency, measured from when each operation was due), exact percentiles, outcome classes, an outage timeline, the generator's own ceiling. `internal/lab` and `dkvlab`: real processes launched, loaded, killed, restarted, joined and snapshotted, scraped before and after (`docs/LOAD_TESTING.md`). `docs/CLUSTER_BENCHMARKS.md` is the first baseline, with raw results in `bench/cluster/`: 1/3/5 nodes × three mixes, 1/4/16 groups, a leader kill (20 runs), a rolling restart, a membership change and snapshots; medians and ranges. It found one fsync per write, never batched (two at the leader); a leader that resends every unacknowledged entry; a restarted node waiting up to 500 ms for its peers' redial; and rolling-restart unknown outcomes, not yet explained. Remaining: partitions under load, value sizes and key skew, more groups and client counts, more runs per configuration |
 | 20 | Correctness & chaos suite | `make test` / `make integration` / `make chaos` | The whole matrix green, from a clean clone | ☐ |
 | 21 | Hardening | validation, limits, timeouts, graceful shutdown | Fuzz/limit tests pass; no secrets; safe logging | ☐ |
 | 22 | Documentation | full `docs/` set | Docs match implementation; every guarantee traces to an invariant with a passing test | ☐ |
@@ -44,10 +44,12 @@ Legend: ☐ not started · ◐ in progress · ☑ complete and verified
 | 24 | Interview prep | `docs/INTERVIEW.md` | Answers derived from this implementation, not from generic theory | ☐ |
 | 25 | Resume material | `docs/RESUME.md` | Bullets cite measured results that exist in `docs/BENCHMARKS.md` | ☐ |
 
-**After Phase 15.** `docs/ENGINEERING_ROADMAP.md` is the audit of the system as built and the ranked
-engineering tasks that follow from it. The first wave — observability (#1), a load generator (#2)
-and cluster experiments with a performance report (#3) — is Phase 16 and the first half of Phase
-19; the LSM-backed state machine comes after it, measured against its baseline.
+**After Phase 15.** `docs/ENGINEERING_ROADMAP.md` is the audit of the system as built, and the
+ranked engineering work that follows from it. The first wave is done: observability (#1, Phase
+16), a load generator (#2) and cluster experiments with a performance report (#3), which together
+are most of Phase 19. The audit after that wave found input and replication bounds a single valid
+request can break. Those come first; then the storage-engine prerequisites, and the LSM-backed
+state machine measured against the baseline.
 
 ---
 

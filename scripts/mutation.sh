@@ -1529,6 +1529,45 @@ mutant "throughput-counts-completions-in-the-window" internal/load/load.go \
   '	res.OKPerSec = float64(res.Classes[ClassOK]+res.Classes[ClassNotFound]) / cfg.Duration.Seconds()' \
   ./internal/load 'TestOverloadReportsAchievedThroughput'
 
+echo "== #3: the cluster lab (docs/CLUSTER_BENCHMARKS.md) =="
+
+# 168. The median of a configuration's runs is read from unsorted values: the
+#      report's medians are whichever run happened to finish in the middle.
+mutant "lab-median-of-sorted-runs" internal/lab/experiment.go \
+  '	sort.Float64s(v)
+	n := len(v)' \
+  '	sort.Float64s(v[:0])
+	n := len(v)' \
+  ./internal/lab 'TestSummarize'
+
+# 169. A restarted node's counters are subtracted from its previous
+#      process's: its CPU, persists and elections come out short or negative.
+mutant "lab-restarted-counters-from-zero" internal/lab/experiment.go \
+  '		if restarted || before == nil {' \
+  '		if before == nil {' \
+  ./internal/lab 'TestUsageFromScrapes'
+
+# 170. The snapshot scenario takes no snapshot (the bug the first suite run
+#      had): it measures the steady load under another name.
+mutant "lab-snapshot-scenario-snapshots" internal/lab/scenarios.go \
+  '		e.Cluster.SnapshotEvery = 100' \
+  '		e.Cluster.SnapshotEvery = 0' \
+  ./internal/lab 'TestScenariosAndSuite'
+
+# 171. The commit index is treated as a counter: a restarted node's commit
+#      advance becomes its whole commit index.
+mutant "lab-commit-advance-is-an-index" internal/lab/experiment.go \
+  '	u.CommitAdvance = after.Sum("dkv_raft_commit_index") - before.Sum("dkv_raft_commit_index")' \
+  '	u.CommitAdvance = delta("dkv_raft_commit_index")' \
+  ./internal/lab 'TestUsageFromScrapes'
+
+# 172. Replication traffic counts every frame kind: votes and responses
+#      inflate the leader's AppendEntries per entry.
+mutant "lab-append-frames-by-kind" internal/lab/experiment.go \
+  '	u.AppendFramesSent = delta("dkv_transport_frames_sent_total", "kind", "append_entries")' \
+  '	u.AppendFramesSent = delta("dkv_transport_frames_sent_total")' \
+  ./internal/lab 'TestUsageFromScrapes'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
 if [ "$TOTAL" -eq 0 ]; then
