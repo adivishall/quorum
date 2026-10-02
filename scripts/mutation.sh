@@ -2062,6 +2062,63 @@ mutant "metrics-server-idle" cmd/dkvd/main.go \
   '		IdleTimeout:       0,' \
   ./cmd/dkvd '^TestMetricsServerBoundsItsConnections$'
 
+# 243. An AppendEntries carries at most MaxEntriesPerMsg entries (audit H4).
+mutant "append-entry-budget" internal/raft/raft.go \
+  '	hi := min(last+1, next+uint64(r.maxEntriesPerMsg))' \
+  '	hi := last + 1' \
+  ./internal/raft '^TestEntryBudgetBindsABacklogOfSmallEntries$'
+
+# 244. ... and at most MaxSizePerMsg bytes of entries.
+mutant "append-byte-budget" internal/raft/raft.go \
+  '	entries, _ := r.log.SliceBounded(next, hi, r.maxSizePerMsg)' \
+  '	entries, _ := r.log.Slice(next, hi)' \
+  ./internal/raft '^TestLaggingFollowerCatchesUpInBudgetedBatches$'
+
+# 245. An acknowledged batch of a cut backlog sends the next at once.
+mutant "cut-backlog-streams" internal/raft/raft.go \
+  '	if r.cut[peer] && match < r.log.LastIndex() {' \
+  '	if false {' \
+  ./internal/raft '^TestLaggingFollowerCatchesUpInBudgetedBatches$'
+
+# 246. ... which needs the cut recorded.
+mutant "cut-recorded" internal/raft/raft.go \
+  '	r.cut[peer] = next+uint64(len(entries)) <= last' \
+  '	r.cut[peer] = false' \
+  ./internal/raft '^TestLaggingFollowerCatchesUpInBudgetedBatches$'
+
+# 247. Reads registered in one cycle share one round.
+mutant "reads-share-a-round" internal/raft/raft.go \
+  '	if !r.roundUnsent {' \
+  '	if true {' \
+  ./internal/raft '^TestReadsInOneCycleShareOneRound$'
+
+# 248. A read never joins a round already sent.
+mutant "read-never-joins-a-sent-round" internal/raft/ready.go \
+  '	r.roundUnsent = false // its messages are sent' \
+  '	_ = r.roundUnsent' \
+  ./internal/raft '^TestAReadNeverJoinsARoundAlreadySent$'
+
+# 249. A read round is entry-less heartbeats, not the unacknowledged tail.
+mutant "read-round-entry-less" internal/raft/raft.go \
+  '				r.sendHeartbeat(p)' \
+  '				r.sendAppend(p)' \
+  ./internal/raft '^TestReadsInOneCycleShareOneRound$'
+
+# 250. A broadcast is a round a read can join.
+mutant "broadcast-is-a-round" internal/raft/raft.go \
+  'func (r *Raft) broadcastAppend() {
+	r.hbSeq++
+	r.roundUnsent = true' \
+  'func (r *Raft) broadcastAppend() {
+	r.hbSeq++' \
+  ./internal/raft '^TestReadsInOneCycleShareOneRound$'
+
+# 251. The driver takes the reads waiting together, so they share a round.
+mutant "driver-batches-reads" internal/raftnode/node.go \
+  '			for i := 1; i < maxReadsPerCycle; i++ {' \
+  '			for i := 1; i < 1; i++ {' \
+  ./internal/raftnode '^TestConcurrentReadsShareRounds$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
 if [ "$TOTAL" -eq 0 ]; then
