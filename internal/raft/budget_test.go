@@ -2,6 +2,7 @@ package raft
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 )
 
@@ -197,4 +198,114 @@ func TestEntryBudgetBindsABacklogOfSmallEntries(t *testing.T) {
 		t.Fatalf("200 entries took %d messages; at 8 per message at least %d", appends, 200/8)
 	}
 	nw.assertLogMatching()
+}
+
+// TestARemovedLeaderSendsNothingOnceItStepsDown: the acknowledgement that
+// commits the final entry of the leader's own removal steps it down. The
+// same acknowledgement used to continue a budget-cut backlog afterwards: the
+// ex-leader sent entries in its old term, and the receiver took it for its
+// leader again, delaying the election of the next.
+func TestARemovedLeaderSendsNothingOnceItStepsDown(t *testing.T) {
+	nw := newNetwork(t, []NodeID{"n1", "n2", "n3"}, 11)
+	nw.electLeader("n1")
+	n1 := nw.nodes["n1"]
+	n1.maxEntriesPerMsg = 1
+	if err := n1.ProposeConfChange(ConfChange{Type: RemoveVoter, Member: Member{ID: "n1"}}); err != nil {
+		t.Fatal(err)
+	}
+	nw.drain("n1")
+	for i := 0; i < 10000; i++ {
+		if c, _ := n1.Conf(); !c.Joint() && !c.IsMember("n1") {
+			break
+		}
+		if !nw.deliverOne() {
+			t.Fatal("premise: the final entry was never appended")
+		}
+	}
+	for i := 0; i < 3; i++ {
+		nw.proposeNoDeliver("n1", fmt.Sprintf("after-final-%d", i)) // a backlog the budget cuts
+	}
+	stepped := false
+	for len(nw.queue) > 0 {
+		m := nw.queue[0]
+		nw.queue = nw.queue[1:]
+		before, was := len(nw.queue), n1.Role() == Leader
+		nw.deliver(m)
+		if was && n1.Role() != Leader {
+			stepped = true
+			for _, out := range nw.queue[before:] {
+				if out.From == "n1" && out.Type == MsgAppendRequest {
+					t.Fatalf("n1 stepped down and in the same step sent %s an AppendEntries of %d entries in term %d", out.To, len(out.Entries), out.Term)
+				}
+			}
+		}
+	}
+	if !stepped {
+		t.Fatal("premise: the removed leader never stepped down")
+	}
+}
+
+// TestASnapshotInstallSendsTheNextBatchOnce: a follower that was streaming a
+// budget-cut backlog and then fell behind the boundary is offered the
+// snapshot; its install is answered with the next batch once. The cut flag
+// survived the snapshot offer, so the reply sent the batch twice — once to
+// continue the cut backlog, once to resume after the snapshot.
+func TestASnapshotInstallSendsTheNextBatchOnce(t *testing.T) {
+	nw := newNetwork(t, ids(3), 913)
+	nw.electLeader("a")
+	a := nw.nodes["a"]
+	a.maxEntriesPerMsg = 2
+	nw.isolate("c")
+	for i := 0; i < 12; i++ {
+		nw.propose("a", fmt.Sprintf("v%d", i))
+	}
+	// c streams one cut batch, then a compacts past it.
+	nw.heal()
+	for i := 0; i < a.heartbeatTicks; i++ {
+		nw.tick("a")
+	}
+	if !a.cut["c"] {
+		t.Fatal("premise: the heartbeat to c is not a cut batch")
+	}
+	nw.queue = nil // c never sees it
+	if err := a.Compact(a.CommitIndex() - 2); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < a.heartbeatTicks; i++ {
+		nw.tick("a")
+	}
+	var offer *Message
+	for _, m := range nw.takeQueue() {
+		if m.To == "c" && m.Type == MsgSnapshot {
+			offer = &m
+		}
+	}
+	if offer == nil {
+		t.Fatal("premise: c was not offered the snapshot")
+	}
+	nw.deliver(*offer) // c installs it and answers
+	var reply *Message
+	for _, m := range nw.takeQueue() {
+		if m.From == "c" && m.Type == MsgSnapshotResponse {
+			reply = &m
+		}
+	}
+	if reply == nil || !reply.Success {
+		t.Fatalf("premise: c did not install the snapshot: %+v", reply)
+	}
+	nw.deliver(*reply)
+	batches := map[uint64]int{}
+	for _, m := range nw.queue {
+		if m.To == "c" && m.Type == MsgAppendRequest && len(m.Entries) > 0 {
+			batches[m.PrevLogIndex]++
+		}
+	}
+	for prev, n := range batches {
+		if n > 1 {
+			t.Fatalf("the snapshot's acknowledgement sent the batch after %d to c %d times", prev, n)
+		}
+	}
+	if len(batches) == 0 {
+		t.Fatal("premise: the snapshot's acknowledgement sent c nothing")
+	}
 }

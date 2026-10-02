@@ -699,7 +699,9 @@ func (r *Raft) progress(peer NodeID, match uint64) {
 		delete(r.snapWait, peer)
 	}
 	r.maybeCommit()
-	if r.cut[peer] && match < r.log.LastIndex() {
+	// maybeCommit may have stepped this node down: the commit of its own
+	// removal's final entry. A follower sends no entries.
+	if r.role == Leader && r.cut[peer] && match < r.log.LastIndex() {
 		r.sendAppend(peer) // the next batch of a backlog the budget cut
 	}
 }
@@ -894,6 +896,9 @@ func (r *Raft) sendAppend(peer NodeID) {
 	// answered or withdrawn (Tick), only heartbeat the peer — at the boundary, so
 	// the heartbeat succeeds as soon as the peer has installed the snapshot.
 	if base, baseTerm := r.log.Boundary(); next <= base {
+		// No batch is in flight now: the snapshot's acknowledgement resumes
+		// replication (handleSnapshotResponse), not a cut backlog's.
+		delete(r.cut, peer)
 		if r.snapPending[peer] == 0 {
 			r.snapPending[peer], r.snapWait[peer] = base, 0
 			r.send(Message{Type: MsgSnapshot, To: peer, Term: r.currentTerm,

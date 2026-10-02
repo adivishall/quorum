@@ -302,6 +302,11 @@ func (r *Raft) setConf(c Configuration, idx uint64) {
 	r.peers = r.conf.Members()
 	if r.role == Leader {
 		r.syncProgress()
+		// The quorum that confirms reads changed with the configuration. A
+		// read may already have its acknowledgements under the new one — or
+		// need none, if this leader alone is its quorum — and no reply may
+		// ever come to confirm it otherwise.
+		r.confirmReads()
 	}
 	if r.role == Candidate {
 		if prev, ok := r.campaignRule(); !ok {
@@ -376,6 +381,7 @@ func (r *Raft) syncProgress() {
 			delete(r.snapPending, p)
 			delete(r.snapWait, p)
 			delete(r.ackSeq, p)
+			delete(r.cut, p)
 		}
 	}
 }

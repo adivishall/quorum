@@ -2278,6 +2278,38 @@ mutant "lost-join-group-is-not-recreated" cmd/dkvd/main.go \
 				what := "genesis group"' \
   ./cmd/dkvd '^TestALostJoinGroupIsReportedNotRecreated$'
 
+# 267. A leader's configuration change re-checks its pending reads: when it
+# alone becomes the quorum, no reply would ever confirm them.
+mutant "conf-change-confirms-pending-reads" internal/raft/membership.go \
+  '		// ever come to confirm it otherwise.
+		r.confirmReads()' \
+  '		// ever come to confirm it otherwise.' \
+  ./internal/raft '^TestReadsPendingWhenTheLeaderBecomesItsOwnQuorumAreConfirmed$'
+
+# 268. A leader stepped down by its own removal's commit continues no backlog.
+mutant "stepped-down-leader-continues-nothing" internal/raft/raft.go \
+  '	if r.role == Leader && r.cut[peer] && match < r.log.LastIndex() {' \
+  '	if r.cut[peer] && match < r.log.LastIndex() {' \
+  ./internal/raft '^TestARemovedLeaderSendsNothingOnceItStepsDown$'
+
+# 269. A snapshot offer ends a cut backlog: its acknowledgement sends the next
+# batch once.
+mutant "snapshot-offer-ends-the-cut" internal/raft/raft.go \
+  '		delete(r.cut, peer)
+		if r.snapPending[peer] == 0 {' \
+  '		if r.snapPending[peer] == 0 {' \
+  ./internal/raft '^TestASnapshotInstallSendsTheNextBatchOnce$'
+
+# 270. An apply failure publishes the Status covering the entries applied
+# before it, whose writes complete.
+mutant "apply-failure-publishes-status" internal/raftnode/node.go \
+  '		// first, as a cycle that succeeds does.
+		n.snapshotStatus()
+' \
+  '		// first, as a cycle that succeeds does.
+' \
+  ./internal/raftnode '^TestApplyFailureStopsTheNode$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then

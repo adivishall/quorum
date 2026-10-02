@@ -647,8 +647,11 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 // entry is in the leader's log AND durably persisted there (so Status already
 // reflects it); raft.ErrNotLeader if this node is not the leader; the persistence
 // failure (wrapping raftlog.ErrFailed) if the entry could not be made durable, in
-// which case the node has fail-stopped; and raft.ErrStopped once the node has
-// stopped. It does not wait for commitment (there is no client commit-wait yet).
+// which case the node has fail-stopped; a state-machine failure (ErrApply) if the
+// node fail-stopped applying an earlier entry in the same cycle — this entry may
+// then be durable and sent, its outcome unknown; and raft.ErrStopped once the
+// node has stopped. It does not wait for commitment (there is no client
+// commit-wait yet).
 //
 // If ctx ends first, Propose returns ctx.Err() — and the outcome is then UNKNOWN:
 // the node may already have appended the entry. That is the same ambiguity any
@@ -1007,6 +1010,10 @@ func (n *Node) processReady() error {
 	}
 	n.trackCommitted()
 	if err := ApplyCommitted(n.core, n.sm, n.cfg.Hook, n.applied); err != nil {
+		// The entries applied before the failure complete all the same
+		// (completeApplied, deferred): publish the Status that covers them
+		// first, as a cycle that succeeds does.
+		n.snapshotStatus()
 		return err // ErrApply, or a crash point fired
 	}
 	n.trackApplied()

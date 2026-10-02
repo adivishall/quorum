@@ -495,14 +495,15 @@ The node now fail-stops on it exactly as on a persistence failure: `event=raft_a
 `Node.Err()` wraps `ErrApply`, every waiting client learns the error, and `dkvd` exits 1 (`-raft`)
 or stops that group alone (`-cluster`). Before, the error was logged and retried every cycle,
 forever: the group stalled behind the entry while its leader went on accepting writes it could
-never apply. `appliedIndex` never passes the refused entry, so a restart refuses it again
+never apply. `appliedIndex` never passes the refused entry, so a restart refuses it again; the
+entries applied before it in the failing cycle complete, and the published `Status` covers them
 (`TestApplyFailureStopsTheNode`). **The contract for a state machine:** `Apply` either applies
 the command completely or returns an error with no effect at all — the key-value store's only
 error, an undecodable command, leaves it unchanged — and an error means the entry can never be
 applied. Recovering such a group needs an operator: a state machine that accepts the entry (a
 fixed binary), or restoring from a snapshot past it.
 
-Mutants 214–226 (`scripts/mutation.sh`) break each bound, the bookkeeping, each release of an
+Mutants 214–226 and 270 (`scripts/mutation.sh`) break each bound, the bookkeeping, each release of an
 abandoned request, the fail-stop and the `UNAVAILABLE` mapping; each is killed by its test.
 
 **Not done here.** PreVote and CheckQuorum — an isolated leader that steps down by itself —
@@ -524,10 +525,16 @@ moved past it, or for good with snapshots off. Three changes:
 - **Streaming a backlog.** When the budget cut a peer's last batch, an acknowledgement that
   advances it sends the next batch at once, so a lagging follower catches up at the speed of round
   trips rather than one batch per heartbeat. A lost batch is resent by the next heartbeat, from
-  `nextIndex`, as before.
+  `nextIndex`, as before. A snapshot offer ends the stream (its acknowledgement resumes
+  replication once, `TestASnapshotInstallSendsTheNextBatchOnce`), and a leader that the
+  acknowledgement steps down — the commit of its own removal — sends nothing more
+  (`TestARemovedLeaderSendsNothingOnceItStepsDown`).
 - **Read rounds.** A read no longer broadcasts the tail: it joins a round still unsent, or starts
   one of entry-less heartbeats (`docs/LINEARIZABILITY.md` §5.1). Reads registered in one cycle —
   and the driver takes the reads waiting together, up to 256 per cycle — are confirmed together.
+  A leader's configuration change re-checks the reads pending: a leader that becomes its own
+  quorum (the change removing its last peer) confirms them, where before no reply would ever come
+  to and they filled `MaxPendingReads` (`TestReadsPendingWhenTheLeaderBecomesItsOwnQuorumAreConfirmed`).
 
 Safety is unchanged: what a follower accepts and how it answers are untouched; the leader sends
 less per message and more often. Evidence: `TestLaggingFollowerCatchesUpInBudgetedBatches`,
@@ -537,7 +544,7 @@ less per message and more often. Evidence: `TestLaggingFollowerCatchesUpInBudget
 off, catches up — before, never), `TestConcurrentReadsShareRounds` (512 concurrent reads cost 8–28
 messages); `TestBudgetedReplicationUnderFaults` (every simulator profile over three seeds with
 budgets of 2 entries and 32 bytes: every invariant and linearizability hold, with tens of
-thousands of batches cut, under every fault the simulator injects); mutants 243–251.
+thousands of batches cut, under every fault the simulator injects); mutants 243–251, 267–269.
 
 **Still open.** `nextIndex` still moves only on an acknowledgement — there is no optimistic
 pipelining — so while a batch is unacknowledged, every heartbeat and proposal resends it. That

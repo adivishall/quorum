@@ -99,7 +99,8 @@ func TestApplyFailureStopsTheNode(t *testing.T) {
 	sm, lg := &poisonSM{}, &logBuf{}
 	n := startSolo(t, logPath, sm, lg)
 	waitSoloLeads(t, n)
-	if _, _, err := writeWithin(n, []byte("before"), 5*time.Second); err != nil {
+	before, _, err := writeWithin(n, []byte("before"), 5*time.Second)
+	if err != nil {
 		t.Fatalf("a write before the poison: %v", err)
 	}
 	if _, _, err := writeWithin(n, []byte("poison"), 5*time.Second); !errors.Is(err, ErrApply) {
@@ -136,6 +137,12 @@ func TestApplyFailureStopsTheNode(t *testing.T) {
 		if c == "poison" {
 			t.Fatal("the refused entry was applied")
 		}
+	}
+	// The restart applied the entries before the refused one in the cycle
+	// that failed; its published Status covers them, as the completion of
+	// their writes would have promised.
+	if got := n2.Status().Applied; got != before {
+		t.Fatalf("restarted: Status().Applied = %d after applying through %d", got, before)
 	}
 }
 

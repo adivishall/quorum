@@ -171,3 +171,31 @@ func TestIsolatedLeaderRefusesReadsBeyondItsBound(t *testing.T) {
 		t.Fatalf("ReadIndex after healing: %v", err)
 	}
 }
+
+// TestReadsPendingWhenTheLeaderBecomesItsOwnQuorumAreConfirmed: reads that
+// wait for a member's acknowledgement when a change removes that member are
+// confirmed once the leader alone is the quorum. Confirmation ran only on a
+// reply, and none comes once no other member is left: the reads stayed
+// pending forever, and, as their bound fills, the leader refused every read.
+func TestReadsPendingWhenTheLeaderBecomesItsOwnQuorumAreConfirmed(t *testing.T) {
+	nw := newNetworkWith(t, []NodeID{"n1", "n2"}, voters("n1", "n2"), 7)
+	nw.electLeader("n1")
+	nw.propose("n1", "a")
+	n1 := nw.nodes["n1"]
+	if err := n1.ProposeConfChange(ConfChange{Type: RemoveVoter, Member: Member{ID: "n2"}}); err != nil {
+		t.Fatal(err)
+	}
+	nw.drain("n1")
+	rs := nw.readIndex("n1") // a round after the joint entry's: n2's ack of the entry does not confirm it
+	if len(n1.pending) != 1 {
+		t.Fatalf("premise: the read is not pending (%d)", len(n1.pending))
+	}
+	nw.deliverAll() // n2 acknowledges the joint entry; it commits; the final {n1} follows
+	if c, _ := n1.Conf(); c.Joint() || c.IsMember("n2") {
+		t.Fatalf("premise: the final entry was not appended: %s", c)
+	}
+	got := nw.readStates("n1")
+	if len(n1.pending) != 0 || len(got) != 1 || got[0].ID != rs.ID {
+		t.Fatalf("the leader is its own quorum, yet %d read(s) still pending, %v confirmed", len(n1.pending), got)
+	}
+}
