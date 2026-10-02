@@ -1680,6 +1680,30 @@ mutant "genesis-only-while-initializing" cmd/dkvd/main.go \
   '		if false {' \
   ./cmd/dkvd '^TestDataDirectoryRules$'
 
+# --- The group lifecycle (audit H3, docs/MULTI_RAFT.md §3): starts and stops of
+#     one group never overlap.
+
+# 189. A start does not see another start of its group in flight: both pass
+#      the existence check and two drivers open one log.
+mutant "lifecycle-one-start-at-a-time" internal/multiraft/host.go \
+  '	case h.busy[g] != "":' \
+  '	case false:' \
+  ./internal/multiraft '^TestAStartingGroupCannotBeStartedOrStoppedAgain$'
+
+# 190. A stop releases its group before its node is closed: an Open recovers
+#      the log under the still-running old node.
+mutant "lifecycle-stop-holds-the-group" internal/multiraft/host.go \
+  '	h.busy[g] = "stopping"' \
+  '	_ = "stopping"' \
+  ./internal/multiraft '^TestAStoppingGroupCannotBeStartedUntilItsNodeIsClosed$'
+
+# 191. A failed first start leaves its empty directory, reported as a failed
+#      group at every later start.
+mutant "failed-start-leaves-no-directory" internal/multiraft/host.go \
+  '			_ = os.Remove(GroupDir(h.cfg.DataDir, g))' \
+  '			_ = GroupDir(h.cfg.DataDir, g)' \
+  ./internal/multiraft '^TestAFailedFirstStartLeavesNoDirectory$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
 if [ "$TOTAL" -eq 0 ]; then
