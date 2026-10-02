@@ -41,6 +41,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,6 +102,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	explicit := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
 	crash, err := parseCrashAt(*crashAt)
 	if err != nil {
 		fmt.Fprintf(stderr, "dkvd: %v\n", err)
@@ -188,6 +191,18 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		_ = tr.Close()
 		return 2
 	}
+	// The routing flags define -cluster mode's groups; anywhere else they were
+	// silently ignored, so a node meant for a sharded cluster could run as
+	// something else unnoticed (audit H5/D5).
+	if !*cluster {
+		for _, name := range []string{"shards", "rf", "nodes"} {
+			if explicit[name] {
+				fmt.Fprintf(stderr, "dkvd: -%s applies to -cluster mode only\n", name)
+				_ = tr.Close()
+				return 2
+			}
+		}
+	}
 	join, err := parseGroups(*joinArg)
 	if err != nil || (*raftMode && (len(join) > 1 || len(join) == 1 && join[0] != 0)) {
 		fmt.Fprintf(stderr, "dkvd: bad -join %q (with -raft only group 0): %v\n", *joinArg, err)
@@ -195,8 +210,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	var assign *multiraft.Assignment
+	var nodes []routing.NodeID
 	if *cluster {
-		nodes := []routing.NodeID{routing.NodeID(*id)}
+		nodes = []routing.NodeID{routing.NodeID(*id)}
 		for p := range peers {
 			nodes = append(nodes, routing.NodeID(p))
 		}
@@ -220,7 +236,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if *raftMode || *cluster {
-		r := raftRun{id: *id, listen: *listen, peers: peers, tr: tr, dataDir: *dataDir, init: *initDir, clusterID: *clusterID, tick: *tickIvl, lg: lg, stderr: stderr, clientAddr: *clientAt, crash: crash,
+		r := raftRun{id: *id, listen: *listen, peers: peers, tr: tr, dataDir: *dataDir, init: *initDir, clusterID: *clusterID,
+			settings: replicaSettings(*cluster, limits, *shards, *rf, nodes), tick: *tickIvl, lg: lg, stderr: stderr, clientAddr: *clientAt, crash: crash,
 			limits: limits, redirectOnly: !*forward, snapshotEvery: *snapEv, snapshotRetain: *snapKeep,
 			assign: assign, join: join, adminAddr: *adminAt, metrics: reg}
 		if crash != nil {
@@ -362,9 +379,11 @@ type raftRun struct {
 	peers   map[transport.NodeID]string
 	tr      transport.Transport
 	dataDir string
-	// init and clusterID: -init and -cluster-id (internal/nodedir).
+	// init and clusterID: -init and -cluster-id (internal/nodedir);
+	// settings: replicaSettings, which the data directory pins.
 	init      bool
 	clusterID string
+	settings  string
 	tick      time.Duration
 	lg        *logger
 	stderr    io.Writer
@@ -418,7 +437,7 @@ func runRaft(ctx context.Context, r raftRun) int {
 	// identity), and a directory with no node is initialized only on request
 	// (-init): a node whose state was lost must not restart empty under its
 	// old id (audit H1, internal/nodedir).
-	nd, err := nodedir.Open(dataDir, nodedir.Options{Node: id, Cluster: r.clusterID, Init: r.init})
+	nd, err := nodedir.Open(dataDir, nodedir.Options{Node: id, Cluster: r.clusterID, Init: r.init, Settings: r.settings})
 	if err != nil {
 		fmt.Fprintf(r.stderr, "dkvd: -data-dir: %v\n", err)
 		return 2
@@ -508,6 +527,11 @@ func runRaft(ctx context.Context, r raftRun) int {
 	}
 	for _, g := range r.join {
 		creations = append(creations, creation{g, nil})
+	}
+	if nd.Initializing() && len(creations) == 0 && len(host.Groups()) == 0 {
+		fmt.Fprintf(r.stderr, "dkvd: node %s would host no group: it is not in the routing's -nodes and joins none (-join)\n", id)
+		_ = host.Close()
+		return 2
 	}
 	// Genesis state is created only while the directory is being initialized.
 	// In an initialized directory a genesis group with no state was lost, and
@@ -852,8 +876,30 @@ func (c *crashConn) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// parsePeers parses "id=host:port,id=host:port" into a map. It rejects empty
-// entries, a missing '=', an empty id, and a duplicate id — never silently.
+// replicaSettings renders, canonically, the settings every replica of this
+// node's groups must share because they are part of the replicated state
+// machine's definition (audit H5): the session table's limits decide entries
+// at apply (SESSION_LIMIT, SESSION_EXPIRED), and in -cluster mode the routing
+// decides every group's genesis members and every key's group. The data
+// directory pins them (internal/nodedir): a node cannot change them by
+// restarting. Peer addresses are not among them: they may legitimately differ
+// from node to node.
+func replicaSettings(cluster bool, limits kv.Limits, shards, rf int, nodes []routing.NodeID) string {
+	var b strings.Builder
+	if cluster {
+		ids := make([]string, 0, len(nodes))
+		for _, n := range nodes {
+			ids = append(ids, string(n))
+		}
+		sort.Strings(ids)
+		fmt.Fprintf(&b, "mode=cluster shards=%d rf=%d nodes=%s ", shards, rf, strings.Join(ids, ","))
+	} else {
+		b.WriteString("mode=raft ")
+	}
+	fmt.Fprintf(&b, "session-max=%d session-max-unacked=%d", limits.MaxSessions, limits.MaxUnacked)
+	return b.String()
+}
+
 // parseGroups parses -join's comma-separated group ids.
 func parseGroups(s string) ([]multiraft.GroupID, error) {
 	if s == "" {
@@ -876,6 +922,8 @@ func parseGroups(s string) ([]multiraft.GroupID, error) {
 	return out, nil
 }
 
+// parsePeers parses "id=host:port,id=host:port" into a map. It rejects empty
+// entries, a missing '=', an empty id, and a duplicate id — never silently.
 func parsePeers(s string) (map[transport.NodeID]string, error) {
 	peers := make(map[transport.NodeID]string)
 	s = strings.TrimSpace(s)

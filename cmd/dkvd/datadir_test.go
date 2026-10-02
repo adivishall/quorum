@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adivishall/quorum/internal/kv"
+	"github.com/adivishall/quorum/internal/routing"
 	"github.com/adivishall/quorum/internal/transport"
 )
 
@@ -171,5 +173,96 @@ func TestRunRequiresADataDirAndAPositiveTick(t *testing.T) {
 		if !strings.Contains(errb.String(), c.why) {
 			t.Fatalf("%v: stderr %q does not say %q", c.args, errb.String(), c.why)
 		}
+	}
+}
+
+// runNode runs dkvd with args until cancelled, returning its output and a wait
+// for its exit code.
+func runNode(t *testing.T, args ...string) (out *syncBuffer, errb *syncBuffer, cancel context.CancelFunc, wait func() int) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	out, errb = &syncBuffer{}, &syncBuffer{}
+	done := make(chan int, 1)
+	go func() { done <- run(ctx, args, out, errb) }()
+	var code *int
+	wait = func() int {
+		if code == nil {
+			select {
+			case c := <-done:
+				code = &c
+			case <-time.After(10 * time.Second):
+				t.Fatalf("dkvd %v did not exit; stderr %q", args, errb.String())
+			}
+		}
+		return *code
+	}
+	t.Cleanup(func() { cancel(); wait() })
+	return out, errb, cancel, wait
+}
+
+// TestReplicaSettingsArePinned (audit H5): the settings that are part of the
+// replicated state machine's definition — the session limits; in -cluster
+// mode the routing — are recorded when a node's directory is initialized, and
+// a restart with others is refused: two replicas deciding the same entries
+// under different limits diverge. A restart repeating them runs.
+func TestReplicaSettingsArePinned(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "n")
+	base := []string{"-id", "solo", "-listen", "127.0.0.1:0", "-raft", "-data-dir", dir, "-tick-interval", "5ms"}
+	out, _, cancel, wait := runNode(t, append(append([]string(nil), base...), "-init", "-cluster-id", "c1", "-session-max", "5")...)
+	waitFor(t, out, "event=raft_commit node=solo index=1", 5*time.Second)
+	cancel()
+	if code := wait(); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	for _, other := range [][]string{{"-session-max", "6"}, {}, {"-session-max", "5", "-session-max-unacked", "7"}} {
+		_, errb, _, wait := runNode(t, append(append([]string(nil), base...), other...)...)
+		if code := wait(); code != 2 || !strings.Contains(errb.String(), "replica settings") {
+			t.Fatalf("a restart with %v: exit %d, stderr %q; want 2 naming the replica settings", other, code, errb.String())
+		}
+	}
+	out, _, cancel, wait = runNode(t, append(append([]string(nil), base...), "-session-max", "5")...)
+	waitFor(t, out, "event=raft_leader node=solo", 5*time.Second)
+	cancel()
+	if code := wait(); code != 0 {
+		t.Fatalf("a restart repeating the settings: exit %d", code)
+	}
+}
+
+// TestRoutingFlagsBelongToClusterMode (audit H5/D5): -shards, -rf and -nodes
+// define -cluster mode's groups; given in another mode they were silently
+// ignored, and are refused now. And in -cluster mode, a node initialized
+// outside the routing that joins nothing would host nothing: refused.
+func TestRoutingFlagsBelongToClusterMode(t *testing.T) {
+	base := []string{"-id", "a", "-listen", "127.0.0.1:0"}
+	for _, extra := range [][]string{
+		{"-raft", "-data-dir", t.TempDir(), "-shards", "8"},
+		{"-raft", "-data-dir", t.TempDir(), "-rf", "1"},
+		{"-raft", "-data-dir", t.TempDir(), "-nodes", "a,b"},
+		{"-nodes", "a"},
+	} {
+		var out, errb bytes.Buffer
+		if code := run(context.Background(), append(append([]string(nil), base...), extra...), &out, &errb); code != 2 || !strings.Contains(errb.String(), "applies to -cluster mode only") {
+			t.Fatalf("%v: exit %d, stderr %q", extra, code, errb.String())
+		}
+	}
+	_, errb, _, wait := runNode(t, "-id", "z", "-listen", "127.0.0.1:0", "-cluster", "-nodes", "a,b,c", "-rf", "3",
+		"-data-dir", t.TempDir(), "-init", "-cluster-id", "c1")
+	if code := wait(); code != 2 || !strings.Contains(errb.String(), "would host no group") {
+		t.Fatalf("a node outside the routing joining nothing: exit %d, stderr %q", code, errb.String())
+	}
+}
+
+// TestReplicaSettingsRendering: the rendering is canonical — the node order
+// of -nodes does not change it (the routing sorts its nodes too) — and every
+// setting appears in it.
+func TestReplicaSettingsRendering(t *testing.T) {
+	limits := kv.Limits{MaxSessions: 3, MaxUnacked: 4}
+	a := replicaSettings(true, limits, 4, 3, []routing.NodeID{"n2", "n1", "n3"})
+	b := replicaSettings(true, limits, 4, 3, []routing.NodeID{"n3", "n2", "n1"})
+	if a != b || a != "mode=cluster shards=4 rf=3 nodes=n1,n2,n3 session-max=3 session-max-unacked=4" {
+		t.Fatalf("cluster settings: %q vs %q", a, b)
+	}
+	if got := replicaSettings(false, limits, 4, 3, nil); got != "mode=raft session-max=3 session-max-unacked=4" {
+		t.Fatalf("raft settings: %q", got)
 	}
 }
