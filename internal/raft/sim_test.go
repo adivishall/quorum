@@ -330,6 +330,34 @@ func (nw *network) leaders() []NodeID {
 func (nw *network) checkContinuousInvariants() {
 	nw.assertAtMostOneLeaderPerTerm()
 	nw.assertLogMatching()
+	for _, id := range nw.ids {
+		nw.assertUncommittedTail(id)
+	}
+}
+
+// assertUncommittedTail: a leader's bookkeeping of its uncommitted tail, which
+// its bounds are checked against (audit M3), is exactly its log's (commit,
+// last] — entry by entry, and in bytes.
+func (nw *network) assertUncommittedTail(id NodeID) {
+	nw.t.Helper()
+	r := nw.nodes[id]
+	if r.Role() != Leader {
+		return
+	}
+	tail, err := nw.logs[id].Slice(r.CommitIndex()+1, r.LastIndex()+1)
+	if err != nil {
+		nw.t.Fatalf("%s: the uncommitted tail: %v", id, err)
+	}
+	sum := 0
+	for i, e := range tail {
+		if i >= len(r.uncommitted) || r.uncommitted[i] != len(e.Data) {
+			nw.t.Fatalf("%s: uncommitted tail tracked as %v, the log's (commit %d, last %d] differs at entry %d", id, r.uncommitted, r.CommitIndex(), r.LastIndex(), e.Index)
+		}
+		sum += len(e.Data)
+	}
+	if len(tail) != len(r.uncommitted) || sum != r.uncommittedBytes {
+		nw.t.Fatalf("%s: uncommitted tail tracked as %d entries of %d bytes, the log holds %d of %d", id, len(r.uncommitted), r.uncommittedBytes, len(tail), sum)
+	}
 }
 
 // assertAtMostOneLeaderPerTerm enforces INV-R1: at most one leader in any term,

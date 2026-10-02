@@ -284,10 +284,12 @@ func (r *Raft) ProposeConfChange(cc ConfChange) error {
 // appendConf appends a configuration entry (the leader's own) and adopts it.
 func (r *Raft) appendConf(c Configuration) {
 	idx := r.log.LastIndex() + 1
-	if err := r.log.Append(Entry{Index: idx, Term: r.currentTerm, Data: replication.EncodeConfiguration(c), Type: replication.EntryConfig}); err != nil {
+	data := replication.EncodeConfiguration(c)
+	if err := r.log.Append(Entry{Index: idx, Term: r.currentTerm, Data: data, Type: replication.EntryConfig}); err != nil {
 		panic("raft: leader append rejected by log: " + err.Error())
 	}
 	r.markUnstable(idx)
+	r.trackUncommitted(len(data))
 	r.setConf(c, idx)
 }
 

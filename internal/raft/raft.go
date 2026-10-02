@@ -36,6 +36,9 @@ type Raft struct {
 	heartbeatTicks     int
 	snapshotRetryTicks int
 
+	// Bounds on a leader's outstanding work (Config, audit M3).
+	maxUncommittedEntries, maxUncommittedBytes, maxPendingReads int
+
 	// Persistent (durable) state.
 	role        Role
 	currentTerm uint64
@@ -53,6 +56,12 @@ type Raft struct {
 	// Leader state.
 	nextIndex  map[NodeID]uint64
 	matchIndex map[NodeID]uint64
+	// uncommitted holds the data size of each entry in (commit, last], oldest
+	// first, and uncommittedBytes their sum: the leader's uncommitted tail,
+	// computed when it becomes leader and kept by its own appends and commits
+	// (a leader's log changes no other way). Not maintained off the leader.
+	uncommitted      []int
+	uncommittedBytes int
 	// Snapshot transfers (Phase 14, docs/SNAPSHOTS.md §8): the index of the
 	// snapshot offered to each peer still being answered, and the ticks since.
 	snapPending map[NodeID]uint64
@@ -120,6 +129,10 @@ func New(cfg Config) (*Raft, error) {
 		baseConf:           base.Clone(),
 		nextIndex:          map[NodeID]uint64{},
 		matchIndex:         map[NodeID]uint64{},
+
+		maxUncommittedEntries: cfg.MaxUncommittedEntries,
+		maxUncommittedBytes:   cfg.MaxUncommittedBytes,
+		maxPendingReads:       cfg.MaxPendingReads,
 	}
 	if len(base.Voters) == 0 && (!base.Empty() || cfg.ConfIndex > 0) {
 		// Only a joiner's genesis is voterless, and then empty and at index 0;
@@ -251,14 +264,20 @@ func (r *Raft) Tick() {
 // Propose appends a client command to the leader's log and replicates it. It
 // returns ErrEntryTooLarge for a command longer than MaxEntryDataLen — on any
 // node, before anything is appended, so no node ever holds, persists or sends an
-// entry its peers or its own recovery would refuse — and ErrNotLeader on a
-// non-leader. Both refusals are definite.
+// entry its peers or its own recovery would refuse — ErrNotLeader on a
+// non-leader, and ErrBusy when the leader's uncommitted tail is at its bound
+// (Config.MaxUncommittedEntries, MaxUncommittedBytes; audit M3). All three
+// refusals are definite.
 func (r *Raft) Propose(data []byte) error {
 	if len(data) > MaxEntryDataLen {
 		return fmt.Errorf("%w: a proposal of %d bytes, the limit is %d", ErrEntryTooLarge, len(data), MaxEntryDataLen)
 	}
 	if r.role != Leader {
 		return ErrNotLeader
+	}
+	if len(r.uncommitted) >= r.maxUncommittedEntries ||
+		r.uncommittedBytes > 0 && r.uncommittedBytes+len(data) > r.maxUncommittedBytes {
+		return fmt.Errorf("%w: %d uncommitted entries of %d bytes", ErrBusy, len(r.uncommitted), r.uncommittedBytes)
 	}
 	r.appendEntry(data)
 	r.broadcastAppend()
@@ -286,6 +305,9 @@ func (r *Raft) Propose(data []byte) error {
 func (r *Raft) ReadIndex() (ReadState, error) {
 	if r.role != Leader {
 		return ReadState{}, ErrNotLeader
+	}
+	if len(r.pending) >= r.maxPendingReads {
+		return ReadState{}, fmt.Errorf("%w: %d reads awaiting confirmation", ErrBusy, len(r.pending))
 	}
 	r.nextReadID++
 	rs := ReadState{ID: r.nextReadID, Index: r.log.CommitIndex()}
@@ -475,6 +497,12 @@ func (r *Raft) becomeLeader() {
 	// and a ReadIndex may not be served below it.
 	r.termStart = r.log.LastIndex() + 1
 	r.pending = nil
+	r.uncommitted, r.uncommittedBytes = r.uncommitted[:0], 0
+	if tail, err := r.log.Slice(r.log.CommitIndex()+1, r.termStart); err == nil {
+		for _, e := range tail {
+			r.trackUncommitted(len(e.Data))
+		}
+	}
 	r.appendEntry(nil)
 	r.heartbeatElapsed = 0
 	r.broadcastAppend()
@@ -702,6 +730,13 @@ func (r *Raft) appendEntry(data []byte) {
 		panic("raft: leader append rejected by log: " + err.Error())
 	}
 	r.markUnstable(idx)
+	r.trackUncommitted(len(data))
+}
+
+// trackUncommitted records a leader's own append in its uncommitted tail.
+func (r *Raft) trackUncommitted(size int) {
+	r.uncommitted = append(r.uncommitted, size)
+	r.uncommittedBytes += size
 }
 
 // appendFollowerEntries installs the leader's entries after prevIndex, keeping any
@@ -891,8 +926,15 @@ func (r *Raft) commitTo(idx uint64) {
 	if last := r.log.LastIndex(); idx > last {
 		idx = last
 	}
-	if idx > r.log.CommitIndex() {
+	if old := r.log.CommitIndex(); idx > old {
 		_ = r.log.Commit(idx) // monotonic; guarded above, cannot error
+		if r.role == Leader {
+			n := min(int(idx-old), len(r.uncommitted))
+			for _, size := range r.uncommitted[:n] {
+				r.uncommittedBytes -= size
+			}
+			r.uncommitted = append(r.uncommitted[:0], r.uncommitted[n:]...)
+		}
 	}
 }
 

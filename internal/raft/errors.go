@@ -42,6 +42,17 @@ var (
 	// timeout at or below the heartbeat interval prevents stable leadership).
 	ErrInvalidTicks = errors.New("raft: invalid tick configuration")
 
+	// ErrInvalidBounds means a MaxUncommitted* or MaxPendingReads bound was
+	// negative.
+	ErrInvalidBounds = errors.New("raft: invalid bound on uncommitted entries or pending reads")
+
+	// ErrBusy means a leader refused a proposal or a read because its bound on
+	// uncommitted entries or on reads awaiting confirmation is reached
+	// (Config.MaxUncommittedEntries, MaxUncommittedBytes, MaxPendingReads) —
+	// usually because it cannot reach a quorum. Nothing was appended or
+	// registered: the refusal is definite; retry later or at another node.
+	ErrBusy = errors.New("raft: busy: too many uncommitted entries or reads awaiting confirmation")
+
 	// ErrNoRand means Config.Rand was nil. Randomness is injected so elections are
 	// deterministic under a seed (ADR-002).
 	ErrNoRand = errors.New("raft: nil rand source")

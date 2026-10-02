@@ -38,6 +38,9 @@ func TestConfigValidation(t *testing.T) {
 		{"dup peer", func(c *Config) { c.Peers = []NodeID{"a", "a", "b"} }, ErrDuplicatePeer},
 		{"empty peer", func(c *Config) { c.Peers = []NodeID{"a", "", "b"} }, ErrEmptyPeer},
 		{"bad ticks", func(c *Config) { c.ElectionTicks = 2; c.HeartbeatTicks = 5 }, ErrInvalidTicks},
+		{"negative uncommitted entries", func(c *Config) { c.MaxUncommittedEntries = -1 }, ErrInvalidBounds},
+		{"negative uncommitted bytes", func(c *Config) { c.MaxUncommittedBytes = -1 }, ErrInvalidBounds},
+		{"negative pending reads", func(c *Config) { c.MaxPendingReads = -1 }, ErrInvalidBounds},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
