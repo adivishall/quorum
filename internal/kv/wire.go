@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -255,8 +257,14 @@ func writeFrame(w io.Writer, kind record.Kind, payload []byte) error {
 	return err
 }
 
+// readChunk is how much of a frame's declared length readFrame allocates
+// ahead of the bytes that arrive.
+const readChunk = 64 << 10
+
 // readFrame reads one framed message of the expected kind, strictly (a torn or
-// damaged frame is a protocol error, never repaired — this is a socket).
+// damaged frame is a protocol error, never repaired — this is a socket). The
+// frame's buffer grows as its bytes arrive (audit M1): a header declaring a
+// megabyte, followed by nothing, costs a chunk, not the megabyte.
 func readFrame(r io.Reader, want record.Kind, max int) ([]byte, error) {
 	hdr := make([]byte, record.HeaderSize)
 	if _, err := io.ReadFull(r, hdr); err != nil {
@@ -266,10 +274,16 @@ func readFrame(r io.Reader, want record.Kind, max int) ([]byte, error) {
 	if length > uint32(max) {
 		return nil, fmt.Errorf("%w: frame of %d bytes", ErrProtocol, length)
 	}
-	frame := make([]byte, record.HeaderSize+int(length))
+	frame := make([]byte, record.HeaderSize, record.HeaderSize+min(int(length), readChunk))
 	copy(frame, hdr)
-	if _, err := io.ReadFull(r, frame[record.HeaderSize:]); err != nil {
-		return nil, err
+	for remaining := int(length); remaining > 0; {
+		n := min(remaining, readChunk)
+		frame = slices.Grow(frame, n)
+		if _, err := io.ReadFull(r, frame[len(frame):len(frame)+n]); err != nil {
+			return nil, err
+		}
+		frame = frame[:len(frame)+n]
+		remaining -= n
 	}
 	rd := record.NewReader(newBytesReader(frame), "wire", int64(len(frame)))
 	kind, payload, err := rd.Next()
@@ -298,32 +312,110 @@ func (r *bytesReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// ServeConfig bounds what the client port's connections may cost (audit M1).
+// Zero fields take the defaults.
+type ServeConfig struct {
+	// MaxConns bounds the connections served at once; each holds a goroutine
+	// and a descriptor. One beyond it is closed as soon as it is accepted.
+	MaxConns int
+	// FrameTimeout bounds how long a request frame may take to arrive once
+	// its first byte has: a client that starts a frame and stalls is
+	// disconnected. An idle connection — no frame begun — is never timed
+	// out: closing one could race a request its client is sending, which the
+	// client would then have to report as an unknown outcome.
+	FrameTimeout time.Duration
+	// WriteTimeout bounds writing a response; a client that stops reading is
+	// disconnected instead of holding its connection's goroutine forever.
+	WriteTimeout time.Duration
+}
+
+// Defaults of ServeConfig.
+const (
+	DefaultMaxConns     = 1024
+	DefaultFrameTimeout = 10 * time.Second
+	DefaultWriteTimeout = 10 * time.Second
+)
+
+func (c ServeConfig) withDefaults() ServeConfig {
+	if c.MaxConns <= 0 {
+		c.MaxConns = DefaultMaxConns
+	}
+	if c.FrameTimeout <= 0 {
+		c.FrameTimeout = DefaultFrameTimeout
+	}
+	if c.WriteTimeout <= 0 {
+		c.WriteTimeout = DefaultWriteTimeout
+	}
+	return c
+}
+
 // Serve answers requests on ln with srv — a group's Server, or a node's Front
-// over all its groups — until ctx ends or ln is closed. Each connection is
-// served by one goroutine, requests strictly in order; a request in progress
-// is abandoned (its outcome unknown to the client) if the connection drops.
-// logf may be nil.
+// over all its groups — until ctx ends or ln is closed, with the default
+// ServeConfig. Each connection is served by one goroutine, requests strictly
+// in order; a request in progress is abandoned (its outcome unknown to the
+// client) if the connection drops. logf may be nil.
 func Serve(ctx context.Context, ln net.Listener, srv Doer, logf func(string, ...any)) {
+	ServeWith(ctx, ln, srv, logf, ServeConfig{})
+}
+
+// ServeWith is Serve with explicit bounds. An Accept error while serving —
+// descriptors exhausted — is logged and retried after a growing pause: before,
+// it ended the loop for good while the listener stayed open, so clients
+// connected into its backlog and were never answered.
+func ServeWith(ctx context.Context, ln net.Listener, srv Doer, logf func(string, ...any), cfg ServeConfig) {
+	cfg = cfg.withDefaults()
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
 	var wg sync.WaitGroup
+	defer wg.Wait()
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
 	}()
+	slots := make(chan struct{}, cfg.MaxConns)
+	backoff := 5 * time.Millisecond
+	var lastRefusal time.Time
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			wg.Wait()
-			return
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			logf("event=kv_accept_failed err=%v retry_in=%s", err, backoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			backoff = min(2*backoff, time.Second)
+			continue
+		}
+		backoff = 5 * time.Millisecond
+		select {
+		case slots <- struct{}{}:
+		default:
+			if time.Since(lastRefusal) >= time.Second { // at most one line a second
+				lastRefusal = time.Now()
+				logf("event=kv_conn_refused remote=%s max_conns=%d", c.RemoteAddr(), cfg.MaxConns)
+			}
+			_ = c.Close()
+			continue
 		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			serveConn(ctx, c, srv, logf)
+			defer func() { <-slots }()
+			serveConn(ctx, c, srv, logf, cfg)
 		}()
 	}
 }
 
-func serveConn(ctx context.Context, c net.Conn, srv Doer, logf func(string, ...any)) {
+func serveConn(ctx context.Context, c net.Conn, srv Doer, logf func(string, ...any), cfg ServeConfig) {
+	cfg = cfg.withDefaults()
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
 	defer c.Close()
 	cctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -333,25 +425,37 @@ func serveConn(ctx context.Context, c net.Conn, srv Doer, logf func(string, ...a
 		_ = c.Close()
 	}()
 	for {
-		payload, err := readFrame(c, kindRequest, MaxRequestFrame)
+		payload, err := readRequestFrame(c, cfg.FrameTimeout)
 		if err != nil {
-			if !errors.Is(err, io.EOF) && logf != nil && cctx.Err() == nil {
+			if !errors.Is(err, io.EOF) && cctx.Err() == nil {
 				logf("event=kv_conn_closed err=%v", err)
 			}
 			return
 		}
 		req, err := decodeRequest(payload)
 		if err != nil {
-			if logf != nil {
-				logf("event=kv_bad_request err=%v", err)
-			}
+			logf("event=kv_bad_request err=%v", err)
 			return // a peer that does not speak the protocol is disconnected
 		}
 		resp, _ := srv.Do(cctx, req)
+		_ = c.SetWriteDeadline(time.Now().Add(cfg.WriteTimeout))
 		if err := writeFrame(c, kindResponse, encodeResponse(resp)); err != nil {
 			return
 		}
 	}
+}
+
+// readRequestFrame waits for a request's first byte with no deadline — an
+// idle connection is not timed out — and then requires the whole frame within
+// timeout.
+func readRequestFrame(c net.Conn, timeout time.Duration) ([]byte, error) {
+	_ = c.SetReadDeadline(time.Time{})
+	var first [1]byte
+	if _, err := io.ReadFull(c, first[:]); err != nil {
+		return nil, err
+	}
+	_ = c.SetReadDeadline(time.Now().Add(timeout))
+	return readFrame(io.MultiReader(bytes.NewReader(first[:]), c), kindRequest, MaxRequestFrame)
 }
 
 // Client speaks the wire protocol to one node. It is safe for sequential use
