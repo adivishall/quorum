@@ -1,0 +1,175 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/adivishall/quorum/internal/transport"
+)
+
+// The data directory rules (audit H1, internal/nodedir), through dkvd's own
+// raft-mode code on a single-node group: what a start is refused for, and
+// that a refusal is a configuration error (exit 2) that writes no Raft state.
+
+// soloRun is a running single-node raft-mode dkvd.
+type soloRun struct {
+	out    *syncBuffer
+	errb   *syncBuffer
+	cancel context.CancelFunc
+	done   chan int
+}
+
+func startSolo(t *testing.T, id, dir string, init bool, cluster string) *soloRun {
+	t.Helper()
+	tr, err := transport.NewTCPTransport(transport.Config{NodeID: transport.NodeID(id), ListenAddr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tr.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &soloRun{out: &syncBuffer{}, errb: &syncBuffer{}, cancel: cancel, done: make(chan int, 1)}
+	go func() {
+		s.done <- runRaft(ctx, raftRun{id: id, tr: tr, dataDir: dir, init: init, clusterID: cluster,
+			tick: 5 * time.Millisecond, lg: &logger{w: s.out}, stderr: s.errb})
+	}()
+	t.Cleanup(func() { cancel(); <-s.done })
+	return s
+}
+
+// exitCode waits for the run to end by itself.
+func (s *soloRun) exitCode(t *testing.T) int {
+	t.Helper()
+	select {
+	case code := <-s.done:
+		s.done <- code // for the cleanup
+		return code
+	case <-time.After(5 * time.Second):
+		t.Fatalf("dkvd kept running; stderr %q", s.errb.String())
+		return -1
+	}
+}
+
+// stop cancels the run and requires a clean exit.
+func (s *soloRun) stop(t *testing.T) {
+	t.Helper()
+	s.cancel()
+	if code := s.exitCode(t); code != 0 {
+		t.Fatalf("exit code %d after a clean shutdown; stderr %q", code, s.errb.String())
+	}
+}
+
+// refused requires the start to exit 2 naming why, without writing any Raft
+// state.
+func refused(t *testing.T, s *soloRun, dir, why string) {
+	t.Helper()
+	if code := s.exitCode(t); code != 2 {
+		t.Fatalf("exit code %d, want 2 (%s); stderr %q", code, why, s.errb.String())
+	}
+	if !strings.Contains(s.errb.String(), why) {
+		t.Fatalf("stderr %q does not say %q", s.errb.String(), why)
+	}
+	if strings.Contains(s.out.String(), "event=raft_started") {
+		t.Fatalf("a refused start started Raft:\n%s", s.out.String())
+	}
+}
+
+func TestDataDirectoryRules(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "solo")
+
+	t.Run("a fresh directory without -init is refused", func(t *testing.T) {
+		refused(t, startSolo(t, "solo", dir, false, "c1"), dir, "does not exist")
+	})
+	t.Run("-init without a cluster id is refused", func(t *testing.T) {
+		refused(t, startSolo(t, "solo", dir, true, ""), dir, "cluster id")
+	})
+
+	// The first start initializes the directory and commits.
+	s := startSolo(t, "solo", dir, true, "c1")
+	waitFor(t, s.out, "event=data_dir_initialized node=solo", 5*time.Second)
+	waitFor(t, s.out, "event=raft_commit node=solo index=1", 5*time.Second)
+
+	t.Run("a second process on the directory is refused while the first runs", func(t *testing.T) {
+		refused(t, startSolo(t, "solo", dir, false, ""), dir, "in use by another process")
+	})
+	s.stop(t)
+
+	t.Run("a restart recovers its own state, with or without the cluster id", func(t *testing.T) {
+		for _, cluster := range []string{"", "c1"} {
+			r := startSolo(t, "solo", dir, false, cluster)
+			waitFor(t, r.out, "event=data_dir node=solo dir="+dir+" cluster=c1 state=running", 5*time.Second)
+			waitFor(t, r.out, "event=raft_started node=solo peers=1 term=", 5*time.Second)
+			if strings.Contains(r.out.String(), "term=0 lastIndex=0") {
+				t.Fatalf("the restart did not recover the durable state:\n%s", r.out.String())
+			}
+			r.stop(t)
+		}
+	})
+	t.Run("-init on an initialized directory is refused", func(t *testing.T) {
+		refused(t, startSolo(t, "solo", dir, true, "c1"), dir, "already initialized")
+	})
+	t.Run("another node id is refused", func(t *testing.T) {
+		refused(t, startSolo(t, "other", dir, false, "c1"), dir, `belongs to node "solo"`)
+	})
+	t.Run("another cluster id is refused", func(t *testing.T) {
+		refused(t, startSolo(t, "solo", dir, false, "c2"), dir, `belongs to cluster "c1"`)
+	})
+	t.Run("an initialized directory whose group state was lost is refused", func(t *testing.T) {
+		lost := filepath.Join(t.TempDir(), "lost")
+		r := startSolo(t, "solo", lost, true, "c1")
+		waitFor(t, r.out, "event=raft_commit node=solo index=1", 5*time.Second)
+		r.stop(t)
+		for _, f := range []string{"raft-solo.log", "raft-solo.log.group"} {
+			if err := os.Remove(filepath.Join(lost, f)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		refused(t, startSolo(t, "solo", lost, false, ""), lost, "has no state")
+	})
+	t.Run("a wiped directory is refused without -init", func(t *testing.T) {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, startSolo(t, "solo", dir, false, "c1"), dir, "does not exist")
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("a refused start created the wiped directory: %v", err)
+		}
+		if err := os.Mkdir(dir, 0o700); err != nil { // wiped, the directory itself kept
+			t.Fatal(err)
+		}
+		refused(t, startSolo(t, "solo", dir, false, "c1"), dir, "holds no node")
+	})
+}
+
+// TestRunRequiresADataDirAndAPositiveTick (audit H1, M5): raft and cluster
+// modes refuse to run without a data directory — a temporary one would be
+// forgotten by the next start, votes and log with it — and a non-positive
+// tick is configuration, not a panic in every group's actor.
+func TestRunRequiresADataDirAndAPositiveTick(t *testing.T) {
+	base := []string{"-id", "a", "-listen", "127.0.0.1:0"}
+	for _, c := range []struct {
+		args []string
+		why  string
+	}{
+		{[]string{"-raft"}, "require -data-dir"},
+		{[]string{"-cluster"}, "require -data-dir"},
+		{[]string{"-raft", "-data-dir", t.TempDir(), "-tick-interval", "0"}, "-tick-interval must be positive"},
+		{[]string{"-raft", "-data-dir", t.TempDir(), "-tick-interval", "-1ms"}, "-tick-interval must be positive"},
+		{[]string{"-tick-interval", "-5s"}, "-tick-interval must be positive"},
+		{[]string{"-init"}, "require -raft or -cluster"},
+		{[]string{"-cluster-id", "c1"}, "require -raft or -cluster"},
+		{[]string{"-raft", "-data-dir", t.TempDir(), "-init", "-cluster-id", "has space"}, "cluster id"},
+	} {
+		var out, errb bytes.Buffer
+		if code := run(context.Background(), append(append([]string(nil), base...), c.args...), &out, &errb); code != 2 {
+			t.Fatalf("%v: exit code %d, want 2 (stderr %q)", c.args, code, errb.String())
+		}
+		if !strings.Contains(errb.String(), c.why) {
+			t.Fatalf("%v: stderr %q does not say %q", c.args, errb.String(), c.why)
+		}
+	}
+}

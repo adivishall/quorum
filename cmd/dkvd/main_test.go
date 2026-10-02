@@ -190,7 +190,7 @@ func TestRaftModeExitsNonZeroWhenTheLogFails(t *testing.T) {
 	done := make(chan int, 1)
 	go func() {
 		done <- runRaft(context.Background(), raftRun{
-			id: "solo", tr: tr, dataDir: t.TempDir(), tick: 5 * time.Millisecond,
+			id: "solo", tr: tr, dataDir: t.TempDir(), init: true, clusterID: "test", tick: 5 * time.Millisecond,
 			lg: &logger{w: out}, stderr: io.Discard, fs: inj,
 		})
 	}()
@@ -222,7 +222,7 @@ func TestRaftModeCleanShutdownExitsZero(t *testing.T) {
 	out := &syncBuffer{}
 	done := make(chan int, 1)
 	go func() {
-		done <- runRaft(ctx, raftRun{id: "solo", tr: tr, dataDir: t.TempDir(), tick: 5 * time.Millisecond, lg: &logger{w: out}, stderr: io.Discard})
+		done <- runRaft(ctx, raftRun{id: "solo", tr: tr, dataDir: t.TempDir(), init: true, clusterID: "test", tick: 5 * time.Millisecond, lg: &logger{w: out}, stderr: io.Discard})
 	}()
 	waitFor(t, out, "event=raft_commit node=solo index=1", 5*time.Second)
 	cancel()

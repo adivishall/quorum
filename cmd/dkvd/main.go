@@ -52,6 +52,7 @@ import (
 	"github.com/adivishall/quorum/internal/kv"
 	"github.com/adivishall/quorum/internal/metrics"
 	"github.com/adivishall/quorum/internal/multiraft"
+	"github.com/adivishall/quorum/internal/nodedir"
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftnode"
 	"github.com/adivishall/quorum/internal/replication"
@@ -77,7 +78,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		peersArg  = fs.String("peers", "", "comma-separated peers as id=host:port")
 		probeIvl  = fs.Duration("probe-interval", 100*time.Millisecond, "how often to probe each peer")
 		raftMode  = fs.Bool("raft", false, "run a single Raft group over the transport (Phase 9) instead of the probe demo")
-		dataDir   = fs.String("data-dir", "", "directory for the durable Raft log (raft mode; a temp dir if empty)")
+		dataDir   = fs.String("data-dir", "", "raft/cluster mode (required): the node's data directory — its Raft logs, snapshots and identity. Locked while the process runs; it belongs to one node of one cluster (docs/MULTI_RAFT.md §5)")
+		initDir   = fs.Bool("init", false, "raft/cluster mode: initialize a new, empty -data-dir for this node (first start only; needs -cluster-id). A directory with no node is otherwise refused: a node whose state was lost must be replaced, not restarted empty")
+		clusterID = fs.String("cluster-id", "", "raft/cluster mode: the cluster this node belongs to (letters, digits, '.', '_', '-'), recorded at -init; later starts may omit it or must repeat it")
 		tickIvl   = fs.Duration("tick-interval", 50*time.Millisecond, "raft logical tick duration")
 		crashAt   = fs.String("crash-at", "", "TEST SEAM (raft mode): kill this process with SIGKILL at a crash point, e.g. after-save:2 (the 2nd time it is reached), fsync:3 (before the 3rd fsync of any of the node's files — its Raft log and snapshot files), rename:1, syncdir:2, after-snapshot-publish:1 or before-reply:1 (before the 1st client response is written); see docs/CRASH_RECOVERY.md and docs/SNAPSHOTS.md")
 		crashArm  = fs.Bool("crash-armed-by-signal", false, "TEST SEAM: count -crash-at occurrences only after this process receives SIGUSR1 (it logs event=crash_armed), so a test can crash at the Nth occurrence after a point of its choosing; driver and reply points only")
@@ -118,6 +121,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	// rejected here as invalid configuration rather than reaching the ticker.
 	if *probeIvl <= 0 {
 		fmt.Fprintf(stderr, "dkvd: -probe-interval must be positive, got %s\n", *probeIvl)
+		return 2
+	}
+	// Likewise the Raft tick: a negative one would panic every group's actor,
+	// and zero would disable the transport's idle timeout (120 ticks) while
+	// the driver silently used its default (audit M5).
+	if *tickIvl <= 0 {
+		fmt.Fprintf(stderr, "dkvd: -tick-interval must be positive, got %s\n", *tickIvl)
 		return 2
 	}
 
@@ -166,8 +176,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		_ = tr.Close()
 		return 2
 	}
-	if (*clientAt != "" || *adminAt != "" || *joinArg != "") && !*raftMode && !*cluster {
-		fmt.Fprintln(stderr, "dkvd: -client-listen, -admin-listen and -join require -raft or -cluster")
+	if (*clientAt != "" || *adminAt != "" || *joinArg != "" || *initDir || *clusterID != "") && !*raftMode && !*cluster {
+		fmt.Fprintln(stderr, "dkvd: -client-listen, -admin-listen, -join, -init and -cluster-id require -raft or -cluster")
+		_ = tr.Close()
+		return 2
+	}
+	// A node's durable state is the whole of its Raft safety: it is never a
+	// temporary directory that a restart would forget (audit H1).
+	if (*raftMode || *cluster) && *dataDir == "" {
+		fmt.Fprintln(stderr, "dkvd: -raft and -cluster require -data-dir")
 		_ = tr.Close()
 		return 2
 	}
@@ -203,7 +220,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if *raftMode || *cluster {
-		r := raftRun{id: *id, listen: *listen, peers: peers, tr: tr, dataDir: *dataDir, tick: *tickIvl, lg: lg, stderr: stderr, clientAddr: *clientAt, crash: crash,
+		r := raftRun{id: *id, listen: *listen, peers: peers, tr: tr, dataDir: *dataDir, init: *initDir, clusterID: *clusterID, tick: *tickIvl, lg: lg, stderr: stderr, clientAddr: *clientAt, crash: crash,
 			limits: limits, redirectOnly: !*forward, snapshotEvery: *snapEv, snapshotRetain: *snapKeep,
 			assign: assign, join: join, adminAddr: *adminAt, metrics: reg}
 		if crash != nil {
@@ -345,11 +362,14 @@ type raftRun struct {
 	peers   map[transport.NodeID]string
 	tr      transport.Transport
 	dataDir string
-	tick    time.Duration
-	lg      *logger
-	stderr  io.Writer
-	fs      vfs.FS
-	hook    raftnode.Hook // -crash-at driver point; nil in normal operation
+	// init and clusterID: -init and -cluster-id (internal/nodedir).
+	init      bool
+	clusterID string
+	tick      time.Duration
+	lg        *logger
+	stderr    io.Writer
+	fs        vfs.FS
+	hook      raftnode.Hook // -crash-at driver point; nil in normal operation
 	// clientAddr, if set, serves the key-value protocol (internal/kv) on that
 	// address, for every group the node hosts (kv.Front).
 	clientAddr   string
@@ -391,16 +411,20 @@ func runRaft(ctx context.Context, r raftRun) int {
 	id, lg := r.id, r.lg
 	dataDir := r.dataDir
 	if dataDir == "" {
-		d, err := os.MkdirTemp("", "dkvd-raft-")
-		if err != nil {
-			fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
-			return 2
-		}
-		dataDir = d
-	} else if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
+		fmt.Fprintln(r.stderr, "dkvd: no data directory")
 		return 2
 	}
+	// The data directory is this process's (locked) and this node's (its
+	// identity), and a directory with no node is initialized only on request
+	// (-init): a node whose state was lost must not restart empty under its
+	// old id (audit H1, internal/nodedir).
+	nd, err := nodedir.Open(dataDir, nodedir.Options{Node: id, Cluster: r.clusterID, Init: r.init})
+	if err != nil {
+		fmt.Fprintf(r.stderr, "dkvd: -data-dir: %v\n", err)
+		return 2
+	}
+	defer nd.Close()
+	lg.logf("event=data_dir node=%s dir=%s cluster=%s state=%s", id, dataDir, nd.ID.Cluster, nd.State)
 	limits := r.limits
 	if limits == (kv.Limits{}) {
 		limits = kv.DefaultLimits
@@ -485,9 +509,31 @@ func runRaft(ctx context.Context, r raftRun) int {
 	for _, g := range r.join {
 		creations = append(creations, creation{g, nil})
 	}
+	// Genesis state is created only while the directory is being initialized.
+	// In an initialized directory a genesis group with no state was lost, and
+	// is reported rather than created empty: its node voted and acknowledged
+	// as a member, and an empty replica under its id would do so again
+	// without that state. In -raft mode group 0 is always opened through
+	// Create (which checks the configured genesis against the recorded one),
+	// so its identity file must already exist.
+	initOK := true
 	for _, c := range creations {
 		if host.Group(c.g) != nil {
 			continue
+		}
+		if !nd.Initializing() {
+			if r.assign == nil {
+				if _, found, err := raftnode.LoadIdentity(r.fs, hc.LogPathFor(c.g)); err != nil || !found {
+					fmt.Fprintf(r.stderr, "dkvd: group %d has no state in the initialized data directory %s (%v): "+
+						"its state was lost; replace this node through a membership change\n", c.g, dataDir, err)
+					_ = host.Close()
+					return 2
+				}
+			} else if c.boot != nil {
+				lg.logf("event=group_failed node=%s group=%d err=%q", id, c.g,
+					"genesis group with no state in an initialized data directory: its state was lost; replace this replica through a membership change")
+				continue
+			}
 		}
 		if _, err := host.Create(c.g, c.boot); err != nil {
 			if r.assign == nil {
@@ -495,7 +541,19 @@ func runRaft(ctx context.Context, r raftRun) int {
 				_ = host.Close()
 				return 2
 			}
+			initOK = false
 			lg.logf("event=group_failed node=%s group=%d err=%v", id, c.g, err)
+		}
+	}
+	if nd.Initializing() {
+		if !initOK {
+			lg.logf("event=init_incomplete node=%s dir=%s: a genesis group did not start; the next start resumes the initialization", id, dataDir)
+		} else if err := nd.FinishInit(); err != nil {
+			fmt.Fprintf(r.stderr, "dkvd: recording the initialization of %s: %v\n", dataDir, err)
+			_ = host.Close()
+			return 2
+		} else {
+			lg.logf("event=data_dir_initialized node=%s dir=%s cluster=%s", id, dataDir, nd.ID.Cluster)
 		}
 	}
 	if r.assign == nil && host.Group(0) == nil {
