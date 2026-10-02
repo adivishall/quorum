@@ -25,9 +25,20 @@ type gate struct {
 	used    atomic.Bool
 	entered chan struct{}
 	open    chan struct{}
+	opened  sync.Once
 }
 
-func newGate() *gate { return &gate{entered: make(chan struct{}), open: make(chan struct{})} }
+// newGate makes a gate that is opened, at the latest, when the test ends —
+// before the host is closed (cleanups run last-registered first), so a test
+// that fails while a transition is held fails at once instead of waiting in
+// Close for the held transition.
+func newGate(t *testing.T) *gate {
+	g := &gate{entered: make(chan struct{}), open: make(chan struct{})}
+	t.Cleanup(g.release)
+	return g
+}
+
+func (g *gate) release() { g.opened.Do(func() { close(g.open) }) }
 
 func (g *gate) block() {
 	if g.used.CompareAndSwap(false, true) {
@@ -58,7 +69,7 @@ func lifecycleHost(t *testing.T, c *hostCluster, id NodeID, newSM func(GroupID) 
 // Stop. Once the first start is done the group is simply running.
 func TestAStartingGroupCannotBeStartedOrStoppedAgain(t *testing.T) {
 	c := newHostCluster(t, "n1")
-	g := newGate()
+	g := newGate(t)
 	var mu sync.Mutex
 	made := 0
 	h := lifecycleHost(t, c, "n1", func(GroupID) raftnode.StateMachine {
@@ -84,7 +95,7 @@ func TestAStartingGroupCannotBeStartedOrStoppedAgain(t *testing.T) {
 	if err := h.Stop(7); !errors.Is(err, ErrGroupBusy) {
 		t.Fatalf("a Stop while a Create is in flight: %v, want ErrGroupBusy", err)
 	}
-	close(g.open)
+	g.release()
 	if err := <-first; err != nil {
 		t.Fatalf("the first Create: %v", err)
 	}
@@ -105,7 +116,7 @@ func TestAStartingGroupCannotBeStartedOrStoppedAgain(t *testing.T) {
 // and then it recovers the group's state.
 func TestAStoppingGroupCannotBeStartedUntilItsNodeIsClosed(t *testing.T) {
 	c := newHostCluster(t, "n1")
-	g := newGate()
+	g := newGate(t)
 	var stopping sync.Mutex
 	block := false
 	h := lifecycleHost(t, c, "n1", func(GroupID) raftnode.StateMachine { return &recSM{} },
@@ -140,7 +151,7 @@ func TestAStoppingGroupCannotBeStartedUntilItsNodeIsClosed(t *testing.T) {
 	if _, err := h.Create(3, c.genesis("n1")); !errors.Is(err, ErrGroupBusy) {
 		t.Fatalf("a Create while the old node is still running: %v, want ErrGroupBusy", err)
 	}
-	close(g.open)
+	g.release()
 	if err := <-stopped; err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
