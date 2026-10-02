@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -71,6 +72,9 @@ type TCPTransport struct {
 	peers  map[NodeID]*peer // the peers it accepts and (smaller id) dials
 	closed bool
 
+	self      hello         // what this node announces in every handshake
+	handshake chan struct{} // a slot per inbound connection in its handshake
+
 	m *transportMetrics // Phase 16; its counters are nil (inert) without Config.Metrics
 }
 
@@ -93,13 +97,16 @@ func NewTCPTransport(cfg Config) (*TCPTransport, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	cfg = cfg.withDefaults()
-
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return nil, err
 	}
+	return newTCPTransport(cfg.withDefaults(), ln), nil
+}
 
+// newTCPTransport runs a transport on an open listener (tests substitute one
+// that fails).
+func newTCPTransport(cfg Config, ln net.Listener) *TCPTransport {
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &TCPTransport{
 		cfg:    cfg,
@@ -109,6 +116,9 @@ func NewTCPTransport(cfg Config) (*TCPTransport, error) {
 		cancel: cancel,
 		conns:  make(map[NodeID]*conn),
 		peers:  make(map[NodeID]*peer),
+		self:   hello{id: cfg.NodeID, cluster: cfg.ClusterID, digest: cfg.SettingsDigest},
+
+		handshake: make(chan struct{}, cfg.MaxPendingHandshakes),
 	}
 	t.m = newTransportMetrics(cfg.Metrics, t)
 
@@ -121,7 +131,7 @@ func NewTCPTransport(cfg Config) (*TCPTransport, error) {
 	}
 	t.mu.Unlock()
 	t.logf("event=node_started node=%s listen=%s peers=%d", cfg.NodeID, ln.Addr(), len(cfg.Peers))
-	return t, nil
+	return t
 }
 
 // addPeerLocked records a peer and, if this node has the smaller id, starts
@@ -228,6 +238,12 @@ func (t *TCPTransport) Send(ctx context.Context, peer NodeID, kind MsgKind, payl
 	}
 	c := t.conns[peer]
 	t.mu.Unlock()
+	if len(payload) > MaxFrameSize {
+		// The peer refuses a frame over MaxFrameSize and drops the connection:
+		// it is refused here, before a byte is written (audit D2).
+		t.m.writeFailed.Inc()
+		return fmt.Errorf("%w: a %d-byte payload", ErrFrameTooLarge, len(payload))
+	}
 	if c == nil {
 		t.m.notConnected.Inc()
 		return ErrPeerNotConnected
@@ -265,44 +281,134 @@ func (t *TCPTransport) Close() error {
 	return nil
 }
 
-// acceptLoop accepts inbound connections until the listener is closed.
+// acceptLoop accepts inbound connections until the transport is closed. An
+// Accept error while it is open — descriptors exhausted (EMFILE), a transient
+// network error — is logged and retried after a growing pause (audit D7/F10):
+// returning would leave the listener open with nobody accepting, so peers
+// would connect into the backlog and be silently black-holed. If the loop
+// ever does give up, it closes the listener, so peers see refusals instead.
 func (t *TCPTransport) acceptLoop() {
 	defer t.wg.Done()
+	defer t.ln.Close()
+	backoff := 5 * time.Millisecond
 	for {
 		nc, err := t.ln.Accept()
 		if err != nil {
-			return // listener closed on shutdown
+			if t.ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return // shutdown
+			}
+			t.m.acceptFailed.Inc()
+			t.logf("event=accept_failed node=%s err=%v retry_in=%s", t.cfg.NodeID, err, backoff)
+			if sleepCtx(t.ctx, backoff) {
+				return
+			}
+			backoff = min(2*backoff, time.Second)
+			continue
+		}
+		backoff = 5 * time.Millisecond
+		select {
+		case t.handshake <- struct{}{}:
+		default:
+			// Too many connections still in their handshake: refuse this one
+			// rather than let unauthenticated connections exhaust descriptors.
+			t.m.handshakeRefused.Inc()
+			_ = nc.Close()
+			continue
 		}
 		t.wg.Add(1)
 		go t.handleInbound(nc)
 	}
 }
 
-// handleInbound reads the dialer's handshake, validates it, and serves the
-// connection. The accepter sends no handshake back (the handshake is one-way).
+// handleInbound reads the dialer's hello, validates it — not this node, a
+// known peer that dials this node (the smaller id dials), this cluster, these
+// settings — answers with a status and this node's own hello, and serves the
+// connection if it accepted it.
 func (t *TCPTransport) handleInbound(nc net.Conn) {
 	defer t.wg.Done()
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			<-t.handshake
+		}
+	}
+	defer release()
 
-	_ = nc.SetReadDeadline(time.Now().Add(t.cfg.HandshakeTimeout))
-	peer, err := readHandshake(nc)
+	_ = nc.SetDeadline(time.Now().Add(t.cfg.HandshakeTimeout))
+	// Shutdown interrupts a handshake in flight instead of waiting out its
+	// timeout.
+	stop := context.AfterFunc(t.ctx, func() { _ = nc.Close() })
+	defer stop()
+	h, err := readHandshake(nc)
 	if err != nil {
 		t.logf("event=handshake_failed dir=inbound err=%v", mapTimeout(err))
 		_ = nc.Close()
 		return
 	}
-	_ = nc.SetReadDeadline(time.Time{}) // clear
+	status := statusAccepted
+	switch {
+	case h.id == t.cfg.NodeID:
+		status = statusSelfConnection
+	case !t.isPeer(h.id):
+		status = statusUnknownPeer
+	case h.id > t.cfg.NodeID:
+		status = statusWrongDirection
+	case h.cluster != t.self.cluster:
+		status = statusWrongCluster
+	case string(h.digest) != string(t.self.digest):
+		status = statusWrongSettings
+	}
+	if err := writeReply(nc, status, t.self); err != nil || status != statusAccepted {
+		if status != statusAccepted {
+			err = statusError(status)
+			t.m.handshakeRejected.Inc()
+		}
+		t.logf("event=handshake_failed dir=inbound peer=%s cluster=%q err=%v", h.id, h.cluster, mapTimeout(err))
+		_ = nc.Close()
+		return
+	}
+	if !stop() {
+		return // shut down: the connection is closed
+	}
+	_ = nc.SetDeadline(time.Time{}) // clear
+	release()
+	t.serve(h.id, nc, "inbound")
+}
 
-	if peer == t.cfg.NodeID {
-		t.logf("event=handshake_failed dir=inbound err=%v", ErrSelfConnection)
-		_ = nc.Close()
-		return
+// dial handshakes an outbound connection to peer: it sends this node's hello
+// and requires the accepter's answer to accept it and to come from peer, of
+// this cluster, with these settings. Cancelling ctx (shutdown, or the peer's
+// removal) interrupts it instead of waiting out the handshake timeout.
+func (t *TCPTransport) dial(ctx context.Context, nc net.Conn, peer NodeID) error {
+	_ = nc.SetDeadline(time.Now().Add(t.cfg.HandshakeTimeout))
+	stop := context.AfterFunc(ctx, func() { _ = nc.Close() })
+	defer stop()
+	if err := writeHandshake(nc, t.self); err != nil {
+		return err
 	}
-	if !t.isPeer(peer) {
-		t.logf("event=handshake_failed dir=inbound peer=%s err=%v", peer, ErrUnknownPeer)
-		_ = nc.Close()
-		return
+	status, h, err := readReply(nc)
+	switch {
+	case err != nil:
+		return err
+	case status != statusAccepted:
+		t.m.handshakeRejected.Inc()
+		return fmt.Errorf("refused by %s: %w", h.id, statusError(status))
+	case h.id != peer:
+		t.m.handshakeRejected.Inc()
+		return fmt.Errorf("%w: dialed %s, reached %s", ErrWrongPeer, peer, h.id)
+	case h.cluster != t.self.cluster:
+		t.m.handshakeRejected.Inc()
+		return fmt.Errorf("%w: %s belongs to %q", ErrClusterMismatch, h.id, h.cluster)
+	case string(h.digest) != string(t.self.digest):
+		t.m.handshakeRejected.Inc()
+		return fmt.Errorf("%w: %s", ErrSettingsMismatch, h.id)
 	}
-	t.serve(peer, nc, "inbound")
+	if !stop() {
+		return ctx.Err() // cancelled: the connection is closed
+	}
+	_ = nc.SetDeadline(time.Time{})
+	return nil
 }
 
 // dialLoop maintains a connection to one peer: dial, handshake, serve until the
@@ -331,8 +437,7 @@ func (t *TCPTransport) dialLoop(ctx context.Context, peer NodeID, addr string) {
 			}
 			continue
 		}
-		_ = nc.SetWriteDeadline(time.Now().Add(t.cfg.HandshakeTimeout))
-		if err := writeHandshake(nc, t.cfg.NodeID); err != nil {
+		if err := t.dial(ctx, nc, peer); err != nil {
 			t.m.dialFailed.Inc()
 			t.logf("event=handshake_failed dir=outbound peer=%s err=%v", peer, mapTimeout(err))
 			_ = nc.Close()
@@ -341,7 +446,6 @@ func (t *TCPTransport) dialLoop(ctx context.Context, peer NodeID, addr string) {
 			}
 			continue
 		}
-		_ = nc.SetWriteDeadline(time.Time{})
 		t.serve(peer, nc, "outbound") // blocks until the connection dies
 		// A dead connection waits the same retry interval as a failed dial.
 		// Redialling immediately would spin at CPU speed against a peer that
@@ -397,14 +501,18 @@ func (t *TCPTransport) serve(peer NodeID, nc net.Conn, dir string) {
 }
 
 // readLoop reads frames until the connection ends or errors, delivering each as
-// an Envelope tagged with the connection's peer identity.
+// an Envelope tagged with the connection's peer identity. The read idle timeout
+// is re-armed before every read, so it measures silence, not frame size: a
+// large frame arriving slowly over a busy link is not torn down while its
+// bytes still flow.
 func (t *TCPTransport) readLoop(c *conn) {
 	hdr := make([]byte, record.HeaderSize)
+	var r io.Reader = c.nc
+	if t.cfg.ReadIdleTimeout > 0 {
+		r = idleReader{c.nc, t.cfg.ReadIdleTimeout}
+	}
 	for {
-		if t.cfg.ReadIdleTimeout > 0 {
-			_ = c.nc.SetReadDeadline(time.Now().Add(t.cfg.ReadIdleTimeout))
-		}
-		kind, payload, err := readFrame(c.nc, hdr)
+		kind, payload, err := readFrame(r, hdr)
 		if err != nil {
 			return // io.EOF (clean) or a protocol error — either way the conn is done
 		}
@@ -415,6 +523,17 @@ func (t *TCPTransport) readLoop(c *conn) {
 			return
 		}
 	}
+}
+
+// idleReader re-arms a connection's read deadline before every read.
+type idleReader struct {
+	nc   net.Conn
+	idle time.Duration
+}
+
+func (r idleReader) Read(p []byte) (int, error) {
+	_ = r.nc.SetReadDeadline(time.Now().Add(r.idle))
+	return r.nc.Read(p)
 }
 
 // hasConn reports whether a live connection to peer is registered.

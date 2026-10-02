@@ -20,6 +20,11 @@ const (
 	DefaultHandshakeTimeout  = 5 * time.Second
 	DefaultWriteTimeout      = 5 * time.Second
 	DefaultDialRetryInterval = 500 * time.Millisecond
+	// DefaultMaxPendingHandshakes bounds the inbound connections still in
+	// their handshake: each holds a goroutine and a descriptor for up to the
+	// handshake timeout, and an unauthenticated flood of them must not exhaust
+	// the process's descriptors (audit F10).
+	DefaultMaxPendingHandshakes = 64
 	// DefaultReadIdleTimeout of 0 disables the idle read deadline; a connection
 	// is then closed only by an explicit shutdown or a read/write failure.
 	DefaultReadIdleTimeout = 0
@@ -31,6 +36,15 @@ const (
 type Config struct {
 	// NodeID is this node's identity, announced in the handshake.
 	NodeID NodeID
+
+	// ClusterID and SettingsDigest are announced in the handshake and must
+	// equal the peer's, or the connection is refused both ways (audit H2,
+	// H5): a node of another cluster — a wrong address, a recycled IP — is
+	// never heard as a peer, and nodes with different replica settings never
+	// exchange a frame. Opaque here; empty values are equal only to empty
+	// values, so in-process tests that set neither still connect.
+	ClusterID      string
+	SettingsDigest []byte
 
 	// ListenAddr is the "host:port" this node accepts connections on.
 	ListenAddr string
@@ -47,6 +61,9 @@ type Config struct {
 	WriteTimeout      time.Duration
 	DialRetryInterval time.Duration
 	ReadIdleTimeout   time.Duration
+	// MaxPendingHandshakes bounds inbound connections in their handshake;
+	// zero is DefaultMaxPendingHandshakes.
+	MaxPendingHandshakes int
 
 	// Logf, if non-nil, receives structured transport events (peer connected,
 	// handshake failed, peer disconnected, shutdown). It is the minimal
@@ -72,6 +89,9 @@ func (c Config) withDefaults() Config {
 	if c.DialRetryInterval == 0 {
 		c.DialRetryInterval = DefaultDialRetryInterval
 	}
+	if c.MaxPendingHandshakes == 0 {
+		c.MaxPendingHandshakes = DefaultMaxPendingHandshakes
+	}
 	// ReadIdleTimeout: zero means disabled, so it is left as-is.
 	return c
 }
@@ -84,6 +104,12 @@ func (c Config) validate() error {
 	}
 	if len(c.NodeID) > MaxNodeIDLen {
 		return fmt.Errorf("%w: node id exceeds %d bytes", ErrInvalidConfig, MaxNodeIDLen)
+	}
+	if len(c.ClusterID) > MaxClusterIDLen || len(c.SettingsDigest) > MaxDigestLen {
+		return fmt.Errorf("%w: cluster id or settings digest too long", ErrInvalidConfig)
+	}
+	if c.MaxPendingHandshakes < 0 {
+		return fmt.Errorf("%w: negative MaxPendingHandshakes", ErrInvalidConfig)
 	}
 	if err := validateAddr(c.ListenAddr); err != nil {
 		return fmt.Errorf("%w: listen addr %q: %v", ErrInvalidConfig, c.ListenAddr, err)
