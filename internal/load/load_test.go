@@ -3,6 +3,7 @@ package load
 import (
 	"context"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -226,5 +227,57 @@ func TestOverloadReportsAchievedThroughput(t *testing.T) {
 	}
 	if res.Late < 300 {
 		t.Fatalf("%d late operations; about 400 of the 500 due could not complete in the window", res.Late)
+	}
+}
+
+// slowRefuser answers GETs at once and refuses every PUT after a delay — the
+// shape of a failure scenario, where the failed operations are the slow ones.
+type slowRefuser struct{ delay time.Duration }
+
+func (slowRefuser) Name() string { return "refuser" }
+func (s slowRefuser) Do(_ context.Context, req kv.Request) (kv.Response, error) {
+	if req.Op == kv.ReqPut {
+		time.Sleep(s.delay)
+		return kv.Response{Status: kv.StatusInvalid, Message: "refused"}, nil
+	}
+	return kv.Response{Status: kv.StatusOK, Index: 1}, nil
+}
+
+// TestFailedOperationsAreNotHiddenFromLatency (audit): the success-only
+// percentiles leave out the refused and unknown operations — usually the
+// slowest — so the result also reports every outcome's latency and how many
+// the success-only figures exclude. Before, the failures' durations were not
+// recorded at all, and a failure scenario's published p99 understated its tail.
+func TestFailedOperationsAreNotHiddenFromLatency(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go kv.Serve(ctx, ln, slowRefuser{delay: 150 * time.Millisecond}, nil)
+	res, err := Run(context.Background(), Config{Endpoints: []Endpoint{{"refuser", ln.Addr().String()}}, Clients: 4,
+		Duration: time.Second, ReadPct: 50, Keys: 100, Anonymous: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	put, get := res.Ops["put"], res.Ops["get"]
+	refused := put.Classes[ClassRefused] + put.Classes[ClassUnknown]
+	if refused == 0 || put.Excluded != refused || put.Latency.Count != 0 {
+		t.Fatalf("puts: classes %v, %d excluded, %d in the success-only latency", put.Classes, put.Excluded, put.Latency.Count)
+	}
+	if put.AllOutcomes.Count != refused || put.AllOutcomes.P50 < 150e3 {
+		t.Fatalf("puts' every-outcome latency: %d samples, p50 %.0f µs; want all %d refused, each at least 150 ms", put.AllOutcomes.Count, put.AllOutcomes.P50, refused)
+	}
+	if get.Excluded != 0 || get.AllOutcomes.Count != get.Latency.Count {
+		t.Fatalf("gets all succeeded: %d excluded, %d vs %d samples", get.Excluded, get.AllOutcomes.Count, get.Latency.Count)
+	}
+	if res.Excluded != refused || res.AllOutcomes.Count != res.All.Count+refused || res.AllOutcomes.Max < 150e3 || res.All.Max >= 150e3 {
+		t.Fatalf("overall: %d excluded of %d; success-only max %.0f µs, every-outcome max %.0f µs", res.Excluded, res.AllOutcomes.Count, res.All.Max, res.AllOutcomes.Max)
+	}
+	var out strings.Builder
+	PrintSummary(&out, res)
+	if !strings.Contains(out.String(), "excluded above") || !strings.Contains(out.String(), "put*") {
+		t.Fatalf("the summary does not show the excluded operations:\n%s", out.String())
 	}
 }

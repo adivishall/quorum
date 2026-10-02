@@ -16,8 +16,18 @@ For each run, from the clients' side:
 - **Late operations:** those due in the window that completed after it. Any at all means the
   offered rate exceeded what the cluster sustained, and the latencies include the backlog. The
   summary prints a warning.
-- **Latency per operation:** exact nearest-rank percentiles (p50, p90, p95, p99, p99.9, max) over
-  every completed operation of the window. No histogram, no sampling, no interpolation.
+- **Latency per operation:** exact nearest-rank percentiles (p50, p90, p95, p99, p99.9, max). No
+  histogram, no sampling, no interpolation. Two populations, both over the operations due in the
+  window:
+  - `latency` — the **successes** (`ok`, `not_found`) only;
+  - `latency_all_outcomes` — **every** operation, each measured to its definite answer or to the
+    client giving up, with `excluded_from_latency` counting what `latency` leaves out.
+
+  The refused and unknown operations are usually the slowest — they waited out their retries — so
+  in a failure scenario the success-only percentiles understate the tail; the summary prints the
+  every-outcome rows (`put*`) whenever anything was excluded (`TestFailedOperationsAreNotHiddenFromLatency`).
+  Before this distinction (audit), only the successes' durations were recorded, though this
+  section said every completed operation counted.
 - **Outcomes, by the class a client must act on** (`docs/CLIENT_SEMANTICS.md` §6):
   - `ok`;
   - `not_found`;

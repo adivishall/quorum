@@ -33,7 +33,13 @@ scrapes every node's `/metrics` before and after the measured window. A run's nu
 
 - **from the clients:** throughput (operations completed with a definite answer inside the window,
   per second), exact latency percentiles per operation, outcomes by class (`ok`, `not_found`,
-  `refused`, `unknown`), and the longest run of 100 ms buckets with no success (the outage);
+  `refused`, `unknown`), and the longest run of 100 ms buckets with no success (the outage).
+  **The latency percentiles in the tables below are of successes only** (`ok`, `not_found`): the
+  runs were recorded before the generator also measured refused and unknown operations
+  (`docs/LOAD_TESTING.md`), and their durations were not stored, so the tables cannot be corrected
+  from the JSON. Where a scenario had unknown outcomes — the rolling restart, 10–14 per run — its
+  p99s leave out exactly those, the slowest operations: in `bench/cluster/rolling-restart.json`
+  run 0, 5 of 495 PUTs, so "PUT p99 280.7 ms" is the p99 of the other 490. A re-run reports both;
 - **from the nodes:** CPU per second, peak RSS, persists (fsyncs) and their mean duration, mean
   commit latency of a write, AppendEntries traffic and commit progress (§6.3 only), snapshots taken;
 - **from the lab:** each action's settle time — a kill to the next leader seen by the admin

@@ -431,7 +431,8 @@ type recorder struct {
 type bucket struct{ ok, failed atomic.Int64 }
 
 type clientRecord struct {
-	lat     [3][]int64 // by op, nanoseconds, measured window only
+	lat     [3][]int64 // by op, nanoseconds, measured window only: successes
+	latAll  [3][]int64 // by op: every outcome, to its definite answer or give-up
 	classes map[string]int64
 	byOp    [3]map[string]int64
 }
@@ -470,8 +471,10 @@ func (r *recorder) record(id int, t task, class string, done time.Time, measureF
 	c := r.perCli[id]
 	c.classes[class]++
 	c.byOp[t.op][class]++
+	d := int64(done.Sub(t.intended))
+	c.latAll[t.op] = append(c.latAll[t.op], d)
 	if class == ClassOK || class == ClassNotFound {
-		c.lat[t.op] = append(c.lat[t.op], int64(done.Sub(t.intended)))
+		c.lat[t.op] = append(c.lat[t.op], d)
 	}
 }
 
@@ -512,10 +515,17 @@ func Summarize(samples []int64) Latency {
 		P50: us(rank(50)), P90: us(rank(90)), P95: us(rank(95)), P99: us(rank(99)), P999: us(rank(99.9)), Max: us(samples[len(samples)-1])}
 }
 
-// OpResult is one operation type's outcome counts and latency.
+// OpResult is one operation type's outcome counts and latency. Latency is of
+// the successes (ok, not_found) only; AllOutcomes of every operation due in
+// the window, each measured to its definite answer or to the client giving up
+// — the refused and unknown ones are usually the slowest, having waited out
+// their retries — and Excluded counts those Latency leaves out (audit:
+// success-only percentiles alone understate a failure scenario's tail).
 type OpResult struct {
-	Classes map[string]int64 `json:"classes"`
-	Latency Latency          `json:"latency"`
+	Classes     map[string]int64 `json:"classes"`
+	Latency     Latency          `json:"latency"`
+	AllOutcomes Latency          `json:"latency_all_outcomes"`
+	Excluded    int64            `json:"excluded_from_latency"`
 }
 
 // Point is one timeline bucket: operations that completed in it.
@@ -533,7 +543,11 @@ type Result struct {
 	Issued  int64               `json:"issued"`
 	Classes map[string]int64    `json:"classes"`
 	Ops     map[string]OpResult `json:"ops"`
-	All     Latency             `json:"all"`
+	All     Latency             `json:"all"` // successes, every operation type
+	// AllOutcomes is every operation due in the window, whatever its outcome,
+	// and Excluded the count All leaves out (OpResult).
+	AllOutcomes Latency `json:"all_outcomes"`
+	Excluded    int64   `json:"excluded_from_latency"`
 	// OKPerSec is the achieved throughput: successes that completed inside
 	// the measured window, per second of it. Classes and the latencies count
 	// the operations DUE in the window, whenever they completed.
@@ -555,21 +569,26 @@ type Result struct {
 func (r *recorder) result(cfg *Config, start, finished time.Time, cpu time.Duration) *Result {
 	res := &Result{Config: *cfg, Start: start, Elapsed: finished.Sub(start), Issued: r.issued.Load(),
 		Classes: map[string]int64{}, Ops: map[string]OpResult{}, GeneratorCPU: cpu}
-	var all []int64
+	var all, allOutcomes []int64
 	for op := Get; op <= Delete; op++ {
-		var lat []int64
+		var lat, latAll []int64
 		classes := map[string]int64{}
 		for _, c := range r.perCli {
 			lat = append(lat, c.lat[op]...)
+			latAll = append(latAll, c.latAll[op]...)
 			for k, v := range c.byOp[op] {
 				classes[k] += v
 			}
 		}
 		all = append(all, lat...)
+		allOutcomes = append(allOutcomes, latAll...)
 		if len(classes) > 0 {
-			res.Ops[op.String()] = OpResult{Classes: classes, Latency: Summarize(lat)}
+			excluded := int64(len(latAll) - len(lat))
+			res.Ops[op.String()] = OpResult{Classes: classes, Latency: Summarize(lat), AllOutcomes: Summarize(latAll), Excluded: excluded}
+			res.Excluded += excluded
 		}
 	}
+	res.AllOutcomes = Summarize(allOutcomes)
 	for _, c := range r.perCli {
 		for k, v := range c.classes {
 			res.Classes[k] += v
@@ -629,12 +648,23 @@ func PrintSummary(w io.Writer, r *Result) {
 		fmt.Fprintf(w, "WARNING: %d operations due in the window completed after it: the offered rate exceeded what the cluster sustained, and latencies include the backlog\n", r.Late)
 	}
 	fmt.Fprintf(w, "%-7s %9s %9s %9s %9s %9s %9s %9s\n", "op", "count", "p50 µs", "p90", "p95", "p99", "p99.9", "max")
+	row := func(name string, l Latency) {
+		fmt.Fprintf(w, "%-7s %9d %9.0f %9.0f %9.0f %9.0f %9.0f %9.0f\n", name, l.Count, l.P50, l.P90, l.P95, l.P99, l.P999, l.Max)
+	}
 	for _, op := range []string{"get", "put", "delete"} {
-		o, ok := r.Ops[op]
-		if !ok {
-			continue
+		if o, ok := r.Ops[op]; ok {
+			row(op, o.Latency)
 		}
-		l := o.Latency
-		fmt.Fprintf(w, "%-7s %9d %9.0f %9.0f %9.0f %9.0f %9.0f %9.0f\n", op, l.Count, l.P50, l.P90, l.P95, l.P99, l.P999, l.Max)
+	}
+	if r.Excluded == 0 {
+		return
+	}
+	// The rows above are successes only; the refused and unknown operations
+	// they leave out are usually the slowest. Every outcome:
+	fmt.Fprintf(w, "%d operations were refused or unknown and are excluded above; every outcome, to its answer or give-up:\n", r.Excluded)
+	for _, op := range []string{"get", "put", "delete"} {
+		if o, ok := r.Ops[op]; ok && o.Excluded > 0 {
+			row(op+"*", o.AllOutcomes)
+		}
 	}
 }
