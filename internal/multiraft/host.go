@@ -60,6 +60,9 @@ var (
 	ErrNoGroup = errors.New("multiraft: no such group on this node")
 	// ErrClosed: the host is closed.
 	ErrClosed = errors.New("multiraft: host closed")
+	// ErrGroupBusy: the group is being started or stopped; retry once that
+	// is done. Starts and stops of one group never overlap (audit H3).
+	ErrGroupBusy = errors.New("multiraft: the group is starting or stopping")
 )
 
 // Config configures a Host.
@@ -116,12 +119,22 @@ type Host struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	mu      sync.Mutex
-	groups  map[GroupID]*hosted
-	failed  map[GroupID]error // groups on disk that did not recover
-	added   map[NodeID]string // transport peers the host added
-	dropped map[string]uint64 // frames dropped, by reason (observability)
-	closed  bool
+	mu     sync.Mutex
+	groups map[GroupID]*hosted
+	// busy holds a group while it is being started or stopped (audit H3).
+	// A start reserves its group before it touches the group's files and
+	// keeps the reservation until the group is registered and announced; a
+	// stop takes the group out of groups into busy and keeps it there until
+	// its node is closed. So a group never has two drivers on its log — two
+	// starts cannot both pass the existence check, and a start cannot open
+	// the log while a stop is still closing it — and OnGroup's attach and
+	// detach of one group strictly alternate.
+	busy        map[GroupID]string
+	transitions sync.WaitGroup    // the starts and stops in flight; Close waits for them
+	failed      map[GroupID]error // groups on disk that did not recover
+	added       map[NodeID]string // transport peers the host added
+	dropped     map[string]uint64 // frames dropped, by reason (observability)
+	closed      bool
 
 	nodeMetrics *raftnode.Metrics // shared by every group's node (nil: none)
 	retired     *metrics.Counter
@@ -154,7 +167,7 @@ func Start(ctx context.Context, cfg Config) (*Host, error) {
 		cfg.InboxSize = DefaultInboxSize
 	}
 	hctx, cancel := context.WithCancel(ctx)
-	h := &Host{cfg: cfg, ctx: hctx, cancel: cancel, groups: map[GroupID]*hosted{}, failed: map[GroupID]error{},
+	h := &Host{cfg: cfg, ctx: hctx, cancel: cancel, groups: map[GroupID]*hosted{}, busy: map[GroupID]string{}, failed: map[GroupID]error{},
 		added: map[NodeID]string{}, dropped: map[string]uint64{}}
 	h.instrument(cfg.Metrics)
 	for id, addr := range cfg.StaticPeers {
@@ -256,23 +269,25 @@ func (h *Host) Create(g GroupID, bootstrap *replication.Configuration) (*Group, 
 func (h *Host) Open(g GroupID) (*Group, error) { return h.start(g, raftnode.Config{}) }
 
 // start runs group g's node with the genesis nc names (none: the identity
-// file supplies it).
+// file supplies it). The group is reserved for the whole start (busy), so
+// nothing else starts or stops it meanwhile.
 func (h *Host) start(g GroupID, nc raftnode.Config) (*Group, error) {
-	h.mu.Lock()
-	if h.closed {
-		h.mu.Unlock()
-		return nil, ErrClosed
+	if err := h.reserve(g, "starting"); err != nil {
+		return nil, err
 	}
-	if _, ok := h.groups[g]; ok {
-		h.mu.Unlock()
-		return nil, fmt.Errorf("%w: group %d", ErrGroupExists, g)
-	}
-	h.mu.Unlock()
+	defer h.release(g)
 	logPath := LogPath(h.cfg.DataDir, g)
+	created := false
 	if h.cfg.LogPathFor != nil {
 		logPath = h.cfg.LogPathFor(g)
-	} else if err := h.mkdirDurable(GroupDir(h.cfg.DataDir, g)); err != nil {
-		return nil, err
+	} else {
+		dir := GroupDir(h.cfg.DataDir, g)
+		if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
+			created = true
+		}
+		if err := h.mkdirDurable(dir); err != nil {
+			return nil, err
+		}
 	}
 	sm := h.cfg.NewStateMachine(g)
 	inbox := make(chan transport.Envelope, h.cfg.InboxSize)
@@ -285,6 +300,14 @@ func (h *Host) start(g GroupID, nc raftnode.Config) (*Group, error) {
 	nc.Metrics = h.nodeMetrics
 	node, err := raftnode.Start(h.ctx, nc)
 	if err != nil {
+		if created {
+			// A start that failed before recording anything (an unknown
+			// group, no genesis) leaves no directory behind to be found and
+			// reported as a failed group at every later start. Remove only
+			// succeeds on an empty directory: anything the start did write
+			// stays.
+			_ = os.Remove(GroupDir(h.cfg.DataDir, g))
+		}
 		return nil, err
 	}
 	grp := &Group{ID: g, Node: node, SM: sm}
@@ -298,6 +321,8 @@ func (h *Host) start(g GroupID, nc raftnode.Config) (*Group, error) {
 	delete(h.failed, g)
 	h.mu.Unlock()
 	h.logf("event=group_started node=%s group=%d", h.cfg.ID, g)
+	// Announced while the group is still reserved: a Stop cannot detach it
+	// before this attach.
 	if h.cfg.OnGroup != nil {
 		h.cfg.OnGroup(g, node, sm)
 	}
@@ -305,18 +330,55 @@ func (h *Host) start(g GroupID, nc raftnode.Config) (*Group, error) {
 	return grp, nil
 }
 
+// reserve marks g busy, or reports why it cannot be: the host is closed, the
+// group is running, or another start or stop of it is in flight.
+func (h *Host) reserve(g GroupID, what string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	switch {
+	case h.closed:
+		return ErrClosed
+	case h.busy[g] != "":
+		return fmt.Errorf("%w: group %d is %s", ErrGroupBusy, g, h.busy[g])
+	case h.groups[g] != nil:
+		return fmt.Errorf("%w: group %d", ErrGroupExists, g)
+	}
+	h.busy[g] = what
+	h.transitions.Add(1)
+	return nil
+}
+
+// release ends g's transition.
+func (h *Host) release(g GroupID) {
+	h.mu.Lock()
+	delete(h.busy, g)
+	h.mu.Unlock()
+	h.transitions.Done()
+}
+
 // Stop stops group g's node, keeping its files: a later Start of the host (or
-// Create) recovers it. Frames for it are dropped meanwhile.
+// Create) recovers it. Frames for it are dropped meanwhile. The group stays
+// reserved until its node is closed, so no start opens its log before then.
 func (h *Host) Stop(g GroupID) error {
 	h.mu.Lock()
-	hg, ok := h.groups[g]
-	if ok {
-		delete(h.groups, g)
+	if h.closed {
+		h.mu.Unlock()
+		return ErrClosed
 	}
-	h.mu.Unlock()
+	if what := h.busy[g]; what != "" {
+		h.mu.Unlock()
+		return fmt.Errorf("%w: group %d is %s", ErrGroupBusy, g, what)
+	}
+	hg, ok := h.groups[g]
 	if !ok {
+		h.mu.Unlock()
 		return fmt.Errorf("%w: group %d", ErrNoGroup, g)
 	}
+	delete(h.groups, g)
+	h.busy[g] = "stopping"
+	h.transitions.Add(1)
+	h.mu.Unlock()
+	defer h.release(g)
 	if h.cfg.OnGroup != nil {
 		h.cfg.OnGroup(g, nil, nil)
 	}
@@ -392,6 +454,10 @@ func (h *Host) Close() error {
 			first = err
 		}
 	}
+	// A start or stop in flight finishes on its own (a start that finds the
+	// host closed closes the node it started); Close returns only once no
+	// node it did not close can still be running.
+	h.transitions.Wait()
 	h.wg.Wait()
 	return first
 }
