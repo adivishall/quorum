@@ -190,43 +190,67 @@ func TestReconnectAfterConnectionDrop(t *testing.T) {
 // after the connection dies, not redial at CPU speed. Without that backoff the
 // dialer reconnects roughly every 250µs (measured against a resetting proxy),
 // burning an ephemeral port and two log lines per cycle.
+//
+// Since the handshake is answered (version 2), a peer that closes before
+// answering fails the dial itself: only a peer that answers and then closes
+// reaches the connection's own death. Both are checked; the first is the
+// backoff after a connection dies.
 func TestDialerBacksOffWhenPeerKeepsClosingConnections(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	var accepted atomic.Int64
-	go func() {
-		for {
-			c, err := ln.Accept()
+	for _, tc := range []struct {
+		name   string
+		answer bool
+	}{
+		{"after the handshake is answered", true},
+		{"before the handshake is answered", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
-				return
+				t.Fatal(err)
 			}
-			accepted.Add(1)
-			_ = c.Close()
-		}
-	}()
+			defer ln.Close()
+			var accepted, answered atomic.Int64
+			go func() {
+				for {
+					c, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					accepted.Add(1)
+					if tc.answer {
+						if _, err := readHandshake(c); err == nil && writeReply(c, statusAccepted, hello{id: "b"}) == nil {
+							answered.Add(1)
+						}
+					}
+					_ = c.Close()
+				}
+			}()
 
-	a, err := NewTCPTransport(Config{
-		NodeID: "a", ListenAddr: "127.0.0.1:0",
-		Peers:             map[NodeID]string{"b": ln.Addr().String()},
-		DialRetryInterval: 100 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer a.Close()
+			a, err := NewTCPTransport(Config{
+				NodeID: "a", ListenAddr: "127.0.0.1:0",
+				Peers:             map[NodeID]string{"b": ln.Addr().String()},
+				DialRetryInterval: 100 * time.Millisecond,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer a.Close()
 
-	time.Sleep(650 * time.Millisecond)
-	got := accepted.Load()
-	if got == 0 {
-		t.Fatal("the dialer never attempted a connection; the test proved nothing")
-	}
-	// At one attempt per 100ms interval, 650ms allows ~7 attempts; 15 leaves
-	// slack for scheduling. A dialer without the backoff makes thousands.
-	if got > 15 {
-		t.Fatalf("%d connection attempts in 650ms with a 100ms retry interval: the dialer must back off after a connection dies, not spin", got)
+			time.Sleep(650 * time.Millisecond)
+			got := accepted.Load()
+			if got == 0 {
+				t.Fatal("the dialer never attempted a connection; the test proved nothing")
+			}
+			if tc.answer && answered.Load() == 0 {
+				t.Fatal("no handshake was answered: no connection was established to die")
+			}
+			// At one attempt per 100ms interval, 650ms allows ~7 attempts; 15
+			// leaves slack for scheduling. A dialer without the backoff makes
+			// hundreds.
+			if got > 15 {
+				t.Fatalf("%d connection attempts in 650ms with a 100ms retry interval: the dialer must back off after a connection dies, not spin", got)
+			}
+		})
 	}
 }
 
