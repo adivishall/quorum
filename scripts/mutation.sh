@@ -2196,6 +2196,57 @@ mutant "compact-refuses-a-failed-log" internal/raftlog/raftlog.go \
 	if false && l.failed != nil {' \
   ./internal/raftlog '^TestAFailedLogRefusesInstallAndCompact$'
 
+# 256. Install never deletes a manifest CURRENT may name (audit M11).
+mutant "install-keeps-a-manifest-current-may-name" internal/storage/manifest/manifest.go \
+  '		if !errors.Is(err, ErrFailed) {
+			_ = FS.Remove(path) // CURRENT was never touched
+		}' \
+  '		_ = FS.Remove(path)' \
+  ./internal/storage/manifest '^TestInstallUnderEveryFault$'
+
+# 257. A failed manifest Writer refuses every later edit.
+mutant "manifest-writer-latches" internal/storage/manifest/manifest.go \
+  '	if w.failed != nil {
+		return w.failed
+	}' \
+  '	if false {
+		return w.failed
+	}' \
+  ./internal/storage/manifest '^TestAppendUnderEveryFault$'
+
+# 258. A compaction's output survives an ambiguous manifest edit.
+mutant "ambiguous-compaction-keeps-its-output" internal/storage/lsmcompact.go \
+  '		if produced && !errors.Is(err, manifest.ErrFailed) {' \
+  '		if produced && !errors.Is(err, nil) {' \
+  ./internal/storage '^TestAnAmbiguousCompactionEditKeepsItsOutput$'
+
+# 259. A latched compaction failure stops the compactor.
+mutant "latched-compactor-stops" internal/storage/lsmcompact.go \
+  '			if s.CompactionError() != nil {' \
+  '			if false {' \
+  ./internal/storage '^TestALatchedCompactionErrorStopsTheCompactor$'
+
+# 260. A flush makes the WAL durable before its manifest edit (audit D10).
+mutant "flush-syncs-the-wal-first" internal/storage/lsmstore.go \
+  '	if err := s.w.Sync(); err != nil {
+		_ = r.Close()' \
+  '	if err := error(nil); err != nil {
+		_ = r.Close()' \
+  ./internal/storage '^TestAFlushMakesTheWALDurableBeforeItsEdit$'
+
+# 261. A failed WAL append latches.
+mutant "wal-append-failure-latches" internal/storage/wal/wal.go \
+  '		w.syncErr = fmt.Errorf("wal: appending to %s: %w", segmentName(w.seg), err)
+		return w.syncErr' \
+  '		return fmt.Errorf("wal: appending to %s: %w", segmentName(w.seg), err)' \
+  ./internal/storage/wal '^TestATornAppendLatches$'
+
+# 262. Close after a failed flush reports it and does not flush again.
+mutant "wal-close-reports-the-latch" internal/storage/wal/wal.go \
+  '	syncErr := w.syncErr' \
+  '	var syncErr error' \
+  ./internal/storage/wal '^TestCloseAfterAFailedFlushReportsItAndDoesNotFlushAgain$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then
