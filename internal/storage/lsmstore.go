@@ -887,6 +887,14 @@ func (s *LSMStore) flushLocked() error {
 	edit.AddFile(fm)
 	edit.SetNextFileNum(s.nextNum)
 	edit.SetLastSequence(s.seq)
+	// The edit declares everything through s.seq persisted in a table; the
+	// WAL must hold it durably first. In batch mode it may not yet, and a
+	// power loss would then leave the manifest ahead of the durable WAL — a
+	// state the next open refuses (audit D10).
+	if err := s.w.Sync(); err != nil {
+		_ = r.Close()
+		return fmt.Errorf("lsm: syncing the WAL before recording %s: %w", sstName(num), err)
+	}
 	if err := s.manifest.Append(&edit); err != nil {
 		_ = r.Close()
 		return fmt.Errorf("lsm: recording %s in the manifest: %w", sstName(num), err)
