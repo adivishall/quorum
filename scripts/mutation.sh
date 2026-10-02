@@ -1568,6 +1568,58 @@ mutant "lab-append-frames-by-kind" internal/lab/experiment.go \
   '	u.AppendFramesSent = delta("dkv_transport_frames_sent_total")' \
   ./internal/lab 'TestUsageFromScrapes'
 
+# --- The entry-size limit (C1, docs/RAFT.md §16): one bound, enforced at every
+#     boundary an entry crosses. Each mutant lets an entry one byte (or 1 MiB)
+#     over the limit through exactly one boundary; the test named for that
+#     boundary must catch it.
+
+# 173. The front admits a write whose ENCODED command exceeds the entry limit
+#      (raw key and value within their limits): the C1 bug's entry point.
+mutant "entry-limit-at-the-front" internal/kv/api.go \
+  '		if n := r.command().EncodedLen(); n > MaxCommandLen {' \
+  '		if n := r.command().EncodedLen(); n > 2*MaxCommandLen {' \
+  ./internal/kv '^TestEncodedEntryLimitDecidesWriteAdmission$'
+
+# 174. Command.Validate (and so Decode) accepts an over-limit command.
+mutant "entry-limit-in-the-command" internal/kv/command.go \
+  '	if n := c.EncodedLen(); n > MaxCommandLen {' \
+  '	if n := c.EncodedLen(); n > 2*MaxCommandLen {' \
+  ./internal/kv '^TestEncodedEntryLimitDecidesWriteAdmission$'
+
+# 175. Propose accepts an entry over the limit (a leader appends it; a
+#      follower answers not-leader instead of a definite refusal).
+mutant "entry-limit-at-propose" internal/raft/raft.go \
+  '	if len(data) > MaxEntryDataLen {' \
+  '	if len(data) > 2*MaxEntryDataLen {' \
+  ./internal/raft '^TestProposeOverTheEntryLimitIsRefused$'
+
+# 176. Step accepts an AppendEntries carrying an over-limit entry: its term is
+#      adopted and the follower answers it.
+mutant "entry-limit-in-step" internal/raft/raft.go \
+  '			if len(e.Data) > MaxEntryDataLen {' \
+  '			if len(e.Data) > 2*MaxEntryDataLen {' \
+  ./internal/raft '^TestStepRefusesAnOversizedAppendEntries$'
+
+# 177. The in-memory log holds an over-limit entry.
+mutant "entry-limit-in-the-log" internal/replication/log.go \
+  '		if len(e.Data) > MaxEntryDataLen {' \
+  '		if len(e.Data) > 2*MaxEntryDataLen {' \
+  ./internal/replication '^TestEntrySizeLimit$'
+
+# 178. The durable log persists an entry its own replay refuses to read (the
+#      node that wrote it could never restart).
+mutant "entry-limit-at-save" internal/raftlog/raftlog.go \
+  '		if len(e.Data) > MaxEntryDataLen {' \
+  '		if len(e.Data) > 2*MaxEntryDataLen {' \
+  ./internal/raftlog '^TestSaveRefusesAnEntryOverTheLimit$'
+
+# 179. A proposal refused as too large is answered UNKNOWN: the client cannot
+#      tell a definite refusal from a write that may have happened.
+mutant "entry-too-large-is-invalid" internal/kv/server.go \
+  '	case errors.Is(err, raft.ErrEntryTooLarge):' \
+  '	case false && errors.Is(err, raft.ErrEntryTooLarge):' \
+  ./internal/kv '^TestEntryTooLargeFromBelowIsInvalid$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
 if [ "$TOTAL" -eq 0 ]; then
