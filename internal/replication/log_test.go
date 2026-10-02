@@ -375,3 +375,44 @@ func TestEntrySizeLimit(t *testing.T) {
 		t.Fatalf("At(2) = %d bytes, %v; want the %d-byte entry", len(got.Data), err, MaxEntryDataLen)
 	}
 }
+
+// TestSliceBounded: the longest prefix within the byte budget — and at least
+// one entry, whatever its size — with the range checks of Slice.
+func TestSliceBounded(t *testing.T) {
+	l := NewMemoryLog()
+	for i, n := range []int{10, 10, 50, 10} {
+		if err := l.Append(Entry{Index: uint64(i + 1), Term: 1, Data: make([]byte, n)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		lo, hi uint64
+		max    int
+		want   int
+	}{
+		{1, 5, 20, 2},   // 10+10; the 50 would pass the budget
+		{1, 5, 19, 1},   // only the first fits
+		{3, 5, 20, 1},   // the 50 alone: never empty
+		{1, 5, 1000, 4}, // everything
+		{1, 3, 1000, 2}, // never past hi
+		{2, 2, 1000, 0}, // an empty range is empty
+	} {
+		es, err := l.SliceBounded(tc.lo, tc.hi, tc.max)
+		if err != nil || len(es) != tc.want {
+			t.Fatalf("SliceBounded(%d, %d, %d) = %d entries, %v; want %d", tc.lo, tc.hi, tc.max, len(es), err, tc.want)
+		}
+		for i, e := range es {
+			if e.Index != tc.lo+uint64(i) {
+				t.Fatalf("SliceBounded(%d, %d, %d): entry %d has index %d", tc.lo, tc.hi, tc.max, i, e.Index)
+			}
+		}
+	}
+	if _, err := l.SliceBounded(2, 6, 100); err != ErrOutOfRange {
+		t.Fatalf("past the end: %v, want ErrOutOfRange", err)
+	}
+	es, _ := l.SliceBounded(1, 2, 100)
+	es[0].Data[0] = 7
+	if e, _ := l.At(1); e.Data[0] != 0 {
+		t.Fatal("SliceBounded returned the log's own bytes, not a copy")
+	}
+}

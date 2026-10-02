@@ -66,6 +66,10 @@ type Log interface {
 	// reaching at or below the boundary is ErrCompacted; any other invalid range
 	// is ErrOutOfRange, never clamped.
 	Slice(lo, hi uint64) ([]Entry, error)
+	// SliceBounded is Slice of the longest prefix of [lo,hi) whose entries'
+	// data total at most maxBytes — but never empty when lo < hi: the first
+	// entry is returned whatever its size. Nothing past the prefix is copied.
+	SliceBounded(lo, hi uint64, maxBytes int) ([]Entry, error)
 
 	// Append extends the log at the end only. Entries must be contiguous starting
 	// at LastIndex()+1 with non-decreasing terms; a gap, a duplicate index, or a
@@ -187,6 +191,27 @@ func (l *MemoryLog) Slice(lo, hi uint64) ([]Entry, error) {
 	out := make([]Entry, 0, hi-lo)
 	for i := lo; i < hi; i++ {
 		out = append(out, copyEntry(l.entries[i-l.base-1]))
+	}
+	return out, nil
+}
+
+// SliceBounded is Slice of the longest prefix of [lo,hi) whose data total at
+// most maxBytes, and at least the first entry (see the Log interface).
+func (l *MemoryLog) SliceBounded(lo, hi uint64, maxBytes int) ([]Entry, error) {
+	if lo <= l.base && l.base > 0 {
+		return nil, ErrCompacted
+	}
+	if lo < 1 || hi < lo || hi > l.LastIndex()+1 {
+		return nil, ErrOutOfRange
+	}
+	var out []Entry
+	size := 0
+	for i := lo; i < hi; i++ {
+		e := l.entries[i-l.base-1]
+		if size += len(e.Data); size > maxBytes && len(out) > 0 {
+			break
+		}
+		out = append(out, copyEntry(e))
 	}
 	return out, nil
 }
