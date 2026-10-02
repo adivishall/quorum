@@ -193,13 +193,19 @@ In the pure core (`internal/raft`, DESIGN §8.5, ADR-019):
    `ri = max(commitIndex, termStart)`, where `termStart` is the index of this leader's own
    election no-op.
 2. **Confirmation.** Every AppendEntries a leader sends carries a heartbeat sequence
-   `Message.Seq`; `broadcastAppend` increments it first. Every AppendEntries response in the same
-   term — success or rejection — echoes the `Seq` of the request it answers. The read is pending
-   with `seq = hbSeq+1`, and registration immediately broadcasts, so that broadcast carries exactly
-   `hbSeq+1`. The read is confirmed when a quorum — the leader plus followers whose highest echoed
-   sequence `ackSeq[peer] ≥ seq` — has answered a request **sent after the read was registered**.
-   A single-node group is its own quorum and confirms at once. Confirmation is FIFO (sequences are
-   non-decreasing), and confirmed reads leave the core as `Ready.ReadStates`.
+   `Message.Seq`; a **round** — a message to every peer under a new sequence — increments it
+   first (`broadcastAppend`, or a read's own round). Every AppendEntries response in the same
+   term — success or rejection — echoes the `Seq` of the request it answers. A read is pending
+   with `seq = hbSeq` of a round whose messages are **not yet sent**: if a round was created since
+   the last `Advance` (its messages are still in the Ready, unsent), the read joins it; otherwise it
+   starts one, of entry-less heartbeats at each peer's match index (audit H4: reads registered in one
+   cycle share one round, and no read resends the unacknowledged tail). Either way every message
+   carrying a sequence ≥ the read's is sent after the read was registered. The read is confirmed
+   when a quorum — the leader plus followers whose highest echoed sequence `ackSeq[peer] ≥ seq` —
+   has answered a request **sent after the read was registered**. A read never joins a round
+   already sent (`TestAReadNeverJoinsARoundAlreadySent`, mutant 248). A single-node group is its
+   own quorum and confirms at once. Confirmation is FIFO (sequences are non-decreasing), and
+   confirmed reads leave the core as `Ready.ReadStates`.
 3. **Leadership change.** Stepping down (`becomeFollower` from leader), campaigning
    (`becomeCandidate`) and winning (`becomeLeader`, which also resets `ackSeq`) all drop every
    unconfirmed read. The driver (`raftnode.Reads.DropStale`, after every cycle) fails every
@@ -223,8 +229,9 @@ at index *i* was committed before *t₀* by the leader of some term *T′* (the 
 *i* committed).
 - If *T′ > T*: a quorum *Q′* had stored an entry of term *T′*, and so had durably adopted term
   ≥ *T′*, before *t₀*. *R*'s confirmation needs a quorum *Q* that answered, **in term *T***, an
-  AppendEntries *L* sent **after *t₀*** (only acknowledgements with `Seq ≥ hbSeq+1` count, and
-  every such request was sent after registration). *Q* ∩ *Q′* ≠ ∅, and a node's term never
+  AppendEntries *L* sent **after *t₀*** (only acknowledgements with `Seq` ≥ the read's sequence
+  count, and every request carrying such a sequence was sent after registration — the read's round
+  was unsent when it registered, and every later message carries that sequence or a higher one). *Q* ∩ *Q′* ≠ ∅, and a node's term never
   decreases — it is fsynced before any reply that depends on it (INV-R6, INV-CR1) — so that node
   cannot answer in term *T < T′* after *t₀*. Contradiction: *R* would never be confirmed.
 - If *T′ < T*: by Leader Completeness *i* is in *L*'s log at its election, so

@@ -441,9 +441,8 @@ made to fit by raising the entry limit by a few KiB. That would have widened wha
 accepts on disk and on the wire — a format change — to keep a value size that never worked; the
 client contract instead states the limit that decides, the encoded entry (`docs/API.md` §3).
 
-**What the limit does not yet bound.** It bounds one entry; an AppendEntries carrying many is
-bounded only by the transport's 16 MiB frame and 65,536 entries (audit H4,
-`docs/ENGINEERING_ROADMAP.md`).
+**What bounds a message.** The limit bounds one entry; an AppendEntries carrying many is bounded
+by the core's per-message budgets (§18).
 
 ## 17. Bounds on a leader's outstanding work, abandoned requests, apply failures
 
@@ -497,3 +496,42 @@ abandoned request, the fail-stop and the `UNAVAILABLE` mapping; each is killed b
 
 **Not done here.** PreVote and CheckQuorum — an isolated leader that steps down by itself —
 remain open (`docs/ENGINEERING_ROADMAP.md`); the bounds limit what it holds meanwhile.
+
+## 18. Replication flow control (audit H4)
+
+Before this section, `sendAppend` sent a follower every entry from its `nextIndex` to the end of
+the log, and `nextIndex` moves only on a response — so every broadcast (a heartbeat, a proposal, a
+read) resent the whole unacknowledged tail, and a backlog beyond the transport's 16 MiB frame or
+the decoder's 65,536 entries could never be sent: the follower stayed behind until a snapshot
+moved past it, or for good with snapshots off. Three changes:
+
+- **Budgets.** One AppendEntries carries at most `MaxEntriesPerMsg` entries (default 4096, at most
+  `MaxEntriesPerMessage`) and `MaxSizePerMsg` bytes of entry data (default 1 MiB, at most 8 MiB);
+  an entry larger than the byte budget travels alone, so no entry is ever unsendable
+  (`replication.Log.SliceBounded` copies nothing past the budget). A message therefore always
+  fits what its receiver accepts, however far behind the follower is.
+- **Streaming a backlog.** When the budget cut a peer's last batch, an acknowledgement that
+  advances it sends the next batch at once, so a lagging follower catches up at the speed of round
+  trips rather than one batch per heartbeat. A lost batch is resent by the next heartbeat, from
+  `nextIndex`, as before.
+- **Read rounds.** A read no longer broadcasts the tail: it joins a round still unsent, or starts
+  one of entry-less heartbeats (`docs/LINEARIZABILITY.md` §5.1). Reads registered in one cycle —
+  and the driver takes the reads waiting together, up to 256 per cycle — are confirmed together.
+
+Safety is unchanged: what a follower accepts and how it answers are untouched; the leader sends
+less per message and more often. Evidence: `TestLaggingFollowerCatchesUpInBudgetedBatches`,
+`TestEntryBudgetBindsABacklogOfSmallEntries`, `TestAnEntryLargerThanTheByteBudgetIsSentAlone`,
+`TestReadsInOneCycleShareOneRound`, `TestAReadNeverJoinsARoundAlreadySent` (core);
+`TestFollowerBehindByMoreThanAFrameCatchesUp` (three real drivers: a follower 18 MB behind, snapshots
+off, catches up — before, never), `TestConcurrentReadsShareRounds` (512 concurrent reads cost 8–28
+messages); `TestBudgetedReplicationUnderFaults` (every simulator profile over three seeds with
+budgets of 2 entries and 32 bytes: every invariant and linearizability hold, with tens of
+thousands of batches cut, under every fault the simulator injects); mutants 243–251.
+
+**Still open.** `nextIndex` still moves only on an acknowledgement — there is no optimistic
+pipelining — so while a batch is unacknowledged, every heartbeat and proposal resends it. That
+redundancy is now bounded by the budgets (at most one batch per peer per broadcast) but not removed;
+removing it means tracking batches in flight per peer (etcd's probe/replicate states), a larger
+change to the core's loss recovery left for a later phase. Snapshots and bulk appends still share
+one connection with every group's heartbeats.
+

@@ -414,9 +414,10 @@ A linearizable read does **not** go through the log. It does this:
 2. Leader confirms it is still leader by exchanging heartbeats with a **quorum**. *(Phase 12: the
    heartbeat carries a sequence number `Seq`, incremented per broadcast; every AppendEntries
    response — success or rejection — echoes it; the read is confirmed only when a quorum,
-   the leader included, has echoed a sequence at least that of the broadcast sent when the read
-   was registered. An acknowledgement of an earlier heartbeat proves leadership only up to when it
-   was sent and does not count. A leader that steps down drops every unconfirmed read.)*
+   the leader included, has echoed a sequence at least that of a round sent after the read was
+   registered — one still unsent when it registered, which it joins, or one it starts. An
+   acknowledgement of an earlier heartbeat proves leadership only up to when it was sent and does
+   not count. A leader that steps down drops every unconfirmed read.)*
 3. Leader waits until `appliedIndex >= readIndex`.
 4. Read from the state machine.
 
