@@ -156,9 +156,17 @@ recovery repairs — as long as nothing is written after it; a later record woul
 mid-segment, which recovery refuses (`TestATornAppendLatches`). And `Close` after a failed flush
 returns that failure **without flushing again**: a second fsync can succeed once the kernel has
 dropped the pages the first failed to write, and reporting that as durability is the fsyncgate
-error (`TestCloseAfterAFailedFlushReportsItAndDoesNotFlushAgain`; mutants 261–262). The LSM store
-syncs the WAL before a flush records its table in the manifest, so the manifest never runs ahead of
-the durable log (`TestAFlushMakesTheWALDurableBeforeItsEdit`, mutant 260).
+error (`TestCloseAfterAFailedFlushReportsItAndDoesNotFlushAgain`; mutants 261–262, 265). After a
+failed **write**, `Close` still flushes, because the records acknowledged before it are owed that
+flush, and then reports the latched failure (`TestCloseAfterAFailedWriteStillFlushes`, mutant 264).
+
+The LSM store syncs the WAL before a flush records its table in the manifest, so the manifest never
+runs ahead of the durable log (`TestAFlushMakesTheWALDurableBeforeItsEdit`, mutant 260). The exception is a
+flush during replay at open: its records come from segments an earlier process wrote, and open
+does not sync them. If that process was killed with records still in the page cache, and the
+machine then loses power after the replay flush but before the kernel writes those pages back, the
+manifest is ahead of the log and the next open refuses it (`ErrCorrupt`). This is a limitation (§10).
+(`TestAReplayThatFlushesOpens`, mutant 263, covers a replay flush itself.)
 
 ### The cost, measured
 
@@ -323,3 +331,4 @@ data to have reached the physical device, which no userspace test on a laptop ca
 | Mis-classification possible if a length field is corrupted within range | inherent to this framing; see §8 |
 | `sync` mode serialises writers behind the flush | Phase 5 may add group commit, if measured to matter |
 | Power-loss durability untested in every mode | not testable here |
+| Open does not sync the recovered segments before a replay flush records a table (§5) | open |

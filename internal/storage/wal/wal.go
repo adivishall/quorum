@@ -164,6 +164,9 @@ type WAL struct {
 	// response — the caller would keep acknowledging writes that may not
 	// survive. Every subsequent append fails with this error.
 	syncErr error
+	// flushFailed is set when the latched failure is a failed flush, rather
+	// than a failed write: Close must not flush again after one (see Close).
+	flushFailed bool
 
 	// fullSyncOK records whether the platform's strongest flush is available
 	// on this file. See supportsFullSync.
@@ -335,6 +338,7 @@ func (w *WAL) syncLocked() error {
 	}
 	if err := syncFile(w.f); err != nil {
 		w.syncErr = fmt.Errorf("wal: flushing %s: %w", segmentName(w.seg), err)
+		w.flushFailed = true
 		return w.syncErr
 	}
 	w.unsynced = 0
@@ -403,13 +407,15 @@ func (w *WAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// After a failure, no fsync: a second fsync can succeed once the kernel
-	// has dropped the pages the first failed to write, and reporting that as
-	// durability is the fsyncgate error (audit M11). Close reports the latched
-	// failure instead.
+	// After a failed flush, no fsync: a second fsync can succeed once the
+	// kernel has dropped the pages the first failed to write, and reporting
+	// that as durability is the fsyncgate error (audit M11). After a failed
+	// write, the records acknowledged before it are still owed their flush;
+	// a partial record it makes durable is a torn tail recovery repairs.
+	// Either way Close reports the latched failure.
 	syncErr := w.syncErr
-	if syncErr == nil && w.opts.SyncMode != SyncOff {
-		if err := syncFile(w.f); err != nil {
+	if !w.flushFailed && w.opts.SyncMode != SyncOff {
+		if err := syncFile(w.f); err != nil && syncErr == nil {
 			syncErr = fmt.Errorf("wal: flushing %s on close: %w", segmentName(w.seg), err)
 		}
 	}

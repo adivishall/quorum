@@ -6,6 +6,7 @@ import (
 	"os"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // A WAL that failed a write or a flush never writes again (audit D10, M11).
@@ -106,5 +107,43 @@ func TestCloseAfterAFailedFlushReportsItAndDoesNotFlushAgain(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("Close flushed again after a failed flush (%d flushes)", calls)
+	}
+}
+
+// TestCloseAfterAFailedWriteStillFlushes: a failed write latches, but the
+// records acknowledged before it were never flushed in batch mode, and Close
+// still owes them that flush — only a failed FLUSH forbids another. Close
+// used to skip it after any failure.
+func TestCloseAfterAFailedWriteStillFlushes(t *testing.T) {
+	writes, syncs := 0, 0
+	defer func(prev func(*os.File) io.Writer) { segmentOut = prev }(segmentOut)
+	segmentOut = func(f *os.File) io.Writer { return tearNth{w: f, n: &writes, nth: 2, short: 5} }
+	defer func(prev func(*os.File) error) { syncFile = prev }(syncFile)
+	syncFile = func(f *os.File) error {
+		syncs++
+		return f.Sync()
+	}
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.SyncMode = SyncBatch
+	opts.SyncInterval = time.Hour // only Close flushes
+	opts.SyncBytes = 1 << 40
+	w, err := Create(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AppendBatch(batchOf("a")); err != nil {
+		t.Fatal(err)
+	}
+	failed := w.AppendBatch(batchOf("b"))
+	if failed == nil {
+		t.Fatal("the torn append succeeded")
+	}
+	before := syncs
+	if err := w.Close(); err == nil || err.Error() != failed.Error() {
+		t.Fatalf("Close after a failed write: %v, want the latched %v", err, failed)
+	}
+	if syncs != before+1 {
+		t.Fatalf("Close after a failed write flushed %d times, want once: the acknowledged record is never made durable", syncs-before)
 	}
 }

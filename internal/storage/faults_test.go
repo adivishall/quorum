@@ -1,6 +1,7 @@
 package storage_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -76,5 +77,31 @@ func TestAFlushMakesTheWALDurableBeforeItsEdit(t *testing.T) {
 	mustFlush(t, s)
 	if unsyncedAtEdit != 0 {
 		t.Fatalf("the flush's manifest edit was written with %d WAL bytes unsynced", unsyncedAtEdit)
+	}
+}
+
+// TestAReplayThatFlushesOpens: an open whose WAL replay outgrows the memtable
+// flushes during replay, before the store has a WAL of its own. Syncing the
+// WAL before the flush's edit must not assume one exists: it did, and every
+// such open panicked.
+func TestAReplayThatFlushesOpens(t *testing.T) {
+	dir := t.TempDir()
+	s := openLSM(t, dir, lsmOpts(storage.DefaultMemTableSize))
+	for i := 0; i < 64; i++ {
+		mustPut(t, s, fmt.Sprintf("key%03d", i), fmt.Sprintf("value%03d", i))
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = openLSM(t, dir, lsmOpts(256))
+	defer func() { _ = s.Close() }()
+	if s.Recovery().FlushesOnReplay == 0 {
+		t.Fatal("premise: the replay did not flush")
+	}
+	for i := 0; i < 64; i++ {
+		got, err := s.Get(context.Background(), []byte(fmt.Sprintf("key%03d", i)))
+		if err != nil || string(got) != fmt.Sprintf("value%03d", i) {
+			t.Fatalf("key%03d after a replay that flushed: %q, %v", i, got, err)
+		}
 	}
 }

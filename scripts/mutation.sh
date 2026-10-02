@@ -2228,10 +2228,10 @@ mutant "latched-compactor-stops" internal/storage/lsmcompact.go \
 
 # 260. A flush makes the WAL durable before its manifest edit (audit D10).
 mutant "flush-syncs-the-wal-first" internal/storage/lsmstore.go \
-  '	if err := s.w.Sync(); err != nil {
-		_ = r.Close()' \
-  '	if err := error(nil); err != nil {
-		_ = r.Close()' \
+  '		if err := s.w.Sync(); err != nil {
+			_ = r.Close()' \
+  '		if err := error(nil); err != nil {
+			_ = r.Close()' \
   ./internal/storage '^TestAFlushMakesTheWALDurableBeforeItsEdit$'
 
 # 261. A failed WAL append latches.
@@ -2245,6 +2245,28 @@ mutant "wal-append-failure-latches" internal/storage/wal/wal.go \
 mutant "wal-close-reports-the-latch" internal/storage/wal/wal.go \
   '	syncErr := w.syncErr' \
   '	var syncErr error' \
+  ./internal/storage/wal '^TestCloseAfterAFailedFlushReportsItAndDoesNotFlushAgain$'
+
+# 263. A flush during replay at open, before the store has a WAL, does not
+# sync a WAL that does not exist.
+mutant "replay-flush-has-no-wal-to-sync" internal/storage/lsmstore.go \
+  '	if s.w != nil {
+		if err := s.w.Sync(); err != nil {' \
+  '	if true {
+		if err := s.w.Sync(); err != nil {' \
+  ./internal/storage '^TestAReplayThatFlushesOpens$'
+
+# 264. Close after a failed WRITE still flushes the records acknowledged before it.
+mutant "wal-close-flushes-after-a-failed-write" internal/storage/wal/wal.go \
+  '	if !w.flushFailed && w.opts.SyncMode != SyncOff {' \
+  '	if w.syncErr == nil && w.opts.SyncMode != SyncOff {' \
+  ./internal/storage/wal '^TestCloseAfterAFailedWriteStillFlushes$'
+
+# 265. A failed flush is remembered as one, so Close does not flush again.
+mutant "wal-failed-flush-is-remembered" internal/storage/wal/wal.go \
+  '		w.flushFailed = true
+' \
+  '' \
   ./internal/storage/wal '^TestCloseAfterAFailedFlushReportsItAndDoesNotFlushAgain$'
 
 echo "== $KILLED/$TOTAL mutants killed =="
