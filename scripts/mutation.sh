@@ -1952,6 +1952,116 @@ mutant "busy-is-unavailable" internal/kv/server.go \
   '	case false:' \
   ./internal/kv '^TestBusyFromBelowIsUnavailable$'
 
+# 227. The client port caps its connections (audit M1).
+mutant "kv-conns-capped" internal/kv/wire.go \
+  '	slots := make(chan struct{}, cfg.MaxConns)' \
+  '	slots := make(chan struct{}, 1<<20)' \
+  ./internal/kv '^TestServeCapsItsConnections$'
+
+# 228. A request frame, once begun, must complete within FrameTimeout.
+mutant "kv-frame-deadline" internal/kv/wire.go \
+  '	_ = c.SetReadDeadline(time.Now().Add(timeout))
+	return readFrame' \
+  '	return readFrame' \
+  ./internal/kv '^TestServeDropsAStalledFrameButKeepsAnIdleConnection$'
+
+# 229. ... and an idle connection is never timed out.
+mutant "kv-idle-not-timed-out" internal/kv/wire.go \
+  '	_ = c.SetReadDeadline(time.Time{})
+	var first [1]byte' \
+  '	_ = c.SetReadDeadline(time.Now().Add(timeout))
+	var first [1]byte' \
+  ./internal/kv '^TestServeDropsAStalledFrameButKeepsAnIdleConnection$'
+
+# 230. A response must be written within WriteTimeout.
+mutant "kv-write-deadline" internal/kv/wire.go \
+  '		_ = c.SetWriteDeadline(time.Now().Add(cfg.WriteTimeout))' \
+  '		_ = cfg.WriteTimeout' \
+  ./internal/kv '^TestServeDropsAClientThatDoesNotRead$'
+
+# 231. An Accept error does not end the client port.
+mutant "kv-accept-retries" internal/kv/wire.go \
+  '			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			logf("event=kv_accept_failed' \
+  '			if true {
+				return
+			}
+			logf("event=kv_accept_failed' \
+  ./internal/kv '^TestServeSurvivesAcceptErrors$'
+
+# 232. A frame's buffer grows with the bytes that arrive.
+mutant "kv-frame-grows" internal/kv/wire.go \
+  '	frame := make([]byte, record.HeaderSize, record.HeaderSize+min(int(length), readChunk))' \
+  '	frame := make([]byte, record.HeaderSize, record.HeaderSize+int(length))' \
+  ./internal/kv '^TestReadFrameGrowsWithTheBytesThatArrive$'
+
+# 233. Inbound forwards are bounded; beyond, UNAVAILABLE.
+mutant "kv-forwards-bounded" internal/kv/server.go \
+  '		select {
+		case s.fwdSlots <- struct{}{}:
+		default:
+			s.refuse(peer, fid)
+			return
+		}' \
+  '		s.fwdSlots <- struct{}{}' \
+  ./internal/kv '^TestForwardsBeyondTheBoundAreRefusedUnavailable$'
+
+# 234. A request naming an unhosted group is labelled "other" (audit M7).
+mutant "kv-unhosted-group-label" internal/kv/front.go \
+  '	m.request(req, resp, start, f.Server(req.Group) != nil)' \
+  '	m.request(req, resp, start, true)' \
+  ./internal/kv '^TestClientsCannotCreateMetricSeries$'
+
+# 235. The admin port caps its connections.
+mutant "admin-conns-capped" internal/multiraft/admin.go \
+  '	slots := make(chan struct{}, MaxAdminConns)' \
+  '	slots := make(chan struct{}, 1<<20)' \
+  ./internal/multiraft '^TestAdminCapsItsConnections$'
+
+# 236. An Accept error does not end the admin port.
+mutant "admin-accept-retries" internal/multiraft/admin.go \
+  '			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {' \
+  '			if true {' \
+  ./internal/multiraft '^TestAdminSurvivesAcceptErrors$'
+
+# 237. An idle admin connection is closed.
+mutant "admin-idle-deadline" internal/multiraft/admin.go \
+  '		_ = c.SetReadDeadline(time.Now().Add(adminIdle))' \
+  '		_ = adminIdle' \
+  ./internal/multiraft '^TestAdminDropsAnIdleConnection$'
+
+# 238. An admin request's timeout is clamped.
+mutant "admin-timeout-clamped" internal/multiraft/admin.go \
+  '	case ms >= int(MaxAdminTimeout/time.Millisecond): // also before ms×1e6 could overflow' \
+  '	case false:' \
+  ./internal/multiraft '^TestAdminTimeoutIsClamped$'
+
+# 239. Admin log fields from the client are quoted.
+mutant "admin-log-quoted" internal/multiraft/admin.go \
+  '				logf("event=admin node=%s op=%q group=%d id=%q ok=%v err=%q", h.cfg.ID, req.Op, req.Group, req.ID, resp.OK, resp.Error)' \
+  '				logf("event=admin node=%s op=%s group=%d id=%s ok=%v err=%q", h.cfg.ID, req.Op, req.Group, req.ID, resp.OK, resp.Error)' \
+  ./internal/multiraft '^TestAdminLogLinesCannotBeForged$'
+
+# 240. dkvd keeps the admin port on loopback unless allowed (audit H6).
+mutant "dkvd-admin-loopback" cmd/dkvd/main.go \
+  '	if *adminAt != "" && !*adminAny && !isLoopback(*adminAt) {' \
+  '	if false && !*adminAny {' \
+  ./cmd/dkvd '^TestAdminListensOnLoopbackUnlessAllowed$'
+
+# 241. A snapshot's state buffer is sized by the bytes that exist.
+mutant "snapshot-decode-allocation" internal/snapshot/snapshot.go \
+  '	data := make([]byte, 0, min(dataLen, uint64(len(b))))' \
+  '	data := make([]byte, 0, dataLen)' \
+  ./internal/snapshot '^TestDecodeAllocatesNoMoreThanItsInput$'
+
+# 242. The metrics server bounds its connections.
+mutant "metrics-server-idle" cmd/dkvd/main.go \
+  '		IdleTimeout:       60 * time.Second,' \
+  '		IdleTimeout:       0,' \
+  ./cmd/dkvd '^TestMetricsServerBoundsItsConnections$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
 if [ "$TOTAL" -eq 0 ]; then
