@@ -557,13 +557,14 @@ func runRaft(ctx context.Context, r raftRun) int {
 		_ = host.Close()
 		return 2
 	}
-	// Genesis state is created only while the directory is being initialized.
-	// In an initialized directory a genesis group with no state was lost, and
-	// is reported rather than created empty: its node voted and acknowledged
-	// as a member, and an empty replica under its id would do so again
-	// without that state. In -raft mode group 0 is always opened through
-	// Create (which checks the configured genesis against the recorded one),
-	// so its identity file must already exist.
+	// Genesis and -join state is created only while the directory is being
+	// initialized. In an initialized directory such a group with no state was
+	// lost, and is reported rather than created empty: its node voted and
+	// acknowledged as a member, and an empty replica under its id would do so
+	// again without that state. A group new to an initialized node is created
+	// through the admin port (create-group). In -raft mode group 0 is always
+	// opened through Create (which checks the configured genesis against the
+	// recorded one), so its identity file must already exist.
 	initOK := true
 	for _, c := range creations {
 		if host.Group(c.g) != nil {
@@ -577,9 +578,13 @@ func runRaft(ctx context.Context, r raftRun) int {
 					_ = host.Close()
 					return 2
 				}
-			} else if c.boot != nil {
+			} else {
+				what := "genesis group"
+				if c.boot == nil {
+					what = "-join group"
+				}
 				lg.logf("event=group_failed node=%s group=%d err=%q", id, c.g,
-					"genesis group with no state in an initialized data directory: its state was lost; replace this replica through a membership change")
+					what+" with no state in an initialized data directory: its state was lost; replace this replica through a membership change")
 				continue
 			}
 		}

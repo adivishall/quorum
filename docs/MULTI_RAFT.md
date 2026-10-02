@@ -132,11 +132,14 @@ twice in a term or lose a committed entry. So `dkvd -raft|-cluster`:
   knows which it is. A node whose state was lost is replaced through a membership change, never
   restarted empty under its old id. `-init` on an initialized directory is refused too, so it cannot
   live in a unit file;
-- creates genesis groups only while initializing. Initialization is crash-safe: `node.identity` is
-  written first, marked unfinished, and marked initialized once every genesis group's identity is
-  durable; a start that finds an unfinished initialization resumes it without `-init`. In an
-  initialized directory a genesis group with no state is reported (`event=group_failed`, or exit 2
-  in `-raft` mode), never created empty;
+- creates genesis and `-join` groups only while initializing. Initialization is crash-safe:
+  `node.identity` is written first, marked unfinished, and marked initialized once every such
+  group's identity is durable; a start that finds an unfinished initialization resumes it without
+  `-init`. In an initialized directory a genesis or `-join` group with no state is reported
+  (`event=group_failed`, or exit 2 in `-raft` mode), never created empty
+  (`TestALostJoinGroupIsReportedNotRecreated`, mutant 266). A group new to an initialized node is
+  created through the admin port (`create-group`, §7), which cannot tell a new group from one whose
+  state was lost: the operator must;
 - adopts a directory written before node identities (Raft state, no `node.identity`) once a
   `-cluster-id` is given, unless it holds another node's `raft-<id>.log`;
 - pins the node's **replica settings** in `node.identity` (audit H5): the settings every replica

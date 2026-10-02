@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/adivishall/quorum/internal/kv"
+	"github.com/adivishall/quorum/internal/multiraft"
 	"github.com/adivishall/quorum/internal/routing"
 	"github.com/adivishall/quorum/internal/transport"
 )
@@ -198,6 +199,42 @@ func runNode(t *testing.T, args ...string) (out *syncBuffer, errb *syncBuffer, c
 	}
 	t.Cleanup(func() { cancel(); wait() })
 	return out, errb, cancel, wait
+}
+
+// TestALostJoinGroupIsReportedNotRecreated (audit H1): in -cluster mode, a
+// group this node joined (-join) whose state was lost from an initialized
+// directory is reported, as a lost genesis group is, not created again empty:
+// the joiner may have been promoted, voted and acknowledged entries, and an
+// empty replica under its id would do so again without them.
+func TestALostJoinGroupIsReportedNotRecreated(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "z")
+	base := []string{"-id", "z", "-listen", "127.0.0.1:0", "-cluster", "-nodes", "a", "-rf", "1", "-shards", "1",
+		"-data-dir", dir, "-tick-interval", "5ms", "-join", "0"}
+	out, _, cancel, wait := runNode(t, append(append([]string(nil), base...), "-init", "-cluster-id", "c1")...)
+	waitFor(t, out, "event=data_dir_initialized node=z", 5*time.Second)
+	if !strings.Contains(out.String(), "event=group_started node=z group=0") {
+		t.Fatalf("premise: the joiner did not start group 0:\n%s", out.String())
+	}
+	cancel()
+	if code := wait(); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if err := os.RemoveAll(multiraft.GroupDir(dir, 0)); err != nil {
+		t.Fatal(err)
+	}
+	out, _, cancel, wait = runNode(t, base...)
+	waitFor(t, out, "event=group_failed node=z group=0", 5*time.Second)
+	if !strings.Contains(out.String(), "its state was lost") {
+		t.Fatalf("the report does not say the state was lost:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "event=group_started node=z group=0") {
+		t.Fatalf("the lost joiner group was created again empty:\n%s", out.String())
+	}
+	if _, err := os.Stat(multiraft.GroupDir(dir, 0)); !os.IsNotExist(err) {
+		t.Fatalf("the refused group's directory was created again: %v", err)
+	}
+	cancel()
+	_ = wait()
 }
 
 // TestReplicaSettingsArePinned (audit H5): the settings that are part of the

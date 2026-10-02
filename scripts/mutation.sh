@@ -2269,6 +2269,15 @@ mutant "wal-failed-flush-is-remembered" internal/storage/wal/wal.go \
   '' \
   ./internal/storage/wal '^TestCloseAfterAFailedFlushReportsItAndDoesNotFlushAgain$'
 
+# 266. In -cluster mode, a -join group whose state was lost from an
+# initialized directory is reported, not created again empty (audit H1).
+mutant "lost-join-group-is-not-recreated" cmd/dkvd/main.go \
+  '			} else {
+				what := "genesis group"' \
+  '			} else if c.boot != nil {
+				what := "genesis group"' \
+  ./cmd/dkvd '^TestALostJoinGroupIsReportedNotRecreated$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then
