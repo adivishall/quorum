@@ -1863,6 +1863,95 @@ mutant "dkvd-transport-carries-identity" cmd/dkvd/main.go \
   '		_ = settingsDigest' \
   ./tests/integration '^TestRealImpostorsNeverJoinTheGroup$'
 
+# 214. A leader's uncommitted entries are bounded (audit M3).
+mutant "uncommitted-entries-bounded" internal/raft/raft.go \
+  '	if len(r.uncommitted) >= r.maxUncommittedEntries ||' \
+  '	if false && len(r.uncommitted) >= r.maxUncommittedEntries ||' \
+  ./internal/raft '^TestIsolatedLeaderRefusesProposalsBeyondItsBound$'
+
+# 215. ... and their bytes.
+mutant "uncommitted-bytes-bounded" internal/raft/raft.go \
+  '		r.uncommittedBytes > 0 && r.uncommittedBytes+len(data) > r.maxUncommittedBytes {' \
+  '		false {' \
+  ./internal/raft '^TestUncommittedBytesBound$'
+
+# 216. A proposal on a tail holding no data is always admitted.
+mutant "dataless-tail-admits" internal/raft/raft.go \
+  '		r.uncommittedBytes > 0 && r.uncommittedBytes+len(data) > r.maxUncommittedBytes {' \
+  '		r.uncommittedBytes+len(data) > r.maxUncommittedBytes {' \
+  ./internal/raft '^TestUncommittedBytesBound$'
+
+# 217. A new leader's inherited tail counts toward its bound.
+mutant "inherited-tail-counts" internal/raft/raft.go \
+  '		for _, e := range tail {
+			r.trackUncommitted(len(e.Data))
+		}' \
+  '		_ = tail' \
+  ./internal/raft '^TestInheritedTailCountsTowardTheBound$'
+
+# 218. Committing shrinks the leader's tracked tail.
+mutant "commit-shrinks-the-tail" internal/raft/raft.go \
+  '		if r.role == Leader {
+			n := min(int(idx-old), len(r.uncommitted))' \
+  '		if false {
+			n := min(int(idx-old), len(r.uncommitted))' \
+  ./internal/raft '^TestIsolatedLeaderRefusesProposalsBeyondItsBound$'
+
+# 219. Reads awaiting confirmation are bounded.
+mutant "pending-reads-bounded" internal/raft/raft.go \
+  '	if len(r.pending) >= r.maxPendingReads {' \
+  '	if false {' \
+  ./internal/raft '^TestIsolatedLeaderRefusesReadsBeyondItsBound$'
+
+# 220. An apply failure stops the node (audit M4).
+mutant "apply-failure-fail-stops" internal/raftnode/node.go \
+  '		return err // ErrApply, or a crash point fired' \
+  '		if !errors.Is(err, ErrApply) {
+			return err
+		}' \
+  ./internal/raftnode '^TestApplyFailureStopsTheNode$'
+
+# 221. A write whose client gave up is forgotten.
+mutant "abandoned-write-forgotten" internal/raftnode/node.go \
+  '		n.abandon(abandoned{index: acc.index, ch: acc.done})' \
+  '		_ = abandoned{}' \
+  ./internal/raftnode '^TestAbandonedRequestsLeaveNothingBehind$'
+
+# 222. A read whose client gave up is forgotten.
+mutant "abandoned-read-forgotten" internal/raftnode/node.go \
+  '		n.abandon(abandoned{readID: acc.id, ch: acc.done})' \
+  '		_ = abandoned{}' \
+  ./internal/raftnode '^TestAbandonedRequestsLeaveNothingBehind$'
+
+# 223. Cancel removes the waiter.
+mutant "waiters-cancel" internal/raftnode/waiters.go \
+  '		if wt.ch == ch {' \
+  '		if wt.ch == nil {' \
+  ./internal/raftnode '^(TestAbandonedRequestsLeaveNothingBehind|TestForgetReleasesWhatTheActorHolds)$'
+
+# 224. A write abandoned before its acceptance was read is forgotten too.
+mutant "abandoned-before-acceptance" internal/raftnode/node.go \
+  '			if acc.err == nil {
+				n.waiters.Cancel(acc.index, acc.done)
+			}' \
+  '			_ = acc' \
+  ./internal/raftnode '^TestForgetReleasesWhatTheActorHolds$'
+
+# 225. Cancel removes only the abandoned waiter, not another at its index.
+mutant "cancel-only-the-abandoned" internal/raftnode/waiters.go \
+  '	if len(ws) == 0 {
+		delete(w.byIndex, index)' \
+  '	if true {
+		w.n -= len(ws)
+		delete(w.byIndex, index)' \
+  ./internal/raftnode '^TestForgetReleasesWhatTheActorHolds$'
+
+# 226. ErrBusy is a definite refusal: UNAVAILABLE, never UNKNOWN.
+mutant "busy-is-unavailable" internal/kv/server.go \
+  '	case errors.Is(err, raft.ErrBusy):' \
+  '	case false:' \
+  ./internal/kv '^TestBusyFromBelowIsUnavailable$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
 if [ "$TOTAL" -eq 0 ]; then
