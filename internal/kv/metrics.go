@@ -36,9 +36,10 @@ type fwdKey struct {
 }
 
 type reqKey struct {
-	g  replication.GroupID
-	op ReqOp
-	st Status
+	g     replication.GroupID
+	op    ReqOp
+	st    Status
+	other bool // a group this node does not host: labelled "other", g 0
 }
 
 type reqSeries struct {
@@ -54,6 +55,9 @@ func (m *Metrics) series(k reqKey) reqSeries {
 		return s
 	}
 	g := groupOf(k.g)
+	if k.other {
+		g = otherGroup
+	}
 	s = reqSeries{count: m.requests.With(g, opLabel(k.op), statusLabel(k.st)), dup: m.duplicates.With(g), dur: m.duration.With(opLabel(k.op))}
 	m.mu.Lock()
 	m.reqs[k] = s
@@ -85,16 +89,26 @@ func NewMetrics(r *metrics.Registry) *Metrics {
 	}
 }
 
+// otherGroup labels a request naming a group this node does not host (audit
+// M7): the group is the client's choice, and labelling it as named would let
+// any client create series without bound — one per group id it sends.
+const otherGroup = "other"
+
 func opLabel(o ReqOp) string               { return strings.ToLower(o.String()) }
 func statusLabel(s Status) string          { return strings.ToLower(s.String()) }
 func groupOf(g replication.GroupID) string { return strconv.FormatUint(uint64(g), 10) }
 
-// request counts one answered client request.
-func (m *Metrics) request(req Request, resp Response, start time.Time) {
+// request counts one answered client request, under its group if this node
+// hosts it and "other" otherwise.
+func (m *Metrics) request(req Request, resp Response, start time.Time, hosted bool) {
 	if m == nil {
 		return
 	}
-	s := m.series(reqKey{req.Group, req.Op, resp.Status})
+	k := reqKey{g: req.Group, op: req.Op, st: resp.Status}
+	if !hosted {
+		k.g, k.other = 0, true
+	}
+	s := m.series(k)
 	s.count.Inc()
 	s.dur.Since(start)
 	if resp.Duplicate {
@@ -119,16 +133,18 @@ func (m *Metrics) forward(g replication.GroupID, result string) {
 	c.Inc()
 }
 
-func (m *Metrics) servedForward(req Request, resp Response) {
+// servedForward counts a forward served by group g's server — labelled with
+// the server's group, never the group the peer's request names.
+func (m *Metrics) servedForward(g replication.GroupID, req Request, resp Response) {
 	if m == nil {
 		return
 	}
-	k := reqKey{req.Group, req.Op, resp.Status}
+	k := reqKey{g: g, op: req.Op, st: resp.Status}
 	m.mu.RLock()
 	c, ok := m.served[k]
 	m.mu.RUnlock()
 	if !ok {
-		c = m.forwarded.With(groupOf(req.Group), opLabel(req.Op), statusLabel(resp.Status))
+		c = m.forwarded.With(groupOf(g), opLabel(req.Op), statusLabel(resp.Status))
 		m.mu.Lock()
 		m.served[k] = c
 		m.mu.Unlock()

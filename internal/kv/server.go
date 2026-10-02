@@ -50,6 +50,26 @@ type Server struct {
 	pending   map[uint64]chan Response
 	noForward bool     // redirect-only mode (SetForwarding(false))
 	m         *Metrics // Phase 16; nil: not instrumented
+
+	// Inbound forwards (audit M1): one slot per forward being served, and
+	// the queue of forwards refused for lack of one, answered UNAVAILABLE by
+	// a single goroutine that lives as long as the node.
+	fwdSlots chan struct{}
+	refusals chan refusal
+	refuser  sync.Once
+}
+
+// MaxForwardsServed bounds the forwards a server serves at once. Each holds a
+// goroutine for up to the request's timeout; beyond the bound a forward is
+// answered UNAVAILABLE at once — definite, nothing executed — instead of
+// costing another goroutine. Healthy operation stays far below it: a
+// forward is a non-leader's client request, served within a commit.
+const MaxForwardsServed = 256
+
+// refusal is an inbound forward refused for lack of a slot.
+type refusal struct {
+	peer raftnode.NodeID
+	fid  uint64
 }
 
 func (s *Server) setMetrics(m *Metrics) {
@@ -82,7 +102,9 @@ func NewServer(id string, node *raftnode.Node, store *Store) *Server {
 		// A forwarder's ids start at a random point, so a response to a
 		// previous incarnation's forward — the transport may deliver it over
 		// the new connection — cannot be taken for one of this incarnation's.
-		nextFwd: binary.LittleEndian.Uint64(seed[:]) >> 1}
+		nextFwd:  binary.LittleEndian.Uint64(seed[:]) >> 1,
+		fwdSlots: make(chan struct{}, MaxForwardsServed),
+		refusals: make(chan refusal, MaxForwardsServed)}
 	node.SetAppHandler(s.onApp)
 	return s
 }
@@ -221,16 +243,16 @@ func (s *Server) forward(ctx context.Context, leader string, req Request) Respon
 		if errors.Is(err, transport.ErrPeerNotConnected) || errors.Is(err, transport.ErrClosed) {
 			st, result = StatusUnavailable, "not_sent" // not handed to any connection: nothing was sent
 		}
-		m.forward(req.Group, result)
+		m.forward(s.node.Group(), result)
 		return Response{Status: st, Node: s.id, Leader: leader, Message: "forward to " + leader + ": " + err.Error()}
 	}
 	select {
 	case resp := <-ch:
-		m.forward(req.Group, "answered")
+		m.forward(s.node.Group(), "answered")
 		resp.Via = s.id
 		return resp
 	case <-ctx.Done():
-		m.forward(req.Group, "timeout")
+		m.forward(s.node.Group(), "timeout")
 		return Response{Status: StatusUnknown, Node: s.id, Leader: leader, Message: "forwarded to " + leader + "; no answer before the deadline"}
 	}
 }
@@ -243,9 +265,11 @@ func deadlineOf(ctx context.Context) time.Time {
 }
 
 // onApp is the node's application-message handler: an inbound forward is
-// served in its own goroutine (never forwarded again) and answered to the peer
-// that sent it; a forward response is delivered to the forward waiting for it,
-// if any (a late or unknown one is dropped).
+// served in its own goroutine (never forwarded again), one of at most
+// MaxForwardsServed, and answered to the peer that sent it — or refused
+// UNAVAILABLE when every slot is taken; a forward response is delivered to the
+// forward waiting for it, if any (a late or unknown one is dropped). It runs
+// on the node's receive path and never blocks.
 func (s *Server) onApp(peer raftnode.NodeID, kind transport.MsgKind, payload []byte) {
 	switch kind {
 	case transport.MsgForward:
@@ -253,10 +277,17 @@ func (s *Server) onApp(peer raftnode.NodeID, kind transport.MsgKind, payload []b
 		if err != nil {
 			return // not our protocol: drop (the forwarder times out: unknown)
 		}
+		select {
+		case s.fwdSlots <- struct{}{}:
+		default:
+			s.refuse(peer, fid)
+			return
+		}
 		go func() {
+			defer func() { <-s.fwdSlots }()
 			req.Timeout = budget
 			resp := s.handle(context.Background(), req, string(peer))
-			s.metrics().servedForward(req, resp)
+			s.metrics().servedForward(s.node.Group(), req, resp)
 			_ = s.node.SendApp(context.Background(), peer, transport.MsgForwardResponse, encodeForwardResponse(fid, resp))
 		}()
 	case transport.MsgForwardResponse:
@@ -272,6 +303,30 @@ func (s *Server) onApp(peer raftnode.NodeID, kind transport.MsgKind, payload []b
 			case ch <- resp:
 			default:
 			}
+		}
+	}
+}
+
+// refuse queues a forward refused for lack of a slot, to be answered
+// UNAVAILABLE. A full queue drops it: its forwarder's deadline then answers its
+// client UNKNOWN, as for any forward that goes unanswered.
+func (s *Server) refuse(peer raftnode.NodeID, fid uint64) {
+	s.refuser.Do(func() { go s.answerRefusals() })
+	select {
+	case s.refusals <- refusal{peer: peer, fid: fid}:
+	default:
+	}
+}
+
+// answerRefusals answers refused forwards until the node stops.
+func (s *Server) answerRefusals() {
+	for {
+		select {
+		case r := <-s.refusals:
+			resp := Response{Status: StatusUnavailable, Node: s.id, Message: "too many forwarded requests in progress"}
+			_ = s.node.SendApp(context.Background(), r.peer, transport.MsgForwardResponse, encodeForwardResponse(r.fid, resp))
+		case <-s.node.Done():
+			return
 		}
 	}
 }
