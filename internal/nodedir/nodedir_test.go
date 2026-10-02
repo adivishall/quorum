@@ -191,7 +191,7 @@ func TestIdentityCodec(t *testing.T) {
 			}
 		}
 	}
-	future, _ := record.Encode(nil, identityKind, append([]byte(identityMagic), 2, 0, 1, 'n', 1, 'c'))
+	future, _ := record.Encode(nil, identityKind, append([]byte(identityMagic), 3, 0, 1, 'n', 1, 'c'))
 	flags, _ := record.Encode(nil, identityKind, append([]byte(identityMagic), 1, 2, 1, 'n', 1, 'c'))
 	trailing, _ := record.Encode(nil, identityKind, append([]byte(identityMagic), 1, 0, 1, 'n', 1, 'c', 0))
 	for name, b := range map[string][]byte{"future version": future, "unknown flag": flags, "trailing byte": trailing} {
@@ -211,6 +211,8 @@ func TestIdentityCodec(t *testing.T) {
 func FuzzDecode(f *testing.F) {
 	good, _ := Encode(Identity{Node: "n1", Cluster: "c1", Initialized: true})
 	f.Add(good)
+	v2, _ := Encode(Identity{Node: "n1", Cluster: "c1", Initialized: true, Settings: "mode=raft"})
+	f.Add(v2)
 	f.Add([]byte{})
 	f.Fuzz(func(t *testing.T, b []byte) {
 		id, err := Decode(b)
@@ -222,4 +224,70 @@ func FuzzDecode(f *testing.F) {
 			t.Fatalf("accepted a non-canonical identity: %v", err)
 		}
 	})
+}
+
+// TestSettingsArePinned (audit H5): a directory records its node's replica
+// settings when it is initialized, and a start with other settings is refused —
+// they are part of the replicated state machine's definition, and a node
+// cannot change them by restarting. A version-1 identity, from before
+// settings were recorded, records the next start's.
+func TestSettingsArePinned(t *testing.T) {
+	dir := t.TempDir()
+	d := open(t, dir, Options{Node: "n1", Cluster: "c1", Init: true, Settings: "mode=raft session-max=8"})
+	if err := d.FinishInit(); err != nil {
+		t.Fatal(err)
+	}
+	_ = d.Close()
+	d = open(t, dir, Options{Node: "n1", Settings: "mode=raft session-max=8"})
+	_ = d.Close()
+	for _, other := range []string{"mode=raft session-max=9", "mode=cluster session-max=8", ""} {
+		if _, err := Open(dir, Options{Node: "n1", Settings: other}); !errors.Is(err, ErrSettings) {
+			t.Fatalf("settings %q over %q: %v, want ErrSettings", other, "mode=raft session-max=8", err)
+		}
+	}
+	// A version-1 identity has none: the next start's are recorded.
+	v1 := t.TempDir()
+	if err := write(v1, Identity{Node: "n1", Cluster: "c1", Initialized: true}); err != nil {
+		t.Fatal(err)
+	}
+	d = open(t, v1, Options{Node: "n1", Settings: "mode=raft session-max=8"})
+	_ = d.Close()
+	if id, _, err := Load(v1); err != nil || id.Settings != "mode=raft session-max=8" || !id.Initialized {
+		t.Fatalf("the upgraded identity: %+v %v", id, err)
+	}
+	if _, err := Open(v1, Options{Node: "n1", Settings: "mode=raft session-max=9"}); !errors.Is(err, ErrSettings) {
+		t.Fatalf("after the upgrade other settings: %v, want ErrSettings", err)
+	}
+}
+
+// TestIdentityCodecV2: the version-2 encoding (with settings) round-trips, and
+// every truncation and bit flip is refused or changes nothing; empty settings
+// in a version-2 record are refused (they are what version 1 means).
+func TestIdentityCodecV2(t *testing.T) {
+	id := Identity{Node: "n1", Cluster: "c1", Initialized: true, Settings: "mode=cluster shards=4"}
+	good, err := Encode(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := Decode(good); err != nil || got != id {
+		t.Fatalf("round trip: %+v %v", got, err)
+	}
+	for n := 0; n < len(good); n++ {
+		if _, err := Decode(good[:n]); !errors.Is(err, ErrIdentity) {
+			t.Fatalf("truncated to %d: %v", n, err)
+		}
+	}
+	for i := range good {
+		for bit := 0; bit < 8; bit++ {
+			bad := append([]byte(nil), good...)
+			bad[i] ^= 1 << bit
+			if got, err := Decode(bad); err == nil && got == id {
+				t.Fatalf("bit %d of byte %d went unnoticed", bit, i)
+			}
+		}
+	}
+	empty, _ := record.Encode(nil, identityKind, append([]byte(identityMagic), 2, 0, 1, 'n', 1, 'c', 0))
+	if _, err := Decode(empty); !errors.Is(err, ErrIdentity) {
+		t.Fatalf("a version-2 record with empty settings: %v", err)
+	}
 }

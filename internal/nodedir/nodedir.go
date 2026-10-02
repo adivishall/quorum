@@ -25,9 +25,18 @@
 // initialization resumes it — the identity file proves an operator initialized
 // THIS directory; only a directory with no identity at all needs -init.
 //
-//	one record (kind 1): magic "QNOD" | version | flags | len | node id | len | cluster id
+// The identity also pins the node's replica settings (audit H5): the settings
+// that are part of the replicated state machine's definition, which every
+// replica must share — the caller's canonical rendering, opaque here. They are
+// recorded when the directory is initialized, and a start whose settings
+// differ is refused: a replica that decided its entries under other settings
+// than its peers would diverge from them.
 //
-// Integers are canonical uvarints; flags bit 0 is Initialized.
+//	one record (kind 1): magic "QNOD" | version | flags | len | node id | len | cluster id [| len | settings]
+//
+// Integers are canonical uvarints; flags bit 0 is Initialized. Version 1 has
+// no settings; a version-1 identity is upgraded on its next start, recording
+// that start's settings.
 package nodedir
 
 import (
@@ -56,14 +65,16 @@ const (
 const (
 	MaxNodeIDLen    = 256
 	MaxClusterIDLen = 128
+	MaxSettingsLen  = 64 << 10
 )
 
 const (
-	identityMagic   = "QNOD"
-	identityVersion = 1
-	identityKind    = record.Kind(1)
-	flagInitialized = 1
-	maxIdentityFile = record.HeaderSize + len(identityMagic) + 3*binary.MaxVarintLen64 + MaxNodeIDLen + MaxClusterIDLen + 1
+	identityMagic     = "QNOD"
+	identityVersionV1 = 1 // no settings
+	identityVersion   = 2
+	identityKind      = record.Kind(1)
+	flagInitialized   = 1
+	maxIdentityFile   = record.HeaderSize + len(identityMagic) + 5*binary.MaxVarintLen64 + MaxNodeIDLen + MaxClusterIDLen + MaxSettingsLen
 )
 
 var (
@@ -81,6 +92,9 @@ var (
 	ErrNotEmpty = errors.New("nodedir: the data directory holds files that are not a Quorum node's")
 	// ErrClusterID: a cluster id is missing where one is required, or malformed.
 	ErrClusterID = errors.New("nodedir: cluster id")
+	// ErrSettings: this start's replica settings differ from those the
+	// directory recorded.
+	ErrSettings = errors.New("nodedir: replica settings")
 )
 
 // Identity is what a data directory records about its node.
@@ -90,6 +104,9 @@ type Identity struct {
 	// Initialized is false between the start of an initialization and the
 	// node's genesis state being durable.
 	Initialized bool
+	// Settings are the node's replica settings, as its caller renders them;
+	// empty only in a version-1 identity.
+	Settings string
 }
 
 // Encode returns the identity file's bytes. They are deterministic.
@@ -97,8 +114,15 @@ func Encode(id Identity) ([]byte, error) {
 	if err := checkIDs(id.Node, id.Cluster); err != nil {
 		return nil, err
 	}
+	if len(id.Settings) > MaxSettingsLen {
+		return nil, fmt.Errorf("%w: settings of %d bytes", ErrIdentity, len(id.Settings))
+	}
 	p := []byte(identityMagic)
-	p = binary.AppendUvarint(p, identityVersion)
+	version := uint64(identityVersion)
+	if id.Settings == "" {
+		version = identityVersionV1
+	}
+	p = binary.AppendUvarint(p, version)
 	var flags uint64
 	if id.Initialized {
 		flags |= flagInitialized
@@ -108,6 +132,10 @@ func Encode(id Identity) ([]byte, error) {
 	p = append(p, id.Node...)
 	p = binary.AppendUvarint(p, uint64(len(id.Cluster)))
 	p = append(p, id.Cluster...)
+	if version == identityVersion {
+		p = binary.AppendUvarint(p, uint64(len(id.Settings)))
+		p = append(p, id.Settings...)
+	}
 	return record.Encode(nil, identityKind, p)
 }
 
@@ -149,8 +177,9 @@ func Decode(b []byte) (Identity, error) {
 		p = p[n:]
 		return s, true
 	}
-	if v, ok := uint(); !ok || v != identityVersion {
-		return bad("version %d (this build reads %d)", v, identityVersion)
+	version, ok := uint()
+	if !ok || (version != identityVersion && version != identityVersionV1) {
+		return bad("version %d (this build reads %d and %d)", version, identityVersionV1, identityVersion)
 	}
 	flags, ok := uint()
 	if !ok || flags&^flagInitialized != 0 {
@@ -164,13 +193,19 @@ func Decode(b []byte) (Identity, error) {
 	if !ok {
 		return bad("cluster id")
 	}
+	var settings string
+	if version == identityVersion {
+		if settings, ok = str(MaxSettingsLen); !ok || settings == "" {
+			return bad("settings")
+		}
+	}
 	if len(p) != 0 {
 		return bad("%d trailing bytes", len(p))
 	}
 	if err := checkIDs(node, cluster); err != nil {
 		return Identity{}, err
 	}
-	return Identity{Node: node, Cluster: cluster, Initialized: flags&flagInitialized != 0}, nil
+	return Identity{Node: node, Cluster: cluster, Initialized: flags&flagInitialized != 0, Settings: settings}, nil
 }
 
 func checkIDs(node, cluster string) error {
@@ -254,6 +289,10 @@ type Options struct {
 	Cluster string
 	// Init initializes a new, empty data directory (the operator's -init).
 	Init bool
+	// Settings are this start's replica settings (see the package comment):
+	// recorded when the directory is initialized or adopted, and compared
+	// with the recorded ones at every later start.
+	Settings string
 }
 
 // State says how Open found the directory.
@@ -303,6 +342,9 @@ func Open(dir string, opts Options) (*Dir, error) {
 			return nil, err
 		}
 	}
+	if len(opts.Settings) > MaxSettingsLen {
+		return nil, fmt.Errorf("%w: settings of %d bytes", ErrSettings, len(opts.Settings))
+	}
 	if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) && !opts.Init {
 		// Nothing to lock or to read, and nothing is created: a mistyped
 		// path must not leave a directory behind.
@@ -345,6 +387,16 @@ func (d *Dir) open(opts Options) error {
 		if !id.Initialized {
 			d.State = Initializing
 		}
+		switch {
+		case id.Settings == "" && opts.Settings != "":
+			// A version-1 identity: its settings were never recorded; this
+			// start's are.
+			d.ID.Settings = opts.Settings
+			return write(d.Path, d.ID)
+		case opts.Settings != id.Settings:
+			return fmt.Errorf("%w: %s recorded [%s]; this start's flags give [%s]. They are part of the replicated "+
+				"state machine's definition and every replica must share them; a node cannot change them by restarting", ErrSettings, d.Path, id.Settings, opts.Settings)
+		}
 		return nil
 	}
 	legacy, err := d.scan(opts.Node)
@@ -361,7 +413,7 @@ func (d *Dir) open(opts Options) error {
 	case opts.Cluster == "":
 		return fmt.Errorf("%w: initializing or adopting a data directory needs a cluster id (-cluster-id)", ErrClusterID)
 	}
-	d.ID = Identity{Node: opts.Node, Cluster: opts.Cluster}
+	d.ID = Identity{Node: opts.Node, Cluster: opts.Cluster, Settings: opts.Settings}
 	if legacy {
 		d.ID.Initialized, d.State = true, Adopted
 	} else {
