@@ -17,7 +17,7 @@ startup error. One registry per process holds every layer's families, so a node 
 reports each group as its own series (label `group`).
 
 ```bash
-dkvd -id n1 -listen 127.0.0.1:7001 -peers n2=...,n3=... -raft -data-dir d1 \
+dkvd -id n1 -listen 127.0.0.1:7001 -peers n2=...,n3=... -raft -data-dir d1 -init -cluster-id demo \
      -client-listen 127.0.0.1:8001 -metrics-listen 127.0.0.1:9101
 curl -s http://127.0.0.1:9101/metrics
 ```

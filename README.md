@@ -242,10 +242,13 @@ cluster runs in one goroutine, replayable from a seed, so the paper's figures (i
 are deterministic tests and the safety invariants are checked after every step. What Phase 9 proves
 and — as carefully — what it does not: [docs/RAFT.md](docs/RAFT.md). Run a real 3-node group with
 `dkvd -raft`, or, since Phase 15, one group per shard with `dkvd -cluster` (identical `-shards`,
-`-rf` and `-nodes` on every node) and change a group's members through its JSON-line admin port:
+`-rf` and `-nodes` on every node) and change a group's members through its JSON-line admin port.
+A node's first start initializes its data directory (`-init -cluster-id NAME`); every later start
+omits `-init` (`docs/MULTI_RAFT.md` §5):
 
 ```bash
 dkvd -id n1 -listen 127.0.0.1:7001 -peers n2=127.0.0.1:7002,n3=127.0.0.1:7003 -data-dir d1 \
+     -init -cluster-id demo \
      -cluster -shards 4 -rf 3 -client-listen 127.0.0.1:8001 -admin-listen 127.0.0.1:9001 \
      -metrics-listen 127.0.0.1:9101
 echo '{"op":"add-learner","group":0,"id":"n4","addr":"127.0.0.1:7004"}' | nc 127.0.0.1 9001

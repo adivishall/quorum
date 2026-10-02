@@ -85,11 +85,13 @@ group id over 32 bits; duplicated frames; one group's frame never moving another
 ## 5. Persistence layout
 
 ```
-<data-dir>/
+<data-dir>/                      mode 0700
+  LOCK                           flock'd by the process using the directory (internal/nodedir)
+  node.identity                  the node identity: node id, cluster id, initialized (written at -init)
   groups/
     <gid>/
       raft.log                   the group's durable Raft log (entries, HardStates, boundaries)
-      raft.log.group             the group identity: group id + genesis configuration (written once)
+      raft.log.group             the group identity: group id + genesis configuration + node id (written once)
       raft.log.snap              its one published snapshot (format v2: group id + configuration)
       raft.log.tmp, raft.log.group.tmp, raft.log.snap.tmp, raft.log.snap.recv
                                  temporaries (a log rewrite, an identity, a snapshot being
@@ -102,6 +104,37 @@ recover, snapshot, compact and fail independently (`TestGroupsSnapshotAndCompact
 `dkvd -raft` — the Phase 9–14 single-group deployment — is the host with one group, 0, whose log
 keeps its Phase 9–14 path (`<data-dir>/raft-<id>.log`) and its first-start I/O, so every earlier
 real-process test runs unchanged.
+
+**A data directory is one node's, and is initialized only on request** (audit H1,
+`internal/nodedir`). Raft's safety rests on each node's durable term, vote and log; a node that
+runs without them — on a temporary directory, on another node's directory, beside a second process
+on the same one, or on an empty directory under the id of a member whose state was lost — can vote
+twice in a term or lose a committed entry. So `dkvd -raft|-cluster`:
+
+- requires `-data-dir` (there is no temporary default) and takes an exclusive `flock` on
+  `<data-dir>/LOCK` for its lifetime — the kernel releases it when the process dies, SIGKILL
+  included;
+- reads `<data-dir>/node.identity`, written once, and refuses a directory recorded for another node
+  id or another cluster id;
+- initializes a directory that holds no node **only with `-init`** (and a `-cluster-id`), and
+  refuses one otherwise: an empty directory and a wiped one look the same, and only the operator
+  knows which it is. A node whose state was lost is replaced through a membership change, never
+  restarted empty under its old id. `-init` on an initialized directory is refused too, so it cannot
+  live in a unit file;
+- creates genesis groups only while initializing. Initialization is crash-safe: `node.identity` is
+  written first, marked unfinished, and marked initialized once every genesis group's identity is
+  durable; a start that finds an unfinished initialization resumes it without `-init`. In an
+  initialized directory a genesis group with no state is reported (`event=group_failed`, or exit 2
+  in `-raft` mode), never created empty;
+- adopts a directory written before node identities (Raft state, no `node.identity`) once a
+  `-cluster-id` is given, unless it holds another node's `raft-<id>.log`.
+
+Each group's identity file (version 2) also records its node, and `raftnode` refuses a group's
+state recorded for another node; a version-1 file, written before, is still read. Evidence:
+`internal/nodedir` (every rule, the codec, the lock), `TestIdentityFileNamesItsNode`,
+`TestDataDirectoryRules` (dkvd's own raft-mode code) and `TestRealWipedNodeIsRefused` (a member's
+directory wiped and restarted with its ordinary flags is refused, and a second process on a running
+node's directory too).
 
 ## 6. Client routing
 

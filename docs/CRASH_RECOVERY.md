@@ -333,7 +333,7 @@ go test ./internal/raftsim -run 'TestRandomizedFaultSchedules/crashpoints' -raft
 go test ./internal/raftsim -run TestReplayScript -raftsim.replay=min.txt -raftsim.nodes=3 -raftsim.seed=42 -raftsim.verbose -v
 go test ./internal/raftlog ./internal/raftnode -run 'Crash|Torn|Corrupt|Partial|SavePlan|Recover'
 go test ./tests/integration -run 'TestRealCrashAt' -v
-dkvd -id n0 -listen 127.0.0.1:7001 -raft -data-dir /tmp/n0 -crash-at fsync:2   # a real node that dies before its 2nd fsync
+dkvd -id n0 -listen 127.0.0.1:7001 -raft -data-dir /tmp/n0 -init -cluster-id demo -crash-at fsync:2   # a real node that dies before its 2nd fsync
 ```
 
 A `crashat` event in a script — `crashat n2 after-save 3` or `crashat n1 write 2 power 16` — arms
