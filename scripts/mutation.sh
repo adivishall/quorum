@@ -1738,6 +1738,131 @@ mutant "groups-draw-their-own-seeds" internal/raftnode/node.go \
   '	if false {' \
   ./internal/raftnode '^TestGroupsDrawDifferentElectionSeeds$'
 
+# 197. The accepter refuses a dialer of another cluster (audit H2).
+mutant "accepter-checks-cluster" internal/transport/transport.go \
+  '	case h.cluster != t.self.cluster:
+		status = statusWrongCluster' \
+  '	case false:
+		status = statusWrongCluster' \
+  ./internal/transport '^TestNodesOfAnotherClusterNeverConnect$'
+
+# 198. The accepter refuses a dialer with other replica settings (audit H5).
+mutant "accepter-checks-settings" internal/transport/transport.go \
+  '	case string(h.digest) != string(t.self.digest):
+		status = statusWrongSettings' \
+  '	case false:
+		status = statusWrongSettings' \
+  ./internal/transport '^TestNodesWithOtherReplicaSettingsNeverConnect$'
+
+# 199. The dialer refuses an answer from another node than the one it dialed.
+mutant "dialer-checks-who-answered" internal/transport/transport.go \
+  '	case h.id != peer:' \
+  '	case false:' \
+  ./internal/transport '^TestDialerChecksTheAnswer$'
+
+# 200. The dialer refuses an accepter of another cluster.
+mutant "dialer-checks-cluster" internal/transport/transport.go \
+  '	case h.cluster != t.self.cluster:
+		t.m.handshakeRejected.Inc()' \
+  '	case false:
+		t.m.handshakeRejected.Inc()' \
+  ./internal/transport '^TestDialerChecksTheAnswer$'
+
+# 201. The dialer refuses an accepter with other replica settings.
+mutant "dialer-checks-settings" internal/transport/transport.go \
+  '	case string(h.digest) != string(t.self.digest):
+		t.m.handshakeRejected.Inc()' \
+  '	case false:
+		t.m.handshakeRejected.Inc()' \
+  ./internal/transport '^TestDialerChecksTheAnswer$'
+
+# 202. A known peer with the larger id never dials; its claim is refused.
+mutant "accepter-checks-direction" internal/transport/transport.go \
+  '	case h.id > t.cfg.NodeID:' \
+  '	case false:' \
+  ./internal/transport '^TestInboundFromTheWrongDirectionIsRefused$'
+
+# 203. A failed write closes the connection (audit M2).
+mutant "failed-write-closes-the-connection" internal/transport/conn.go \
+  '	if err != nil {
+		c.close()
+	}
+	return err' \
+  '	return err' \
+  ./internal/transport '^TestFailedWriteClosesTheConnection$'
+
+# 204. Send refuses a frame its peer would refuse (audit D2).
+mutant "send-refuses-an-oversized-frame" internal/transport/transport.go \
+  '	if len(payload) > MaxFrameSize {' \
+  '	if false {' \
+  ./internal/transport '^TestSendRefusesAFrameItsPeerWouldRefuse$'
+
+# 205. An Accept error is retried, not the end of the accept loop (audit D7).
+mutant "accept-loop-retries" internal/transport/transport.go \
+  '			if t.ctx.Err() != nil || errors.Is(err, net.ErrClosed) {' \
+  '			if true {' \
+  ./internal/transport '^TestAcceptLoopSurvivesAcceptErrors$'
+
+# 206. Connections in their handshake are bounded.
+mutant "pending-handshakes-bounded" internal/transport/transport.go \
+  '		handshake: make(chan struct{}, cfg.MaxPendingHandshakes),' \
+  '		handshake: make(chan struct{}, 1<<16),' \
+  ./internal/transport '^TestPendingHandshakesAreBounded$'
+
+# 207. A connection past its handshake gives its slot back.
+mutant "handshake-slot-released" internal/transport/transport.go \
+  '	release()
+	t.serve(h.id, nc, "inbound")' \
+  '	t.serve(h.id, nc, "inbound")' \
+  ./internal/transport '^TestPendingHandshakesAreBounded$'
+
+# 208. The dialer's handshake is bounded by the handshake timeout.
+mutant "dialer-handshake-timeout" internal/transport/transport.go \
+  '	_ = nc.SetDeadline(time.Now().Add(t.cfg.HandshakeTimeout))
+	stop := context.AfterFunc(ctx' \
+  '	stop := context.AfterFunc(ctx' \
+  ./internal/transport '^TestDialerDropsAPeerThatNeverAnswers$'
+
+# 209. Shutdown interrupts an outbound handshake waiting for its answer.
+mutant "close-interrupts-dial" internal/transport/transport.go \
+  '	stop := context.AfterFunc(ctx, func() { _ = nc.Close() })' \
+  '	stop := func() bool { return true }' \
+  ./internal/transport '^TestCloseInterruptsHandshakesInFlight$'
+
+# 210. Shutdown interrupts an inbound handshake being read.
+mutant "close-interrupts-inbound-handshake" internal/transport/transport.go \
+  '	stop := context.AfterFunc(t.ctx, func() { _ = nc.Close() })' \
+  '	stop := func() bool { return true }' \
+  ./internal/transport '^TestCloseInterruptsHandshakesInFlight$'
+
+# 211. The idle timeout measures silence, not a frame's size.
+mutant "idle-timeout-per-read" internal/transport/transport.go \
+  '		r = idleReader{c.nc, t.cfg.ReadIdleTimeout}
+	}
+	for {' \
+  '	}
+	for {
+		if t.cfg.ReadIdleTimeout > 0 {
+			_ = c.nc.SetReadDeadline(time.Now().Add(t.cfg.ReadIdleTimeout))
+		}' \
+  ./internal/transport '^TestSlowFrameIsNotCutByTheIdleTimeout$'
+
+# 212. A caller's deadline does not cut a started frame.
+mutant "caller-deadline-spares-a-started-frame" internal/transport/conn.go \
+  '		_ = c.nc.SetWriteDeadline(time.Now().Add(c.writeTimeout))' \
+  '		dl := time.Now().Add(c.writeTimeout)
+		if d, ok := ctx.Deadline(); ok && d.Before(dl) {
+			dl = d
+		}
+		_ = c.nc.SetWriteDeadline(dl)' \
+  ./internal/transport '^TestCallerDeadlineDoesNotCutAStartedFrame$'
+
+# 213. dkvd gives its transport the data directory's cluster id and settings.
+mutant "dkvd-transport-carries-identity" cmd/dkvd/main.go \
+  '		tcfg.ClusterID, tcfg.SettingsDigest = nd.ID.Cluster, settingsDigest(nd.ID.Settings)' \
+  '		_ = settingsDigest' \
+  ./tests/integration '^TestRealImpostorsNeverJoinTheGroup$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
 if [ "$TOTAL" -eq 0 ]; then
