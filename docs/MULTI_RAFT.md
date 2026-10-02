@@ -50,7 +50,8 @@ The host owns only what is per process:
   starts a group for the first time as a genesis member or a joiner; `Stop` stops one, keeping its
   files; `Open` starts a stopped one again from its own identity file; a group whose node reports its
   removal (`docs/MEMBERSHIP.md` §7) is **retired** — stopped, files kept (`event=group_retired`,
-  `TestRemovedLeaderRetiresItsGroup`). Nothing is ever deleted automatically. A group directory is
+  logged and counted once, when the stop is certain: `TestRemovedLeaderRetiresItsGroup`,
+  `TestARetirementIsLoggedOnce`). Nothing is ever deleted automatically. A group directory is
   created durably: each new directory's parent is fsynced, so a group can never vanish from a
   node that held its state. **Starts and stops of one group never overlap** (audit H3): a start
   reserves the group before it touches its files and holds it until the group is registered and
@@ -212,9 +213,11 @@ only on a network you trust. No token is offered: on plaintext it would only see
 What a connection may cost is bounded (audit M1): at most 16 at once (one beyond is closed at
 once), 30 s to send each request line, 10 s to take each answer, a request's `timeout_ms` clamped
 to 60 s, and an `Accept` error retried rather than ending the loop. The client's `op` and `id` are
-logged quoted, so a newline cannot forge an event line (`TestAdminCapsItsConnections`,
+logged quoted, so a newline cannot forge an event line; and a member id or address holding
+whitespace or a control character is refused, since a member enters the replicated configuration
+and every node logs it in its own event lines (`TestAdminCapsItsConnections`,
 `TestAdminDropsAnIdleConnection`, `TestAdminTimeoutIsClamped`, `TestAdminSurvivesAcceptErrors`,
-`TestAdminLogLinesCannotBeForged`).
+`TestAdminLogLinesCannotBeForged`, `TestAMemberIDCannotForgeLogLines`).
 
 ## 8. Evidence
 

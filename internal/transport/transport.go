@@ -364,7 +364,7 @@ func (t *TCPTransport) handleInbound(nc net.Conn) {
 			err = statusError(status)
 			t.m.handshakeRejected.Inc()
 		}
-		t.logf("event=handshake_failed dir=inbound peer=%s cluster=%q err=%v", h.id, h.cluster, mapTimeout(err))
+		t.logf("event=handshake_failed dir=inbound peer=%q cluster=%q err=%v", h.id, h.cluster, mapTimeout(err)) // an unauthenticated claim: quoted
 		_ = nc.Close()
 		return
 	}
@@ -393,16 +393,16 @@ func (t *TCPTransport) dial(ctx context.Context, nc net.Conn, peer NodeID) error
 		return err
 	case status != statusAccepted:
 		t.m.handshakeRejected.Inc()
-		return fmt.Errorf("refused by %s: %w", h.id, statusError(status))
+		return fmt.Errorf("refused by %q: %w", h.id, statusError(status))
 	case h.id != peer:
 		t.m.handshakeRejected.Inc()
-		return fmt.Errorf("%w: dialed %s, reached %s", ErrWrongPeer, peer, h.id)
+		return fmt.Errorf("%w: dialed %s, reached %q", ErrWrongPeer, peer, h.id)
 	case h.cluster != t.self.cluster:
 		t.m.handshakeRejected.Inc()
-		return fmt.Errorf("%w: %s belongs to %q", ErrClusterMismatch, h.id, h.cluster)
+		return fmt.Errorf("%w: %q belongs to %q", ErrClusterMismatch, h.id, h.cluster)
 	case string(h.digest) != string(t.self.digest):
 		t.m.handshakeRejected.Inc()
-		return fmt.Errorf("%w: %s", ErrSettingsMismatch, h.id)
+		return fmt.Errorf("%w: %q", ErrSettingsMismatch, h.id)
 	}
 	if !stop() {
 		return ctx.Err() // cancelled: the connection is closed

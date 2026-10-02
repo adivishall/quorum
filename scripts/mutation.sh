@@ -2333,6 +2333,58 @@ mutant "ack-never-lowers-next-index" internal/raft/raft.go \
   '	r.nextIndex[peer] = match + 1' \
   ./internal/raft '^TestAReadDoesNotMoveNextIndexBack$'
 
+# 274. Abandon notices are never dropped: a burst of clients giving up at
+# once leaves nothing behind (review of PR #10).
+mutant "abandon-notices-are-never-dropped" internal/raftnode/node.go \
+  '	n.abandonList = append(n.abandonList, a)' \
+  '	if len(n.abandonList) < 4 {
+		n.abandonList = append(n.abandonList, a)
+	}' \
+  ./internal/raftnode '^TestABurstOfAbandonedRequestsLeavesNothingBehind$'
+
+# 275. A periodic snapshot's failure publishes Status before the cycle's
+# writes complete.
+mutant "snapshot-failure-publishes-status" internal/raftnode/node.go \
+  '			n.snapshotStatus() // the cycle'"'"'s applied writes complete (deferred): Status first
+' \
+  '' \
+  ./internal/raftnode '^TestASnapshotFailurePublishesStatusFirst$'
+
+# 276. The admin refuses a member id or address that could forge log lines.
+mutant "admin-checks-member-ids" internal/multiraft/admin.go \
+  '		if err := checkMember(req.ID, req.Addr); err != nil {' \
+  '		if err := error(nil); err != nil {' \
+  ./internal/multiraft '^TestAMemberIDCannotForgeLogLines$'
+
+# 277. ... the genesis voters of create-group too.
+mutant "admin-checks-genesis-voters" internal/multiraft/admin.go \
+  '				if err := checkMember(m.ID, m.Addr); err != nil {' \
+  '				if err := error(nil); err != nil {' \
+  ./internal/multiraft '^TestAMemberIDCannotForgeLogLines$'
+
+# 278. A refused handshake logs the claimed (unauthenticated) id quoted.
+mutant "handshake-failure-quotes-the-claimed-id" internal/transport/transport.go \
+  'peer=%q cluster=%q err=%v", h.id' \
+  'peer=%s cluster=%q err=%v", h.id' \
+  ./internal/transport '^TestAnUnauthenticatedIDCannotForgeLogLines$'
+
+# 279. A retirement is announced only once its stop is certain.
+mutant "retirement-announced-once" internal/multiraft/host.go \
+  '	if what := h.busy[g]; what != "" {
+		h.mu.Unlock()
+		return fmt.Errorf("%w: group %d is %s", ErrGroupBusy, g, what)
+	}
+	hg, ok := h.groups[g]' \
+  '	if what := h.busy[g]; what != "" {
+		h.mu.Unlock()
+		if announce != nil {
+			announce()
+		}
+		return fmt.Errorf("%w: group %d is %s", ErrGroupBusy, g, what)
+	}
+	hg, ok := h.groups[g]' \
+  ./internal/multiraft '^TestARetirementIsLoggedOnce$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then

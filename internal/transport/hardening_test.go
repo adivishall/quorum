@@ -553,3 +553,40 @@ func TestCallerDeadlineDoesNotCutAStartedFrame(t *testing.T) {
 		t.Fatal("the connection was torn down")
 	}
 }
+
+// TestAnUnauthenticatedIDCannotForgeLogLines: whoever reaches the listen port
+// announces an id of its choosing, and a refused handshake is logged with it.
+// Logged unquoted, a newline in it forged a whole event line of dkvd's
+// machine-readable output.
+func TestAnUnauthenticatedIDCannotForgeLogLines(t *testing.T) {
+	lb := &logSink{}
+	b, err := NewTCPTransport(Config{NodeID: "b", ListenAddr: "127.0.0.1:0", ClusterID: "prod", SettingsDigest: []byte{1}, Logf: lb.logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	nc, err := net.Dial("tcp", b.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	if err := writeHandshake(nc, hello{id: "x\nevent=raft_leader node=b term=999 group=0", cluster: "whatever"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = nc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if status, _, err := readReply(nc); err != nil || status == statusAccepted {
+		t.Fatalf("premise: the forged hello was not refused (status %d, %v)", status, err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(lb.String(), "event=handshake_failed dir=inbound") {
+		if time.Now().After(deadline) {
+			t.Fatalf("premise: the refusal was not logged:\n%s", lb.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	for _, line := range strings.Split(lb.String(), "\n") {
+		if strings.HasPrefix(line, "event=raft_leader") {
+			t.Fatalf("a forged log line from an unauthenticated hello: %q", line)
+		}
+	}
+}

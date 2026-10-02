@@ -214,3 +214,37 @@ func TestAdminDropsAnIdleConnection(t *testing.T) {
 		t.Fatalf("the idle connection was closed after %s", took)
 	}
 }
+
+// TestAMemberIDCannotForgeLogLines: a member's id and address enter the
+// group's replicated configuration, and every node then logs them as fields
+// of its own event lines — quoting the admin's line did not cover those. A
+// member id or address with whitespace or a control character is refused at
+// the admin port; before, add-learner accepted one and the leader forged an
+// event line with every heartbeat to it.
+func TestAMemberIDCannotForgeLogLines(t *testing.T) {
+	c := newHostCluster(t, "a")
+	h := c.startHost("a", false)
+	c.create(1, "a")
+	c.leader(1, "a")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	forged := "x\nevent=raft_leader node=forged term=999 group=1"
+	for _, req := range []AdminRequest{
+		{Op: "add-learner", Group: 1, ID: forged, Addr: "127.0.0.1:1"},
+		{Op: "add-learner", Group: 1, ID: "x", Addr: "127.0.0.1:1\nevent=raft_leader node=forged"},
+		{Op: "create-group", Group: 2, Voters: []Member{{ID: forged, Addr: "127.0.0.1:1"}}},
+	} {
+		if resp := h.Admin(ctx, req); resp.OK || !strings.Contains(resp.Error, "whitespace or control characters") {
+			t.Fatalf("%s with a forging member was not refused: %+v", req.Op, resp)
+		}
+	}
+	if conf := h.Group(1).Node.Status().Conf; len(conf.Members()) != 1 {
+		t.Fatalf("the refused member entered the configuration: %s", conf)
+	}
+	time.Sleep(100 * time.Millisecond)
+	for _, line := range strings.Split(c.log("a"), "\n") {
+		if strings.HasPrefix(line, "event=raft_leader node=forged") {
+			t.Fatalf("a member id forged a log line: %q", line)
+		}
+	}
+}

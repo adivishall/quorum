@@ -380,7 +380,11 @@ func (h *Host) release(g GroupID) {
 // Stop stops group g's node, keeping its files: a later Start of the host (or
 // Create) recovers it. Frames for it are dropped meanwhile. The group stays
 // reserved until its node is closed, so no start opens its log before then.
-func (h *Host) Stop(g GroupID) error {
+func (h *Host) Stop(g GroupID) error { return h.stop(g, nil) }
+
+// stop is Stop, calling announce (if any) once the stop is certain — the group
+// reserved for it — and before anything takes effect.
+func (h *Host) stop(g GroupID, announce func()) error {
 	h.mu.Lock()
 	if h.closed {
 		h.mu.Unlock()
@@ -400,6 +404,9 @@ func (h *Host) Stop(g GroupID) error {
 	h.transitions.Add(1)
 	h.mu.Unlock()
 	defer h.release(g)
+	if announce != nil {
+		announce()
+	}
 	if h.cfg.OnGroup != nil {
 		h.cfg.OnGroup(g, nil, nil)
 	}
@@ -561,10 +568,14 @@ func (h *Host) retireRemoved() {
 			continue
 		}
 		// The decision is logged before it takes effect, so an observer that
-		// sees the group gone also sees why.
-		h.logf("event=group_retired node=%s group=%d reason=removed", h.cfg.ID, g)
-		h.retired.Inc()
-		_ = h.Stop(g)
+		// sees the group gone also sees why — and only once the stop is
+		// certain: a group busy starting refuses it (ErrGroupBusy), and the
+		// next tick tries again, which logged and counted one retirement
+		// again with every tick.
+		_ = h.stop(g, func() {
+			h.logf("event=group_retired node=%s group=%d reason=removed", h.cfg.ID, g)
+			h.retired.Inc()
+		})
 	}
 }
 

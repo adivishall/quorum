@@ -13,6 +13,7 @@ import (
 
 	"github.com/adivishall/quorum/internal/fault"
 	"github.com/adivishall/quorum/internal/raft"
+	"github.com/adivishall/quorum/internal/snapshot"
 	"github.com/adivishall/quorum/internal/transport"
 )
 
@@ -146,6 +147,55 @@ func TestApplyFailureStopsTheNode(t *testing.T) {
 	}
 }
 
+// TestASnapshotFailurePublishesStatusFirst: a periodic snapshot that fails
+// with an I/O error fail-stops the node in the cycle that applied a write, and
+// that write completes all the same — after the Status covering it, as in a
+// cycle that succeeds. The failure returned before publishing it, so a client
+// saw its write succeed while the node's final Status had not applied it.
+func TestASnapshotFailurePublishesStatusFirst(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "raft.log")
+	ifs := fault.NewInjectFS(nil)
+	tr, err := transport.NewTCPTransport(transport.Config{NodeID: "n0", ListenAddr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	// Delay the apply of the write, so its client is waiting on the outcome
+	// when the cycle fails; nothing fails but the injected I/O error.
+	hook := func(p Point, idx uint64) error {
+		if p == BeforeApply && idx > 1 {
+			time.Sleep(50 * time.Millisecond)
+		}
+		return nil
+	}
+	n, err := Start(context.Background(), Config{
+		ID: "n0", Peers: []NodeID{"n0"}, Transport: tr, LogPath: logPath, FS: ifs,
+		StateMachine: &snapSM{}, TickInterval: 5 * time.Millisecond, DisableSync: true,
+		SnapshotEvery: 1, Logf: (&logBuf{}).logf, Hook: hook,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+	waitSoloLeads(t, n)
+	waitApplied(t, n, 1)
+	time.Sleep(50 * time.Millisecond) // the no-op's snapshot is done
+	ifs.Arm(fault.Injection{Op: fault.OpOpen, Path: snapshot.Files{Base: logPath}.TmpPath(), Err: errors.New("injected ENOSPC")})
+	idx, _, werr := writeWithin(n, []byte("x"), 5*time.Second)
+	select {
+	case <-n.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the node did not fail-stop on the snapshot failure (write %d: %v)", idx, werr)
+	}
+	if werr != nil {
+		t.Fatalf("premise: the write applied in the failing cycle did not complete: %v", werr)
+	}
+	if st := n.Status(); st.Applied < idx {
+		t.Fatalf("the write completed at index %d, but the node's final Status has applied %d", idx, st.Applied)
+	}
+}
+
 // isolatedLeader starts a three-node group, elects a leader, commits a write,
 // and cuts the leader off from both followers.
 func isolatedLeader(t *testing.T) (*harness, *Node, *fault.Network) {
@@ -198,6 +248,42 @@ func TestAbandonedRequestsLeaveNothingBehind(t *testing.T) {
 		t.Fatal("the isolated leader stepped down: nothing reaches it, and it has no CheckQuorum")
 	}
 	waitStatus(t, l, 2*time.Second, "every abandoned request forgotten", func(st Status) bool {
+		return st.PendingWrites == 0 && st.PendingReads == 0
+	})
+}
+
+// TestABurstOfAbandonedRequestsLeavesNothingBehind: the clients of an
+// isolated leader give up together — one shared deadline, as a front's or a
+// load balancer's produces — and every waiter and read is forgotten. The
+// notices went through a buffer of 256 that dropped the rest: about 600 of
+// 1000 abandoned writes stayed, and on an idle group they stayed for good.
+func TestABurstOfAbandonedRequestsLeavesNothingBehind(t *testing.T) {
+	_, l, _ := isolatedLeader(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var wg sync.WaitGroup
+	var accepted atomic.Int64
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if idx, _, _, err := l.Write(ctx, []byte(fmt.Sprintf("burst-%d", i))); idx != 0 && errors.Is(err, context.DeadlineExceeded) {
+				accepted.Add(1)
+			}
+		}(i)
+	}
+	for i := 0; i < 500; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = l.ReadIndex(ctx)
+		}()
+	}
+	wg.Wait()
+	if accepted.Load() < 300 {
+		t.Fatalf("premise: only %d writes were accepted before the deadline", accepted.Load())
+	}
+	waitStatus(t, l, 3*time.Second, "every abandoned request of the burst forgotten", func(st Status) bool {
 		return st.PendingWrites == 0 && st.PendingReads == 0
 	})
 }

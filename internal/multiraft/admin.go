@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/replication"
@@ -267,6 +268,9 @@ func (h *Host) Admin(ctx context.Context, req AdminRequest) AdminResponse {
 		if req.ID == "" {
 			return fail(errors.New("an id is required"))
 		}
+		if err := checkMember(req.ID, req.Addr); err != nil {
+			return fail(err)
+		}
 		cc := raft.ConfChange{Member: raft.Member{ID: NodeID(req.ID), Addr: req.Addr}}
 		switch req.Op {
 		case "add-learner":
@@ -298,6 +302,9 @@ func (h *Host) Admin(ctx context.Context, req AdminRequest) AdminResponse {
 		case !req.Join && len(req.Voters) > 0:
 			var voters []replication.Member
 			for _, m := range req.Voters {
+				if err := checkMember(m.ID, m.Addr); err != nil {
+					return fail(err)
+				}
 				voters = append(voters, replication.Member{ID: NodeID(m.ID), Addr: m.Addr})
 			}
 			sort.Slice(voters, func(i, j int) bool { return voters[i].ID < voters[j].ID })
@@ -364,4 +371,18 @@ func AdminCall(ctx context.Context, addr string, req AdminRequest) (AdminRespons
 		return AdminResponse{}, err
 	}
 	return resp, nil
+}
+
+// checkMember refuses a member id or address holding whitespace or a control
+// character. A member enters the replicated configuration — every replica
+// holds it, across restarts — and its id and address are logged as
+// key=value fields: a newline in one forged event lines on every node that
+// sent to the member (quoting only the admin's own line did not stop that).
+func checkMember(id, addr string) error {
+	for _, f := range []struct{ name, v string }{{"id", id}, {"address", addr}} {
+		if strings.IndexFunc(f.v, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+			return fmt.Errorf("a member %s may not hold whitespace or control characters: %q", f.name, f.v)
+		}
+	}
+	return nil
 }

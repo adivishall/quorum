@@ -107,7 +107,8 @@ only if both sides agree on both:
 Accepter statuses: `0` accepted, `1` unknown peer, `2` another cluster, `3` other settings, `4`
 self-connection, `5` wrong direction (a known peer with the LARGER id dialed; the smaller id
 dials, §4 — such a claim never comes from that peer, so it may not take its slot). Any status but
-`0` closes the connection on both sides and is logged on both (`event=handshake_failed`); the
+`0` closes the connection on both sides and is logged on both (`event=handshake_failed`, the
+claimed id quoted: it is unauthenticated, `TestAnUnauthenticatedIDCannotForgeLogLines`); the
 dialer retries at its interval, so a node whose cluster or settings are fixed connects again.
 Cluster ids and digests are opaque here: empty values are equal only to empty values (the
 in-process library tests set neither).

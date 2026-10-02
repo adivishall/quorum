@@ -419,13 +419,19 @@ type Node struct {
 	proposeCh chan proposal
 	writeCh   chan writeReq
 	readCh    chan readReq
-	abandonCh chan abandoned // requests whose clients gave up (audit M3)
-	confCh    chan confReq
-	snapCh    chan chan error
-	outboxes  map[NodeID]*outbox // actor-owned; one per peer it has sent to
-	waiters   *Waiters           // requests waiting for an apply (actor-owned)
-	reads     *Reads             // unconfirmed ReadIndex requests (actor-owned)
-	changes   []*confWait        // membership changes awaiting completion (actor-owned)
+	// Requests whose clients gave up (audit M3): appended by any client
+	// goroutine, taken whole by the actor when kicked. A list, not a buffered
+	// channel: a burst of clients sharing one deadline overflowed a buffer of
+	// 256, and every notice it dropped left a waiter behind.
+	abandonMu   sync.Mutex
+	abandonList []abandoned
+	abandonKick chan struct{} // one slot: notices await the actor
+	confCh      chan confReq
+	snapCh      chan chan error
+	outboxes    map[NodeID]*outbox // actor-owned; one per peer it has sent to
+	waiters     *Waiters           // requests waiting for an apply (actor-owned)
+	reads       *Reads             // unconfirmed ReadIndex requests (actor-owned)
+	changes     []*confWait        // membership changes awaiting completion (actor-owned)
 
 	// Phase 15: the configuration last reported (actor-owned), for the
 	// raft_conf and raft_removed events and for retiring outboxes.
@@ -537,11 +543,6 @@ type abandoned struct {
 	read  chan readAccepted
 }
 
-// abandonBuffer is how many abandoned requests may await the actor. A full
-// buffer drops the notice: the waiter is then released as before, when its
-// index is applied, and the core's bounds still hold.
-const abandonBuffer = 256
-
 // Status is one consistent snapshot of a node's Raft state, taken by the actor
 // after it finished processing an event.
 type Status struct {
@@ -600,20 +601,20 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 	n := &Node{
 		cfg: cfg, core: rc.Core, log: rc.Log, dur: rc.Durable, tr: cfg.Transport, sm: cfg.StateMachine,
 		ctx: nctx, cancel: cancel, done: make(chan struct{}),
-		recvCh:    make(chan raft.Message, 256),
-		chunkCh:   make(chan inChunk, 16),
-		sending:   map[NodeID]bool{},
-		proposeCh: make(chan proposal),
-		writeCh:   make(chan writeReq),
-		readCh:    make(chan readReq),
-		abandonCh: make(chan abandoned, abandonBuffer),
-		confCh:    make(chan confReq),
-		snapCh:    make(chan chan error),
-		outboxes:  map[NodeID]*outbox{},
-		waiters:   NewWaiters(),
-		reads:     NewReads(),
-		m:         cfg.Metrics.forGroup(cfg.Group),
-		inflight:  map[uint64]inflightWrite{},
+		recvCh:      make(chan raft.Message, 256),
+		chunkCh:     make(chan inChunk, 16),
+		sending:     map[NodeID]bool{},
+		proposeCh:   make(chan proposal),
+		writeCh:     make(chan writeReq),
+		readCh:      make(chan readReq),
+		abandonKick: make(chan struct{}, 1),
+		confCh:      make(chan confReq),
+		snapCh:      make(chan chan error),
+		outboxes:    map[NodeID]*outbox{},
+		waiters:     NewWaiters(),
+		reads:       NewReads(),
+		m:           cfg.Metrics.forGroup(cfg.Group),
+		inflight:    map[uint64]inflightWrite{},
 	}
 	n.store = n.dur
 	if n.m.enabled() {
@@ -770,11 +771,18 @@ func (n *Node) forget(a abandoned) {
 	}
 }
 
-// abandon tells the actor a client stopped waiting, without ever blocking it.
+// abandon tells the actor a client stopped waiting, without ever waiting on
+// the actor.
 func (n *Node) abandon(a abandoned) {
+	if n.ctx.Err() != nil {
+		return // stopped: the actor has released everything (FailAll)
+	}
+	n.abandonMu.Lock()
+	n.abandonList = append(n.abandonList, a)
+	n.abandonMu.Unlock()
 	select {
-	case n.abandonCh <- a:
-	default:
+	case n.abandonKick <- struct{}{}:
+	default: // a kick is already pending; it takes this notice too
 	}
 }
 
@@ -937,8 +945,14 @@ func (n *Node) actorLoop() {
 					break more
 				}
 			}
-		case a := <-n.abandonCh:
-			n.forget(a)
+		case <-n.abandonKick:
+			n.abandonMu.Lock()
+			list := n.abandonList
+			n.abandonList = nil
+			n.abandonMu.Unlock()
+			for _, a := range list {
+				n.forget(a)
+			}
 		case c := <-n.confCh:
 			if err := n.core.ProposeConfChange(c.cc); err != nil {
 				n.m.confChange(c.cc.Type, "refused")
@@ -1024,6 +1038,7 @@ func (n *Node) processReady() error {
 	snapStart := time.Now()
 	if err := n.dur.MaybeSnapshot(n.core, n.cfg.Hook); err != nil {
 		if !errors.Is(err, snapshot.ErrTooLarge) && !errors.Is(err, raft.ErrConfUnknown) {
+			n.snapshotStatus() // the cycle's applied writes complete (deferred): Status first
 			return err
 		}
 		n.logf("event=raft_snapshot_skipped node=%s applied=%d group=%d err=%v", n.cfg.ID, n.core.AppliedIndex(), n.cfg.Group, err)

@@ -484,9 +484,10 @@ one is in progress at most. Tests: `TestIsolatedLeaderRefusesProposalsBeyondItsB
 **Abandoned requests.** A client whose deadline passes after its request was accepted tells the
 node's actor, which forgets the write's waiter or the unconfirmed read at once (`Waiters.Cancel`,
 `Reads.Cancel`); before, a waiter stayed until its index was applied — for an entry an isolated
-leader appended, possibly never, if the log that replaced it never grew that far. The notice is
-non-blocking and best-effort (a full buffer drops it, and the waiter is then released when its
-index is applied); it decides nothing — the entry, if it commits, is applied as before, and the
+leader appended, possibly never, if the log that replaced it never grew that far. The notice
+never waits on the actor and is never dropped: it joins a list the actor takes whole (a buffered
+channel of 256 used to drop the rest of a burst — clients sharing one deadline — and about 600 of
+1000 waiters stayed; `TestABurstOfAbandonedRequestsLeavesNothingBehind`); it decides nothing — the entry, if it commits, is applied as before, and the
 outcome stays unknown to that client. A waiter is never completed early as `ErrLost` when its
 entry is truncated from this node's log: another leader that holds the entry may still commit it.
 `TestAbandonedRequestsLeaveNothingBehind`.
@@ -499,13 +500,14 @@ or stops that group alone (`-cluster`). Before, the error was logged and retried
 forever: the group stalled behind the entry while its leader went on accepting writes it could
 never apply. `appliedIndex` never passes the refused entry, so a restart refuses it again; the
 entries applied before it in the failing cycle complete, and the published `Status` covers them
-(`TestApplyFailureStopsTheNode`). **The contract for a state machine:** `Apply` either applies
+(`TestApplyFailureStopsTheNode`; so does a periodic snapshot's I/O failure,
+`TestASnapshotFailurePublishesStatusFirst`). **The contract for a state machine:** `Apply` either applies
 the command completely or returns an error with no effect at all — the key-value store's only
 error, an undecodable command, leaves it unchanged — and an error means the entry can never be
 applied. Recovering such a group needs an operator: a state machine that accepts the entry (a
 fixed binary), or restoring from a snapshot past it.
 
-Mutants 214–226 and 270 (`scripts/mutation.sh`) break each bound, the bookkeeping, each release of an
+Mutants 214–226, 270 and 274–275 (`scripts/mutation.sh`) break each bound, the bookkeeping, each release of an
 abandoned request, the fail-stop and the `UNAVAILABLE` mapping; each is killed by its test.
 
 **Not done here.** PreVote and CheckQuorum — an isolated leader that steps down by itself —
