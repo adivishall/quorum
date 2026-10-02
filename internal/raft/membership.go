@@ -276,7 +276,7 @@ func (r *Raft) ProposeConfChange(cc ConfChange) error {
 		return err
 	}
 	r.appendConf(next)
-	r.broadcastAppend()
+	r.broadcastAppend(false)
 	r.maybeCommit()
 	return nil
 }
@@ -427,7 +427,7 @@ func (r *Raft) afterCommit() {
 	}
 	if r.conf.Joint() {
 		r.appendConf(Final(r.conf))
-		r.broadcastAppend()
+		r.broadcastAppend(false)
 		// When the leader alone is a quorum of the final configuration — the
 		// removal of all voters but it — no acknowledgement will ever come to
 		// retry the commit: try now (found by the bounded membership model).

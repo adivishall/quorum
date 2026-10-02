@@ -526,8 +526,11 @@ moved past it, or for good with snapshots off. Three changes:
   fits what its receiver accepts, however far behind the follower is.
 - **Streaming a backlog.** When the budget cut a peer's last batch, an acknowledgement that
   advances it sends the next batch at once, so a lagging follower catches up at the speed of round
-  trips rather than one batch per heartbeat. A lost batch is resent by the next heartbeat, from
-  `nextIndex`, as before. A snapshot offer ends the stream (its acknowledgement resumes
+  trips rather than one batch per heartbeat. While that batch is in flight, a proposal sends the
+  peer an entry-less heartbeat rather than the batch again: copies of it queued ahead of the next
+  batch, so a follower behind under load fell further behind the more clients wrote (an 18 MB
+  backlog took 5.8 s under 8 writers, 267 ms idle; `TestABatchInFlightIsNotResentWithEveryProposal`).
+  A lost batch is resent by the next heartbeat tick, from `nextIndex`. A snapshot offer ends the stream (its acknowledgement resumes
   replication once, `TestASnapshotInstallSendsTheNextBatchOnce`), and a leader that the
   acknowledgement steps down — the commit of its own removal — sends nothing more
   (`TestARemovedLeaderSendsNothingOnceItStepsDown`).
@@ -537,6 +540,9 @@ moved past it, or for good with snapshots off. Three changes:
   A leader's configuration change re-checks the reads pending: a leader that becomes its own
   quorum (the change removing its last peer) confirms them, where before no reply would ever come
   to and they filled `MaxPendingReads` (`TestReadsPendingWhenTheLeaderBecomesItsOwnQuorumAreConfirmed`).
+  A round's heartbeat goes at the peer's match index (or the boundary), so its acknowledgement can
+  report less than `nextIndex` assumes; an acknowledgement never moves `nextIndex` back — only a
+  rejection does — or a new leader re-sent a peer entries it held (`TestAReadDoesNotMoveNextIndexBack`).
 
 Safety is unchanged: what a follower accepts and how it answers are untouched; the leader sends
 less per message and more often. Evidence: `TestLaggingFollowerCatchesUpInBudgetedBatches`,
@@ -546,10 +552,11 @@ less per message and more often. Evidence: `TestLaggingFollowerCatchesUpInBudget
 off, catches up — before, never), `TestConcurrentReadsShareRounds` (512 concurrent reads cost 8–28
 messages); `TestBudgetedReplicationUnderFaults` (every simulator profile over three seeds with
 budgets of 2 entries and 32 bytes: every invariant and linearizability hold, with tens of
-thousands of batches cut, under every fault the simulator injects); mutants 243–251, 267–269.
+thousands of batches cut, under every fault the simulator injects); mutants 243–251, 267–269, 271–273.
 
 **Still open.** `nextIndex` still moves only on an acknowledgement — there is no optimistic
-pipelining — so while a batch is unacknowledged, every heartbeat and proposal resends it. That
+pipelining — so while a batch is unacknowledged, every heartbeat tick resends it, and a peer whose
+unacknowledged tail fits one batch gets it again with every proposal. That
 redundancy is now bounded by the budgets (at most one batch per peer per broadcast) but not removed;
 removing it means tracking batches in flight per peer (etcd's probe/replicate states), a larger
 change to the core's loss recovery left for a later phase. Snapshots and bulk appends still share

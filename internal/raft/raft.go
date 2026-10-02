@@ -262,7 +262,7 @@ func (r *Raft) Tick() {
 		r.heartbeatElapsed++
 		if r.heartbeatElapsed >= r.heartbeatTicks {
 			r.heartbeatElapsed = 0
-			r.broadcastAppend()
+			r.broadcastAppend(true)
 		}
 		return
 	}
@@ -295,7 +295,7 @@ func (r *Raft) Propose(data []byte) error {
 		return fmt.Errorf("%w: %d uncommitted entries of %d bytes", ErrBusy, len(r.uncommitted), r.uncommittedBytes)
 	}
 	r.appendEntry(data)
-	r.broadcastAppend()
+	r.broadcastAppend(false)
 	r.maybeCommit() // a single-node leader (self is the quorum) commits at once
 	return nil
 }
@@ -308,9 +308,10 @@ func (r *Raft) Propose(data []byte) error {
 // until its own no-op commits, and every earlier entry is committed by then.
 //
 // The read is NOT yet safe to serve. The leader must first confirm it is still
-// the leader: it advances its heartbeat sequence and broadcasts AppendEntries
-// carrying it, and the read is confirmed only when a quorum (itself included,
-// if it is a voter) has echoed a sequence at least that high — acknowledgements
+// the leader: the read joins a round of messages not yet sent, or starts one of
+// entry-less heartbeats under a new heartbeat sequence, and is confirmed only
+// when a quorum (itself included, if it is a voter) has echoed a sequence at
+// least that high — acknowledgements
 // that were in flight before the read was registered do not count, because they
 // prove leadership only up to the time they were sent. A confirmed read appears
 // in Ready.ReadStates; the driver serves it once it has applied through its
@@ -547,7 +548,7 @@ func (r *Raft) becomeLeader() {
 	}
 	r.appendEntry(nil)
 	r.heartbeatElapsed = 0
-	r.broadcastAppend()
+	r.broadcastAppend(true)
 	r.maybeCommit() // a single-node leader commits the no-op at once
 }
 
@@ -693,7 +694,11 @@ func (r *Raft) progress(peer NodeID, match uint64) {
 		return
 	}
 	r.matchIndex[peer] = match
-	r.nextIndex[peer] = match + 1
+	// Never backward: an acknowledgement of a read round's heartbeat, sent at
+	// the match index or the boundary, can report less than nextIndex already
+	// assumes, and lowering it re-sent entries the peer holds. A rejection
+	// moves nextIndex back when the peer truly lacks them.
+	r.nextIndex[peer] = max(r.nextIndex[peer], match+1)
 	if s := r.snapPending[peer]; s != 0 && match >= s {
 		delete(r.snapPending, peer)
 		delete(r.snapWait, peer)
@@ -927,11 +932,23 @@ func (r *Raft) sendAppend(peer NodeID) {
 // broadcastAppend sends AppendEntries (a heartbeat when there is nothing to
 // replicate) to every member — voters of both sets and learners — under a fresh
 // heartbeat sequence.
-func (r *Raft) broadcastAppend() {
+//
+// A peer streaming a backlog the budget cut has a batch in flight, and that
+// batch's acknowledgement sends the next (progress). Sending the batch again
+// with every proposal only queued copies of it ahead of the next one: the more
+// clients wrote, the further a lagging follower fell behind. Such a peer gets
+// an entry-less heartbeat instead — the round's sequence and the commit index
+// — unless retransmit is set: the heartbeat tick, which resends a batch that
+// may have been lost.
+func (r *Raft) broadcastAppend(retransmit bool) {
 	r.hbSeq++
 	r.roundUnsent = true
 	for _, p := range r.peers {
 		if p == r.id {
+			continue
+		}
+		if r.cut[p] && !retransmit {
+			r.sendHeartbeat(p)
 			continue
 		}
 		r.sendAppend(p)

@@ -309,3 +309,129 @@ func TestASnapshotInstallSendsTheNextBatchOnce(t *testing.T) {
 		t.Fatal("premise: the snapshot's acknowledgement sent c nothing")
 	}
 }
+
+// TestABatchInFlightIsNotResentWithEveryProposal: while a cut batch is in
+// flight to a lagging peer, a proposal sends that peer a heartbeat, not the
+// batch again; the heartbeat tick still resends it, so a lost batch is not
+// stranded; and a follower catches up while clients keep writing, in about as
+// many batches as its backlog needs. Every proposal used to resend the batch
+// in flight — 50 writes queued 50 copies of it — and a follower behind under
+// load caught up 20 times slower than idle (a review of the budgets).
+func TestABatchInFlightIsNotResentWithEveryProposal(t *testing.T) {
+	nw := newNetwork(t, ids(3), 4242)
+	nw.electLeader("a")
+	a := nw.nodes["a"]
+	a.maxSizePerMsg = 64 << 10
+	nw.isolate("c")
+	v := string(bytes.Repeat([]byte{'x'}, 4<<10))
+	for i := 0; i < 200; i++ {
+		nw.propose("a", v)
+	}
+	nw.heal()
+	for i := 0; i < a.heartbeatTicks; i++ {
+		nw.tick("a")
+	}
+	if !a.cut["c"] {
+		t.Fatal("premise: the batch to c is not cut")
+	}
+	inFlight := nw.takeQueue() // its acknowledgement is not back yet
+	entriesTo := func(q []Message) (msgs int) {
+		for _, m := range q {
+			if m.To == "c" && m.Type == MsgAppendRequest && len(m.Entries) > 0 {
+				msgs++
+			}
+		}
+		return msgs
+	}
+	for i := 0; i < 50; i++ {
+		nw.proposeNoDeliver("a", "w")
+	}
+	if n := entriesTo(nw.queue); n != 0 {
+		t.Fatalf("50 proposals with a batch in flight sent c %d more batches", n)
+	}
+	nw.queue = nil
+	for i := 0; i < a.heartbeatTicks; i++ {
+		nw.tick("a")
+	}
+	if n := entriesTo(nw.queue); n != 1 {
+		t.Fatalf("the heartbeat tick resent %d batches to c, want the one in flight", n)
+	}
+	// Catch up from here while a client keeps writing: one write every few
+	// deliveries, as fast as the simulated network drains.
+	nw.queue = append(inFlight, nw.queue...)
+	target := a.LastIndex()
+	sent := 0
+	for i := 0; a.matchIndex["c"] < target; i++ {
+		if i > 20000 || len(nw.queue) == 0 {
+			t.Fatalf("c reached %d of %d", a.matchIndex["c"], target)
+		}
+		m := nw.queue[0]
+		nw.queue = nw.queue[1:]
+		sent += entriesTo([]Message{m})
+		nw.deliver(m)
+		if i%6 == 0 {
+			nw.proposeNoDeliver("a", "w")
+		}
+	}
+	need := int(target)*4<<10/(64<<10) + 1
+	if sent > 2*need+4 {
+		t.Fatalf("c caught up through %d with %d batches sent; its backlog needs about %d", target, sent, need)
+	}
+	t.Logf("caught up through %d with %d batches (about %d needed)", target, sent, need)
+}
+
+// TestAReadDoesNotMoveNextIndexBack: a read round's heartbeat goes at the
+// match index or the boundary, and its acknowledgement reports no more. A new
+// leader on a compacted log, whose no-op append to a peer was lost, took that
+// as the peer's progress and lowered nextIndex to the boundary: the next
+// heartbeat re-sent every entry after it, all of which the peer held.
+func TestAReadDoesNotMoveNextIndexBack(t *testing.T) {
+	nw := newNetwork(t, ids(3), 4343)
+	nw.electLeader("a")
+	for i := 0; i < 60; i++ {
+		nw.propose("a", fmt.Sprintf("v%d", i))
+	}
+	nw.heartbeatRounds()
+	for _, id := range []NodeID{"a", "b", "c"} {
+		if err := nw.nodes[id].Compact(10); err != nil {
+			t.Fatalf("compact %s: %v", id, err)
+		}
+	}
+	nw.isolate("a")
+	nw.campaign("c")
+	c := nw.nodes["c"]
+	for i := 0; i < 1000 && c.Role() != Leader && nw.deliverOne(); i++ {
+	}
+	if c.Role() != Leader {
+		t.Fatal("premise: c did not win")
+	}
+	var kept []Message
+	for _, m := range nw.queue {
+		if !(m.From == "c" && m.To == "b" && m.Type == MsgAppendRequest) {
+			kept = append(kept, m) // c's no-op append to b is lost
+		}
+	}
+	nw.queue = kept
+	if _, err := c.ReadIndex(); err != nil {
+		t.Fatal(err)
+	}
+	nw.drain("c")
+	nw.deliverAll()
+	bLast := nw.nodes["b"].LastIndex()
+	if c.nextIndex["b"] <= bLast {
+		t.Fatalf("after the read, nextIndex[b] = %d although b holds through %d", c.nextIndex["b"], bLast)
+	}
+	nw.queue = nil
+	for i := 0; i < c.heartbeatTicks; i++ {
+		nw.tick("c")
+	}
+	for _, m := range nw.queue {
+		if m.To == "b" && m.Type == MsgAppendRequest {
+			for _, e := range m.Entries {
+				if e.Index <= bLast {
+					t.Fatalf("the heartbeat re-sent b entry %d, which it holds (through %d)", e.Index, bLast)
+				}
+			}
+		}
+	}
+}

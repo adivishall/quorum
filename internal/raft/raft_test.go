@@ -41,6 +41,12 @@ func TestConfigValidation(t *testing.T) {
 		{"negative uncommitted entries", func(c *Config) { c.MaxUncommittedEntries = -1 }, ErrInvalidBounds},
 		{"negative uncommitted bytes", func(c *Config) { c.MaxUncommittedBytes = -1 }, ErrInvalidBounds},
 		{"negative pending reads", func(c *Config) { c.MaxPendingReads = -1 }, ErrInvalidBounds},
+		{"negative entries per message", func(c *Config) { c.MaxEntriesPerMsg = -1 }, ErrInvalidBounds},
+		{"entries per message at its limit", func(c *Config) { c.MaxEntriesPerMsg = MaxEntriesPerMessage }, nil},
+		{"entries per message beyond its limit", func(c *Config) { c.MaxEntriesPerMsg = MaxEntriesPerMessage + 1 }, ErrInvalidBounds},
+		{"negative bytes per message", func(c *Config) { c.MaxSizePerMsg = -1 }, ErrInvalidBounds},
+		{"bytes per message at its limit", func(c *Config) { c.MaxSizePerMsg = MaxSizePerMsgLimit }, nil},
+		{"bytes per message beyond its limit", func(c *Config) { c.MaxSizePerMsg = MaxSizePerMsgLimit + 1 }, ErrInvalidBounds},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

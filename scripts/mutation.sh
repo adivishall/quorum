@@ -2312,6 +2312,27 @@ mutant "apply-failure-publishes-status" internal/raftnode/node.go \
 ' \
   ./internal/raftnode '^TestApplyFailureStopsTheNode$'
 
+# 271. A proposal sends a peer with a cut batch in flight a heartbeat, not
+# the batch again (review of PR #10).
+mutant "proposal-does-not-resend-the-batch-in-flight" internal/raft/raft.go \
+  '		if r.cut[p] && !retransmit {' \
+  '		if false {' \
+  ./internal/raft '^TestABatchInFlightIsNotResentWithEveryProposal$'
+
+# 272. ... but the heartbeat tick does, so a lost batch is not stranded.
+mutant "heartbeat-tick-resends-the-batch" internal/raft/raft.go \
+  '			r.heartbeatElapsed = 0
+			r.broadcastAppend(true)' \
+  '			r.heartbeatElapsed = 0
+			r.broadcastAppend(false)' \
+  ./internal/raft '^TestABatchInFlightIsNotResentWithEveryProposal$'
+
+# 273. An acknowledgement never moves nextIndex back.
+mutant "ack-never-lowers-next-index" internal/raft/raft.go \
+  '	r.nextIndex[peer] = max(r.nextIndex[peer], match+1)' \
+  '	r.nextIndex[peer] = match + 1' \
+  ./internal/raft '^TestAReadDoesNotMoveNextIndexBack$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then
