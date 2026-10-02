@@ -44,7 +44,7 @@ type AdminRequest struct {
 	Addr    string   `json:"addr,omitempty"`
 	Join    bool     `json:"join,omitempty"`
 	Voters  []Member `json:"voters,omitempty"`
-	Timeout int      `json:"timeout_ms,omitempty"` // default 10s
+	Timeout int      `json:"timeout_ms,omitempty"` // default 10s, at most 60s
 }
 
 // Member is a member in an admin request or response.
@@ -116,61 +116,123 @@ func IDs(ms []Member) []string {
 	return out
 }
 
-// MaxAdminLine bounds one admin request line.
-const MaxAdminLine = 64 << 10
+// Bounds of the admin port (audit M1, L): what one connection may cost.
+const (
+	// MaxAdminLine bounds one admin request line.
+	MaxAdminLine = 64 << 10
+	// MaxAdminConns bounds the admin connections served at once; one beyond
+	// it is closed as soon as it is accepted. The admin port serves an
+	// operator's occasional command, one per connection.
+	MaxAdminConns = 16
+	// AdminIdleTimeout bounds the wait for a connection's next request line,
+	// and AdminWriteTimeout the writing of an answer.
+	AdminIdleTimeout  = 30 * time.Second
+	AdminWriteTimeout = 10 * time.Second
+	// DefaultAdminTimeout is a request's timeout when it names none, and
+	// MaxAdminTimeout the most it may name.
+	DefaultAdminTimeout = 10 * time.Second
+	MaxAdminTimeout     = 60 * time.Second
+)
 
 // ServeAdmin answers admin requests on ln for host h until ctx ends or ln is
-// closed. logf may be nil.
+// closed. logf may be nil. An Accept error is logged and retried after a
+// growing pause, never the end of the loop.
 func ServeAdmin(ctx context.Context, ln net.Listener, h *Host, logf func(string, ...any)) {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
 	var wg sync.WaitGroup
+	defer wg.Wait()
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
 	}()
+	slots := make(chan struct{}, MaxAdminConns)
+	backoff := 5 * time.Millisecond
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			wg.Wait()
-			return
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			logf("event=admin_accept_failed node=%s err=%v retry_in=%s", h.cfg.ID, err, backoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			backoff = min(2*backoff, time.Second)
+			continue
+		}
+		backoff = 5 * time.Millisecond
+		select {
+		case slots <- struct{}{}:
+		default:
+			_ = c.Close()
+			continue
 		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer c.Close()
-			cctx, cancel := context.WithCancel(ctx)
-			defer cancel()
-			go func() {
-				<-cctx.Done()
-				_ = c.Close()
-			}()
-			sc := bufio.NewScanner(c)
-			sc.Buffer(make([]byte, 4096), MaxAdminLine)
-			enc := json.NewEncoder(c)
-			for sc.Scan() {
-				var req AdminRequest
-				var resp AdminResponse
-				if err := json.Unmarshal(sc.Bytes(), &req); err != nil {
-					resp = AdminResponse{Error: "malformed request: " + err.Error()}
-				} else {
-					resp = h.Admin(cctx, req)
-					if logf != nil && req.Op != "status" {
-						logf("event=admin node=%s op=%s group=%d id=%s ok=%v err=%q", h.cfg.ID, req.Op, req.Group, req.ID, resp.OK, resp.Error)
-					}
-				}
-				if err := enc.Encode(resp); err != nil {
-					return
-				}
-			}
+			defer func() { <-slots }()
+			serveAdminConn(ctx, c, h, logf)
 		}()
 	}
 }
 
+func serveAdminConn(ctx context.Context, c net.Conn, h *Host, logf func(string, ...any)) {
+	defer c.Close()
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		<-cctx.Done()
+		_ = c.Close()
+	}()
+	sc := bufio.NewScanner(c)
+	sc.Buffer(make([]byte, 4096), MaxAdminLine)
+	enc := json.NewEncoder(c)
+	for {
+		_ = c.SetReadDeadline(time.Now().Add(adminIdle))
+		if !sc.Scan() {
+			return
+		}
+		var req AdminRequest
+		var resp AdminResponse
+		if err := json.Unmarshal(sc.Bytes(), &req); err != nil {
+			resp = AdminResponse{Error: "malformed request: " + err.Error()}
+		} else {
+			resp = h.Admin(cctx, req)
+			if req.Op != "status" {
+				// Quoted: the op and id are the client's, and a newline in
+				// either would otherwise forge log lines.
+				logf("event=admin node=%s op=%q group=%d id=%q ok=%v err=%q", h.cfg.ID, req.Op, req.Group, req.ID, resp.OK, resp.Error)
+			}
+		}
+		_ = c.SetWriteDeadline(time.Now().Add(AdminWriteTimeout))
+		if err := enc.Encode(resp); err != nil {
+			return
+		}
+	}
+}
+
+// adminIdle is AdminIdleTimeout, a variable so tests can shorten it.
+var adminIdle = AdminIdleTimeout
+
+// adminTimeout is a request's timeout: its own, clamped to MaxAdminTimeout,
+// or DefaultAdminTimeout.
+func adminTimeout(ms int) time.Duration {
+	switch {
+	case ms <= 0:
+		return DefaultAdminTimeout
+	case ms >= int(MaxAdminTimeout/time.Millisecond): // also before ms×1e6 could overflow
+		return MaxAdminTimeout
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 // Admin executes one admin request against this host.
 func (h *Host) Admin(ctx context.Context, req AdminRequest) AdminResponse {
-	timeout := 10 * time.Second
-	if req.Timeout > 0 {
-		timeout = time.Duration(req.Timeout) * time.Millisecond
-	}
+	timeout := adminTimeout(req.Timeout)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	g := GroupID(req.Group)

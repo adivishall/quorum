@@ -98,7 +98,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		nodesArg  = fs.String("nodes", "", "cluster mode: comma-separated node ids of the routing (the genesis cluster); default this node and its -peers. Identical on every node, including one that joins later")
 		joinArg   = fs.String("join", "", "raft/cluster mode: comma-separated group ids this node hosts as a JOINER — it starts with no configuration and its group's leader adds it (admin add-learner); -raft takes only 0")
 		metricsAt = fs.String("metrics-listen", "", "serve Prometheus metrics over HTTP (GET /metrics, docs/OBSERVABILITY.md) on this host:port — separate from the client and admin ports")
-		adminAt   = fs.String("admin-listen", "", "raft/cluster mode: serve the admin protocol (docs/MULTI_RAFT.md §7: status, add-learner, promote, remove-voter, remove-learner, create-group, stop-group, snapshot) on this host:port — separate from the client port")
+		adminAt   = fs.String("admin-listen", "", "raft/cluster mode: serve the admin protocol (docs/MULTI_RAFT.md §7: status, add-learner, promote, remove-voter, remove-learner, create-group, stop-group, snapshot) on this host:port — separate from the client port. A loopback address only, unless -admin-allow-remote")
+		adminAny  = fs.Bool("admin-allow-remote", false, "allow -admin-listen on an address other than loopback. The admin port is unauthenticated plaintext: anyone who can reach it can remove voters and stop groups (docs/LIMITATIONS.md)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -141,6 +142,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	if (*clientAt != "" || *adminAt != "" || *joinArg != "" || *initDir || *clusterID != "") && !*raftMode && !*cluster {
 		fmt.Fprintln(stderr, "dkvd: -client-listen, -admin-listen, -join, -init and -cluster-id require -raft or -cluster")
+		return 2
+	}
+	// The admin port can remove voters and stop groups, with no
+	// authentication: it listens on loopback unless the operator says
+	// otherwise (audit H6).
+	if *adminAt != "" && !*adminAny && !isLoopback(*adminAt) {
+		fmt.Fprintf(stderr, "dkvd: -admin-listen %s is not a loopback address; the admin port is unauthenticated — pass -admin-allow-remote to expose it anyway\n", *adminAt)
 		return 2
 	}
 	// A node's durable state is the whole of its Raft safety: it is never a
@@ -892,6 +900,20 @@ func (c *crashConn) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// isLoopback reports whether a listen address binds loopback only: localhost
+// or a loopback IP. An empty host binds every interface.
+func isLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // openDataDir opens and locks the node's data directory (internal/nodedir).
 func openDataDir(dir, id, cluster string, init bool, settings string, lg *logger) (*nodedir.Dir, error) {
 	nd, err := nodedir.Open(dir, nodedir.Options{Node: id, Cluster: cluster, Init: init, Settings: settings})
@@ -1000,6 +1022,20 @@ func (l *logger) logf(format string, args ...any) {
 // serveMetrics serves reg at GET /metrics on addr (Phase 16,
 // docs/OBSERVABILITY.md) and returns the function that stops it. The listener is
 // bound before it returns, so a bad address is a startup error.
+// newMetricsServer bounds what a metrics connection may cost (audit M1): a
+// scraper's request must arrive, and its answer be taken, within bounds, and
+// an idle keep-alive connection is closed instead of held for ever.
+func newMetricsServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+}
+
 func serveMetrics(addr string, reg *metrics.Registry, id string, lg *logger) (func(), error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -1007,7 +1043,7 @@ func serveMetrics(addr string, reg *metrics.Registry, id string, lg *logger) (fu
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", metrics.Handler(reg))
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	srv := newMetricsServer(mux)
 	go func() { _ = srv.Serve(ln) }()
 	lg.logf("event=metrics_ready node=%s addr=%s", id, ln.Addr())
 	return func() { _ = srv.Close() }, nil

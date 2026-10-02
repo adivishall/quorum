@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -264,5 +266,45 @@ func TestParseCrashAt(t *testing.T) {
 		if _, err := parseCrashAt(bad); err == nil {
 			t.Errorf("%s accepted", bad)
 		}
+	}
+}
+
+// TestAdminListensOnLoopbackUnlessAllowed (audit H6): the admin port can
+// remove voters and stop groups, unauthenticated; dkvd refuses to expose it
+// beyond loopback unless -admin-allow-remote says so — before anything is
+// opened or listened on.
+func TestAdminListensOnLoopbackUnlessAllowed(t *testing.T) {
+	for addr, want := range map[string]bool{
+		"127.0.0.1:7000": true, "[::1]:7000": true, "localhost:7000": true, "127.1.2.3:0": true,
+		"0.0.0.0:7000": false, ":7000": false, "[::]:7000": false, "10.0.0.5:7000": false, "example.com:1": false, "nonsense": false,
+	} {
+		if got := isLoopback(addr); got != want {
+			t.Errorf("isLoopback(%q) = %v, want %v", addr, got, want)
+		}
+	}
+	dir := filepath.Join(t.TempDir(), "never-created")
+	base := []string{"-id", "a", "-listen", "127.0.0.1:0", "-raft", "-data-dir", dir, "-admin-listen", "0.0.0.0:0"}
+	var out, errb bytes.Buffer
+	if code := run(context.Background(), base, &out, &errb); code != 2 || !strings.Contains(errb.String(), "not a loopback address") {
+		t.Fatalf("admin on every interface: exit %d, stderr %q; want 2 naming the loopback rule", code, errb.String())
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("the refused start touched its data directory: %v", err)
+	}
+	errb.Reset()
+	// Allowed, the start goes on — and here stops at the data directory, which
+	// does not exist (no -init): the admin rule passed.
+	if code := run(context.Background(), append(base, "-admin-allow-remote"), &out, &errb); code != 2 || strings.Contains(errb.String(), "loopback") {
+		t.Fatalf("admin on every interface, allowed: exit %d, stderr %q; want it past the loopback rule", code, errb.String())
+	}
+}
+
+// TestMetricsServerBoundsItsConnections (audit M1): the metrics port times out
+// slow requests, slow readers and idle keep-alive connections, and caps a
+// request's headers — none of it was bounded but the header read.
+func TestMetricsServerBoundsItsConnections(t *testing.T) {
+	s := newMetricsServer(nil)
+	if s.ReadHeaderTimeout <= 0 || s.ReadTimeout <= 0 || s.WriteTimeout <= 0 || s.IdleTimeout <= 0 || s.MaxHeaderBytes <= 0 {
+		t.Fatalf("an unbounded metrics server: %+v", s)
 	}
 }
