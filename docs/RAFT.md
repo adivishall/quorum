@@ -327,6 +327,17 @@ its crash-recovery rules (`docs/CRASH_RECOVERY.md` §11); Phase 12 adds 27 for R
 completion, the client protocol and policy, the state machine, the codecs and the checker
 (`docs/LINEARIZABILITY.md` §11); `make mutation` runs all 60.
 
+**What counts as a kill** (since the audit hardening, mutants 173–255 cover its fixes): a target
+must be tracked by git and clean, or it is not mutated (`git diff` is blind to an untracked file, so
+its mutation went unnoticed and was never reverted). A kill must be a failing test — a `--- FAIL`
+line, or the test binary dying in a test (a panic, a timeout); a run that fails otherwise is not
+attributable to the mutant and fails the runner. For real-process killers, whose timing is real,
+the same tests are re-run on the clean tree and the kill counts only if they pass there, so a flaky
+failure cannot pass for one; `CONFIRM=1` does this for every mutant. A pattern matching several
+sites is reported, since only the first is mutated. `DRY=1` checks every pattern still applies
+without running tests — a whole-suite dry run after this branch's changes found six mutants whose
+code had moved, now re-targeted.
+
 ## 13. Multi-Raft and membership (Phase 15)
 
 *Phases 9–14:* membership was static (ADR-005) and quorum was `⌊n/2⌋+1` over a fixed peer list.

@@ -461,7 +461,7 @@ make check        # gofmt + gitignore guard + go vet + the unit packages under -
 make build
 make test
 make race
-make integration  # real-process tests (tests/integration, -race): SIGKILL recovery, Raft over TCP, kill/stop/partition faults, linearizability, membership, metrics, load, the lab
+make integration  # real-process tests (tests/integration, -race; dkvd race-built too): SIGKILL recovery, Raft over TCP, kill/stop/partition faults, linearizability, membership, metrics, load, the lab
 make faults       # the deterministic fault schedules and client workloads at a large seed budget (FAULT_SEEDS=200)
 make mutation     # mutation testing: every rule-violating edit must be caught
 make fuzz         # every fuzz target in the repository (FUZZTIME=10s each)
