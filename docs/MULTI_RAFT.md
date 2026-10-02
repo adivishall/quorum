@@ -145,7 +145,8 @@ twice in a term or lose a committed entry. So `dkvd -raft|-cluster`:
 - pins the node's **replica settings** in `node.identity` (audit H5): the settings every replica
   must share — the session limits, and in `-cluster` mode the routing (`-shards`, `-rf`, the
   sorted `-nodes`) — recorded at initialization; a start whose flags give others exits 2 naming
-  both. Peer addresses are not among them. `-shards/-rf/-nodes` outside `-cluster` mode are
+  both, even one resuming an unfinished initialization (its genesis groups may already exist
+  under the recorded settings). Peer addresses are not among them. `-shards/-rf/-nodes` outside `-cluster` mode are
   refused;
 - opens the directory **before** the transport listens, and the transport handshake carries the
   recorded cluster id and a SHA-256 digest of the pinned settings: a node of another cluster, or

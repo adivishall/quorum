@@ -26,7 +26,9 @@ is how a request finds its group. Version 3 is version 2 (Phase 13) plus the req
   frame must arrive whole within 10 s of its first byte; a response must be taken within 10 s.
   Either deadline missed closes the connection. An **idle** connection is never timed out: closing
   one could race a request its client is sending, which the client would then have to report as
-  an unknown outcome. A frame's buffer grows with the bytes that arrive, never to the length a
+  an unknown outcome. So 1024 idle connections hold every slot, and new clients are refused until
+  one closes: the cap bounds the cost of connections, not who holds them (there is no
+  authentication to tell clients apart, `docs/LIMITATIONS.md`). A frame's buffer grows with the bytes that arrive, never to the length a
   header merely declares. Tests: `TestServeCapsItsConnections`,
   `TestServeDropsAStalledFrameButKeepsAnIdleConnection`, `TestServeDropsAClientThatDoesNotRead`,
   `TestServeSurvivesAcceptErrors`, `TestReadFrameGrowsWithTheBytesThatArrive`.

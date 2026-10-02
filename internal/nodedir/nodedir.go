@@ -394,8 +394,14 @@ func (d *Dir) open(opts Options) error {
 			d.ID.Settings = opts.Settings
 			return write(d.Path, d.ID)
 		case opts.Settings != id.Settings:
+			unfinished := ""
+			if !id.Initialized {
+				// Its genesis groups may already exist under the recorded
+				// settings, so even an unfinished initialization keeps them.
+				unfinished = " (also while its initialization is unfinished: groups it created follow them)"
+			}
 			return fmt.Errorf("%w: %s recorded [%s]; this start's flags give [%s]. They are part of the replicated "+
-				"state machine's definition and every replica must share them; a node cannot change them by restarting", ErrSettings, d.Path, id.Settings, opts.Settings)
+				"state machine's definition and every replica must share them; a node cannot change them by restarting%s", ErrSettings, d.Path, id.Settings, opts.Settings, unfinished)
 		}
 		return nil
 	}
