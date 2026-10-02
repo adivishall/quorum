@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -79,44 +80,75 @@ func TestFollowerBehindByMoreThanAFrameCatchesUp(t *testing.T) {
 	}
 }
 
-// TestConcurrentReadsShareRounds: hundreds of concurrent reads on a leader
-// cost far fewer messages than reads: the actor takes the reads waiting with
-// one, and the core confirms them with one round of entry-less heartbeats.
-// Before, every read broadcast the unacknowledged tail to every peer.
+// TestConcurrentReadsShareRounds: reads that wait for the actor together are
+// taken together — up to maxReadsPerCycle in one cycle — and the core confirms
+// each cycle's reads with one round of entry-less heartbeats. The leader's
+// actor is held (an apply hook) while 512 reads queue for it, then released:
+// they cost a few rounds, not a round each. Before, every read broadcast the
+// unacknowledged tail to every peer. (Reads that merely run concurrently are
+// spread over cycles by the scheduler — 8 to 300 messages for the same 512 —
+// so only reads that are queued together measure the batching.)
 func TestConcurrentReadsShareRounds(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	net := fault.NewNetwork()
-	h := startClusterWith(t, ctx, 3, func(tr transport.Transport) transport.Transport { return net.Wrap(tr) })
+	var holdOn atomic.Value // NodeID whose actor the hook holds
+	var holdAt atomic.Uint64
+	held := make(chan struct{}, 1)
+	release := make(chan struct{})
+	h := startClusterHooked(t, ctx, 3, func(tr transport.Transport) transport.Transport { return net.Wrap(tr) }, 15*time.Millisecond,
+		func(id NodeID) Hook {
+			return func(p Point, idx uint64) error {
+				if p == BeforeApply && idx == holdAt.Load() && holdOn.Load() == id {
+					select {
+					case held <- struct{}{}:
+					default:
+					}
+					<-release
+				}
+				return nil
+			}
+		})
 	defer h.stop()
 	l := h.waitLeader(5 * time.Second)
 	if _, _, err := writeWithin(h.nodes[l], []byte("x"), 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
+	// Hold the leader's actor in the apply of one more write.
+	holdOn.Store(l)
+	holdAt.Store(h.nodes[l].Status().LastIndex + 1)
+	go func() { _, _, _ = writeWithin(h.nodes[l], []byte("hold"), 10*time.Second) }()
+	select {
+	case <-held:
+	case <-time.After(5 * time.Second):
+		t.Fatal("premise: the leader's actor was not held")
+	}
 	const reads = 512
-	before := net.Stats().Passed
 	var wg sync.WaitGroup
 	errs := make(chan error, reads)
-	start := make(chan struct{})
 	for i := 0; i < reads; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			<-start
 			if _, err := readWithin(h.nodes[l], 10*time.Second); err != nil {
 				errs <- err
 			}
 		}()
 	}
-	close(start)
+	time.Sleep(40 * time.Millisecond) // every read is waiting for the actor (well inside an election timeout)
+	before := net.Stats().Passed
+	close(release)
 	wg.Wait()
 	close(errs)
 	for err := range errs {
 		t.Fatalf("a read on a healthy leader (role now %s): %v", h.nodes[l].Status().Role, err)
 	}
+	// Two cycles of 256 cost two rounds — 2 heartbeats and 2 acknowledgements
+	// each — plus the held write's and the ticks' traffic meanwhile. A cycle
+	// per few reads would cost hundreds.
 	sent := net.Stats().Passed - before
-	if sent >= reads {
-		t.Fatalf("%d reads cost %d messages; reads sharing rounds cost far fewer than one each", reads, sent)
+	if sent >= 64 {
+		t.Fatalf("%d reads queued together cost %d messages; taken %d per cycle they cost a few rounds", reads, sent, maxReadsPerCycle)
 	}
-	t.Logf("%d reads cost %d messages", reads, sent)
+	t.Logf("%d reads queued together cost %d messages", reads, sent)
 }

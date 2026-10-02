@@ -42,14 +42,19 @@ cd "$(dirname "$0")/.."
 # an as-yet-uncommitted copy of this script) do not affect revert safety.
 
 LOG="${TMPDIR:-/tmp}/mutation.$$.log"
-TOUCHED=()
-revert_all() {
-  local f
-  for f in "${TOUCHED[@]:-}"; do
-    [ -n "$f" ] && git checkout -- "$f" 2>/dev/null
-  done
+# CURRENT is the file a mutant has edited and not yet reverted: the only file
+# the exit trap may check out. (A list of every file any mutant touched made
+# the trap check out, at a normal exit, files reverted long before — losing
+# whatever a developer had edited in them during the run: a review of the
+# runner.)
+CURRENT=""
+revert_current() {
+  if [ -n "$CURRENT" ]; then
+    git checkout -- "$CURRENT" 2>/dev/null
+    CURRENT=""
+  fi
 }
-trap revert_all EXIT
+trap revert_current EXIT
 
 FAIL=0
 KILLED=0
@@ -82,22 +87,22 @@ mutant() {
     echo "⚠ $name: the pattern matches $sites sites in $file; only the first is mutated."
   fi
   # Only a file this mutant is about to edit — clean, so a checkout loses
-  # nothing — goes on the exit trap's revert list. (Recording it before the
-  # check above made the trap check out a refused, dirty file at exit,
-  # discarding its uncommitted changes: found in Phase 15.)
-  TOUCHED+=("$file")
+  # nothing — is the exit trap's to revert, until it is reverted. (Recording
+  # it before the check above made the trap check out a refused, dirty file
+  # at exit, discarding its uncommitted changes: found in Phase 15.)
+  CURRENT="$file"
 
   S="$search" R="$replace" perl -0pi -e 's/\Q$ENV{S}\E/$ENV{R}/' "$file"
   if git diff --quiet -- "$file"; then
     echo "✗ $name: PATTERN DID NOT MATCH in $file — cannot mutate (source changed?)."
     FAIL=$((FAIL + 1))
-    git checkout -- "$file" 2>/dev/null
+    revert_current
     return
   fi
 
   if [ -n "${DRY:-}" ]; then
     echo "· $name: pattern applies"
-    git checkout -- "$file" 2>/dev/null
+    revert_current
     return
   fi
 
@@ -119,7 +124,7 @@ mutant() {
     tail -n 5 "$LOG"
     FAIL=$((FAIL + 1))
   else
-    git checkout -- "$file" 2>/dev/null
+    revert_current
     # Real-process killers run on real timing; with CONFIRM=1, every killer.
     # A kill counts only if the same tests pass on the clean tree, so a
     # flaky failure can never pass for one (audit).
@@ -137,7 +142,7 @@ mutant() {
     fi
     KILLED=$((KILLED + 1))
   fi
-  git checkout -- "$file" 2>/dev/null
+  revert_current
 }
 
 echo "== Raft mutation testing =="
@@ -1662,6 +1667,8 @@ mutant "entry-too-large-is-invalid" internal/kv/server.go \
 #     a node's durable state is its own, locked, and never silently empty.
 
 # 180. -raft/-cluster run without a data directory (the old temporary default).
+#      Since nodedir also refuses an empty path, the start still fails; the
+#      kill is that the operator is no longer told which flag is missing.
 mutant "data-dir-required" cmd/dkvd/main.go \
   '	if (*raftMode || *cluster) && *dataDir == "" {' \
   '	if false && (*raftMode || *cluster) && *dataDir == "" {' \
@@ -1782,7 +1789,7 @@ mutant "accepter-checks-cluster" internal/transport/transport.go \
 		status = statusWrongCluster' \
   '	case false:
 		status = statusWrongCluster' \
-  ./internal/transport '^TestNodesOfAnotherClusterNeverConnect$'
+  ./internal/transport '^(TestNodesOfAnotherClusterNeverConnect|TestTheAccepterRefusesAnotherClusterOrSettings)$'
 
 # 198. The accepter refuses a dialer with other replica settings (audit H5).
 mutant "accepter-checks-settings" internal/transport/transport.go \
@@ -1790,7 +1797,7 @@ mutant "accepter-checks-settings" internal/transport/transport.go \
 		status = statusWrongSettings' \
   '	case false:
 		status = statusWrongSettings' \
-  ./internal/transport '^TestNodesWithOtherReplicaSettingsNeverConnect$'
+  ./internal/transport '^(TestNodesWithOtherReplicaSettingsNeverConnect|TestTheAccepterRefusesAnotherClusterOrSettings)$'
 
 # 199. The dialer refuses an answer from another node than the one it dialed.
 mutant "dialer-checks-who-answered" internal/transport/transport.go \
@@ -2492,6 +2499,28 @@ mutant "sync-after-a-failed-write-flushes" internal/storage/wal/wal.go \
 	}
 	if err := w.syncLocked(); err != nil {' \
   ./internal/storage/wal '^TestSyncAfterAFailedWriteFlushes$'
+
+# 294. The actor takes the reads waiting together, a cycle's worth at once:
+# taking a few per cycle costs a round each few (review of PR #10; the
+# killer holds the actor while the reads queue, so the count is exact).
+mutant "reads-taken-a-cycle-at-once" internal/raftnode/node.go \
+  '			for i := 1; i < maxReadsPerCycle; i++ {' \
+  '			for i := 1; i < 8; i++ {' \
+  ./internal/raftnode '^TestConcurrentReadsShareRounds$'
+
+# 295. A child's race report fails its integration test.
+mutant "race-report-fails-the-test" tests/integration/launch_test.go \
+  '				t.Errorf("%s reported a data race:\n%s", filepath.Base(cmd.Path), report)' \
+  '				_ = report' \
+  ./tests/integration '^TestARaceReportFailsItsTest$'
+
+# 296. The host refuses a negative tick at Start.
+mutant "host-refuses-a-negative-tick" internal/multiraft/host.go \
+  '	if cfg.TickInterval < 0 {
+		return nil, fmt.Errorf("multiraft: tick interval %s is negative", cfg.TickInterval)' \
+  '	if false {
+		return nil, fmt.Errorf("multiraft: tick interval %s is negative", cfg.TickInterval)' \
+  ./internal/multiraft '^TestHostRefusesANegativeTick$'
 
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"

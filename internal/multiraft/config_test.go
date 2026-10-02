@@ -1,6 +1,7 @@
 package multiraft
 
 import (
+	"context"
 	"reflect"
 	"testing"
 	"time"
@@ -42,5 +43,22 @@ func TestHostForwardsEveryNodeSetting(t *testing.T) {
 		if _, ok := v.Type().FieldByName(name); !ok {
 			t.Errorf("hostLeavesUnset names %s, which raftnode.Config no longer has", name)
 		}
+	}
+}
+
+// TestHostRefusesANegativeTick (audit M5): a negative tick is configuration
+// the host refuses at Start, before any group: every group's driver would
+// refuse it (a ticker panics on it), one by one, as a failed group.
+func TestHostRefusesANegativeTick(t *testing.T) {
+	tr, err := transport.NewTCPTransport(transport.Config{NodeID: "a", ListenAddr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	h, err := Start(context.Background(), Config{ID: "a", DataDir: t.TempDir(), Transport: tr, TickInterval: -time.Millisecond,
+		NewStateMachine: func(GroupID) raftnode.StateMachine { return &recSM{} }})
+	if err == nil {
+		_ = h.Close()
+		t.Fatal("the host accepted a negative tick interval")
 	}
 }

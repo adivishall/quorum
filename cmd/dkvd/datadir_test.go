@@ -162,15 +162,22 @@ func TestRunRequiresADataDirAndAPositiveTick(t *testing.T) {
 	}{
 		{[]string{"-raft"}, "require -data-dir"},
 		{[]string{"-cluster"}, "require -data-dir"},
-		{[]string{"-raft", "-data-dir", t.TempDir(), "-tick-interval", "0"}, "-tick-interval must be positive"},
-		{[]string{"-raft", "-data-dir", t.TempDir(), "-tick-interval", "-1ms"}, "-tick-interval must be positive"},
+		// With -init a start that passed the rule would run: the refusal is the
+		// tick rule's, not the data directory's.
+		{[]string{"-raft", "-data-dir", t.TempDir(), "-init", "-cluster-id", "c1", "-tick-interval", "0"}, "-tick-interval must be positive"},
+		{[]string{"-raft", "-data-dir", t.TempDir(), "-init", "-cluster-id", "c1", "-tick-interval", "-1ms"}, "-tick-interval must be positive"},
 		{[]string{"-tick-interval", "-5s"}, "-tick-interval must be positive"},
 		{[]string{"-init"}, "require -raft or -cluster"},
 		{[]string{"-cluster-id", "c1"}, "require -raft or -cluster"},
 		{[]string{"-raft", "-data-dir", t.TempDir(), "-init", "-cluster-id", "has space"}, "cluster id"},
 	} {
 		var out, errb bytes.Buffer
-		if code := run(context.Background(), append(append([]string(nil), base...), c.args...), &out, &errb); code != 2 {
+		// A start the rule failed to refuse runs until the deadline, then
+		// exits 0: caught as such, not as a different message.
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		code := run(ctx, append(append([]string(nil), base...), c.args...), &out, &errb)
+		cancel()
+		if code != 2 {
 			t.Fatalf("%v: exit code %d, want 2 (stderr %q)", c.args, code, errb.String())
 		}
 		if !strings.Contains(errb.String(), c.why) {
@@ -274,13 +281,18 @@ func TestReplicaSettingsArePinned(t *testing.T) {
 func TestRoutingFlagsBelongToClusterMode(t *testing.T) {
 	base := []string{"-id", "a", "-listen", "127.0.0.1:0"}
 	for _, extra := range [][]string{
-		{"-raft", "-data-dir", t.TempDir(), "-shards", "8"},
-		{"-raft", "-data-dir", t.TempDir(), "-rf", "1"},
-		{"-raft", "-data-dir", t.TempDir(), "-nodes", "a,b"},
+		// With -init a start that ignored the flag would run (until the
+		// deadline, then exit 0): the refusal is the routing rule's.
+		{"-raft", "-data-dir", t.TempDir(), "-init", "-cluster-id", "c1", "-shards", "8"},
+		{"-raft", "-data-dir", t.TempDir(), "-init", "-cluster-id", "c1", "-rf", "1"},
+		{"-raft", "-data-dir", t.TempDir(), "-init", "-cluster-id", "c1", "-nodes", "a,b"},
 		{"-nodes", "a"},
 	} {
 		var out, errb bytes.Buffer
-		if code := run(context.Background(), append(append([]string(nil), base...), extra...), &out, &errb); code != 2 || !strings.Contains(errb.String(), "applies to -cluster mode only") {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		code := run(ctx, append(append([]string(nil), base...), extra...), &out, &errb)
+		cancel()
+		if code != 2 || !strings.Contains(errb.String(), "applies to -cluster mode only") {
 			t.Fatalf("%v: exit %d, stderr %q", extra, code, errb.String())
 		}
 	}

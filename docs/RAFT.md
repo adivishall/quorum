@@ -336,7 +336,9 @@ including one that breaks only `dkvd`, which a real-process test builds itself a
 own failure. For real-process killers, whose timing is real,
 the same tests are re-run on the clean tree and the kill counts only if they pass there, so a flaky
 failure cannot pass for one; `CONFIRM=1` does this for every mutant. A pattern matching several
-sites is reported, since only the first is mutated. `DRY=1` checks every pattern still applies
+sites is reported, since only the first is mutated. The exit trap reverts only the file a mutant
+has edited and not yet reverted: it used to check out every file any mutant had touched, losing an
+edit a developer made to one of them during the run. `DRY=1` checks every pattern still applies
 without running tests — a whole-suite dry run after this branch's changes found six mutants whose
 code had moved, now re-targeted.
 
@@ -551,8 +553,8 @@ less per message and more often. Evidence: `TestLaggingFollowerCatchesUpInBudget
 `TestEntryBudgetBindsABacklogOfSmallEntries`, `TestAnEntryLargerThanTheByteBudgetIsSentAlone`,
 `TestReadsInOneCycleShareOneRound`, `TestAReadNeverJoinsARoundAlreadySent` (core);
 `TestFollowerBehindByMoreThanAFrameCatchesUp` (three real drivers: a follower 18 MB behind, snapshots
-off, catches up — before, never), `TestConcurrentReadsShareRounds` (512 concurrent reads cost 8–28
-messages); `TestBudgetedReplicationUnderFaults` (every simulator profile over three seeds with
+off, catches up — before, never), `TestConcurrentReadsShareRounds` (512 reads queued for a held actor cost 8 messages — two
+rounds; taken 8 per cycle they cost 260); `TestBudgetedReplicationUnderFaults` (every simulator profile over three seeds with
 budgets of 2 entries and 32 bytes: every invariant and linearizability hold, with tens of
 thousands of batches cut, under every fault the simulator injects); mutants 243–251, 267–269, 271–273.
 

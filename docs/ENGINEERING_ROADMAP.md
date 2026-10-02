@@ -63,7 +63,7 @@ Ranked by what a single input can do.
 | D5 | **Fixed** (each data directory pins its replica settings — the session limits, and in `-cluster` mode the routing — and refuses a start with others; the transport handshake carries their digest and nodes whose settings differ never connect; `-shards/-rf/-nodes` are refused outside `-cluster` mode; `docs/MULTI_RAFT.md` §5, `docs/TRANSPORT.md` §3, `TestRealImpostorsNeverJoinTheGroup`). **Replicated configuration is not validated across nodes.** Session limits must be identical on every replica (they decide `SESSION_LIMIT`/`EXPIRED` at apply), but nothing checks. Mismatched nodes decide differently before a snapshot, and refuse each other's snapshots after one. `-shards/-rf/-nodes` are unchecked, and silently ignored under `-raft`; `-id` need not be in `-nodes`. | `cmd/dkvd/main.go:85-86, 181-192`; `kv/snapshot.go:142` | From the code | High (replica divergence), configuration-triggered |
 | D6 | **Fixed** (the node fail-stops on an apply error; `docs/RAFT.md` §17). **A deterministic Apply error is logged and retried every cycle, forever,** instead of failing stop. | `raftnode/node.go` processReady; `crashpoint.go` ApplyCommitted | From the code | Medium |
 | D7 | **Fixed** (every accept loop logs and retries an error; the transport bounds pending handshakes, the client and admin ports their connections and deadlines; `docs/TRANSPORT.md` §8, `docs/API.md` §1, `docs/MULTI_RAFT.md` §7). **Accept loops (transport, client, admin) exit permanently on any error, EMFILE included, without logging. Client and admin connections have no deadlines and no cap.** | `transport.go:272`, `kv/wire.go:312, 326`, `multiraft/admin.go:131` | From the code | Medium |
-| D8 | **Fixed** (a non-positive tick is a startup error in `dkvd`, `raftnode` and `multiraft`). **`-tick-interval` is unvalidated.** 0 disables the idle-connection timeout while the driver silently uses 50 ms; a negative value panics the actor, and with it every group (there is no `recover`). | `cmd/dkvd/main.go:81, 137`; `raftnode/node.go` | From the code | Medium |
+| D8 | **Fixed** (a non-positive `-tick-interval` is a startup error in `dkvd`; a negative tick is refused by `raftnode` and `multiraft`, where zero means the default). **`-tick-interval` is unvalidated.** 0 disables the idle-connection timeout while the driver silently uses 50 ms; a negative value panics the actor, and with it every group (there is no `recover`). | `cmd/dkvd/main.go:81, 137`; `raftnode/node.go` | From the code | Medium |
 | D9 | **Fixed** (handshake version 2: answered, with the cluster id and settings digest; `docs/TRANSPORT.md` §3, mutants 197–213). **The transport's handshake version stayed 1 when Phase 15 added the group envelope,** so a pre-envelope peer passes the handshake and its frames are dropped as malformed. | `transport/handshake.go:16` | From the code (`git log -S`) | Low (no mixed deployments exist) |
 | D10 | **Fixed** (the WAL and MANIFEST writers latch a failed write; a flush syncs the WAL before its manifest edit; `docs/WAL.md`, `docs/MANIFEST.md` §5, mutants 256–265; open does not yet sync recovered WAL segments before a replay flush, `docs/WAL.md` §10). **Storage engine (standalone):** the WAL and MANIFEST writers do not latch a failed write, so the next append follows a partial record and recovery then refuses the store; a flush does not sync the WAL first, so a power loss in `batch` mode can leave tables ahead of the durable WAL, which open refuses. | `wal/wal.go:277`, `manifest.go:694`, `lsmstore.go:833` | From the code | Medium (engine only; blocks hosting it) |
 
@@ -166,6 +166,14 @@ Phase 19 row, and LIMITATIONS' status, metrics and measurement statements.
   - harness logic is duplicated: four ways to launch `dkvd`, four leader waits, three percentile
     definitions.
 
+  Status (the hardening branch): `dkvd` under the integration tests is race-built, and a race
+  report in its output fails the test (a SIGKILLed process never exits with the detector's
+  status, so its output is the evidence); every job has a timeout; the mutation runner confirms
+  real-process kills on the clean tree, attributes kills to a failing test, refuses a build
+  failure, and covers the storage engine. Still open: macOS in CI; the lab (`internal/lab`)
+  launches `dkvd` itself, outside the integration launcher, so its processes are neither
+  race-scanned nor guaranteed to die with a timed-out test binary.
+
 ### 1.9 Out of scope, deliberately
 
 Shard rebalancing and moving data between groups, cross-group transactions, TLS, authentication,
@@ -206,7 +214,8 @@ log and more configuration on top of exactly these paths, so they must hold firs
 ### 1. Input and replication bounds (D1, D2) — next
 
 - **Status:** D1 done — the entry budget is enforced at the front, at `raft.Propose`, in the
-  in-memory log, at `Step` and at `raftlog.Save` (`docs/RAFT.md` §16). D2 is open.
+  in-memory log, at `Step` and at `raftlog.Save` (`docs/RAFT.md` §16). D2 is mostly fixed (row
+  D2 above).
 
 - **Problem:** a request within the documented limits can disable a node; a replication message
   has no size bound.

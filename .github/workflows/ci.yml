@@ -15,10 +15,11 @@ defaults:
   run:
     shell: bash
 
-# A newer push to the same branch or pull request supersedes a run in progress.
+# A newer push to a pull request supersedes its run in progress; a push to a
+# branch (main) always gets a complete verdict.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Every job runs on a pinned runner image with the toolchain go.mod names, not
 # a moving image and the latest patch release, which shift under the
@@ -94,7 +95,8 @@ jobs:
       # crashed node replaced, a joint configuration through a leader SIGKILL,
       # two groups on the same processes with one broken, workloads across
       # changes checked for linearizability). No prebuilt binaries.
-      # The dkvd processes are race-built too (tests/integration/launch_test.go).
+      # The dkvd processes are race-built too, and a race one of them reports
+      # fails its test (tests/integration/launch_test.go).
       - name: integration tests (real processes, race detector)
         env:
           QUORUM_ARTIFACTS: ${{ github.workspace }}/artifacts

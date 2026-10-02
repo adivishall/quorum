@@ -590,3 +590,39 @@ func TestAnUnauthenticatedIDCannotForgeLogLines(t *testing.T) {
 		}
 	}
 }
+
+// TestTheAccepterRefusesAnotherClusterOrSettings: the accepter itself checks a
+// dialer's cluster and settings and answers the refusal's status — whatever
+// the dialer checked on its side (a dialer of another build, or a raw one,
+// checks nothing). The two-transport tests are refused by the dialer first.
+func TestTheAccepterRefusesAnotherClusterOrSettings(t *testing.T) {
+	b, err := NewTCPTransport(Config{NodeID: "b", ListenAddr: "127.0.0.1:0", Peers: map[NodeID]string{"a": "127.0.0.1:1"},
+		ClusterID: "prod", SettingsDigest: []byte{1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for _, tc := range []struct {
+		name string
+		h    hello
+		want byte
+	}{
+		{"another cluster", hello{id: "a", cluster: "staging", digest: []byte{1}}, statusWrongCluster},
+		{"other settings", hello{id: "a", cluster: "prod", digest: []byte{2}}, statusWrongSettings},
+		{"the same cluster and settings", hello{id: "a", cluster: "prod", digest: []byte{1}}, statusAccepted},
+	} {
+		nc, err := net.DialTimeout("tcp", b.LocalAddr().String(), 2*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = nc.SetDeadline(time.Now().Add(3 * time.Second))
+		if err := writeHandshake(nc, tc.h); err != nil {
+			t.Fatal(err)
+		}
+		status, _, err := readReply(nc)
+		_ = nc.Close()
+		if err != nil || status != tc.want {
+			t.Fatalf("%s: status %d, %v; want %d", tc.name, status, err, tc.want)
+		}
+	}
+}

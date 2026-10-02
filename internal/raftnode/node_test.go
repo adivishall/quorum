@@ -81,6 +81,13 @@ func startClusterWith(t *testing.T, ctx context.Context, n int, wrap func(transp
 // startClusterTick is startClusterWith with every node's tick interval.
 func startClusterTick(t *testing.T, ctx context.Context, n int, wrap func(transport.Transport) transport.Transport, tick time.Duration) *harness {
 	t.Helper()
+	return startClusterHooked(t, ctx, n, wrap, tick, nil)
+}
+
+// startClusterHooked is startClusterTick with each node's driver hook (nil:
+// none) made by hook from its id.
+func startClusterHooked(t *testing.T, ctx context.Context, n int, wrap func(transport.Transport) transport.Transport, tick time.Duration, hook func(NodeID) Hook) *harness {
+	t.Helper()
 	var ids []NodeID
 	addrs := map[NodeID]string{}
 	for i := 0; i < n; i++ {
@@ -105,10 +112,14 @@ func startClusterTick(t *testing.T, ctx context.Context, n int, wrap func(transp
 		h.trs[id] = tr
 		sm := &recSM{}
 		h.sms[id] = sm
+		var hk Hook
+		if hook != nil {
+			hk = hook(id)
+		}
 		node, err := Start(ctx, Config{
 			ID: id, Peers: ids, Transport: wrap(tr),
 			LogPath:      filepath.Join(h.dir, string(id)+".log"),
-			StateMachine: sm, TickInterval: tick, DisableSync: true,
+			StateMachine: sm, TickInterval: tick, DisableSync: true, Hook: hk,
 		})
 		if err != nil {
 			t.Fatalf("node %s: %v", id, err)
@@ -291,8 +302,16 @@ func TestGracefulRecovery(t *testing.T) {
 // take down every group of the process.
 func TestStartRefusesANegativeTick(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "n0.log")
-	_, err := Start(context.Background(), Config{ID: "n0", Peers: []NodeID{"n0"}, LogPath: path, StateMachine: &recSM{}, TickInterval: -time.Millisecond})
+	// A complete config, so a Start that let the tick through would reach the
+	// actor's ticker — the panic the rule prevents — not fail elsewhere.
+	tr, err := transport.NewTCPTransport(transport.Config{NodeID: "n0", ListenAddr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	n, err := Start(context.Background(), Config{ID: "n0", Peers: []NodeID{"n0"}, Transport: tr, LogPath: path, StateMachine: &recSM{}, TickInterval: -time.Millisecond})
 	if err == nil {
+		_ = n.Close()
 		t.Fatal("Start accepted a negative tick interval")
 	}
 	if _, found, _ := LoadIdentity(nil, path); found {
