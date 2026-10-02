@@ -41,6 +41,7 @@ cd "$(dirname "$0")/.."
 # checks its own target file is clean before editing (below). Untracked files (e.g.
 # an as-yet-uncommitted copy of this script) do not affect revert safety.
 
+LOG="${TMPDIR:-/tmp}/mutation.$$.log"
 TOUCHED=()
 revert_all() {
   local f
@@ -62,10 +63,23 @@ mutant() {
   fi
   TOTAL=$((TOTAL + 1))
 
+  # Revert safety rests on git: the target must be tracked (git diff is blind
+  # to an untracked file, so a mutation of one went unnoticed and was never
+  # reverted — audit) and clean (a checkout must lose nothing).
+  if ! git ls-files --error-unmatch -- "$file" >/dev/null 2>&1; then
+    echo "✗ $name: $file is not tracked by git; refusing to mutate (revert safety)."
+    FAIL=$((FAIL + 1))
+    return
+  fi
   if ! git diff --quiet -- "$file"; then
     echo "✗ $name: $file has uncommitted changes; refusing to mutate (revert safety)."
     FAIL=$((FAIL + 1))
     return
+  fi
+  local sites
+  sites=$(S="$search" perl -0ne '$n = () = /\Q$ENV{S}\E/g; print $n' "$file")
+  if [ "${sites:-0}" -gt 1 ]; then
+    echo "⚠ $name: the pattern matches $sites sites in $file; only the first is mutated."
   fi
   # Only a file this mutant is about to edit — clean, so a checkout loses
   # nothing — goes on the exit trap's revert list. (Recording it before the
@@ -88,15 +102,37 @@ mutant() {
   fi
 
   # shellcheck disable=SC2086 # $pkg is a deliberate word-split package list
-  if go test $pkg -run "$tests" -count=1 -timeout 300s >/tmp/mutation.$$.log 2>&1; then
+  if go test $pkg -run "$tests" -count=1 -timeout 300s >"$LOG" 2>&1; then
     echo "✗ $name: SURVIVED — killer tests [$tests] still PASSED with the rule broken."
     FAIL=$((FAIL + 1))
-  elif grep -qE '\[build failed\]|\[setup failed\]' /tmp/mutation.$$.log; then
+  elif grep -qE '\[build failed\]|\[setup failed\]' "$LOG"; then
     echo "✗ $name: the mutant does not compile — that is not a kill."
-    grep -m 3 -E '\.go:[0-9]+' /tmp/mutation.$$.log
+    grep -m 3 -E '\.go:[0-9]+' "$LOG"
+    FAIL=$((FAIL + 1))
+  elif ! grep -qE -- '--- FAIL: |^panic: |^fatal error: ' "$LOG"; then
+    # Attribution (audit): a kill is a failing test — a test's FAIL, or the
+    # binary dying in one (a panic, a timeout). A run that failed without
+    # either failed somewhere else.
+    echo "✗ $name: the run failed without a failing test — not attributable to the mutant."
+    tail -n 5 "$LOG"
     FAIL=$((FAIL + 1))
   else
-    echo "✓ $name: killed by [$tests]."
+    git checkout -- "$file" 2>/dev/null
+    # Real-process killers run on real timing; with CONFIRM=1, every killer.
+    # A kill counts only if the same tests pass on the clean tree, so a
+    # flaky failure can never pass for one (audit).
+    if [ -n "${CONFIRM:-}" ] || [[ "$pkg" == *tests/integration* ]]; then
+      # shellcheck disable=SC2086
+      if ! go test $pkg -run "$tests" -count=1 -timeout 300s >"$LOG.clean" 2>&1; then
+        echo "✗ $name: [$tests] fail on the clean tree too — a flaky or broken test is not a kill."
+        tail -n 5 "$LOG.clean"
+        FAIL=$((FAIL + 1))
+        return
+      fi
+      echo "✓ $name: killed by [$tests] (they pass on the clean tree)."
+    else
+      echo "✓ $name: killed by [$tests]."
+    fi
     KILLED=$((KILLED + 1))
   fi
   git checkout -- "$file" 2>/dev/null
@@ -316,12 +352,12 @@ mutant "dialer-backs-off-after-dead-conn" internal/transport/transport.go \
 # 24. Ignore the read idle deadline, so a silent (established-but-dead) connection
 #     blocks the reader forever and the peer is never reconnected (Phase 10, bug 6).
 mutant "read-idle-timeout-detects-dead-conn" internal/transport/transport.go \
-  '		if t.cfg.ReadIdleTimeout > 0 {
-			_ = c.nc.SetReadDeadline(time.Now().Add(t.cfg.ReadIdleTimeout))
-		}' \
-  '		if false {
-			_ = c.nc.SetReadDeadline(time.Time{})
-		}' \
+  '	if t.cfg.ReadIdleTimeout > 0 {
+		r = idleReader{c.nc, t.cfg.ReadIdleTimeout}
+	}' \
+  '	if false {
+		r = idleReader{c.nc, t.cfg.ReadIdleTimeout}
+	}' \
   ./internal/transport 'TestReaderIdleTimeoutReconnectsASilentConnection'
 
 # --- Phase 11: crash-recovery rules (docs/CRASH_RECOVERY.md §10) ---
@@ -460,8 +496,8 @@ mutant "readindex-at-least-the-noop" internal/raft/raft.go \
 # 36. Acknowledgements of a heartbeat sent BEFORE the read confirm it (a stale
 #     ReadIndex response accepted): a deposed leader serves its old state.
 mutant "readindex-ignores-acks-sent-before-the-read" internal/raft/raft.go \
-  'seq: r.hbSeq + 1})' \
   'seq: r.hbSeq})' \
+  'seq: r.hbSeq - 1})' \
   "./internal/raft ./internal/raftsim" 'TestAcksFromBeforeTheReadDoNotConfirmIt|TestKVStaleLeaderReadIsNeverServed'
 
 # 37. A ReadIndex confirmed without a quorum (the leader alone suffices).
@@ -607,8 +643,8 @@ mutant "readindex-needs-a-quorum (simulated history)" internal/raft/raft.go \
 # 56. Pre-read acknowledgements confirm the read: the simulated stale leader
 #     serves its old value once the delayed acks arrive.
 mutant "readindex-ignores-acks-sent-before-the-read (simulated history)" internal/raft/raft.go \
-  'seq: r.hbSeq + 1})' \
   'seq: r.hbSeq})' \
+  'seq: r.hbSeq - 1})' \
   ./internal/raftsim 'TestKVStaleLeaderReadIsNeverServed'
 
 # 57. No no-op rule: the new leader serves below its predecessor's last commit.
@@ -758,8 +794,8 @@ mutant "dkvd-applies-the-configured-session-limits" cmd/dkvd/main.go \
 #     above its RequestID is proposed, and every replica refuses the entry at
 #     apply as malformed.
 mutant "requests-are-validated-before-they-are-proposed" internal/kv/api.go \
-  '	if r.RequestID == 0 || r.AckedBelow == 0 || r.AckedBelow > r.RequestID {' \
-  '	if r.RequestID == 0 || r.AckedBelow == 0 {' \
+  '	} else if r.RequestID == 0 || r.AckedBelow == 0 || r.AckedBelow > r.RequestID {' \
+  '	} else if r.RequestID == 0 || r.AckedBelow == 0 {' \
   ./internal/kv 'TestRequestValidationRejectsEveryOutOfContractField|TestValidatedRequestsAlwaysApply'
 
 # 88. A duplicate is answered with its OWN entry's index instead of the
@@ -1474,7 +1510,7 @@ mutant "series-keys-are-unambiguous" internal/metrics/metrics.go \
 
 # 161. The front answers a request without counting it.
 mutant "the-front-counts-every-answer" internal/kv/front.go \
-  '	m.request(req, resp, start)' \
+  '	m.request(req, resp, start, f.Server(req.Group) != nil)' \
   '	_ = start' \
   ./internal/kv 'TestKVMetricsMatchTheResponses'
 
@@ -1716,8 +1752,8 @@ mutant "replica-settings-pinned" internal/nodedir/nodedir.go \
 
 # 193. dkvd does not hand its settings to the data directory.
 mutant "dkvd-pins-its-settings" cmd/dkvd/main.go \
-  'Init: r.init, Settings: r.settings})' \
-  'Init: r.init, Settings: ""})' \
+  'Init: init, Settings: settings})' \
+  'Init: init, Settings: ""})' \
   ./cmd/dkvd '^TestReplicaSettingsArePinned$'
 
 # 194. Routing flags outside -cluster mode are silently ignored again.
@@ -2119,8 +2155,49 @@ mutant "driver-batches-reads" internal/raftnode/node.go \
   '			for i := 1; i < 1; i++ {' \
   ./internal/raftnode '^TestConcurrentReadsShareRounds$'
 
+# 252. One vote per term: a voter refuses a second candidate in its term — the
+#      check that once skipped itself on every run (audit H.1).
+mutant "restarted-voter-refuses-same-term" internal/raft/raft.go \
+  '	if (r.votedFor == "" || r.votedFor == m.From) && r.candidateUpToDate(m.LastLogIndex, m.LastLogTerm) {' \
+  '	if r.candidateUpToDate(m.LastLogIndex, m.LastLogTerm) {' \
+  ./internal/raftsim '^TestVoterCrashAroundPersistingItsVote$'
+
+# 253–255. The second and third sites of two durability rules (the patterns of
+#      fsync-before-reply and durability-failure-latches match several sites
+#      and mutate only the first, Save's — audit): Install fsyncs its boundary
+#      before reporting it, and Install and Compact refuse to run on a failed
+#      log.
+mutant "install-fsyncs-its-boundary" internal/raftlog/raftlog.go \
+  '	if l.sync {
+		if err := l.f.Sync(); err != nil {
+			return l.fail(err)
+		}
+	}
+	l.boundary = Boundary{index, term}' \
+  '	if false && l.sync {
+		if err := l.f.Sync(); err != nil {
+			return l.fail(err)
+		}
+	}
+	l.boundary = Boundary{index, term}' \
+  ./internal/raftlog '^(TestInstallSurvivesEveryCrash|TestInstallIsDurableWhenItReturns)$'
+
+mutant "install-refuses-a-failed-log" internal/raftlog/raftlog.go \
+  'func (l *Log) Install(index, term uint64) error {
+	if l.failed != nil {' \
+  'func (l *Log) Install(index, term uint64) error {
+	if false && l.failed != nil {' \
+  ./internal/raftlog '^TestAFailedLogRefusesInstallAndCompact$'
+
+mutant "compact-refuses-a-failed-log" internal/raftlog/raftlog.go \
+  'func (l *Log) Compact(index, term uint64) error {
+	if l.failed != nil {' \
+  'func (l *Log) Compact(index, term uint64) error {
+	if false && l.failed != nil {' \
+  ./internal/raftlog '^TestAFailedLogRefusesInstallAndCompact$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
-rm -f /tmp/mutation.$$.log
+rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then
   echo "MUTATION TESTING FAILED: no mutant matched ONLY=${ONLY:-}; nothing was tested." >&2
   exit 1

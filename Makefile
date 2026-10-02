@@ -35,7 +35,10 @@ integration:
 ## forwarding and the session client, Phase 14 snapshots and log compaction,
 ## Phase 15 membership and multi-Raft, Phase 16 observability, the load generator, the lab;
 ## ONLY='a|b' runs the mutants whose names match the regex alone, and fails if none does).
-## DRY=1 checks every mutant still applies without running tests. Applies deliberate rule-violating edits to the source,
+## DRY=1 checks every mutant still applies without running tests; CONFIRM=1 re-runs every
+## killer on the clean tree and counts a kill only if it passes there (always done for
+## real-process killers). A kill must be a failing test; a target must be tracked by git.
+## Applies deliberate rule-violating edits to the source,
 ## runs the tests that must catch each, and requires every mutant to be killed
 ## (edits are reverted via git). Needs a clean working tree for the files it
 ## mutates. See docs/RAFT.md §12a and docs/FAULTS.md.
