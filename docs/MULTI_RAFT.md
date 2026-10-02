@@ -52,7 +52,17 @@ The host owns only what is per process:
   removal (`docs/MEMBERSHIP.md` §7) is **retired** — stopped, files kept (`event=group_retired`,
   `TestRemovedLeaderRetiresItsGroup`). Nothing is ever deleted automatically. A group directory is
   created durably: each new directory's parent is fsynced, so a group can never vanish from a
-  node that held its state;
+  node that held its state. **Starts and stops of one group never overlap** (audit H3): a start
+  reserves the group before it touches its files and holds it until the group is registered and
+  announced (`OnGroup`); a stop moves it out of the registry into the reservation and holds it until
+  its node is closed. Meanwhile any other `Create`, `Open` or `Stop` of that group — an admin
+  operation, or a retirement — is refused with `ErrGroupBusy` (the admin answers it as an error, to
+  retry), so a group never has two drivers on its log, and the front's attach and detach of a group
+  strictly alternate. `Close` waits for transitions in flight. A first start that fails before
+  recording anything removes the empty group directory it made
+  (`TestAStartingGroupCannotBeStartedOrStoppedAgain`, `TestAStoppingGroupCannotBeStartedUntilItsNodeIsClosed`,
+  `TestConcurrentLifecycleOperations` under `-race`, `TestAFailedFirstStartLeavesNoDirectory`;
+  mutants 189–191);
 - **the demultiplexer** (§4);
 - **the transport's peer set** — the members with addresses of every hosted group's current
   configuration, plus the static peers (`-peers`), kept in step as configurations change
