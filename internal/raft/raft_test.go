@@ -115,7 +115,7 @@ func TestCoreDeterminism(t *testing.T) {
 		}
 		return b.String()
 	}
-	if trace() != trace() {
+	if first, second := trace(), trace(); first != second {
 		t.Fatal("core is not deterministic under identical seed and inputs")
 	}
 }

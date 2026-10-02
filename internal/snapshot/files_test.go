@@ -262,7 +262,7 @@ func TestSplitSizeReassembles(t *testing.T) {
 	file := mustEncode(t, meta(9, 2), bytes.Repeat([]byte("z"), 1000))
 	for _, size := range []int{-5, 0, 1, 7, 64, 999, len(file), MaxChunk, MaxChunk + 1} {
 		chunks := SplitSize(3, meta(9, 2), file, size)
-		want := len(file)
+		var want int
 		if size >= 1 && size < len(file) {
 			want = (len(file) + size - 1) / size
 		} else if size < 1 {

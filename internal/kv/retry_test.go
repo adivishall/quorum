@@ -208,12 +208,12 @@ func TestRetryAtEveryCrashPointOfAWrite(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
 				c := startClusterWith(t, ctx, 3, false, kv.Limits{})
-				l := c.waitLeader(0, 10*time.Second)
+				c.waitLeader(0, 10*time.Second)
 				s := register(t, c, kv.SessionOptions{AttemptTimeout: 2 * time.Second, MaxAttempts: 20, Backoff: 20 * time.Millisecond})
 				if o := s.Put(ctx, []byte("k"), []byte("old"), nil); o.Err != nil {
 					t.Fatal(o.Err)
 				}
-				l = c.waitLeader(0, 10*time.Second)
+				l := c.waitLeader(0, 10*time.Second)
 				t1 := c.node(l).Status().Term
 				idx := c.quiesce(l) + 1
 				c.premise(c.ledThroughout(l, t1), "%s was deposed during setup", l)
