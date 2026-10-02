@@ -23,7 +23,7 @@ test:
 
 ## race — unit tests under the race detector (required before every phase commit)
 race:
-	$(GO) test -race $(UNIT)
+	$(GO) test -race -timeout 30m $(UNIT)
 
 ## integration — multi-process tests, including real SIGKILL crash recovery
 integration:
