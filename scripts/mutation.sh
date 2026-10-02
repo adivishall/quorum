@@ -1620,6 +1620,66 @@ mutant "entry-too-large-is-invalid" internal/kv/server.go \
   '	case false && errors.Is(err, raft.ErrEntryTooLarge):' \
   ./internal/kv '^TestEntryTooLargeFromBelowIsInvalid$'
 
+# --- The data directory (audit H1, M5; internal/nodedir, docs/MULTI_RAFT.md §5):
+#     a node's durable state is its own, locked, and never silently empty.
+
+# 180. -raft/-cluster run without a data directory (the old temporary default).
+mutant "data-dir-required" cmd/dkvd/main.go \
+  '	if (*raftMode || *cluster) && *dataDir == "" {' \
+  '	if false && (*raftMode || *cluster) && *dataDir == "" {' \
+  ./cmd/dkvd '^TestRunRequiresADataDirAndAPositiveTick$'
+
+# 181. A zero tick is accepted (the idle timeout disabled, the driver's
+#      default silently used).
+mutant "tick-must-be-positive" cmd/dkvd/main.go \
+  '	if *tickIvl <= 0 {' \
+  '	if *tickIvl < 0 {' \
+  ./cmd/dkvd '^TestRunRequiresADataDirAndAPositiveTick$'
+
+# 182. A negative tick reaches the actor's time.NewTicker.
+mutant "raftnode-negative-tick" internal/raftnode/node.go \
+  '	if cfg.TickInterval < 0 {' \
+  '	if false && cfg.TickInterval < 0 {' \
+  ./internal/raftnode '^TestStartRefusesANegativeTick$'
+
+# 183. An empty data directory starts as a new node without -init: a wiped
+#      member restarts empty under its old id.
+mutant "data-dir-needs-init" internal/nodedir/nodedir.go \
+  '	case !legacy && !opts.Init:' \
+  '	case false:' \
+  ./internal/nodedir '^TestFreshDirectoryNeedsInit$'
+
+# 184. A data directory recorded for another node is accepted.
+mutant "data-dir-belongs-to-its-node" internal/nodedir/nodedir.go \
+  '		case id.Node != opts.Node:' \
+  '		case false:' \
+  ./internal/nodedir '^TestIdentityMismatchIsRefused$'
+
+# 185. -init re-initializes an initialized directory (so it could live in a
+#      unit file, and a wiped directory would be re-initialized silently).
+mutant "data-dir-init-once" internal/nodedir/nodedir.go \
+  '		case id.Initialized && opts.Init:' \
+  '		case false:' \
+  ./internal/nodedir '^TestInitializationLifecycle$'
+
+# 186. Two processes share a data directory (a shared lock excludes nothing).
+mutant "data-dir-exclusive-lock" internal/nodedir/lock_unix.go \
+  'syscall.LOCK_EX|syscall.LOCK_NB' \
+  'syscall.LOCK_SH|syscall.LOCK_NB' \
+  ./internal/nodedir '^TestDataDirectoryIsLocked$'
+
+# 187. A group's state recorded for another node is run by this one.
+mutant "group-identity-names-its-node" internal/raftnode/node.go \
+  '		if id.Node != "" && id.Node != c.ID {' \
+  '		if false {' \
+  ./internal/raftnode '^TestIdentityFileNamesItsNode$'
+
+# 188. An initialized directory whose group state is gone creates it empty.
+mutant "genesis-only-while-initializing" cmd/dkvd/main.go \
+  '		if !nd.Initializing() {' \
+  '		if false {' \
+  ./cmd/dkvd '^TestDataDirectoryRules$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
 if [ "$TOTAL" -eq 0 ]; then
