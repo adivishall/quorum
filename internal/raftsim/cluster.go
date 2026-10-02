@@ -53,6 +53,11 @@ type Config struct {
 	// GenesisIDs, if set, names the genesis voters explicitly instead (the
 	// multi-group simulator: each group's are its shard's replica group).
 	GenesisIDs []NodeID
+	// MaxEntriesPerMsg and MaxSizePerMsg are every node's AppendEntries
+	// budgets (raftnode.Config; zero: the core's defaults). Tiny ones make
+	// every backlog travel in batches, each acknowledged batch sending the
+	// next (audit H4).
+	MaxEntriesPerMsg, MaxSizePerMsg int
 }
 
 func (c Config) chunkSize() int {
@@ -121,6 +126,9 @@ type Stats struct {
 	// The committed configuration entries by kind: a learner added or
 	// removed, a joint configuration, a final one.
 	LearnerCommits, JointCommits, FinalCommits int
+	// Audit H4: AppendEntries that carried exactly MaxEntriesPerMsg entries —
+	// a backlog the budget cut into batches.
+	FullBatches int
 }
 
 // flight is a message in the network. A snapshot travels as chunk flights
@@ -415,6 +423,7 @@ func (c *Cluster) boot(n *node) error {
 		ElectionTicks: c.cfg.ElectionTicks, HeartbeatTicks: c.cfg.HeartbeatTicks,
 		StateMachine:  &snapSM{c: c, n: n},
 		SnapshotEvery: c.cfg.SnapshotEvery, SnapshotRetain: c.cfg.SnapshotRetain,
+		MaxEntriesPerMsg: c.cfg.MaxEntriesPerMsg, MaxSizePerMsg: c.cfg.MaxSizePerMsg,
 	})
 	if err != nil {
 		n.inc--
