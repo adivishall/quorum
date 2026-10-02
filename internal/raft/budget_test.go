@@ -174,3 +174,27 @@ func TestAReadNeverJoinsARoundAlreadySent(t *testing.T) {
 		t.Fatalf("after its own round: %d reads confirmed, want 2", got)
 	}
 }
+
+// TestEntryBudgetBindsABacklogOfSmallEntries: when entries are small the
+// count budget, not the byte budget, cuts the backlog — a message never
+// carries more than MaxEntriesPerMsg entries (the decoder refuses more than
+// MaxEntriesPerMessage, whatever their size).
+func TestEntryBudgetBindsABacklogOfSmallEntries(t *testing.T) {
+	nw := newNetwork(t, ids(3), 904)
+	nw.electLeader("a")
+	a := nw.nodes["a"]
+	a.maxEntriesPerMsg = 8 // the byte budget stays 1 MiB: never reached here
+	nw.isolate("c")
+	nw.blocked[linkKey("a", "b")], nw.blocked[linkKey("b", "a")] = false, false
+	for i := 0; i < 200; i++ {
+		nw.propose("a", "small")
+	}
+	appends := catchUp(t, nw, "a", 8, DefaultMaxSizePerMsg)
+	if c := nw.nodes["c"]; c.LastIndex() != a.LastIndex() {
+		t.Fatalf("c reached %d of %d", c.LastIndex(), a.LastIndex())
+	}
+	if appends < 200/8 {
+		t.Fatalf("200 entries took %d messages; at 8 per message at least %d", appends, 200/8)
+	}
+	nw.assertLogMatching()
+}
