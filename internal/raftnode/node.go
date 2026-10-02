@@ -413,6 +413,7 @@ type Node struct {
 	proposeCh chan proposal
 	writeCh   chan writeReq
 	readCh    chan readReq
+	abandonCh chan abandoned // requests whose clients gave up (audit M3)
 	confCh    chan confReq
 	snapCh    chan chan error
 	outboxes  map[NodeID]*outbox // actor-owned; one per peer it has sent to
@@ -508,9 +509,32 @@ type readReq struct {
 }
 
 type readAccepted struct {
+	id   uint64 // the core's read id
 	done <-chan Outcome
 	err  error
 }
+
+// abandoned is a request whose client stopped waiting (its context ended)
+// after the actor accepted it: a write's waiter at index, or an unconfirmed
+// read. The actor forgets it, so a client that gives up leaves nothing behind
+// (audit M3). Nothing is decided by it: the write's entry, if it commits, is
+// applied as before, and the outcome stays unknown to that client.
+type abandoned struct {
+	index  uint64 // a write's index (readID 0)
+	readID uint64 // a read's id
+	ch     <-chan Outcome
+	// A client that gave up after the actor took its request but before it
+	// read the acceptance hands over the acceptance channel instead: the
+	// actor answered it in the same event it took the request, so by the
+	// time the actor reads this notice the acceptance is there.
+	write chan writeAccepted
+	read  chan readAccepted
+}
+
+// abandonBuffer is how many abandoned requests may await the actor. A full
+// buffer drops the notice: the waiter is then released as before, when its
+// index is applied, and the core's bounds still hold.
+const abandonBuffer = 256
 
 // Status is one consistent snapshot of a node's Raft state, taken by the actor
 // after it finished processing an event.
@@ -576,6 +600,7 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		proposeCh: make(chan proposal),
 		writeCh:   make(chan writeReq),
 		readCh:    make(chan readReq),
+		abandonCh: make(chan abandoned, abandonBuffer),
 		confCh:    make(chan confReq),
 		snapCh:    make(chan chan error),
 		outboxes:  map[NodeID]*outbox{},
@@ -654,12 +679,15 @@ func (n *Node) Propose(ctx context.Context, data []byte) error {
 //     appended. The client should retry at the leader (LeaderID). Definite.
 //   - raft.ErrEntryTooLarge: data exceeds raft.MaxEntryDataLen; nothing was
 //     appended, on any node. Definite, and retrying cannot help.
+//   - raft.ErrBusy: the leader's uncommitted tail is at its bound (it is
+//     probably cut off from a quorum); nothing was appended. Definite.
 //   - ErrLost: the entry was appended but a DIFFERENT entry was committed at its
 //     index (this node lost leadership first). The write had no effect. Definite.
 //   - ctx.Err(): the outcome is UNKNOWN — the entry may still commit and apply.
 //     A client must treat it exactly as a timeout (docs/CONSISTENCY.md C4).
-//   - raft.ErrStopped, or a persistence failure: the node stopped. If the
-//     proposal had been accepted the outcome is likewise unknown.
+//   - raft.ErrStopped, or a persistence or state-machine failure (ErrApply):
+//     the node stopped. If the proposal had been accepted the outcome is
+//     likewise unknown.
 func (n *Node) Write(ctx context.Context, data []byte) (index, term uint64, result any, err error) {
 	req := writeReq{data: append([]byte(nil), data...), result: make(chan writeAccepted, 1)}
 	select {
@@ -675,6 +703,7 @@ func (n *Node) Write(ctx context.Context, data []byte) (index, term uint64, resu
 	case <-n.ctx.Done():
 		return 0, 0, nil, raft.ErrStopped
 	case <-ctx.Done():
+		n.abandon(abandoned{write: req.result})
 		return 0, 0, nil, ctx.Err()
 	}
 	if acc.err != nil {
@@ -684,7 +713,45 @@ func (n *Node) Write(ctx context.Context, data []byte) (index, term uint64, resu
 	case out := <-acc.done:
 		return acc.index, acc.term, out.Result, out.Err
 	case <-ctx.Done():
+		n.abandon(abandoned{index: acc.index, ch: acc.done})
 		return acc.index, acc.term, nil, ctx.Err()
+	}
+}
+
+// forget drops what the actor holds for an abandoned request. A read is
+// forgotten only while unconfirmed (the core drops it when it is confirmed or
+// its term ends); once confirmed it is a barrier, released as soon as its
+// index is applied.
+func (n *Node) forget(a abandoned) {
+	switch {
+	case a.write != nil:
+		select {
+		case acc := <-a.write:
+			if acc.err == nil {
+				n.waiters.Cancel(acc.index, acc.done)
+			}
+		default:
+		}
+	case a.read != nil:
+		select {
+		case acc := <-a.read:
+			if acc.err == nil {
+				n.reads.Cancel(acc.id)
+			}
+		default:
+		}
+	case a.readID != 0:
+		n.reads.Cancel(a.readID)
+	default:
+		n.waiters.Cancel(a.index, a.ch)
+	}
+}
+
+// abandon tells the actor a client stopped waiting, without ever blocking it.
+func (n *Node) abandon(a abandoned) {
+	select {
+	case n.abandonCh <- a:
+	default:
 	}
 }
 
@@ -694,8 +761,9 @@ func (n *Node) Write(ctx context.Context, data []byte) (index, term uint64, resu
 // after the read was registered, and the state machine has applied through it.
 // The returned index is that read index. Errors: raft.ErrNotLeader (this node is
 // not the leader, or stopped leading before the read was confirmed — retry at
-// the leader; a read has no effect either way), ctx.Err() (give up; no effect),
-// raft.ErrStopped.
+// the leader; a read has no effect either way), raft.ErrBusy (the leader has
+// its bound of reads awaiting confirmation; retry later), ctx.Err() (give up;
+// no effect), raft.ErrStopped.
 func (n *Node) ReadIndex(ctx context.Context) (uint64, error) {
 	req := readReq{result: make(chan readAccepted, 1)}
 	select {
@@ -711,6 +779,7 @@ func (n *Node) ReadIndex(ctx context.Context) (uint64, error) {
 	case <-n.ctx.Done():
 		return 0, raft.ErrStopped
 	case <-ctx.Done():
+		n.abandon(abandoned{read: req.result})
 		return 0, ctx.Err()
 	}
 	if acc.err != nil {
@@ -720,6 +789,7 @@ func (n *Node) ReadIndex(ctx context.Context) (uint64, error) {
 	case out := <-acc.done:
 		return out.Index, out.Err
 	case <-ctx.Done():
+		n.abandon(abandoned{readID: acc.id, ch: acc.done})
 		return 0, ctx.Err()
 	}
 }
@@ -836,8 +906,10 @@ func (n *Node) actorLoop() {
 			if err != nil {
 				r.result <- readAccepted{err: err}
 			} else {
-				r.result <- readAccepted{done: n.reads.Add(rs.ID, n.core.Term())}
+				r.result <- readAccepted{id: rs.ID, done: n.reads.Add(rs.ID, n.core.Term())}
 			}
+		case a := <-n.abandonCh:
+			n.forget(a)
 		case c := <-n.confCh:
 			if err := n.core.ProposeConfChange(c.cc); err != nil {
 				n.m.confChange(c.cc.Type, "refused")
@@ -889,8 +961,13 @@ func (n *Node) actorLoop() {
 // (fsync), then hand messages to the outboxes (DrainReadyAt) — then applies
 // committed entries (ApplyCommitted) and publishes a status snapshot. A persistence
 // failure is returned before anything of that Ready is sent or applied; so is a
-// crash-point abort (Config.Hook). A state-machine failure is logged and left for
-// the next cycle: appliedIndex does not advance past it, and the node keeps running.
+// crash-point abort (Config.Hook). So is a state-machine failure (ErrApply), and
+// the node fail-stops on it as on a persistence failure (audit M4): a committed
+// entry is the same on every replica, so a state machine that refuses it refuses
+// it on every replica and every retry — retrying each cycle stalled the group
+// forever behind it while its leader went on accepting writes it could never
+// apply. appliedIndex never advances past the refused entry, and the entries
+// applied before it in the cycle still complete their waiters.
 func (n *Node) processReady() error {
 	defer n.dur.Snap.Unstage() // a staged snapshot lives for one cycle at most
 	// Writes applied in this cycle complete when it ends — after the Status
@@ -904,10 +981,7 @@ func (n *Node) processReady() error {
 	}
 	n.trackCommitted()
 	if err := ApplyCommitted(n.core, n.sm, n.cfg.Hook, n.applied); err != nil {
-		if !errors.Is(err, ErrApply) {
-			return err // a crash point fired
-		}
-		n.logf("event=raft_apply_failed node=%s group=%d err=%v", n.cfg.ID, n.cfg.Group, err)
+		return err // ErrApply, or a crash point fired
 	}
 	n.trackApplied()
 	// Phase 14: snapshot and compact when the trigger says so. A state too
@@ -967,16 +1041,21 @@ func (n *Node) completeApplied() {
 	n.completed = n.completed[:0]
 }
 
-// fail records a persistence failure and stops every goroutine of the node. The
-// actor has already sent nothing of the failed Ready and will not run again; the
-// durable log refuses further writes on its own (raftlog's latch).
+// fail records a persistence or state-machine failure and stops every
+// goroutine of the node. The actor has already sent nothing of the failed Ready
+// and will not run again; the durable log refuses further writes on its own
+// (raftlog's latch).
 func (n *Node) fail(err error) {
 	n.mu.Lock()
 	if n.err == nil {
 		n.err = err
 	}
 	n.mu.Unlock()
-	n.logf("event=raft_persist_failed node=%s group=%d err=%v", n.cfg.ID, n.cfg.Group, err)
+	event := "raft_persist_failed"
+	if errors.Is(err, ErrApply) {
+		event = "raft_apply_failed"
+	}
+	n.logf("event=%s node=%s group=%d err=%v", event, n.cfg.ID, n.cfg.Group, err)
 	n.waiters.FailAll(err)
 	n.reads.FailAll(err)
 	n.cancel()

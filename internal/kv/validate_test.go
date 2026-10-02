@@ -296,3 +296,16 @@ func TestEntryTooLargeFromBelowIsInvalid(t *testing.T) {
 		t.Fatalf("a proposal refused as too large is answered %v, want %v", resp.Status, StatusInvalid)
 	}
 }
+
+// TestBusyFromBelowIsUnavailable (audit M3): a leader at its bound of
+// uncommitted entries or pending reads refuses with raft.ErrBusy before
+// appending or registering anything — a definite no-effect, answered
+// UNAVAILABLE, never the UNKNOWN that would make a client treat it as
+// possibly executed.
+func TestBusyFromBelowIsUnavailable(t *testing.T) {
+	s := &Server{id: "n1"}
+	resp := s.failed(Response{Node: "n1"}, fmt.Errorf("propose: %w", raft.ErrBusy))
+	if resp.Status != StatusUnavailable {
+		t.Fatalf("a request refused as busy is answered %v, want %v", resp.Status, StatusUnavailable)
+	}
+}

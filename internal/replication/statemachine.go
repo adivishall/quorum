@@ -13,7 +13,12 @@ package replication
 // linearizable reads, forwarding — are Phases 13+, not here.
 //
 // A correct driver applies committed entries exactly once, in index order, and
-// advances the log's AppliedIndex only after Apply returns nil. Phase 8's tests
+// advances the log's AppliedIndex only after Apply returns nil.
+//
+// Apply either applies command completely or returns an error with no effect
+// at all. An error means the entry can never be applied — a committed entry is
+// the same on every replica — and the driver (internal/raftnode) stops the
+// node on it rather than retrying (docs/RAFT.md §17). Phase 8's tests
 // drive a trivial in-test StateMachine to show the seam composes; that is the
 // extent of what this phase builds on top of it.
 type StateMachine interface {

@@ -186,6 +186,10 @@ func (s *Server) failed(resp Response, err error) Response {
 		// Refused by Propose before anything was appended: definite. The front
 		// refuses such a request first; this is the layer below agreeing.
 		resp.Status = StatusInvalid
+	case errors.Is(err, raft.ErrBusy):
+		// The leader is at its bound of uncommitted entries or pending reads
+		// (audit M3): nothing was appended or registered. Definite.
+		resp.Status = StatusUnavailable
 	default:
 		resp.Status = StatusUnknown
 	}
