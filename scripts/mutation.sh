@@ -2405,7 +2405,7 @@ mutant "flag-only-refusal-records-nothing" cmd/dkvd/main.go \
 mutant "unfinished-init-without-groups-repins" internal/nodedir/nodedir.go \
   '		if !legacy {
 			id.Settings = opts.Settings' \
-  '		if false {
+  '		if legacy && false {
 			id.Settings = opts.Settings' \
   ./internal/nodedir '^TestAnUnfinishedInitWithNoGroupStateTakesNewFlags$'
 
