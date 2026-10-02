@@ -226,3 +226,14 @@ func exists(fsys vfs.FS, name string) (bool, error) {
 	}
 	return false, err
 }
+
+// Prepare records the identity of a group's first start — cfg's ID, Group and
+// genesis (Peers, Bootstrap or Join), beside cfg.LogPath — without starting
+// it; a later Start finds it as if its own first start had written it. An
+// identity already recorded is checked as Start checks it, and kept. A node
+// initializing its data directory prepares every group before any runs
+// (cmd/dkvd, audit H1).
+func Prepare(cfg Config) error {
+	_, err := cfg.identity(cfg.snapshotFiles())
+	return err
+}

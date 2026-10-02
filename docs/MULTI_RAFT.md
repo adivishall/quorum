@@ -133,21 +133,30 @@ twice in a term or lose a committed entry. So `dkvd -raft|-cluster`:
   knows which it is. A node whose state was lost is replaced through a membership change, never
   restarted empty under its old id. `-init` on an initialized directory is refused too, so it cannot
   live in a unit file;
-- creates genesis and `-join` groups only while initializing. Initialization is crash-safe:
-  `node.identity` is written first, marked unfinished, and marked initialized once every such
-  group's identity is durable; a start that finds an unfinished initialization resumes it without
-  `-init`. In an initialized directory a genesis or `-join` group with no state is reported
+- creates genesis and `-join` groups only while initializing, and **runs none of them until the
+  initialization is recorded**: `node.identity` is written first, marked unfinished; then every
+  such group's identity is recorded without starting it (`multiraft.Prepare`); then the directory
+  is marked initialized; only then does any group start. A group that cannot be recorded exits 2
+  with nothing started, and the next start resumes without `-init`. So no group ever runs in a
+  directory whose initialization did not finish — before, a `-cluster` start ran the groups it
+  could create as voting members while another failed, and every later start, still
+  initializing, created a lost one again empty (`TestAnUnfinishedInitRunsNoGroup`, mutant 280). A
+  node that would host no group is refused from its flags, before the directory records anything
+  (`TestAnInitRefusedByItsFlagsRecordsNothing`). In an initialized directory a genesis or `-join` group with no state is reported
   (`event=group_failed`, or exit 2 in `-raft` mode), never created empty
   (`TestALostJoinGroupIsReportedNotRecreated`, mutant 266). A group new to an initialized node is
   created through the admin port (`create-group`, §7), which cannot tell a new group from one whose
   state was lost: the operator must;
 - adopts a directory written before node identities (Raft state, no `node.identity`) once a
-  `-cluster-id` is given, unless it holds another node's `raft-<id>.log`;
+  `-cluster-id` is given, unless it holds another node's `raft-<id>.log` (matched by its whole
+  name: an id may contain `.log`). It cannot tell another node's `groups/`: their version-1 group
+  identity files name no node, so adopting the wrong directory is the operator's error to avoid;
 - pins the node's **replica settings** in `node.identity` (audit H5): the settings every replica
   must share — the session limits, and in `-cluster` mode the routing (`-shards`, `-rf`, the
   sorted `-nodes`) — recorded at initialization; a start whose flags give others exits 2 naming
-  both, even one resuming an unfinished initialization (its genesis groups may already exist
-  under the recorded settings). Peer addresses are not among them. `-shards/-rf/-nodes` outside `-cluster` mode are
+  both, even one resuming an unfinished initialization once it recorded a group (the group
+  follows them); one that recorded none takes the new settings and cluster id
+  (`TestAnUnfinishedInitWithNoGroupStateTakesNewFlags`). Peer addresses are not among them. `-shards/-rf/-nodes` outside `-cluster` mode are
   refused;
 - opens the directory **before** the transport listens, and the transport handshake carries the
   recorded cluster id and a SHA-256 digest of the pinned settings: a node of another cluster, or

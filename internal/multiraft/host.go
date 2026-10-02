@@ -203,7 +203,26 @@ func Start(ctx context.Context, cfg Config) (*Host, error) {
 // each new directory's parent so the new entry survives a power loss: a group
 // directory that vanished would make its node forget it ever held the group's
 // durable state.
-func (h *Host) mkdirDurable(dir string) error {
+func (h *Host) mkdirDurable(dir string) error { return mkdirDurable(h.cfg.FS, dir) }
+
+// Prepare records group g's first-start identity in cfg's data directory — a
+// genesis member's (bootstrap non-nil) or a joiner's — creating its directory
+// durably, without starting it: Start, run afterwards, finds the group and
+// starts it from that identity. A node initializing its data directory
+// prepares every group before any runs, so that no group ever ran in a
+// directory whose initialization did not finish (cmd/dkvd, audit H1).
+func Prepare(cfg Config, g GroupID, bootstrap *replication.Configuration) error {
+	logPath := LogPath(cfg.DataDir, g)
+	if cfg.LogPathFor != nil {
+		logPath = cfg.LogPathFor(g)
+	} else if err := mkdirDurable(cfg.FS, GroupDir(cfg.DataDir, g)); err != nil {
+		return err
+	}
+	return raftnode.Prepare(raftnode.Config{ID: cfg.ID, Group: g, LogPath: logPath, FS: cfg.FS,
+		Join: bootstrap == nil, Bootstrap: bootstrap})
+}
+
+func mkdirDurable(fsys vfs.FS, dir string) error {
 	var missing []string
 	for d := dir; ; d = filepath.Dir(d) {
 		if _, err := os.Stat(d); err == nil {
@@ -220,7 +239,7 @@ func (h *Host) mkdirDurable(dir string) error {
 		if err := os.Mkdir(missing[i], 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
 			return err
 		}
-		if err := vfs.Or(h.cfg.FS).SyncDir(filepath.Dir(missing[i])); err != nil {
+		if err := vfs.Or(fsys).SyncDir(filepath.Dir(missing[i])); err != nil {
 			return err
 		}
 	}

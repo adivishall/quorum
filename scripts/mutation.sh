@@ -2385,6 +2385,49 @@ mutant "retirement-announced-once" internal/multiraft/host.go \
 	hg, ok := h.groups[g]' \
   ./internal/multiraft '^TestARetirementIsLoggedOnce$'
 
+# 280. An initialization that cannot record a group runs nothing: it exits
+# before any group starts (review of PR #10, audit H1).
+mutant "unfinished-init-runs-no-group" cmd/dkvd/main.go \
+  'the next start resumes the initialization)\n", c.g, dataDir, err)
+				return 2' \
+  'the next start resumes the initialization)\n", c.g, dataDir, err)
+				continue' \
+  ./cmd/dkvd '^TestAnUnfinishedInitRunsNoGroup$'
+
+# 281. A node that would host no group is refused from its flags, before the
+# data directory records anything.
+mutant "flag-only-refusal-records-nothing" cmd/dkvd/main.go \
+  '		if *initDir && assign != nil && len(join) == 0 && len(assign.GenesisGroups(multiraft.NodeID(*id))) == 0 {' \
+  '		if false {' \
+  ./cmd/dkvd '^TestAnInitRefusedByItsFlagsRecordsNothing$'
+
+# 282. An unfinished initialization with no group state takes new settings.
+mutant "unfinished-init-without-groups-repins" internal/nodedir/nodedir.go \
+  '		if !legacy {
+			id.Settings = opts.Settings' \
+  '		if false {
+			id.Settings = opts.Settings' \
+  ./internal/nodedir '^TestAnUnfinishedInitWithNoGroupStateTakesNewFlags$'
+
+# 283. A legacy log is matched by its whole name.
+mutant "legacy-log-whole-name" internal/nodedir/nodedir.go \
+  '			if name != own && !strings.HasPrefix(name, own+".") {' \
+  '			if !strings.HasPrefix(name, own) {' \
+  ./internal/nodedir '^TestALegacyLogIsMatchedByItsWholeName$'
+
+# 284. Every return of run closes the transport.
+mutant "run-closes-its-transport" cmd/dkvd/main.go \
+  '	defer func() { _ = tr.Close() }() // on every return; Close is idempotent
+' \
+  '' \
+  ./cmd/dkvd '^TestAStartupErrorClosesTheTransport$'
+
+# 285. The metrics port caps its connections.
+mutant "metrics-port-caps-connections" cmd/dkvd/main.go \
+  '	ln = capListener(ln, maxMetricsConns)' \
+  '' \
+  ./cmd/dkvd '^TestMetricsPortCapsItsConnections$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then

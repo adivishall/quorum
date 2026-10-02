@@ -239,6 +239,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		// ones in force, so the transport admits only nodes that share both
 		// (audit H2, H5; docs/TRANSPORT.md §3).
 		settings = replicaSettings(*cluster, limits, *shards, *rf, nodes)
+		if *initDir && assign != nil && len(join) == 0 && len(assign.GenesisGroups(multiraft.NodeID(*id))) == 0 {
+			// Decided by the flags alone: refused before the directory
+			// records anything, so a corrected retry is not refused for
+			// settings no group was ever created under.
+			fmt.Fprintf(stderr, "dkvd: node %s would host no group: it is not in the routing's -nodes and joins none (-join)\n", *id)
+			return 2
+		}
 		nd, err = openDataDir(*dataDir, *id, *clusterID, *initDir, settings, lg)
 		if err != nil {
 			fmt.Fprintf(stderr, "dkvd: -data-dir: %v\n", err)
@@ -252,6 +259,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "dkvd: %v\n", err)
 		return 2
 	}
+	defer func() { _ = tr.Close() }() // on every return; Close is idempotent
 	lg.logf("event=ready node=%s addr=%s peers=%d", *id, tr.LocalAddr(), len(peers))
 
 	if *raftMode || *cluster {
@@ -505,11 +513,6 @@ func runRaft(ctx context.Context, r raftRun) int {
 	if r.assign == nil {
 		hc.LogPathFor = func(multiraft.GroupID) string { return filepath.Join(dataDir, "raft-"+id+".log") }
 	}
-	host, err := multiraft.Start(ctx, hc)
-	if err != nil {
-		fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
-		return 2
-	}
 	// The genesis groups, then the joined ones. A group already running (found
 	// on disk) is left as it is; a group that cannot start is fatal in -raft
 	// mode and reported in -cluster mode.
@@ -543,7 +546,6 @@ func runRaft(ctx context.Context, r raftRun) int {
 			conf, err := r.assign.Genesis(g, addrs)
 			if err != nil {
 				fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
-				_ = host.Close()
 				return 2
 			}
 			creations = append(creations, creation{g, &conf})
@@ -552,61 +554,71 @@ func runRaft(ctx context.Context, r raftRun) int {
 	for _, g := range r.join {
 		creations = append(creations, creation{g, nil})
 	}
-	if nd.Initializing() && len(creations) == 0 && len(host.Groups()) == 0 {
-		fmt.Fprintf(r.stderr, "dkvd: node %s would host no group: it is not in the routing's -nodes and joins none (-join)\n", id)
-		_ = host.Close()
+	// Initialization records every genesis and -join group's identity, then
+	// the initialization itself, and only then starts any group: no group ever
+	// runs in a directory whose initialization did not finish. A group that
+	// ran there — voted, acknowledged — and then lost its state was created
+	// again empty by the next start, which still counted as initializing
+	// (audit H1). A failure here leaves the initialization to resume; nothing
+	// has run.
+	if nd.Initializing() {
+		if len(creations) == 0 {
+			fmt.Fprintf(r.stderr, "dkvd: node %s would host no group: it is not in the routing's -nodes and joins none (-join)\n", id)
+			return 2
+		}
+		for _, c := range creations {
+			if err := multiraft.Prepare(hc, c.g, c.boot); err != nil {
+				fmt.Fprintf(r.stderr, "dkvd: initializing group %d in %s: %v (no group has started; the next start resumes the initialization)\n", c.g, dataDir, err)
+				return 2
+			}
+		}
+		if err := nd.FinishInit(); err != nil {
+			fmt.Fprintf(r.stderr, "dkvd: recording the initialization of %s: %v\n", dataDir, err)
+			return 2
+		}
+		lg.logf("event=data_dir_initialized node=%s dir=%s cluster=%s", id, dataDir, nd.ID.Cluster)
+	}
+	host, err := multiraft.Start(ctx, hc)
+	if err != nil {
+		fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
 		return 2
 	}
-	// Genesis and -join state is created only while the directory is being
-	// initialized. In an initialized directory such a group with no state was
-	// lost, and is reported rather than created empty: its node voted and
-	// acknowledged as a member, and an empty replica under its id would do so
-	// again without that state. A group new to an initialized node is created
-	// through the admin port (create-group). In -raft mode group 0 is always
-	// opened through Create (which checks the configured genesis against the
-	// recorded one), so its identity file must already exist.
-	initOK := true
+	// Genesis and -join state is created only by initialization (above). In an
+	// initialized directory such a group with no state was lost, and is
+	// reported rather than created empty: its node voted and acknowledged as a
+	// member, and an empty replica under its id would do so again without that
+	// state. A group new to an initialized node is created through the admin
+	// port (create-group). A group that failed to recover is reported by the
+	// host already. In -raft mode group 0 is always opened through Create
+	// (which checks the configured genesis against the recorded one), so its
+	// identity file must exist.
 	for _, c := range creations {
 		if host.Group(c.g) != nil {
 			continue
 		}
-		if !nd.Initializing() {
-			if r.assign == nil {
-				if _, found, err := raftnode.LoadIdentity(r.fs, hc.LogPathFor(c.g)); err != nil || !found {
-					fmt.Fprintf(r.stderr, "dkvd: group %d has no state in the initialized data directory %s (%v): "+
-						"its state was lost; replace this node through a membership change\n", c.g, dataDir, err)
-					_ = host.Close()
-					return 2
-				}
-			} else {
-				what := "genesis group"
-				if c.boot == nil {
-					what = "-join group"
-				}
-				lg.logf("event=group_failed node=%s group=%d err=%q", id, c.g,
-					what+" with no state in an initialized data directory: its state was lost; replace this replica through a membership change")
-				continue
-			}
+		if _, failed := host.Failed()[c.g]; failed && r.assign != nil {
+			continue
 		}
-		if _, err := host.Create(c.g, c.boot); err != nil {
-			if r.assign == nil {
-				fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
+		if r.assign == nil {
+			if _, found, err := raftnode.LoadIdentity(r.fs, hc.LogPathFor(c.g)); err != nil || !found {
+				fmt.Fprintf(r.stderr, "dkvd: group %d has no state in the initialized data directory %s (%v): "+
+					"its state was lost; replace this node through a membership change\n", c.g, dataDir, err)
 				_ = host.Close()
 				return 2
 			}
-			initOK = false
-			lg.logf("event=group_failed node=%s group=%d err=%v", id, c.g, err)
+		} else {
+			what := "genesis group"
+			if c.boot == nil {
+				what = "-join group"
+			}
+			lg.logf("event=group_failed node=%s group=%d err=%q", id, c.g,
+				what+" with no state in an initialized data directory: its state was lost; replace this replica through a membership change")
+			continue
 		}
-	}
-	if nd.Initializing() {
-		if !initOK {
-			lg.logf("event=init_incomplete node=%s dir=%s: a genesis group did not start; the next start resumes the initialization", id, dataDir)
-		} else if err := nd.FinishInit(); err != nil {
-			fmt.Fprintf(r.stderr, "dkvd: recording the initialization of %s: %v\n", dataDir, err)
+		if _, err := host.Create(c.g, c.boot); err != nil {
+			fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
 			_ = host.Close()
 			return 2
-		} else {
-			lg.logf("event=data_dir_initialized node=%s dir=%s cluster=%s", id, dataDir, nd.ID.Cluster)
 		}
 	}
 	if r.assign == nil && host.Group(0) == nil {
@@ -1041,11 +1053,56 @@ func newMetricsServer(h http.Handler) *http.Server {
 	}
 }
 
+// maxMetricsConns bounds the metrics port's connections (audit M1): one
+// beyond is closed as soon as it is accepted, as on the client and admin
+// ports. A scraper needs one or two; without a cap, a flood held a descriptor
+// and a goroutine per connection, for as long as the idle timeout.
+const maxMetricsConns = 64
+
+// cappedListener closes a connection accepted beyond its capacity at once.
+type cappedListener struct {
+	net.Listener
+	slots chan struct{}
+}
+
+func capListener(ln net.Listener, n int) net.Listener {
+	return &cappedListener{Listener: ln, slots: make(chan struct{}, n)}
+}
+
+func (l *cappedListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		select {
+		case l.slots <- struct{}{}:
+			return &slotConn{Conn: c, release: func() { <-l.slots }}, nil
+		default:
+			_ = c.Close()
+		}
+	}
+}
+
+// slotConn returns its slot when it is first closed.
+type slotConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *slotConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
+}
+
 func serveMetrics(addr string, reg *metrics.Registry, id string, lg *logger) (func(), error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
+	ln = capListener(ln, maxMetricsConns)
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", metrics.Handler(reg))
 	srv := newMetricsServer(mux)

@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +16,7 @@ import (
 	"time"
 
 	"github.com/adivishall/quorum/internal/fault"
+	"github.com/adivishall/quorum/internal/metrics"
 	"github.com/adivishall/quorum/internal/transport"
 )
 
@@ -306,5 +311,74 @@ func TestMetricsServerBoundsItsConnections(t *testing.T) {
 	s := newMetricsServer(nil)
 	if s.ReadHeaderTimeout <= 0 || s.ReadTimeout <= 0 || s.WriteTimeout <= 0 || s.IdleTimeout <= 0 || s.MaxHeaderBytes <= 0 {
 		t.Fatalf("an unbounded metrics server: %+v", s)
+	}
+}
+
+// TestMetricsPortCapsItsConnections (audit M1): the metrics port serves at
+// most maxMetricsConns connections at once — one beyond is closed as soon as
+// it is accepted — and a closed connection frees its slot. It held any
+// number: 3000 connections a flood opened stayed open, each a descriptor and
+// a goroutine, for as long as the idle timeout.
+func TestMetricsPortCapsItsConnections(t *testing.T) {
+	out := &syncBuffer{}
+	stop, err := serveMetrics("127.0.0.1:0", metrics.NewRegistry(), "m", &logger{w: out})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	_, addr, ok := strings.Cut(out.String(), "event=metrics_ready node=m addr=")
+	if !ok {
+		t.Fatalf("no metrics_ready event: %q", out.String())
+	}
+	addr = strings.TrimSpace(addr)
+	scrape := func(c net.Conn) error {
+		fmt.Fprintf(c, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		return err
+	}
+	var held []net.Conn
+	defer func() {
+		for _, c := range held {
+			_ = c.Close()
+		}
+	}()
+	for i := 0; i < maxMetricsConns; i++ {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, c)
+		if err := scrape(c); err != nil {
+			t.Fatalf("scrape on connection %d of %d: %v", i+1, maxMetricsConns, err)
+		}
+	}
+	extra, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer extra.Close()
+	if err := scrape(extra); err == nil {
+		t.Fatalf("connection %d was served beyond the cap of %d", maxMetricsConns+1, maxMetricsConns)
+	}
+	_ = held[0].Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = scrape(c)
+		_ = c.Close()
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a closed connection's slot was never freed: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

@@ -291,3 +291,63 @@ func TestIdentityCodecV2(t *testing.T) {
 		t.Fatalf("a version-2 record with empty settings: %v", err)
 	}
 }
+
+// TestAnUnfinishedInitWithNoGroupStateTakesNewFlags: an initialization that
+// stopped before any group state was recorded pinned nothing a group follows,
+// so a retry with corrected settings or cluster id replaces them. Once group
+// state exists, they stay pinned, finished or not. Before, the first attempt's
+// values were pinned forever, and only removing node.identity by hand let the
+// operator correct them.
+func TestAnUnfinishedInitWithNoGroupStateTakesNewFlags(t *testing.T) {
+	dir := t.TempDir()
+	d := open(t, dir, Options{Node: "n1", Cluster: "c1", Init: true, Settings: "nodes=a"})
+	_ = d.Close() // stopped before FinishInit, before any group
+	d = open(t, dir, Options{Node: "n1", Cluster: "c2", Settings: "nodes=a,n1"})
+	if d.State != Initializing || d.ID.Cluster != "c2" || d.ID.Settings != "nodes=a,n1" {
+		t.Fatalf("the retry: state %s, identity %+v", d.State, d.ID)
+	}
+	_ = d.Close()
+	if id, _, err := Load(dir); err != nil || id.Cluster != "c2" || id.Settings != "nodes=a,n1" {
+		t.Fatalf("the recorded identity after the retry: %+v %v", id, err)
+	}
+	// A group's state now exists: the values it was recorded under stay.
+	if err := os.MkdirAll(filepath.Join(dir, "groups", "0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir, Options{Node: "n1", Settings: "nodes=b"}); !errors.Is(err, ErrSettings) {
+		t.Fatalf("other settings once a group exists: %v, want ErrSettings", err)
+	}
+	if _, err := Open(dir, Options{Node: "n1", Cluster: "c3", Settings: "nodes=a,n1"}); !errors.Is(err, ErrIdentity) {
+		t.Fatalf("another cluster once a group exists: %v, want ErrIdentity", err)
+	}
+}
+
+// TestALegacyLogIsMatchedByItsWholeName: a node's legacy log is
+// raft-<id>.log (and raft-<id>.log.*), and an id may contain ".log". The
+// owner was cut at the first ".log": node "app.log1" was refused its own log,
+// and node "app" adopted app.log1's.
+func TestALegacyLogIsMatchedByItsWholeName(t *testing.T) {
+	for _, tc := range []struct {
+		node string
+		ok   bool
+	}{{"app.log1", true}, {"app", false}} {
+		dir := t.TempDir()
+		for _, f := range []string{"raft-app.log1.log", "raft-app.log1.log.group"} {
+			if err := os.WriteFile(filepath.Join(dir, f), nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		d, err := Open(dir, Options{Node: tc.node, Cluster: "c1", Settings: "s"})
+		if tc.ok {
+			if err != nil || d.State != Adopted {
+				t.Fatalf("node %s on its own log: %v", tc.node, err)
+			}
+			_ = d.Close()
+		} else if !errors.Is(err, ErrIdentity) {
+			if err == nil {
+				_ = d.Close()
+			}
+			t.Fatalf("node %s on node app.log1's log: %v, want ErrIdentity", tc.node, err)
+		}
+	}
+}

@@ -374,6 +374,26 @@ func (d *Dir) open(opts Options) error {
 	if err != nil {
 		return err
 	}
+	if found && !id.Initialized && id.Node == opts.Node &&
+		(opts.Settings != id.Settings || opts.Cluster != "" && opts.Cluster != id.Cluster) {
+		// An initialization that stopped before it recorded any group state
+		// pinned nothing a group follows: this start's cluster and settings
+		// replace the recorded ones, so a retry with corrected flags is not
+		// refused for values no group was ever created under.
+		legacy, err := d.scan(opts.Node)
+		if err != nil {
+			return err
+		}
+		if !legacy {
+			id.Settings = opts.Settings
+			if opts.Cluster != "" {
+				id.Cluster = opts.Cluster
+			}
+			if err := write(d.Path, id); err != nil {
+				return err
+			}
+		}
+	}
 	if found {
 		switch {
 		case id.Node != opts.Node:
@@ -396,9 +416,9 @@ func (d *Dir) open(opts Options) error {
 		case opts.Settings != id.Settings:
 			unfinished := ""
 			if !id.Initialized {
-				// Its genesis groups may already exist under the recorded
-				// settings, so even an unfinished initialization keeps them.
-				unfinished = " (also while its initialization is unfinished: groups it created follow them)"
+				// Only reached once group state exists (above): the groups
+				// it recorded follow the recorded settings.
+				unfinished = " (also while its initialization is unfinished: groups it recorded follow them)"
 			}
 			return fmt.Errorf("%w: %s recorded [%s]; this start's flags give [%s]. They are part of the replicated "+
 				"state machine's definition and every replica must share them; a node cannot change them by restarting%s", ErrSettings, d.Path, id.Settings, opts.Settings, unfinished)
@@ -439,13 +459,16 @@ func (d *Dir) scan(node string) (legacy bool, err error) {
 	for _, e := range entries {
 		name := e.Name()
 		switch {
-		case name == LockFile:
+		case name == LockFile, name == IdentityFile:
 		case name == "groups" && e.IsDir():
 			legacy = true
 		case strings.HasPrefix(name, "raft-") && strings.Contains(name, ".log"):
-			owner := strings.TrimPrefix(name[:strings.Index(name, ".log")], "raft-")
-			if owner != node {
-				return false, fmt.Errorf("%w: %s holds node %q's log (%s), this process is node %q", ErrIdentity, d.Path, owner, name, node)
+			// This node's log is raft-<node>.log and its siblings
+			// raft-<node>.log.*; the id may itself contain ".log", so the
+			// name is matched whole rather than cut at the first ".log".
+			own := "raft-" + node + ".log"
+			if name != own && !strings.HasPrefix(name, own+".") {
+				return false, fmt.Errorf("%w: %s holds another node's log (%s), this process is node %q", ErrIdentity, d.Path, name, node)
 			}
 			legacy = true
 		default:

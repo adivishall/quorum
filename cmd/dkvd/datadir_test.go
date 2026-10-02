@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/adivishall/quorum/internal/kv"
 	"github.com/adivishall/quorum/internal/multiraft"
+	"github.com/adivishall/quorum/internal/nodedir"
 	"github.com/adivishall/quorum/internal/routing"
 	"github.com/adivishall/quorum/internal/transport"
 )
@@ -302,4 +304,123 @@ func TestReplicaSettingsRendering(t *testing.T) {
 	if got := replicaSettings(false, limits, 4, 3, nil); got != "mode=raft session-max=3 session-max-unacked=4" {
 		t.Fatalf("raft settings: %q", got)
 	}
+}
+
+// unfinishedInit records node z's identity in dir as an -init that stopped
+// before any group (cluster c1, the default session limits, a one-node
+// routing of shards groups), and puts a file where group blocked's directory
+// goes, so that group cannot be recorded.
+func unfinishedInit(t *testing.T, dir string, shards int, blocked multiraft.GroupID) (blocker string) {
+	t.Helper()
+	settings := replicaSettings(true, kv.Limits{MaxSessions: kv.DefaultLimits.MaxSessions, MaxUnacked: kv.DefaultLimits.MaxUnacked},
+		shards, 1, []routing.NodeID{"z"})
+	nd, err := nodedir.Open(dir, nodedir.Options{Node: "z", Cluster: "c1", Init: true, Settings: settings})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = nd.Close()
+	if err := os.MkdirAll(filepath.Join(dir, "groups"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	blocker = multiraft.GroupDir(dir, blocked)
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return blocker
+}
+
+// TestAnUnfinishedInitRunsNoGroup (audit H1): an initialization records every
+// group's identity, then itself, before any group runs. When a group cannot be
+// recorded, the start exits 2 with nothing started; a later start resumes and
+// finishes it; and a group that ran and then lost its state is reported, not
+// created again empty. Before, a -cluster start ran the groups it could create
+// as voting members while the initialization stayed unfinished, and every
+// later start — still initializing — created a lost one again empty.
+func TestAnUnfinishedInitRunsNoGroup(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "z")
+	blocker := unfinishedInit(t, dir, 2, 1)
+	base := []string{"-id", "z", "-listen", "127.0.0.1:0", "-cluster", "-nodes", "z", "-rf", "1", "-shards", "2",
+		"-data-dir", dir, "-tick-interval", "5ms"}
+	out, errb, _, wait := runNode(t, base...)
+	if code := wait(); code != 2 || !strings.Contains(errb.String(), "initializing group 1") {
+		t.Fatalf("an initialization that cannot record group 1: exit %d, stderr %q", code, errb.String())
+	}
+	for _, ev := range []string{"event=raft_started", "event=group_started", "event=data_dir_initialized"} {
+		if strings.Contains(out.String(), ev) {
+			t.Fatalf("the failed initialization ran something (%s):\n%s", ev, out.String())
+		}
+	}
+	// Resumed once the obstacle is gone: it finishes, and the groups run.
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	out, _, cancel, wait := runNode(t, base...)
+	waitFor(t, out, "event=data_dir_initialized node=z", 5*time.Second)
+	waitFor(t, out, "event=raft_commit node=z index=1 group=0", 5*time.Second)
+	cancel()
+	if code := wait(); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	// Group 0 — elected, committed — loses its state: reported, not recreated.
+	if err := os.RemoveAll(multiraft.GroupDir(dir, 0)); err != nil {
+		t.Fatal(err)
+	}
+	out, _, cancel, wait = runNode(t, base...)
+	waitFor(t, out, "event=group_failed node=z group=0", 5*time.Second)
+	if !strings.Contains(out.String(), "its state was lost") || strings.Contains(out.String(), "event=group_started node=z group=0") {
+		t.Fatalf("the lost group 0 was not reported as lost, or was created again:\n%s", out.String())
+	}
+	cancel()
+	_ = wait()
+}
+
+// TestAnInitRefusedByItsFlagsRecordsNothing: a check decidable from the flags
+// alone — this node is in no group of the routing and joins none — refuses
+// before the data directory records anything, so the corrected retry is not
+// refused for settings no group was ever created under.
+func TestAnInitRefusedByItsFlagsRecordsNothing(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "z")
+	args := func(nodes string) []string {
+		return []string{"-id", "z", "-listen", "127.0.0.1:0", "-cluster", "-nodes", nodes, "-rf", "1", "-shards", "1",
+			"-data-dir", dir, "-tick-interval", "5ms", "-init", "-cluster-id", "c1"}
+	}
+	_, errb, _, wait := runNode(t, args("a")...)
+	if code := wait(); code != 2 || !strings.Contains(errb.String(), "would host no group") {
+		t.Fatalf("a node outside the routing: exit %d, stderr %q", code, errb.String())
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("the refused start created its data directory: %v", err)
+	}
+	out, _, cancel, wait := runNode(t, args("z")...)
+	waitFor(t, out, "event=data_dir_initialized node=z", 5*time.Second)
+	cancel()
+	if code := wait(); code != 0 {
+		t.Fatalf("the corrected retry: exit %d", code)
+	}
+}
+
+// TestAStartupErrorClosesTheTransport: run returns 2 from a startup error
+// after its transport listens, and the listen address is free again. The
+// error paths returned without closing it: an in-process caller (these tests)
+// kept its listener and goroutines.
+func TestAStartupErrorClosesTheTransport(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	_ = l.Close()
+	dir := filepath.Join(t.TempDir(), "z")
+	unfinishedInit(t, dir, 1, 0) // group 0 cannot be recorded: runRaft fails after the transport listens
+	var out, errb syncBuffer
+	code := run(context.Background(), []string{"-id", "z", "-listen", addr, "-cluster", "-nodes", "z", "-rf", "1", "-shards", "1",
+		"-data-dir", dir, "-tick-interval", "5ms"}, &out, &errb)
+	if code != 2 || !strings.Contains(out.String(), "event=ready") {
+		t.Fatalf("premise: exit %d after the transport listened (stdout %q, stderr %q)", code, out.String(), errb.String())
+	}
+	l2, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("after run returned 2 its transport still holds %s: %v", addr, err)
+	}
+	_ = l2.Close()
 }
