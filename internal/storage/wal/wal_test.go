@@ -624,7 +624,10 @@ func TestBatchModeFlushesInBackground(t *testing.T) {
 	dir := testDir(t)
 	opts := wal.DefaultOptions()
 	opts.SyncMode = wal.SyncBatch
-	opts.SyncInterval = 10 * time.Millisecond
+	// Long enough that the append is observed unsynced before the flusher's
+	// first tick — so that observation can be required (it used to be a skip,
+	// which also hid an append synced inline) — and short against the wait below.
+	opts.SyncInterval = 200 * time.Millisecond
 	opts.SyncBytes = 1 << 30 // force the time-based path, not the byte-based one
 
 	w, err := wal.Create(dir, opts)
@@ -637,17 +640,17 @@ func TestBatchModeFlushesInBackground(t *testing.T) {
 		t.Fatal(err)
 	}
 	if w.Stats().UnsyncedBytes == 0 {
-		t.Skip("the append was flushed before it could be observed as unsynced")
+		t.Fatal("batch mode left nothing unsynced right after an append: it synced inline")
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if w.Stats().UnsyncedBytes == 0 {
 			return
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	t.Fatalf("batch mode left %d bytes unsynced after 2s with a 10ms interval", w.Stats().UnsyncedBytes)
+	t.Fatalf("batch mode left %d bytes unsynced after 3s with a 200ms interval", w.Stats().UnsyncedBytes)
 }
 
 func TestClosedWALRejectsAppends(t *testing.T) {
