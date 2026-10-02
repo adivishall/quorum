@@ -18,7 +18,11 @@ func TestCommandRoundTrip(t *testing.T) {
 		{Op: OpPut, Key: []byte("k"), Value: []byte{}},
 		{Op: OpPut, Key: []byte("a b\n\x00"), Value: bytes.Repeat([]byte{0xff}, 1000)},
 		{Op: OpDelete, Key: []byte("k")},
-		{Op: OpPut, Key: bytes.Repeat([]byte("k"), MaxKeyLen), Value: bytes.Repeat([]byte("v"), MaxValueLen)},
+		// The largest command: the longest key, and the value that makes its
+		// encoding exactly MaxCommandLen (1 op + 2 key length + key + 3 value
+		// length + value). A max key with a max value is not a command: its
+		// entry would exceed the limit (C1).
+		{Op: OpPut, Key: bytes.Repeat([]byte("k"), MaxKeyLen), Value: bytes.Repeat([]byte("v"), MaxCommandLen-1-2-MaxKeyLen-3)},
 	}
 	for _, c := range cases {
 		got, err := Decode(c.Encode())
@@ -90,6 +94,9 @@ func FuzzDecodeIsTotal(f *testing.F) {
 		}
 		if !bytes.Equal(c.Encode(), b) {
 			t.Fatalf("decode/encode not canonical: %x -> %x", b, c.Encode())
+		}
+		if c.EncodedLen() != len(b) {
+			t.Fatalf("EncodedLen() = %d for a %d-byte command", c.EncodedLen(), len(b))
 		}
 	})
 }

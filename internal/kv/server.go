@@ -182,6 +182,10 @@ func (s *Server) failed(resp Response, err error) Response {
 		resp.Status, resp.Leader = StatusNotLeader, string(s.node.LeaderID())
 	case errors.Is(err, ErrLost):
 		resp.Status = StatusLost
+	case errors.Is(err, raft.ErrEntryTooLarge):
+		// Refused by Propose before anything was appended: definite. The front
+		// refuses such a request first; this is the layer below agreeing.
+		resp.Status = StatusInvalid
 	default:
 		resp.Status = StatusUnknown
 	}

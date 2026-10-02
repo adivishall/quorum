@@ -644,6 +644,8 @@ func (n *Node) Propose(ctx context.Context, data []byte) error {
 //
 //   - raft.ErrNotLeader: this node did not accept the proposal; nothing was
 //     appended. The client should retry at the leader (LeaderID). Definite.
+//   - raft.ErrEntryTooLarge: data exceeds raft.MaxEntryDataLen; nothing was
+//     appended, on any node. Definite, and retrying cannot help.
 //   - ErrLost: the entry was appended but a DIFFERENT entry was committed at its
 //     index (this node lost leadership first). The write had no effect. Definite.
 //   - ctx.Err(): the outcome is UNKNOWN — the entry may still commit and apply.

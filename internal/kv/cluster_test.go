@@ -97,6 +97,8 @@ type cluster struct {
 	// limits are the session-table limits every node's store uses (zero:
 	// kv.DefaultLimits); they must be the same on every node.
 	limits kv.Limits
+	// tick is every node's Raft tick (zero: 15 ms).
+	tick time.Duration
 	// hook, if set, is consulted at every driver crash point of every node: it
 	// lets a test abort one node's cycle at an exact point (Phase 11's seam).
 	hook atomic.Pointer[func(id raftnode.NodeID, p raftnode.Point, arg uint64) error]
@@ -113,7 +115,14 @@ func (c *cluster) setHook(h func(id raftnode.NodeID, p raftnode.Point, arg uint6
 
 func startCluster(t testing.TB, ctx context.Context, n int, faults bool) *cluster {
 	t.Helper()
-	c := &cluster{t: t, ctx: ctx, dir: t.TempDir(), addrs: map[raftnode.NodeID]string{},
+	return startClusterTicking(t, ctx, n, faults, 0)
+}
+
+// startClusterTicking is startCluster with every node's Raft tick set (zero:
+// 15 ms).
+func startClusterTicking(t testing.TB, ctx context.Context, n int, faults bool, tick time.Duration) *cluster {
+	t.Helper()
+	c := &cluster{t: t, ctx: ctx, dir: t.TempDir(), addrs: map[raftnode.NodeID]string{}, tick: tick,
 		trs: map[raftnode.NodeID]*transport.TCPTransport{}, nodes: map[raftnode.NodeID]*raftnode.Node{}, eps: map[raftnode.NodeID]*endpoint{}}
 	if faults {
 		c.net = fault.NewNetwork()
@@ -141,8 +150,12 @@ func (c *cluster) startNode(id raftnode.NodeID) {
 			peers[transport.NodeID(other)] = c.addrs[other]
 		}
 	}
+	tick := c.tick
+	if tick == 0 {
+		tick = 15 * time.Millisecond
+	}
 	tr, err := transport.NewTCPTransport(transport.Config{NodeID: transport.NodeID(id), ListenAddr: c.addrs[id], Peers: peers,
-		ReadIdleTimeout: 120 * 15 * time.Millisecond})
+		ReadIdleTimeout: 120 * tick})
 	if err != nil {
 		c.t.Fatalf("transport %s: %v", id, err)
 	}
@@ -157,7 +170,7 @@ func (c *cluster) startNode(id raftnode.NodeID) {
 	node, err := raftnode.Start(c.ctx, raftnode.Config{
 		ID: id, Peers: c.ids, Transport: wrapped,
 		LogPath:      filepath.Join(c.dir, string(id)+".log"),
-		StateMachine: store, TickInterval: 15 * time.Millisecond, DisableSync: true,
+		StateMachine: store, TickInterval: tick, DisableSync: true,
 		Hook: func(p raftnode.Point, arg uint64) error {
 			if h := c.hook.Load(); h != nil {
 				return (*h)(id, p, arg)
