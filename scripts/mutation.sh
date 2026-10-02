@@ -1704,6 +1704,40 @@ mutant "failed-start-leaves-no-directory" internal/multiraft/host.go \
   '			_ = GroupDir(h.cfg.DataDir, g)' \
   ./internal/multiraft '^TestAFailedFirstStartLeavesNoDirectory$'
 
+# --- Replica settings (audit H5): what the replicated state machine's definition
+#     depends on is pinned, and a node setting cannot be dropped on its way to
+#     the groups.
+
+# 192. A start with other replica settings than the directory recorded runs.
+mutant "replica-settings-pinned" internal/nodedir/nodedir.go \
+  '		case opts.Settings != id.Settings:' \
+  '		case false:' \
+  ./internal/nodedir '^TestSettingsArePinned$'
+
+# 193. dkvd does not hand its settings to the data directory.
+mutant "dkvd-pins-its-settings" cmd/dkvd/main.go \
+  'Init: r.init, Settings: r.settings})' \
+  'Init: r.init, Settings: ""})' \
+  ./cmd/dkvd '^TestReplicaSettingsArePinned$'
+
+# 194. Routing flags outside -cluster mode are silently ignored again.
+mutant "routing-flags-cluster-only" cmd/dkvd/main.go \
+  '			if explicit[name] {' \
+  '			if false {' \
+  ./cmd/dkvd '^TestRoutingFlagsBelongToClusterMode$'
+
+# 195. A node setting is dropped on its way to the hosted groups.
+mutant "host-forwards-every-setting" internal/multiraft/host.go \
+  '	nc.Metrics = h.nodeMetrics' \
+  '	_ = h.nodeMetrics' \
+  ./internal/multiraft '^TestHostForwardsEveryNodeSetting$'
+
+# 196. Every group of a node draws the node's election timeout sequence.
+mutant "groups-draw-their-own-seeds" internal/raftnode/node.go \
+  '	if g != 0 {' \
+  '	if false {' \
+  ./internal/raftnode '^TestGroupsDrawDifferentElectionSeeds$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f /tmp/mutation.$$.log
 if [ "$TOTAL" -eq 0 ]; then
