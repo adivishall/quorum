@@ -100,6 +100,11 @@ type Config struct {
 	TickInterval   time.Duration
 	ElectionTicks  int
 	HeartbeatTicks int
+	// MaxEntriesPerMsg and MaxSizePerMsg are the core's budgets of one
+	// AppendEntries (raft.Config; zero: the core's defaults). Tests and the
+	// simulator lower them so every backlog travels in batches.
+	MaxEntriesPerMsg int
+	MaxSizePerMsg    int
 
 	// DisableSync turns OFF the fsync of the durable Raft log on every Save. It is
 	// UNSAFE and exists only for tests and benchmarks where durability is not under
@@ -381,6 +386,7 @@ func Recover(cfg Config) (*Recovered, error) {
 	core, err := raft.New(raft.Config{
 		ID: cfg.ID, Conf: &base, ConfIndex: baseIndex, Rand: cfg.Rand, Log: mlog,
 		ElectionTicks: cfg.ElectionTicks, HeartbeatTicks: cfg.HeartbeatTicks,
+		MaxEntriesPerMsg: cfg.MaxEntriesPerMsg, MaxSizePerMsg: cfg.MaxSizePerMsg,
 		Term: rec.HardState.Term, Vote: rec.HardState.Vote,
 	})
 	if err != nil {
@@ -718,6 +724,20 @@ func (n *Node) Write(ctx context.Context, data []byte) (index, term uint64, resu
 	}
 }
 
+// maxReadsPerCycle bounds the reads the actor takes in one cycle, so a flood
+// of reads cannot starve its other events.
+const maxReadsPerCycle = 256
+
+// acceptRead registers a ReadIndex with the core and answers its caller.
+func (n *Node) acceptRead(r readReq) {
+	rs, err := n.core.ReadIndex()
+	if err != nil {
+		r.result <- readAccepted{err: err}
+		return
+	}
+	r.result <- readAccepted{id: rs.ID, done: n.reads.Add(rs.ID, n.core.Term())}
+}
+
 // forget drops what the actor holds for an abandoned request. A read is
 // forgotten only while unconfirmed (the core drops it when it is confirmed or
 // its term ends); once confirmed it is a barrier, released as soon as its
@@ -902,11 +922,17 @@ func (n *Node) actorLoop() {
 				w.result <- writeAccepted{index: idx, term: term, done: n.waiters.Add(idx, term, n.core.AppliedIndex())}
 			}
 		case r := <-n.readCh:
-			rs, err := n.core.ReadIndex()
-			if err != nil {
-				r.result <- readAccepted{err: err}
-			} else {
-				r.result <- readAccepted{id: rs.ID, done: n.reads.Add(rs.ID, n.core.Term())}
+			n.acceptRead(r)
+			// Reads already waiting join this cycle: the core confirms all
+			// of them with one round (audit H4), not a round each.
+		more:
+			for i := 1; i < maxReadsPerCycle; i++ {
+				select {
+				case r := <-n.readCh:
+					n.acceptRead(r)
+				default:
+					break more
+				}
 			}
 		case a := <-n.abandonCh:
 			n.forget(a)

@@ -75,6 +75,12 @@ func startCluster(t *testing.T, ctx context.Context, n int) *harness {
 // and closes the underlying TCP transports.
 func startClusterWith(t *testing.T, ctx context.Context, n int, wrap func(transport.Transport) transport.Transport) *harness {
 	t.Helper()
+	return startClusterTick(t, ctx, n, wrap, 15*time.Millisecond)
+}
+
+// startClusterTick is startClusterWith with every node's tick interval.
+func startClusterTick(t *testing.T, ctx context.Context, n int, wrap func(transport.Transport) transport.Transport, tick time.Duration) *harness {
+	t.Helper()
 	var ids []NodeID
 	addrs := map[NodeID]string{}
 	for i := 0; i < n; i++ {
@@ -102,7 +108,7 @@ func startClusterWith(t *testing.T, ctx context.Context, n int, wrap func(transp
 		node, err := Start(ctx, Config{
 			ID: id, Peers: ids, Transport: wrap(tr),
 			LogPath:      filepath.Join(h.dir, string(id)+".log"),
-			StateMachine: sm, TickInterval: 15 * time.Millisecond, DisableSync: true,
+			StateMachine: sm, TickInterval: tick, DisableSync: true,
 		})
 		if err != nil {
 			t.Fatalf("node %s: %v", id, err)

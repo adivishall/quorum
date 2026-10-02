@@ -345,6 +345,10 @@ var hostLeavesUnset = map[string]string{
 	"Bootstrap": "set by Create for a genesis member; Open reads the identity file",
 	"Join":      "set by Create for a joiner",
 	"Rand":      "raftnode seeds it from the node and the group, so groups on one node do not share a timeout sequence",
+	// The core's AppendEntries budgets: its defaults fit every deployment
+	// (the transport's frame, the decoder's count); tests set them directly.
+	"MaxEntriesPerMsg": "the core's default budget",
+	"MaxSizePerMsg":    "the core's default budget",
 }
 
 // reserve marks g busy, or reports why it cannot be: the host is closed, the
