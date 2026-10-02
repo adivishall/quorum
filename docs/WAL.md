@@ -151,6 +151,15 @@ A failed background flush **latches**: every subsequent append fails with that e
 Continuing to accept writes after the log can no longer honour its durability promise would
 mean acknowledging writes that may not survive, which is the worst possible response.
 
+So does a failed **append** (audit D10): its write may have left a partial record — a torn tail
+recovery repairs — as long as nothing is written after it; a later record would make it damage
+mid-segment, which recovery refuses (`TestATornAppendLatches`). And `Close` after a failed flush
+returns that failure **without flushing again**: a second fsync can succeed once the kernel has
+dropped the pages the first failed to write, and reporting that as durability is the fsyncgate
+error (`TestCloseAfterAFailedFlushReportsItAndDoesNotFlushAgain`; mutants 261–262). The LSM store
+syncs the WAL before a flush records its table in the manifest, so the manifest never runs ahead of
+the durable log (`TestAFlushMakesTheWALDurableBeforeItsEdit`, mutant 260).
+
 ### The cost, measured
 
 Apple M4, macOS 26.5.2, Go 1.27.1, APFS on internal SSD. 100-byte values, single-operation

@@ -133,6 +133,28 @@ The asymmetry is deliberate: a file becomes live at exactly one instant (the fsy
 before that instant it does not exist as far as the database is concerned, no matter how complete it
 is on disk.
 
+**A FAILED step 5 is not a crash** (audit M11). When the append's write or fsync fails, the record
+may be absent, partial, or complete and durable — the process cannot know which — so:
+
+- the Writer **latches** (`manifest.ErrFailed`): it refuses every later edit, since an edit appended
+  after a partial record would turn a repairable torn tail into damage mid-file, which recovery
+  refuses;
+- the output is **not deleted** — the edit naming it may be durable, and the next open would then
+  refuse a store whose live file is missing; if the edit did not survive, the next startup sweeps
+  the output as an orphan;
+- the store stops publishing: the compactor runs no more compactions (§COMPACTION.md 7), and a
+  flush, which needs the manifest, latches its failure too.
+
+The same holds for `Install` on every open: a failure of `CURRENT`'s rename or of the directory
+fsync after it may leave `CURRENT` naming the new manifest, so `Install` keeps both manifests —
+it used to delete the new one, leaving `CURRENT` naming a file that did not exist. Only a failure
+before the rename removes the unreferenced new manifest. `TestInstallUnderEveryFault` and
+`TestAppendUnderEveryFault` fail a write, a torn write, an fsync, a rename and a directory fsync at
+each of their first three occurrences and require the directory to recover to the state before the
+operation or after it; `TestAnAmbiguousCompactionEditKeepsItsOutput` does the same through the
+engine (mutants 256–258). The manifest writes through `manifest.FS` (the OS; a fault injector in
+tests).
+
 ## 6. Startup
 
 ```
