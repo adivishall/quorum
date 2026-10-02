@@ -27,7 +27,7 @@ race:
 
 ## integration — multi-process tests, including real SIGKILL crash recovery
 integration:
-	$(GO) test -race -count=1 -v ./tests/integration/
+	$(GO) test -race -count=1 -v -timeout 40m ./tests/integration/
 
 ## mutation — mutation testing (Phase 9 Raft rules, Phase 10 failure handling and
 ## fault-model fidelity, Phase 11 crash-recovery rules, Phase 12 client-visible

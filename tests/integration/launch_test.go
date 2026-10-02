@@ -71,3 +71,15 @@ func startProc(t *testing.T, cmd *exec.Cmd) error {
 	})
 	return cmd.Start()
 }
+
+// artifactRoot is where a failing test writes its evidence (a history, node
+// logs): $QUORUM_ARTIFACTS when set — CI uploads that directory when a job
+// fails — else the system's temporary directory.
+func artifactRoot() string {
+	if dir := os.Getenv("QUORUM_ARTIFACTS"); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err == nil {
+			return dir
+		}
+	}
+	return ""
+}

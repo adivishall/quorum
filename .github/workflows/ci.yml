@@ -5,16 +5,38 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: the jobs read the repository and nothing else.
+permissions:
+  contents: read
+
+# An explicit bash runs every step with -eo pipefail, so a failing command
+# piped to tee still fails its step (the implicit default has no pipefail).
+defaults:
+  run:
+    shell: bash
+
+# A newer push to the same branch or pull request supersedes a run in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Every job runs on a pinned runner image with the toolchain go.mod names, not
+# a moving image and the latest patch release, which shift under the
+# timing-sensitive tests and the pinned trace hash. The repository has no
+# dependencies and no go.sum, so the module and build caches are keyed on
+# go.mod. A failing job uploads its evidence: its test log, the histories and
+# node logs written under $QUORUM_ARTIFACTS, and new fuzz crashers.
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.27'
-          check-latest: true
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
 
       - name: gofmt
         run: make fmtcheck
@@ -26,17 +48,34 @@ jobs:
         run: make vet
 
       - name: unit tests (race detector)
-        run: make race
+        run: make race 2>&1 | tee unit.log
+
+      # Correctness checks only (SA*): the style checks would churn code that
+      # is not wrong. Pinned versions, run with the module's toolchain.
+      - name: staticcheck (correctness checks)
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 -checks 'SA*' ./...
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
+      - name: upload evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-evidence
+          path: unit.log
+          if-no-files-found: ignore
 
   integration:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.27'
-          check-latest: true
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
 
       # Real multi-process tests: builds cmd/dkvd from source and launches actual
       # OS processes over localhost TCP, including the Phase 9 Raft election and
@@ -53,18 +92,32 @@ jobs:
       # crashed node replaced, a joint configuration through a leader SIGKILL,
       # two groups on the same processes with one broken, workloads across
       # changes checked for linearizability). No prebuilt binaries.
+      # The dkvd processes are race-built too (tests/integration/launch_test.go).
       - name: integration tests (real processes, race detector)
-        run: make integration
+        env:
+          QUORUM_ARTIFACTS: ${{ github.workspace }}/artifacts
+        run: make integration 2>&1 | tee integration.log
+
+      - name: upload evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-evidence
+          path: |
+            integration.log
+            artifacts/
+          if-no-files-found: ignore
 
   faults:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.27'
-          check-latest: true
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
 
       # Phase 10: every chaos profile over 200 seeds each (including Phase 11's
       # crashpoints profile), in the deterministic simulator, plus the
@@ -81,17 +134,26 @@ jobs:
       # failure prints its seed, the exact reproduction command, and a minimized
       # script (or the exact crashat event).
       - name: deterministic fault schedules (200 seeds per profile) and the crash matrix
-        run: make faults FAULT_SEEDS=200
+        run: make faults FAULT_SEEDS=200 2>&1 | tee faults.log
+
+      - name: upload evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: faults-evidence
+          path: faults.log
+          if-no-files-found: ignore
 
   mutation:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.27'
-          check-latest: true
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
 
       # Every rule-violating edit (Phase 9 protocol rules, Phase 10 failure
       # handling and fault-model fidelity, Phase 11 crash-recovery rules, Phase 12
@@ -101,19 +163,38 @@ jobs:
       # by the tests named for it; a surviving
       # mutant — or one that does not compile — fails the build.
       - name: mutation testing
-        run: make mutation
+        run: make mutation 2>&1 | tee mutation.log
+
+      - name: upload evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-evidence
+          path: mutation.log
+          if-no-files-found: ignore
 
   fuzz:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.27'
-          check-latest: true
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
 
       # A short pass over every fuzz target in the repository (discovered, not
       # listed), including the fault-schedule fuzzer.
       - name: fuzz every target (5s each)
-        run: make fuzz FUZZTIME=5s
+        run: make fuzz FUZZTIME=5s 2>&1 | tee fuzz.log
+
+      - name: upload evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-evidence
+          path: |
+            fuzz.log
+            **/testdata/fuzz/**
+          if-no-files-found: ignore
