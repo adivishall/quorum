@@ -3,6 +3,7 @@ package wal
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -172,6 +173,14 @@ type WAL struct {
 	syncerDone sync.WaitGroup
 }
 
+// Seams for this package's own tests: how a segment is flushed, and the
+// writer its records reach the file through. Production uses fullSync and the
+// file itself; a test fails a flush, or tears a write, at an exact point.
+var (
+	syncFile   = fullSync
+	segmentOut = func(f *os.File) io.Writer { return f }
+)
+
 // Create opens the WAL in dir for appending, creating dir if necessary.
 //
 // Recover must be called first on any directory that may already contain
@@ -231,7 +240,7 @@ func (w *WAL) openSegment(seg uint64, isNew bool) error {
 	}
 
 	w.f = f
-	w.w = record.NewWriter(f)
+	w.w = record.NewWriter(segmentOut(f))
 	w.seg = seg
 	w.segBytes = info.Size()
 	w.fullSyncOK = supportsFullSync(f)
@@ -279,9 +288,12 @@ func (w *WAL) append(kind record.Kind, payload []byte) error {
 	w.unsynced += int64(n)
 	if err != nil {
 		// The file may now hold a partial record. That is recoverable — it is
-		// precisely the torn tail the reader detects — but the caller must not
-		// be told the write succeeded.
-		return fmt.Errorf("wal: appending to %s: %w", segmentName(w.seg), err)
+		// precisely the torn tail the reader detects — as long as nothing is
+		// ever written after it: a later record would turn the torn tail into
+		// damage mid-file, which recovery refuses. So the failure latches
+		// (audit D10), and the caller is not told the write succeeded.
+		w.syncErr = fmt.Errorf("wal: appending to %s: %w", segmentName(w.seg), err)
+		return w.syncErr
 	}
 
 	switch w.opts.SyncMode {
@@ -321,7 +333,7 @@ func (w *WAL) syncLocked() error {
 	if w.unsynced == 0 {
 		return nil
 	}
-	if err := fullSync(w.f); err != nil {
+	if err := syncFile(w.f); err != nil {
 		w.syncErr = fmt.Errorf("wal: flushing %s: %w", segmentName(w.seg), err)
 		return w.syncErr
 	}
@@ -391,9 +403,13 @@ func (w *WAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	var syncErr error
-	if w.opts.SyncMode != SyncOff {
-		if err := fullSync(w.f); err != nil {
+	// After a failure, no fsync: a second fsync can succeed once the kernel
+	// has dropped the pages the first failed to write, and reporting that as
+	// durability is the fsyncgate error (audit M11). Close reports the latched
+	// failure instead.
+	syncErr := w.syncErr
+	if syncErr == nil && w.opts.SyncMode != SyncOff {
+		if err := syncFile(w.f); err != nil {
 			syncErr = fmt.Errorf("wal: flushing %s on close: %w", segmentName(w.seg), err)
 		}
 	}
