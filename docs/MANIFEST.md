@@ -142,7 +142,7 @@ may be absent, partial, or complete and durable — the process cannot know whic
 - the output is **not deleted** — the edit naming it may be durable, and the next open would then
   refuse a store whose live file is missing; if the edit did not survive, the next startup sweeps
   the output as an orphan;
-- the store stops publishing: the compactor runs no more compactions (§COMPACTION.md 7), and a
+- the store stops publishing: the compactor runs no more compactions (`docs/COMPACTION.md` §7), and a
   flush, which needs the manifest, latches its failure too.
 
 The same holds for `Install` on every open: a failure of `CURRENT`'s rename or of the directory
