@@ -28,6 +28,19 @@ const (
 	DefaultMaxPendingReads       = 1024
 )
 
+// Default budgets of one AppendEntries (audit H4): a leader sends a follower's
+// backlog in messages of at most this many entries and bytes of entry data —
+// one entry more than the byte budget when that entry alone exceeds it — so a
+// message always fits what its receiver accepts (MaxEntriesPerMessage entries,
+// the transport's frame), however far behind the follower is.
+const (
+	DefaultMaxEntriesPerMsg = 4096
+	DefaultMaxSizePerMsg    = 1 << 20
+	// MaxSizePerMsgLimit bounds MaxSizePerMsg: with one entry of
+	// MaxEntryDataLen beyond it, a message stays under 10 MiB of entry data.
+	MaxSizePerMsgLimit = 8 << 20
+)
+
 // Config constructs a Raft core. The membership it starts from is Conf — the
 // configuration at log index ConfIndex (a snapshot's, at the snapshot's index;
 // or the group's genesis, at 0) — or, when Conf is nil, the fixed voter set
@@ -84,6 +97,12 @@ type Config struct {
 	MaxUncommittedEntries int
 	MaxUncommittedBytes   int
 	MaxPendingReads       int
+
+	// MaxEntriesPerMsg and MaxSizePerMsg are the budgets of one AppendEntries
+	// (at most MaxEntriesPerMessage and MaxSizePerMsgLimit). Zero means the
+	// default; negative or over the limit is invalid.
+	MaxEntriesPerMsg int
+	MaxSizePerMsg    int
 }
 
 func (c *Config) withDefaults() {
@@ -104,6 +123,12 @@ func (c *Config) withDefaults() {
 	}
 	if c.MaxPendingReads == 0 {
 		c.MaxPendingReads = DefaultMaxPendingReads
+	}
+	if c.MaxEntriesPerMsg == 0 {
+		c.MaxEntriesPerMsg = DefaultMaxEntriesPerMsg
+	}
+	if c.MaxSizePerMsg == 0 {
+		c.MaxSizePerMsg = DefaultMaxSizePerMsg
 	}
 }
 
@@ -127,7 +152,9 @@ func (c *Config) validate() (replication.Configuration, error) {
 	if c.ElectionTicks <= 0 || c.HeartbeatTicks <= 0 || c.ElectionTicks <= c.HeartbeatTicks {
 		return none, ErrInvalidTicks
 	}
-	if c.MaxUncommittedEntries < 0 || c.MaxUncommittedBytes < 0 || c.MaxPendingReads < 0 {
+	if c.MaxUncommittedEntries < 0 || c.MaxUncommittedBytes < 0 || c.MaxPendingReads < 0 ||
+		c.MaxEntriesPerMsg < 0 || c.MaxEntriesPerMsg > MaxEntriesPerMessage ||
+		c.MaxSizePerMsg < 0 || c.MaxSizePerMsg > MaxSizePerMsgLimit {
 		return none, ErrInvalidBounds
 	}
 	var base replication.Configuration

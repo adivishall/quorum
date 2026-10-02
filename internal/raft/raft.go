@@ -36,8 +36,10 @@ type Raft struct {
 	heartbeatTicks     int
 	snapshotRetryTicks int
 
-	// Bounds on a leader's outstanding work (Config, audit M3).
+	// Bounds on a leader's outstanding work (Config, audit M3), and the
+	// budgets of one AppendEntries (audit H4).
 	maxUncommittedEntries, maxUncommittedBytes, maxPendingReads int
+	maxEntriesPerMsg, maxSizePerMsg                             int
 
 	// Persistent (durable) state.
 	role        Role
@@ -62,6 +64,11 @@ type Raft struct {
 	// (a leader's log changes no other way). Not maintained off the leader.
 	uncommitted      []int
 	uncommittedBytes int
+	// cut is the peers whose last AppendEntries the budget cut short: a
+	// success from one that is still behind sends the next batch at once
+	// (audit H4) — a lagging follower catches up at the speed of round trips,
+	// not one batch per heartbeat.
+	cut map[NodeID]bool
 	// Snapshot transfers (Phase 14, docs/SNAPSHOTS.md §8): the index of the
 	// snapshot offered to each peer still being answered, and the ticks since.
 	snapPending map[NodeID]uint64
@@ -78,12 +85,17 @@ type Raft struct {
 	lastPersistedCommit uint64 // to detect a commit change worth persisting
 
 	// ReadIndex state (Phase 12, docs/DESIGN.md §8.5), leader only.
-	hbSeq      uint64            // sequence carried by the next AppendEntries this leader sends
+	hbSeq      uint64            // sequence of this leader's latest round of AppendEntries to every peer
 	ackSeq     map[NodeID]uint64 // highest sequence each peer has echoed in the current term
 	termStart  uint64            // index of this leader's election no-op
 	nextReadID uint64
 	pending    []pendingRead // registered reads awaiting a quorum of post-registration acks, FIFO
 	readStates []ReadState   // confirmed reads, drained by Ready/Advance
+	// roundUnsent: a round under hbSeq went to every peer since the last
+	// Advance — its messages are still in msgs, unsent — so a read registered
+	// now can wait for that round's acknowledgements instead of starting its
+	// own (audit H4): reads are confirmed together, not one round each.
+	roundUnsent bool
 
 	// counters record what this core did, for observability (Phase 16): plain
 	// integers nothing in the core reads.
@@ -129,10 +141,13 @@ func New(cfg Config) (*Raft, error) {
 		baseConf:           base.Clone(),
 		nextIndex:          map[NodeID]uint64{},
 		matchIndex:         map[NodeID]uint64{},
+		cut:                map[NodeID]bool{},
 
 		maxUncommittedEntries: cfg.MaxUncommittedEntries,
 		maxUncommittedBytes:   cfg.MaxUncommittedBytes,
 		maxPendingReads:       cfg.MaxPendingReads,
+		maxEntriesPerMsg:      cfg.MaxEntriesPerMsg,
+		maxSizePerMsg:         cfg.MaxSizePerMsg,
 	}
 	if len(base.Voters) == 0 && (!base.Empty() || cfg.ConfIndex > 0) {
 		// Only a joiner's genesis is voterless, and then empty and at index 0;
@@ -318,11 +333,37 @@ func (r *Raft) ReadIndex() (ReadState, error) {
 		r.readStates = append(r.readStates, rs)
 		return rs, nil
 	}
-	// The broadcast below carries hbSeq+1; only acks of that or a later sequence
-	// confirm this read.
-	r.pending = append(r.pending, pendingRead{id: rs.ID, index: rs.Index, seq: r.hbSeq + 1})
-	r.broadcastAppend()
+	// The read is confirmed by acks of a round of messages sent AFTER it was
+	// registered. A round created since the last Advance qualifies: its
+	// messages are still unsent, and every later message carries its sequence
+	// or a higher one. Otherwise the read starts a round — entry-less
+	// heartbeats, not the unacknowledged tail: the round only asks every peer
+	// to acknowledge this leader.
+	if !r.roundUnsent {
+		r.hbSeq++
+		r.roundUnsent = true
+		for _, p := range r.peers {
+			if p != r.id {
+				r.sendHeartbeat(p)
+			}
+		}
+	}
+	r.pending = append(r.pending, pendingRead{id: rs.ID, index: rs.Index, seq: r.hbSeq})
 	return rs, nil
+}
+
+// sendHeartbeat sends peer an entry-less AppendEntries under the current
+// sequence, at the index the peer is known to hold (its match, or the
+// boundary, below which nothing can be named), so it succeeds unless the peer
+// has yet to install a snapshot — and either answer acknowledges the round.
+func (r *Raft) sendHeartbeat(peer NodeID) {
+	prev := r.matchIndex[peer]
+	if base, _ := r.log.Boundary(); prev < base {
+		prev = base
+	}
+	prevTerm, _ := r.log.Term(prev)
+	r.send(Message{Type: MsgAppendRequest, To: peer, Term: r.currentTerm,
+		PrevLogIndex: prev, PrevLogTerm: prevTerm, LeaderCommit: r.log.CommitIndex(), Seq: r.hbSeq})
 }
 
 // confirmReads moves every pending read whose sequence a quorum has echoed into
@@ -491,6 +532,7 @@ func (r *Raft) becomeLeader() {
 	r.snapPending = map[NodeID]uint64{}
 	r.snapWait = map[NodeID]int{}
 	r.ackSeq = map[NodeID]uint64{}
+	r.cut = map[NodeID]bool{}
 	r.syncProgress() // nextIndex = last+1, matchIndex = 0 for every member
 	// The no-op entry in the current term is mandatory (docs/DESIGN.md §8.2,
 	// §5.4.2): without it a new leader cannot commit entries from prior terms —
@@ -657,6 +699,9 @@ func (r *Raft) progress(peer NodeID, match uint64) {
 		delete(r.snapWait, peer)
 	}
 	r.maybeCommit()
+	if r.cut[peer] && match < r.log.LastIndex() {
+		r.sendAppend(peer) // the next batch of a backlog the budget cut
+	}
 }
 
 // handleSnapshot is a follower offered the leader's snapshot (Raft §7). The
@@ -861,7 +906,12 @@ func (r *Raft) sendAppend(peer NodeID) {
 	}
 	prevIndex := next - 1
 	prevTerm, _ := r.log.Term(prevIndex)
-	entries, _ := r.log.Slice(next, r.log.LastIndex()+1)
+	// At most the per-message budgets (audit H4): a backlog beyond them is
+	// sent batch by batch, each acknowledged batch sending the next.
+	last := r.log.LastIndex()
+	hi := min(last+1, next+uint64(r.maxEntriesPerMsg))
+	entries, _ := r.log.SliceBounded(next, hi, r.maxSizePerMsg)
+	r.cut[peer] = next+uint64(len(entries)) <= last
 	r.send(Message{
 		Type: MsgAppendRequest, To: peer, Term: r.currentTerm,
 		PrevLogIndex: prevIndex, PrevLogTerm: prevTerm,
@@ -874,6 +924,7 @@ func (r *Raft) sendAppend(peer NodeID) {
 // heartbeat sequence.
 func (r *Raft) broadcastAppend() {
 	r.hbSeq++
+	r.roundUnsent = true
 	for _, p := range r.peers {
 		if p == r.id {
 			continue

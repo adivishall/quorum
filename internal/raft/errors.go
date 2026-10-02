@@ -43,7 +43,7 @@ var (
 	ErrInvalidTicks = errors.New("raft: invalid tick configuration")
 
 	// ErrInvalidBounds means a MaxUncommitted* or MaxPendingReads bound was
-	// negative.
+	// negative, or a per-message budget negative or beyond its limit.
 	ErrInvalidBounds = errors.New("raft: invalid bound on uncommitted entries or pending reads")
 
 	// ErrBusy means a leader refused a proposal or a read because its bound on
