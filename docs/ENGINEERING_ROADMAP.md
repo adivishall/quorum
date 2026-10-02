@@ -56,7 +56,7 @@ Ranked by what a single input can do.
 
 | # | Defect | Evidence | How verified | Severity |
 |---|---|---|---|---|
-| D1 | **A PUT near the 1 MiB value limit breaks the group.** The client protocol accepts a 4 KiB key and a 1 MiB value; the Raft decoders accept an entry of at most 1 MiB (`raft.MaxEntryDataLen`, `raftlog.MaxEntryDataLen`); nothing checks at `raft.Propose` or `raftlog.Save`. The leader persists the entry; every follower drops the AppendEntries carrying it; an election replaces the leader; the write is `LOST`; and the old leader can never restart (`raftlog: corrupt log: length 1048582 out of range`). | `kv/api.go` validation; `raft/message.go:20`; `raftlog/raftlog.go:654` | **Reproduced** (in-process three-node group, a 1 MiB value) | Critical: one valid request permanently disables a node; three in turn, a group |
+| D1 | **Fixed** (one entry-size limit enforced at every boundary; `docs/RAFT.md` §16, `TestRealEntryLimit`, mutants 173–179). **A PUT near the 1 MiB value limit breaks the group.** The client protocol accepts a 4 KiB key and a 1 MiB value; the Raft decoders accept an entry of at most 1 MiB (`raft.MaxEntryDataLen`, `raftlog.MaxEntryDataLen`); nothing checks at `raft.Propose` or `raftlog.Save`. The leader persists the entry; every follower drops the AppendEntries carrying it; an election replaces the leader; the write is `LOST`; and the old leader can never restart (`raftlog: corrupt log: length 1048582 out of range`). | `kv/api.go` validation; `raft/message.go:20`; `raftlog/raftlog.go:654` | **Reproduced** (in-process three-node group, a 1 MiB value) | Critical: one valid request permanently disables a node; three in turn, a group |
 | D2 | **AppendEntries has no byte or count budget, and every broadcast resends the unacknowledged tail.** `sendAppend` sends `[nextIndex, last]`; `nextIndex` moves only on a response. The receiver refuses a frame over 16 MiB (`transport.MaxFrameSize`), which the sender does not check, so a backlog above it can never be sent; past 65,536 entries the decoder refuses the message (`MaxEntriesPerMessage`). | `raft/raft.go` `sendAppend`; `transport/wire.go:147` | Resend **measured** (bytes per entry ×10.9 from 1 to 16 clients, `docs/CLUSTER_BENCHMARKS.md` §6.3); the 16 MiB stall **from the code** | High: liveness of a lagging follower; bandwidth grows with the square of the writes in flight |
 | D3 | **Concurrent `create-group`/`start-group` admin calls can start two drivers on one log.** `Host.start` checks `groups[g]` under the lock, releases it, starts the node, and re-takes it to store the result. | `multiraft/host.go` `start` | From the code | High (durability), operator-triggered |
 | D4 | **`dkvd -data-dir` defaults to a fresh temporary directory on every start**, so a restarted node forgets its term, vote and log, which Raft forbids. Nothing locks a data directory, so two processes can open one log. | `cmd/dkvd/main.go:80, 394`; no flock anywhere | From the code | High (safety), configuration-triggered |
@@ -204,6 +204,9 @@ break safety or make replicas diverge. The engine integration adds a durable app
 log and more configuration on top of exactly these paths, so they must hold first.
 
 ### 1. Input and replication bounds (D1, D2) — next
+
+- **Status:** D1 done — the entry budget is enforced at the front, at `raft.Propose`, in the
+  in-memory log, at `Step` and at `raftlog.Save` (`docs/RAFT.md` §16). D2 is open.
 
 - **Problem:** a request within the documented limits can disable a node; a replication message
   has no size bound.

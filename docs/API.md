@@ -44,7 +44,7 @@ is a protocol error). Byte strings are a varint length followed by the bytes.
 | ackedBelow | varint | the client's watermark (0 when anonymous) |
 | timeoutMillis | varint | the client's budget for this attempt; 0 = the server default; more than fits a `time.Duration` (≈292 years): protocol error |
 | key | bytes | ≤ 4 KiB (longer: protocol error) |
-| value | bytes | **PUT only** — absent for every other op; ≤ 1 MiB |
+| value | bytes | **PUT only** — absent for every other op; ≤ 1 MiB, and the write's whole entry ≤ 1 MiB (§3) |
 
 **Response** (kind 4):
 
@@ -95,7 +95,18 @@ proposed. The rules (`Request.validate`; each pinned by
 - REGISTER carries no key, value, clientID, requestID or ackedBelow;
 - PUT/GET/DELETE: a non-empty key of at most 4 KiB; a value only on PUT, at most 1 MiB;
 - anonymous (clientID 0): requestID = ackedBelow = 0;
-- identified: requestID ≥ 1 and 1 ≤ ackedBelow ≤ requestID.
+- identified: requestID ≥ 1 and 1 ≤ ackedBelow ≤ requestID;
+- PUT/DELETE: the **log entry the write becomes** — its encoded command — is at most
+  `kv.MaxCommandLen` = 1 MiB (1,048,576 bytes), the system's one entry-size limit
+  (`raft.MaxEntryDataLen`, `docs/RAFT.md` §16). The encoding adds to the key and value an op
+  byte, the uvarint lengths of key and value and, for an identified write, its three identity
+  varints (1–10 bytes each), so **the largest value depends on the key and identity**: an
+  anonymous PUT of a 1-byte key carries up to 1,048,570 bytes of value, the longest key with the
+  largest identities leaves room for 1,044,444. A value of the full 1 MiB is therefore always
+  `INVALID_REQUEST`. The refusal is definite and comes before anything is proposed or forwarded
+  (`TestEncodedEntryLimitDecidesWriteAdmission`, `TestEntryLimitEndToEnd`, `TestRealEntryLimit`;
+  mutants 173–179). Until this rule (audit C1), such a write was proposed, persisted by the
+  leader as an entry every follower refused, and left that leader unable to restart.
 
 Anything that validates becomes a log command every replica can apply
 (`TestValidatedRequestsAlwaysApply`) — no client can get an entry proposed that replicas refuse.

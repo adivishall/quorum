@@ -407,3 +407,40 @@ an unanswered offer re-offered, a matching suffix kept, a covered snapshot ignor
 below a boundary, compaction needing the applied index, back-up stopping at the boundary) and 40
 randomized schedules with compaction; `internal/replication`'s differential test against a
 reference log with `Compact` and `InstallSnapshot`; everything in `docs/SNAPSHOTS.md`.
+
+## 16. The entry-size limit
+
+One constant bounds an entry's bytes everywhere: `replication.MaxEntryDataLen` = 1 MiB, aliased as
+`raft.MaxEntryDataLen` and `raftlog.MaxEntryDataLen` and, at the client, `kv.MaxCommandLen`. It is
+the bound every on-disk and on-wire decoder has always read an entry by; what was missing was its
+enforcement where entries are **created** and **written**. The invariant:
+
+> No code path creates, holds, persists, transmits or accepts a Raft entry whose data exceeds
+> `MaxEntryDataLen`.
+
+| Boundary | Enforcement | Test (mutant) |
+|---|---|---|
+| Client front (`kv.Request.validate`) | the **encoded** command, not the raw key and value, must fit: `INVALID_REQUEST`, before anything is proposed or forwarded | `TestEncodedEntryLimitDecidesWriteAdmission` (173) |
+| Command (`kv.Command.Validate`, so `Decode`) | an over-limit command is malformed | same (174) |
+| Proposal (`raft.Propose`) | `ErrEntryTooLarge` on any node, checked before the role: definite, nothing appended | `TestProposeOverTheEntryLimitIsRefused` (175) |
+| In-memory log (`replication.MemoryLog`) | `Append`/`TruncateAndAppend` refuse it, leaving the log unchanged | `TestEntrySizeLimit` (177) |
+| Receipt (`raft.Step`; the AppendEntries codec) | an AppendEntries carrying one is malformed and has no effect, not even its term; the codec never decodes one | `TestStepRefusesAnOversizedAppendEntries` (176), `TestCodecEntryLimit` |
+| Persistence (`raftlog.Save`) | checked for every entry before any byte is written; the log fails (it cannot claim durability for what its caller holds) but the file is untouched and reopens | `TestSaveRefusesAnEntryOverTheLimit` (178) |
+| Recovery (`raftlog` replay) | refuses a longer entry, as before — now the same bound `Save` writes by | `TestSaveAndReplayAtTheEntryLimit` |
+| Driver and server (`raftnode.Node.Write`, `kv.Server`) | `raft.ErrEntryTooLarge` is a definite refusal: `INVALID_REQUEST`, never `UNKNOWN` | `TestEntryTooLargeFromBelowIsInvalid` (179) |
+
+A configuration entry always fits (`replication.MaxEncodedConfiguration` is checked against the
+limit at compile time); the election no-op is empty. End to end, `TestEntryLimitEndToEnd` (three
+real drivers) and `TestRealEntryLimit` (three `dkvd` processes, a full-cluster SIGKILL) commit an
+entry of exactly the limit on every node, refuse one byte more at every node, read every node's
+durable log to confirm nothing over the limit reached it, and restart every node from its own log.
+
+**Why the limit was not raised instead.** A 1 MiB value plus its key and framing could have been
+made to fit by raising the entry limit by a few KiB. That would have widened what every decoder
+accepts on disk and on the wire — a format change — to keep a value size that never worked; the
+client contract instead states the limit that decides, the encoded entry (`docs/API.md` §3).
+
+**What the limit does not yet bound.** It bounds one entry; an AppendEntries carrying many is
+bounded only by the transport's 16 MiB frame and 65,536 entries (audit H4,
+`docs/ENGINEERING_ROADMAP.md`).
+
