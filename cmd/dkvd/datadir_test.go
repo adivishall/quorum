@@ -221,9 +221,8 @@ func TestALostJoinGroupIsReportedNotRecreated(t *testing.T) {
 		"-data-dir", dir, "-tick-interval", "5ms", "-join", "0"}
 	out, _, cancel, wait := runNode(t, append(append([]string(nil), base...), "-init", "-cluster-id", "c1")...)
 	waitFor(t, out, "event=data_dir_initialized node=z", 5*time.Second)
-	if !strings.Contains(out.String(), "event=group_started node=z group=0") {
-		t.Fatalf("premise: the joiner did not start group 0:\n%s", out.String())
-	}
+	// The initialization is recorded before any group starts.
+	waitFor(t, out, "event=group_started node=z group=0", 5*time.Second)
 	cancel()
 	if code := wait(); code != 0 {
 		t.Fatalf("exit %d", code)
