@@ -2428,6 +2428,71 @@ mutant "metrics-port-caps-connections" cmd/dkvd/main.go \
   '' \
   ./cmd/dkvd '^TestMetricsPortCapsItsConnections$'
 
+# 286. Open sweeps orphans only against the durable fresh manifest
+# (review of PR #10, audit M11).
+mutant "open-sweeps-after-the-fresh-manifest" internal/storage/lsmstore.go \
+  '	if err := s.installManifest(state); err != nil {
+		s.closeManifest()' \
+  '	if err := s.sweepOrphans(files); err != nil {
+		return nil, err
+	}
+	if err := s.installManifest(state); err != nil {
+		s.closeManifest()' \
+  ./internal/storage '^TestOpenSweepsOnlyAgainstADurableManifest$'
+
+# 287. A failed open closes the manifest it installed.
+mutant "failed-open-closes-its-manifest" internal/storage/lsmstore.go \
+  '	if err := s.installManifest(state); err != nil {
+		s.closeManifest()
+		s.closeAllReaders()' \
+  '	if err := s.installManifest(state); err != nil {
+		s.closeAllReaders()' \
+  ./internal/storage '^TestAFailedOpenClosesItsManifest$'
+
+# 288. An explicit compaction honours the latch.
+mutant "explicit-compaction-honours-the-latch" internal/storage/lsmcompact.go \
+  '	if err := s.CompactionError(); err != nil {
+		return false, classify("compact"' \
+  '	if err := s.CompactionError(); err != nil && false {
+		return false, classify("compact"' \
+  ./internal/storage '^TestAnExplicitCompactionAfterAFailureRunsNothing$'
+
+# 289. SyncOff never fsyncs the WAL, a flush included.
+mutant "syncoff-flush-does-not-fsync" internal/storage/lsmstore.go \
+  '	if s.w != nil && s.opts.WAL.SyncMode != wal.SyncOff {' \
+  '	if s.w != nil {' \
+  ./internal/storage '^TestSyncOffNeverFsyncsTheWAL$'
+
+# 290. The options bound a put to what one WAL record holds.
+mutant "options-bound-a-put-by-the-wal-record" internal/storage/store.go \
+  '	if int64(o.MaxKeySize)+int64(o.MaxValueSize) > maxKeyValueBytes {' \
+  '	if false {' \
+  ./internal/storage '^TestAPutAlwaysFitsAWALRecord$'
+
+# 291. An oversized record is refused before anything is written, unlatched.
+mutant "oversized-record-latches-nothing" internal/storage/wal/wal.go \
+  '	if len(payload) > record.MaxRecordSize {' \
+  '	if false {' \
+  ./internal/storage/wal '^TestAnOversizedRecordLatchesNothing$'
+
+# 292. A failed write does not stop the batch syncer.
+mutant "failed-write-keeps-the-batch-flush" internal/storage/wal/wal.go \
+  '				if !w.closed && !w.flushFailed {' \
+  '				if !w.closed && w.syncErr == nil {' \
+  ./internal/storage/wal '^TestAFailedWriteDoesNotStopTheBatchFlush$'
+
+# 293. Sync after a failed write flushes.
+mutant "sync-after-a-failed-write-flushes" internal/storage/wal/wal.go \
+  '	if w.flushFailed {
+		return w.syncErr
+	}
+	if err := w.syncLocked(); err != nil {' \
+  '	if w.syncErr != nil {
+		return w.syncErr
+	}
+	if err := w.syncLocked(); err != nil {' \
+  ./internal/storage/wal '^TestSyncAfterAFailedWriteFlushes$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then

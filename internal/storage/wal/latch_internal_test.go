@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -145,5 +146,115 @@ func TestCloseAfterAFailedWriteStillFlushes(t *testing.T) {
 	}
 	if syncs != before+1 {
 		t.Fatalf("Close after a failed write flushed %d times, want once: the acknowledged record is never made durable", syncs-before)
+	}
+}
+
+// TestAnOversizedRecordLatchesNothing: an append the framing cannot hold is
+// refused before anything is written, and the log goes on taking appends. It
+// latched: one refused record — nothing on disk — failed every later append.
+func TestAnOversizedRecordLatchesNothing(t *testing.T) {
+	opts := DefaultOptions()
+	opts.SyncMode = SyncOff
+	w, err := Create(t.TempDir(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	big := Batch{{Kind: OpPut, Key: []byte("k"), Value: make([]byte, 65<<20)}}
+	if err := w.AppendBatch(big); !errors.Is(err, ErrRecordTooLarge) {
+		t.Fatalf("an oversized append: %v, want ErrRecordTooLarge", err)
+	}
+	if got := w.Stats().ActiveBytes; got != 0 {
+		t.Fatalf("the refused append wrote %d bytes", got)
+	}
+	if err := w.AppendBatch(batchOf("a")); err != nil {
+		t.Fatalf("an append after a refused oversized one: %v", err)
+	}
+}
+
+// TestAFailedWriteDoesNotStopTheBatchFlush: after a failed write, batch mode
+// still flushes the records acknowledged before it within its interval, and
+// Sync flushes them too — reporting the latched failure, since the log takes
+// no more appends. Only a failed flush forbids another. Both refused after
+// any failure, so those records stayed unflushed until Close.
+func TestAFailedWriteDoesNotStopTheBatchFlush(t *testing.T) {
+	writes := 0
+	var mu sync.Mutex
+	syncs := 0
+	defer func(prev func(*os.File) io.Writer) { segmentOut = prev }(segmentOut)
+	segmentOut = func(f *os.File) io.Writer { return tearNth{w: f, n: &writes, nth: 2, short: 5} }
+	defer func(prev func(*os.File) error) { syncFile = prev }(syncFile)
+	syncFile = func(f *os.File) error {
+		mu.Lock()
+		syncs++
+		mu.Unlock()
+		return f.Sync()
+	}
+	opts := DefaultOptions()
+	opts.SyncMode = SyncBatch
+	opts.SyncInterval = 20 * time.Millisecond
+	opts.SyncBytes = 1 << 40
+	w, err := Create(t.TempDir(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.AppendBatch(batchOf("a")); err != nil { // acknowledged, unflushed
+		t.Fatal(err)
+	}
+	failed := w.AppendBatch(batchOf("b"))
+	if failed == nil {
+		t.Fatal("premise: the torn append succeeded")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for w.Stats().UnsyncedBytes != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the batch syncer never flushed after a failed write (%d bytes unsynced)", w.Stats().UnsyncedBytes)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := w.Sync(); err == nil || err.Error() != failed.Error() {
+		t.Fatalf("Sync after a failed write: %v, want the latched %v", err, failed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if syncs == 0 {
+		t.Fatal("no flush happened")
+	}
+}
+
+// TestSyncAfterAFailedWriteFlushes: an explicit Sync after a failed write
+// flushes the records acknowledged before it, and reports the latched
+// failure. It refused without flushing.
+func TestSyncAfterAFailedWriteFlushes(t *testing.T) {
+	writes, syncs := 0, 0
+	defer func(prev func(*os.File) io.Writer) { segmentOut = prev }(segmentOut)
+	segmentOut = func(f *os.File) io.Writer { return tearNth{w: f, n: &writes, nth: 2, short: 5} }
+	defer func(prev func(*os.File) error) { syncFile = prev }(syncFile)
+	syncFile = func(f *os.File) error {
+		syncs++
+		return f.Sync()
+	}
+	opts := DefaultOptions()
+	opts.SyncMode = SyncBatch
+	opts.SyncInterval = time.Hour // only explicit flushes
+	opts.SyncBytes = 1 << 40
+	w, err := Create(t.TempDir(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.AppendBatch(batchOf("a")); err != nil {
+		t.Fatal(err)
+	}
+	failed := w.AppendBatch(batchOf("b"))
+	if failed == nil {
+		t.Fatal("premise: the torn append succeeded")
+	}
+	if err := w.Sync(); err == nil || err.Error() != failed.Error() {
+		t.Fatalf("Sync after a failed write: %v, want the latched %v", err, failed)
+	}
+	if syncs != 1 || w.Stats().UnsyncedBytes != 0 {
+		t.Fatalf("Sync after a failed write flushed %d times, %d bytes still unsynced", syncs, w.Stats().UnsyncedBytes)
 	}
 }

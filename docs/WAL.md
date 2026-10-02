@@ -157,11 +157,17 @@ mid-segment, which recovery refuses (`TestATornAppendLatches`). And `Close` afte
 returns that failure **without flushing again**: a second fsync can succeed once the kernel has
 dropped the pages the first failed to write, and reporting that as durability is the fsyncgate
 error (`TestCloseAfterAFailedFlushReportsItAndDoesNotFlushAgain`; mutants 261–262, 265). After a
-failed **write**, `Close` still flushes, because the records acknowledged before it are owed that
-flush, and then reports the latched failure (`TestCloseAfterAFailedWriteStillFlushes`, mutant 264).
+failed **write**, the records acknowledged before it are still owed their flush: the batch syncer
+goes on flushing, `Sync` flushes, and `Close` flushes, each then reporting the latched failure
+(`TestAFailedWriteDoesNotStopTheBatchFlush`, `TestSyncAfterAFailedWriteFlushes`,
+`TestCloseAfterAFailedWriteStillFlushes`; mutants 264, 292–293). A record larger than the framing
+holds is refused before anything is written and latches nothing (`ErrRecordTooLarge`,
+`TestAnOversizedRecordLatchesNothing`, mutant 291); the LSM store refuses options whose largest put
+would not fit one (`TestAPutAlwaysFitsAWALRecord`).
 
-The LSM store syncs the WAL before a flush records its table in the manifest, so the manifest never
-runs ahead of the durable log (`TestAFlushMakesTheWALDurableBeforeItsEdit`, mutant 260). The exception is a
+The LSM store syncs the WAL before a flush records its table in the manifest — except in `SyncOff`,
+which never fsyncs (`TestSyncOffNeverFsyncsTheWAL`) — so the manifest never runs ahead of the
+durable log (`TestAFlushMakesTheWALDurableBeforeItsEdit`, mutant 260). The exception is a
 flush during replay at open: its records come from segments an earlier process wrote, and open
 does not sync them. If that process was killed with records still in the page cache, and the
 machine then loses power after the replay flush but before the kernel writes those pages back, the

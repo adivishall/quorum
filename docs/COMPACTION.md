@@ -193,9 +193,11 @@ it is deleting explicitly, so a level-0 file added by a concurrent flush carries
 **A failed compaction latches**, like a failed flush. The data is intact and still readable, so
 reads and writes keep working; what is no longer happening is file-count control, which an operator
 needs to know about, so it is exposed through `CompactionError` rather than only logged. Latched
-means **no compaction runs again** in that process (`TestALatchedCompactionErrorStopsTheCompactor`,
-mutant 259): the compactor used to retry on every flush after a failure, appending after an edit
-whose outcome was unknown and burning file numbers. A compaction whose manifest append failed keeps
+means **no compaction runs again** in that process — the background compactor's nor an explicit
+`Compact`/`CompactAll`, which latches its own failure too (`TestALatchedCompactionErrorStopsTheCompactor`,
+`TestAnExplicitCompactionAfterAFailureRunsNothing`, mutants 259, 288): the compactor used to retry on
+every flush after a failure, appending after an edit whose outcome was unknown and burning file
+numbers, and an explicit compaction merged again, keeping an orphan output per call. A compaction whose manifest append failed keeps
 its output (`docs/MANIFEST.md` §5).
 
 ## 8. Measurements

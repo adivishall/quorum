@@ -162,8 +162,8 @@ tests).
        -> live file set, each file's sequence range and level, nextFileNum, lastSequence
 2. open every referenced file; cross-check it against the MANIFEST
 3. check the file set is coherent: sequence ranges disjoint and ascending, no empty tables
-4. sweep orphans: *.sst.tmp, *.sst the MANIFEST does not name, superseded MANIFESTs, CURRENT.tmp
-5. install a fresh MANIFEST holding a full snapshot; point CURRENT at it; delete the old ones
+4. install a fresh MANIFEST holding a full snapshot; point CURRENT at it; delete the old ones
+5. sweep orphans: *.sst.tmp, *.sst the MANIFEST does not name, CURRENT.tmp
 6. replay the WAL from sequence 1, skipping every mutation at or below the highest flushed sequence
 ```
 
@@ -179,11 +179,15 @@ than as a missing key (INV-L7). `Options.VerifySSTablesOnOpen` restores the Phas
 operators who would rather pay at startup, and `TestCorruptSSTableRefusesToOpen` pins both halves
 so neither can drift silently.
 
-**Step 4 is after step 1 for a reason.** Deleting a file because it is absent from a file set we are
-not yet sure of would be the one way this could lose data. Orphan sweeping is safe only once the
-MANIFEST has been recovered successfully.
+**Step 5 is after step 4 for a reason.** Deleting a file because it is absent from a file set we are
+not yet sure of would be the one way this could lose data. Recovering the MANIFEST is not enough:
+what step 1 read may include an edit that was written but never fsynced — a compaction whose
+manifest fsync failed — and only the fresh manifest of step 4 makes that state durable. Sweeping
+first deleted the compaction's inputs; when step 4 then failed, a power loss left the old manifest
+naming them, and the store never opened again (`TestOpenSweepsOnlyAgainstADurableManifest`). A
+failed step 4 also closes the manifest it opened (`TestAFailedOpenClosesItsManifest`).
 
-**Step 5 is what bounds a manifest's length.** Without it a manifest would accumulate every edit
+**Step 4 is what bounds a manifest's length.** Without it a manifest would accumulate every edit
 for the life of the database and recovery time would track total history rather than current state.
 Installing a fresh one on every open means recovery replays one snapshot plus one session's edits.
 A crash partway through leaves the previous `CURRENT` and manifest untouched and the new manifest

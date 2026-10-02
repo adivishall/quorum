@@ -75,6 +75,11 @@ const (
 // ErrClosed is returned by operations on a closed WAL.
 var ErrClosed = errors.New("wal: closed")
 
+// ErrRecordTooLarge is returned for an append whose record exceeds the
+// framing's maximum (record.MaxRecordSize). Nothing was written and the log
+// is unaffected.
+var ErrRecordTooLarge = errors.New("wal: record too large")
+
 // Options configures a WAL.
 type Options struct {
 	// SyncMode selects the durability policy. The zero value is SyncOff, so
@@ -278,6 +283,14 @@ func (w *WAL) append(kind record.Kind, payload []byte) error {
 		return w.syncErr
 	}
 
+	// A record the framing cannot hold is refused before anything is written:
+	// a caller error, not a failure of the log, so it latches nothing. (The
+	// framing's own refusal comes after the call that latches.)
+	if len(payload) > record.MaxRecordSize {
+		return fmt.Errorf("%w: a record of %d bytes exceeds the %d-byte maximum; nothing was written",
+			ErrRecordTooLarge, len(payload), record.MaxRecordSize)
+	}
+
 	// Rotate before writing, never in the middle: a record is never split
 	// across segments, so replay can treat each segment independently.
 	if w.segBytes > 0 && w.segBytes >= w.opts.SegmentSize {
@@ -337,9 +350,12 @@ func (w *WAL) syncLocked() error {
 		return nil
 	}
 	if err := syncFile(w.f); err != nil {
-		w.syncErr = fmt.Errorf("wal: flushing %s: %w", segmentName(w.seg), err)
+		ferr := fmt.Errorf("wal: flushing %s: %w", segmentName(w.seg), err)
+		if w.syncErr == nil {
+			w.syncErr = ferr // a failed write latched first stays the cause
+		}
 		w.flushFailed = true
-		return w.syncErr
+		return ferr
 	}
 	w.unsynced = 0
 	w.syncs++ // count fsyncs so a benchmark can prove a batch flush happened
@@ -353,10 +369,16 @@ func (w *WAL) Sync() error {
 	if w.closed {
 		return ErrClosed
 	}
-	if w.syncErr != nil {
+	// After a failed write the records before it are still owed their flush
+	// (only a failed flush forbids another); the latched failure is reported
+	// all the same, since the log takes no more appends.
+	if w.flushFailed {
 		return w.syncErr
 	}
-	return w.syncLocked()
+	if err := w.syncLocked(); err != nil {
+		return err
+	}
+	return w.syncErr
 }
 
 // startSyncer runs the periodic flush for SyncBatch mode.
@@ -373,9 +395,10 @@ func (w *WAL) startSyncer() {
 				return
 			case <-t.C:
 				w.mu.Lock()
-				if !w.closed && w.syncErr == nil {
+				if !w.closed && !w.flushFailed {
 					// A failure latches into w.syncErr and is surfaced on the
-					// next append; it is not logged and forgotten.
+					// next append; it is not logged and forgotten. A failed
+					// write does not stop the flush of what came before it.
 					_ = w.syncLocked()
 				}
 				w.mu.Unlock()

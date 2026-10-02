@@ -197,8 +197,15 @@ func (s *LSMStore) Compact() (bool, error) {
 	if s.closed {
 		return false, opErr("compact", nil, ErrClosed)
 	}
+	// Latched as the background compactor is: after a failure no compaction
+	// runs again in this process. An explicit one used to merge again after a
+	// failed manifest edit, and keep each output on disk (audit M11).
+	if err := s.CompactionError(); err != nil {
+		return false, classify("compact", nil, fmt.Errorf("lsm: compaction stopped by an earlier failure: %w", err))
+	}
 	ran, err := s.compactOnce()
 	if err != nil {
+		s.setCompactErr(err)
 		return false, classify("compact", nil, err)
 	}
 	return ran, nil
