@@ -263,3 +263,47 @@ func TestIsolatedLeaderRefusesWorkBeyondItsBounds(t *testing.T) {
 		}
 	}
 }
+
+// TestForgetReleasesWhatTheActorHolds: each kind of abandon notice releases
+// exactly what the actor holds for its request — a write's waiter, an
+// unconfirmed read — including for a client that gave up before it read the
+// acceptance the actor had already sent; a notice for a request already
+// completed, or refused, changes nothing.
+func TestForgetReleasesWhatTheActorHolds(t *testing.T) {
+	n := &Node{waiters: NewWaiters(), reads: NewReads()}
+	other := n.waiters.Add(7, 1, 0) // another client's write at the same index, still waiting
+
+	w := n.waiters.Add(7, 1, 0)
+	n.forget(abandoned{index: 7, ch: w})
+	if n.waiters.Len() != 1 {
+		t.Fatalf("an abandoned write: %d waiters left, want 1 (the other client's)", n.waiters.Len())
+	}
+
+	acc := make(chan writeAccepted, 1)
+	acc <- writeAccepted{index: 8, term: 1, done: n.waiters.Add(8, 1, 0)}
+	n.forget(abandoned{write: acc})
+	if n.waiters.Len() != 1 {
+		t.Fatalf("a write abandoned before its acceptance was read: %d waiters left, want 1", n.waiters.Len())
+	}
+
+	n.reads.Add(3, 1)
+	n.forget(abandoned{readID: 3})
+	racc := make(chan readAccepted, 1)
+	racc <- readAccepted{id: 4, done: n.reads.Add(4, 1)}
+	n.forget(abandoned{read: racc})
+	if n.reads.Len() != 0 {
+		t.Fatalf("abandoned reads: %d left, want 0", n.reads.Len())
+	}
+
+	refused := make(chan writeAccepted, 1)
+	refused <- writeAccepted{err: raft.ErrNotLeader}
+	n.forget(abandoned{write: refused})
+	n.forget(abandoned{index: 7, ch: w}) // already forgotten
+	n.waiters.Applied(7, 1, nil)
+	if n.waiters.Len() != 0 {
+		t.Fatalf("%d waiters left", n.waiters.Len())
+	}
+	if out := <-other; out.Err != nil || out.Index != 7 {
+		t.Fatalf("the other client's write at the same index: %+v, want success", out)
+	}
+}
