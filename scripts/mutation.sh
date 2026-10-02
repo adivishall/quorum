@@ -1719,10 +1719,11 @@ mutant "group-identity-names-its-node" internal/raftnode/node.go \
   '		if false {' \
   ./internal/raftnode '^TestIdentityFileNamesItsNode$'
 
-# 188. An initialized directory whose group state is gone creates it empty.
+# 188. An initialized directory whose group state is gone creates it empty
+#      (-raft mode; mutant 266 is -cluster mode's).
 mutant "genesis-only-while-initializing" cmd/dkvd/main.go \
-  '		if !nd.Initializing() {' \
-  '		if false {' \
+  'hc.LogPathFor(c.g)); err != nil || !found {' \
+  'hc.LogPathFor(c.g)); (err != nil || !found) && false {' \
   ./cmd/dkvd '^TestDataDirectoryRules$'
 
 # --- The group lifecycle (audit H3, docs/MULTI_RAFT.md §3): starts and stops of
@@ -2151,10 +2152,10 @@ mutant "read-round-entry-less" internal/raft/raft.go \
 
 # 250. A broadcast is a round a read can join.
 mutant "broadcast-is-a-round" internal/raft/raft.go \
-  'func (r *Raft) broadcastAppend() {
+  'func (r *Raft) broadcastAppend(retransmit bool) {
 	r.hbSeq++
 	r.roundUnsent = true' \
-  'func (r *Raft) broadcastAppend() {
+  'func (r *Raft) broadcastAppend(retransmit bool) {
 	r.hbSeq++' \
   ./internal/raft '^TestReadsInOneCycleShareOneRound$'
 
@@ -2259,9 +2260,9 @@ mutant "wal-close-reports-the-latch" internal/storage/wal/wal.go \
 # 263. A flush during replay at open, before the store has a WAL, does not
 # sync a WAL that does not exist.
 mutant "replay-flush-has-no-wal-to-sync" internal/storage/lsmstore.go \
-  '	if s.w != nil {
+  '	if s.w != nil && s.opts.WAL.SyncMode != wal.SyncOff {
 		if err := s.w.Sync(); err != nil {' \
-  '	if true {
+  '	if s.opts.WAL.SyncMode != wal.SyncOff {
 		if err := s.w.Sync(); err != nil {' \
   ./internal/storage '^TestAReplayThatFlushesOpens$'
 
@@ -2281,10 +2282,10 @@ mutant "wal-failed-flush-is-remembered" internal/storage/wal/wal.go \
 # 266. In -cluster mode, a -join group whose state was lost from an
 # initialized directory is reported, not created again empty (audit H1).
 mutant "lost-join-group-is-not-recreated" cmd/dkvd/main.go \
-  '			} else {
-				what := "genesis group"' \
-  '			} else if c.boot != nil {
-				what := "genesis group"' \
+  '		} else {
+			what := "genesis group"' \
+  '		} else if c.boot != nil {
+			what := "genesis group"' \
   ./cmd/dkvd '^TestALostJoinGroupIsReportedNotRecreated$'
 
 # 267. A leader's configuration change re-checks its pending reads: when it
