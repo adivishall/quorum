@@ -1,5 +1,16 @@
 package replication
 
+// MaxEntryDataLen is the largest Entry.Data, in bytes, anywhere in the system:
+// the one authoritative entry-size limit. Every layer an entry passes through
+// enforces this same constant — the key-value front validates the ENCODED
+// command against it, raft.Propose refuses a larger proposal, the log refuses
+// to hold one, the AppendEntries codec and the core refuse to accept one,
+// raftlog.Save refuses to persist one and raftlog replay refuses to read one.
+// So no code path creates, persists, transmits or accepts an entry that some
+// other path would refuse to read back (docs/RAFT.md §16). It is 1 MiB, the
+// size every on-disk and on-wire decoder has always bounded an entry by.
+const MaxEntryDataLen = 1 << 20
+
 // Entry is one opaque log entry. Data is arbitrary bytes the replication layer
 // never interprets — in the finished system it is an encoded state-machine
 // command, but Phase 8 treats it as opaque (docs/REPLICATION.md §3.1).
@@ -225,6 +236,9 @@ func (l *MemoryLog) appendFrom(f uint64, entries []Entry) error {
 		}
 		if e.Term < prevTerm {
 			return ErrTermRegression
+		}
+		if len(e.Data) > MaxEntryDataLen {
+			return ErrEntryTooLarge
 		}
 		prevTerm = e.Term
 	}

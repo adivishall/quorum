@@ -249,8 +249,14 @@ func (r *Raft) Tick() {
 }
 
 // Propose appends a client command to the leader's log and replicates it. It
-// returns ErrNotLeader on a non-leader.
+// returns ErrEntryTooLarge for a command longer than MaxEntryDataLen — on any
+// node, before anything is appended, so no node ever holds, persists or sends an
+// entry its peers or its own recovery would refuse — and ErrNotLeader on a
+// non-leader. Both refusals are definite.
 func (r *Raft) Propose(data []byte) error {
+	if len(data) > MaxEntryDataLen {
+		return fmt.Errorf("%w: a proposal of %d bytes, the limit is %d", ErrEntryTooLarge, len(data), MaxEntryDataLen)
+	}
 	if r.role != Leader {
 		return ErrNotLeader
 	}
@@ -330,6 +336,19 @@ func (r *Raft) Compact(index uint64) error {
 
 // Step handles one inbound message. It is the only entry point for peer traffic.
 func (r *Raft) Step(m Message) error {
+	// An AppendEntries carrying an entry larger than MaxEntryDataLen is not a
+	// message any correct leader sends (Propose refuses such an entry), and the
+	// codec refuses to decode one; a message that reaches Step without the codec
+	// is refused here too, before it has any effect — not even its term is
+	// adopted — so the log never holds an entry its own durable log would refuse
+	// to persist.
+	if m.Type == MsgAppendRequest {
+		for _, e := range m.Entries {
+			if len(e.Data) > MaxEntryDataLen {
+				return fmt.Errorf("%w: %w: entry %d of %d bytes, the limit is %d", ErrMalformedMessage, ErrEntryTooLarge, e.Index, len(e.Data), MaxEntryDataLen)
+			}
+		}
+	}
 	// A node outside this node's configuration (docs/MEMBERSHIP.md §5): its
 	// responses are dropped, and its vote request is refused — its term never
 	// adopted — unless its log is at least as up to date as this node's. A

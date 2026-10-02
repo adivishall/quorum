@@ -344,3 +344,34 @@ func TestEmptyAndNilDataArePreserved(t *testing.T) {
 		t.Errorf("empty Data became %v", b.Data)
 	}
 }
+
+// TestEntrySizeLimit: the log holds an entry of exactly MaxEntryDataLen bytes
+// and refuses one byte more — by Append and by a suffix replacement alike —
+// leaving the log unchanged (the system's one entry-size limit, C1).
+func TestEntrySizeLimit(t *testing.T) {
+	l := NewMemoryLog()
+	mustAppend(t, l, ent(1, 1))
+	atLimit := Entry{Index: 2, Term: 1, Data: bytes.Repeat([]byte{'v'}, MaxEntryDataLen)}
+	over := Entry{Index: 2, Term: 1, Data: bytes.Repeat([]byte{'v'}, MaxEntryDataLen+1)}
+
+	if err := l.Append(over); !errors.Is(err, ErrEntryTooLarge) {
+		t.Fatalf("Append of a %d-byte entry = %v, want ErrEntryTooLarge", len(over.Data), err)
+	}
+	if err := l.TruncateAndAppend(over); !errors.Is(err, ErrEntryTooLarge) {
+		t.Fatalf("TruncateAndAppend of a %d-byte entry = %v, want ErrEntryTooLarge", len(over.Data), err)
+	}
+	// A refused batch has no effect, even when an acceptable entry precedes the
+	// oversized one.
+	if err := l.Append(ent(2, 1), Entry{Index: 3, Term: 1, Data: over.Data}); !errors.Is(err, ErrEntryTooLarge) {
+		t.Fatalf("Append of a batch ending in an oversized entry = %v, want ErrEntryTooLarge", err)
+	}
+	if l.LastIndex() != 1 {
+		t.Fatalf("LastIndex() = %d after refused appends, want 1", l.LastIndex())
+	}
+
+	mustAppend(t, l, atLimit)
+	got, err := l.At(2)
+	if err != nil || len(got.Data) != MaxEntryDataLen {
+		t.Fatalf("At(2) = %d bytes, %v; want the %d-byte entry", len(got.Data), err, MaxEntryDataLen)
+	}
+}

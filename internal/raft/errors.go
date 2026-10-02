@@ -1,6 +1,10 @@
 package raft
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/adivishall/quorum/internal/replication"
+)
 
 // Sentinel errors. Callers branch with errors.Is, never on strings — the same
 // discipline as internal/storage and internal/routing.
@@ -12,6 +16,11 @@ var (
 	// ErrStopped means the core has been closed and rejects further input. (The
 	// core itself has no lifecycle; the driver uses this when appropriate.)
 	ErrStopped = errors.New("raft: stopped")
+
+	// ErrEntryTooLarge means Propose was given more than MaxEntryDataLen bytes.
+	// Nothing was appended: the refusal is definite. It is the replication
+	// layer's sentinel, so errors.Is matches it at every layer.
+	ErrEntryTooLarge = replication.ErrEntryTooLarge
 
 	// --- configuration ---
 
