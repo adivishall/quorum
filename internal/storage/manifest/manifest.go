@@ -66,7 +66,15 @@ import (
 	"strings"
 
 	"github.com/adivishall/quorum/internal/record"
+	"github.com/adivishall/quorum/internal/vfs"
 )
+
+// FS is the filesystem the manifest WRITES through — its files, CURRENT, the
+// renames and directory fsyncs (reads use package os). It is the OS; tests
+// substitute a fault injector (internal/fault) to fail a write, a sync, a
+// rename or a directory sync at an exact point. Never change it while a store
+// is open.
+var FS vfs.FS = vfs.OS{}
 
 // File names.
 const (
@@ -116,6 +124,16 @@ var (
 	// condition, and distinguishing the two is the caller's job, not this
 	// package's — see storage.OpenLSMStore.
 	ErrNoManifest = errors.New("manifest: no CURRENT file")
+
+	// ErrFailed means a write, fsync, rename or directory fsync of the
+	// manifest failed part-way, so what is on disk is unknown: an edit's
+	// record may be partly written, or fully written and durable; CURRENT may
+	// name the old manifest or the new one. A Writer that failed refuses
+	// every later edit (appending after a partial record would make the next
+	// recovery refuse the manifest as damaged), and nothing the failed
+	// operation may have made reachable is deleted (audit M11). The store
+	// must stop; the next open recovers whichever state is on disk.
+	ErrFailed = errors.New("manifest: a write or fsync failed; the outcome is unknown")
 )
 
 // FileMeta describes one SSTable, and is exactly what docs/DESIGN.md §6's
@@ -573,44 +591,43 @@ func ReadCurrent(dir string) (uint64, error) {
 // The sequence is docs/DESIGN.md §6's: write the temporary file, fsync it so its
 // contents exist before any name refers to them, rename over CURRENT (atomic on
 // POSIX), then fsync the directory so the rename itself survives a crash.
+//
+// Every failure before the rename leaves CURRENT as it was. A failure of the
+// rename itself or after it — the directory fsync — is ambiguous: CURRENT may
+// already name num, or may name it only until a power loss. Such an error
+// wraps ErrFailed, and the caller must keep both manifests.
 func writeCurrent(dir string, num uint64) error {
 	tmp := filepath.Join(dir, currentTempName)
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	f, err := FS.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("manifest: creating %s: %w", currentTempName, err)
 	}
-	if _, err := f.WriteString(Name(num) + "\n"); err != nil {
+	if _, err := f.Write([]byte(Name(num) + "\n")); err != nil {
 		_ = f.Close()
-		_ = os.Remove(tmp)
+		_ = FS.Remove(tmp)
 		return fmt.Errorf("manifest: writing %s: %w", currentTempName, err)
 	}
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
-		_ = os.Remove(tmp)
+		_ = FS.Remove(tmp)
 		return fmt.Errorf("manifest: syncing %s: %w", currentTempName, err)
 	}
 	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
+		_ = FS.Remove(tmp)
 		return fmt.Errorf("manifest: closing %s: %w", currentTempName, err)
 	}
-	if err := os.Rename(tmp, filepath.Join(dir, CurrentName)); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("manifest: installing %s: %w", CurrentName, err)
+	if err := FS.Rename(tmp, filepath.Join(dir, CurrentName)); err != nil {
+		return fmt.Errorf("%w: installing %s: %w", ErrFailed, CurrentName, err)
 	}
-	return SyncDir(dir)
+	if err := SyncDir(dir); err != nil {
+		return fmt.Errorf("%w: syncing %s after installing %s: %w", ErrFailed, dir, CurrentName, err)
+	}
+	return nil
 }
 
 // SyncDir fsyncs a directory, making a rename within it durable.
 func SyncDir(dir string) error {
-	d, err := os.Open(filepath.Clean(dir))
-	if err != nil {
-		return err
-	}
-	if err := d.Sync(); err != nil {
-		_ = d.Close()
-		return err
-	}
-	return d.Close()
+	return FS.SyncDir(filepath.Clean(dir))
 }
 
 func truncateForMessage(s string) string {
@@ -629,11 +646,12 @@ func truncateForMessage(s string) string {
 // depends on the fsync having completed before the new file set is treated as
 // live.
 type Writer struct {
-	f      *os.File
+	f      vfs.File
 	dir    string
 	num    uint64
 	offset int64
 	closed bool
+	failed error // the first failed write or fsync, wrapping ErrFailed
 }
 
 // Install writes a brand-new manifest holding a snapshot of state, then points
@@ -649,7 +667,7 @@ func Install(dir string, num uint64, state State) (*Writer, error) {
 		return nil, fmt.Errorf("manifest: number %d is outside [1,%d]", num, maxManifestNumber)
 	}
 	path := filepath.Join(dir, Name(num))
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	f, err := FS.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("manifest: creating %s: %w", Name(num), err)
 	}
@@ -657,13 +675,19 @@ func Install(dir string, num uint64, state State) (*Writer, error) {
 
 	snap := state.Snapshot()
 	if err := w.Append(&snap); err != nil {
+		// CURRENT does not name it yet: the new manifest is an orphan.
 		_ = f.Close()
-		_ = os.Remove(path)
+		_ = FS.Remove(path)
 		return nil, err
 	}
 	if err := writeCurrent(dir, num); err != nil {
 		_ = f.Close()
-		_ = os.Remove(path)
+		if !errors.Is(err, ErrFailed) {
+			_ = FS.Remove(path) // CURRENT was never touched
+		}
+		// Otherwise CURRENT may name the new manifest — removing it here
+		// used to leave CURRENT naming a file that did not exist, a store
+		// that would not open (audit M11). Both manifests stay.
 		return nil, err
 	}
 	return w, nil
@@ -673,7 +697,7 @@ func Install(dir string, num uint64, state State) (*Writer, error) {
 // which must be the end of the last good record.
 func Reopen(dir string, num uint64, offset int64) (*Writer, error) {
 	path := filepath.Join(dir, Name(num))
-	f, err := os.OpenFile(path, os.O_WRONLY, 0o644)
+	f, err := FS.OpenFile(path, os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("manifest: opening %s: %w", Name(num), err)
 	}
@@ -690,10 +714,15 @@ func (w *Writer) Num() uint64 { return w.num }
 // Offset returns the byte offset after the last appended record.
 func (w *Writer) Offset() int64 { return w.offset }
 
-// Append writes one edit as one record and fsyncs it.
+// Append writes one edit as one record and fsyncs it. A failed write or
+// fsync latches (ErrFailed): the edit may be on disk, partly or wholly, so the
+// Writer refuses every later edit rather than append after it.
 func (w *Writer) Append(e *Edit) error {
 	if w.closed {
 		return fmt.Errorf("manifest: writer is closed")
+	}
+	if w.failed != nil {
+		return w.failed
 	}
 	if e.Empty() {
 		return fmt.Errorf("manifest: refusing to append an edit that changes nothing")
@@ -704,14 +733,16 @@ func (w *Writer) Append(e *Edit) error {
 	}
 	n, err := w.f.Write(buf)
 	w.offset += int64(n)
-	if err != nil {
-		return fmt.Errorf("manifest: appending to %s: %w", Name(w.num), err)
+	if err == nil && n != len(buf) {
+		err = io.ErrShortWrite
 	}
-	if n != len(buf) {
-		return fmt.Errorf("manifest: short write to %s: %w", Name(w.num), io.ErrShortWrite)
+	if err != nil {
+		w.failed = fmt.Errorf("%w: appending to %s: %w", ErrFailed, Name(w.num), err)
+		return w.failed
 	}
 	if err := w.f.Sync(); err != nil {
-		return fmt.Errorf("manifest: syncing %s: %w", Name(w.num), err)
+		w.failed = fmt.Errorf("%w: syncing %s: %w", ErrFailed, Name(w.num), err)
+		return w.failed
 	}
 	return nil
 }
@@ -830,7 +861,7 @@ func Recover(dir string) (State, Recovery, error) {
 }
 
 func truncateAt(path string, at int64) error {
-	f, err := os.OpenFile(path, os.O_WRONLY, 0o644)
+	f, err := FS.OpenFile(path, os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("manifest: opening %s to repair: %w", filepath.Base(path), err)
 	}
@@ -863,14 +894,14 @@ func RemoveObsolete(dir string, keep uint64) (int, error) {
 		if n == keep {
 			continue
 		}
-		if err := os.Remove(filepath.Join(dir, Name(n))); err != nil {
+		if err := FS.Remove(filepath.Join(dir, Name(n))); err != nil {
 			return removed, fmt.Errorf("manifest: removing obsolete %s: %w", Name(n), err)
 		}
 		removed++
 	}
 	// A leftover CURRENT.tmp is an interrupted writeCurrent. It is never read,
 	// so removing it cannot lose anything.
-	if err := os.Remove(filepath.Join(dir, currentTempName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := FS.Remove(filepath.Join(dir, currentTempName)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return removed, fmt.Errorf("manifest: removing %s: %w", currentTempName, err)
 	}
 	return removed, nil
