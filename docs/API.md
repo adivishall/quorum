@@ -21,6 +21,15 @@ is how a request finds its group. Version 3 is version 2 (Phase 13) plus the req
   (`kv.Client` does this; mutant 47).
 - A connection carries no identity. Sessions (§3) are named in every request, so a client may use
   any number of connections, to any nodes, over the life of one session.
+- **What a connection may cost is bounded** (`kv.ServeConfig`, audit M1): a node serves at most
+  1024 client connections at once — one beyond is closed as soon as it is accepted; a request
+  frame must arrive whole within 10 s of its first byte; a response must be taken within 10 s.
+  Either deadline missed closes the connection. An **idle** connection is never timed out: closing
+  one could race a request its client is sending, which the client would then have to report as
+  an unknown outcome. A frame's buffer grows with the bytes that arrive, never to the length a
+  header merely declares. Tests: `TestServeCapsItsConnections`,
+  `TestServeDropsAStalledFrameButKeepsAnIdleConnection`, `TestServeDropsAClientThatDoesNotRead`,
+  `TestServeSurvivesAcceptErrors`, `TestReadFrameGrowsWithTheBytesThatArrive`.
 
 Record kinds: **5 = request, 4 = response.** Kinds 1 and 2 were version 1 (Phase 12: no identity,
 six statuses) and kind 3 was version 2's request (Phase 13: no group); both versions are retired and
@@ -151,6 +160,8 @@ the internal transport, and relays the answer with `via` set to itself:
   `NOT_LEADER` (no loops, whatever the nodes believe; mutant 70);
 - a forward is **sent at most once**; its answer is waited for within the client's budget:
   - not sent (the leader is not connected) → `UNAVAILABLE`;
+  - refused by the leader, which serves at most 256 forwards at once (audit M1) → `UNAVAILABLE`,
+    answered at once (`TestForwardsBeyondTheBoundAreRefusedUnavailable`);
   - sent, not answered in time → `UNKNOWN_OUTCOME` (the leader may have executed it; mutant 71);
   - no leader known → `NOT_LEADER` with no hint;
 - forward ids start at a random point per process, so a response to a previous incarnation's

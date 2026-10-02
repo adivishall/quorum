@@ -51,12 +51,12 @@ Types: C counter, G gauge, H histogram (seconds; buckets 50 µs to about 26 s, d
 
 | Metric | Type | Labels | Meaning | Produced by |
 |---|---|---|---|---|
-| `dkv_kv_requests_total` | C | group, op, status | Client requests this node's front answered, by the status it returned. A request relayed from a forward is counted here with the leader's status. | `Front.Do` |
+| `dkv_kv_requests_total` | C | group, op, status | Client requests this node's front answered, by the status it returned. A request relayed from a forward is counted here with the leader's status. A request naming a group this node does not host is counted under `group="other"`: the group is the client's choice, and labelling it as named let any client create series without bound (audit M7, `TestClientsCannotCreateMetricSeries`). | `Front.Do` |
 | `dkv_kv_request_seconds` | H | op | Server-side duration: the front receiving the decoded request to its response being ready. Network time excluded. | `Front.Do` |
 | `dkv_kv_duplicate_responses_total` | C | group | OK responses for a retry answered from the session table. | `Front.Do` |
 | `dkv_kv_inflight_requests` | G | | Requests the front is working on. | `Front.Do` |
 | `dkv_kv_forwards_total` | C | group, result | Forwards to the group's leader, by outcome: `answered`, `not_sent` (no connection: definite no effect), `send_unknown`, `timeout`. | `Server.forward` |
-| `dkv_kv_forwarded_requests_total` | C | group, op, status | Requests forwarded to this node by a peer and served here. | `Server.onApp` |
+| `dkv_kv_forwarded_requests_total` | C | group, op, status | Requests forwarded to this node by a peer and served here, labelled with the serving group (never the group the peer's request names). | `Server.onApp` |
 | `dkv_kv_apply_decisions_total` | C | group, decision | State-machine decisions this replica made applying committed commands: `registered`, `executed`, `duplicate`, `conflict`, `stale`, `expired`, `limit`, and `evicted` sessions. | `Store.ApplyResult` via `Metrics.Observe` |
 
 ### Raft driver (`internal/raftnode`), per group

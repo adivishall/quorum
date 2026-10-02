@@ -201,6 +201,17 @@ request and per answer, acting on this node's groups only:
 A membership operation completes only when the group's log says so (`docs/MEMBERSHIP.md` §7). The
 protocol never decides membership (`TestAdminDrivesMembershipThroughTheLog`).
 
+**The port is unauthenticated plaintext**, and anyone who reaches it can remove voters and stop
+groups. So `dkvd` refuses an `-admin-listen` address other than loopback unless
+`-admin-allow-remote` is given (audit H6, `TestAdminListensOnLoopbackUnlessAllowed`); expose it
+only on a network you trust. No token is offered: on plaintext it would only seem to protect.
+What a connection may cost is bounded (audit M1): at most 16 at once (one beyond is closed at
+once), 30 s to send each request line, 10 s to take each answer, a request's `timeout_ms` clamped
+to 60 s, and an `Accept` error retried rather than ending the loop. The client's `op` and `id` are
+logged quoted, so a newline cannot forge an event line (`TestAdminCapsItsConnections`,
+`TestAdminDropsAnIdleConnection`, `TestAdminTimeoutIsClamped`, `TestAdminSurvivesAcceptErrors`,
+`TestAdminLogLinesCannotBeForged`).
+
 ## 8. Evidence
 
 - **Host** (`internal/multiraft`, real TCP, race detector): two groups on three nodes independent;
