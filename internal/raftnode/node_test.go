@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/adivishall/quorum/internal/raft"
+	"github.com/adivishall/quorum/internal/replication"
 	"github.com/adivishall/quorum/internal/testport"
 	"github.com/adivishall/quorum/internal/transport"
 )
@@ -290,5 +291,25 @@ func TestStartRefusesANegativeTick(t *testing.T) {
 	}
 	if _, found, _ := LoadIdentity(nil, path); found {
 		t.Fatal("a refused Start recorded durable state")
+	}
+}
+
+// TestGroupsDrawDifferentElectionSeeds (audit F13): the default election seed
+// of a node's groups mixes in the group, so groups on one node do not draw one
+// timeout sequence and campaign in lockstep; group 0 keeps the node's seed.
+func TestGroupsDrawDifferentElectionSeeds(t *testing.T) {
+	if seedFor("n1", 0) != seedFromID("n1") {
+		t.Fatal("group 0's seed changed: the single-group deployment's timing would change")
+	}
+	seen := map[int64]bool{}
+	for g := 0; g < 256; g++ {
+		s := seedFor("n1", replication.GroupID(g))
+		if s <= 0 {
+			t.Fatalf("group %d: seed %d is not positive", g, s)
+		}
+		if seen[s] {
+			t.Fatalf("group %d shares a seed with another group of the node", g)
+		}
+		seen[s] = true
 	}
 }

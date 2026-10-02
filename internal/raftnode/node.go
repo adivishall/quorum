@@ -559,7 +559,7 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		cfg.TickInterval = DefaultTickInterval
 	}
 	if cfg.Rand == nil {
-		cfg.Rand = rand.New(rand.NewSource(seedFromID(cfg.ID)))
+		cfg.Rand = rand.New(rand.NewSource(seedFor(cfg.ID, cfg.Group)))
 	}
 	rc, err := Recover(cfg)
 	if err != nil {
@@ -1230,6 +1230,22 @@ func (n *Node) logf(format string, args ...any) {
 
 // seedFromID derives a deterministic rand seed from a node id, so different nodes
 // get different election timeouts without a global clock.
+// seedFor is the default election-timeout seed of a node's group: the node's,
+// mixed with the group's id so that the groups one node hosts draw different
+// timeout sequences — sharing one, they would time out and campaign together
+// after every disturbance (audit F13). Group 0, the single-group deployment,
+// keeps the node's seed.
+func seedFor(id NodeID, g replication.GroupID) int64 {
+	s := seedFromID(id)
+	if g != 0 {
+		s ^= int64(uint64(g) * 0x9E3779B97F4A7C15 >> 1)
+		if s <= 0 {
+			s = -s + 1
+		}
+	}
+	return s
+}
+
 func seedFromID(id NodeID) int64 {
 	var h int64 = 1469598103934665603 // FNV-1a 64 offset basis (low bits)
 	for _, b := range []byte(id) {

@@ -291,14 +291,7 @@ func (h *Host) start(g GroupID, nc raftnode.Config) (*Group, error) {
 	}
 	sm := h.cfg.NewStateMachine(g)
 	inbox := make(chan transport.Envelope, h.cfg.InboxSize)
-	nc.ID, nc.Group, nc.Transport, nc.Inbox = h.cfg.ID, g, h.cfg.Transport, inbox
-	nc.LogPath, nc.StateMachine = logPath, sm
-	nc.TickInterval, nc.DisableSync, nc.FS, nc.Hook = h.cfg.TickInterval, h.cfg.DisableSync, h.cfg.FS, h.cfg.Hook
-	nc.SnapshotEvery, nc.SnapshotRetain = h.cfg.SnapshotEvery, h.cfg.SnapshotRetain
-	nc.ElectionTicks, nc.HeartbeatTicks = h.cfg.ElectionTicks, h.cfg.HeartbeatTicks
-	nc.Logf = h.cfg.Logf
-	nc.Metrics = h.nodeMetrics
-	node, err := raftnode.Start(h.ctx, nc)
+	node, err := raftnode.Start(h.ctx, h.nodeConfig(g, nc, logPath, sm, inbox))
 	if err != nil {
 		if created {
 			// A start that failed before recording anything (an unknown
@@ -328,6 +321,30 @@ func (h *Host) start(g GroupID, nc raftnode.Config) (*Group, error) {
 	}
 	h.syncPeers()
 	return grp, nil
+}
+
+// nodeConfig completes group g's driver configuration from the host's. Every
+// raftnode.Config field is set here or named in hostLeavesUnset with the
+// reason (TestHostForwardsEveryNodeSetting), so a setting added to the driver
+// cannot be silently dropped on its way from the process to its groups.
+func (h *Host) nodeConfig(g GroupID, nc raftnode.Config, logPath string, sm raftnode.StateMachine, inbox chan transport.Envelope) raftnode.Config {
+	nc.ID, nc.Group, nc.Transport, nc.Inbox = h.cfg.ID, g, h.cfg.Transport, inbox
+	nc.LogPath, nc.StateMachine = logPath, sm
+	nc.TickInterval, nc.DisableSync, nc.FS, nc.Hook = h.cfg.TickInterval, h.cfg.DisableSync, h.cfg.FS, h.cfg.Hook
+	nc.SnapshotEvery, nc.SnapshotRetain = h.cfg.SnapshotEvery, h.cfg.SnapshotRetain
+	nc.ElectionTicks, nc.HeartbeatTicks = h.cfg.ElectionTicks, h.cfg.HeartbeatTicks
+	nc.Logf = h.cfg.Logf
+	nc.Metrics = h.nodeMetrics
+	return nc
+}
+
+// hostLeavesUnset are the raftnode.Config fields nodeConfig deliberately does
+// not set, and why.
+var hostLeavesUnset = map[string]string{
+	"Peers":     "the legacy single-group genesis; a hosted group's genesis is Bootstrap or Join",
+	"Bootstrap": "set by Create for a genesis member; Open reads the identity file",
+	"Join":      "set by Create for a joiner",
+	"Rand":      "raftnode seeds it from the node and the group, so groups on one node do not share a timeout sequence",
 }
 
 // reserve marks g busy, or reports why it cannot be: the host is closed, the
