@@ -456,7 +456,9 @@ offset  size  field
 
 Handshake on connect: `"DKV1"` magic + 4-byte protocol version + length-prefixed node ID, so a
 misdirected or wrong-version connection fails immediately instead of being interpreted as a
-frame. Exact grammar, sizes, and timeouts: `docs/TRANSPORT.md` §3.
+frame. Since version 2 it also carries the cluster id and the replica-settings digest and is
+answered, so a node of another cluster, or with other settings, is refused both ways. Exact
+grammar, sizes, and timeouts: `docs/TRANSPORT.md` §3.
 
 Message types: `Probe` and `ProbeResponse` (liveness) are implemented in Phase 7. `RequestVote`,
 `AppendEntries` and their responses are **implemented in Phase 9** — the codec lives in

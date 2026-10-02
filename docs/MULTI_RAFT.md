@@ -97,7 +97,8 @@ group id over 32 bits; duplicated frames; one group's frame never moving another
 ```
 <data-dir>/                      mode 0700
   LOCK                           flock'd by the process using the directory (internal/nodedir)
-  node.identity                  the node identity: node id, cluster id, initialized (written at -init)
+  node.identity                  the node identity: node id, cluster id, replica settings,
+                                 initialized (written at -init)
   groups/
     <gid>/
       raft.log                   the group's durable Raft log (entries, HardStates, boundaries)
@@ -137,7 +138,16 @@ twice in a term or lose a committed entry. So `dkvd -raft|-cluster`:
   initialized directory a genesis group with no state is reported (`event=group_failed`, or exit 2
   in `-raft` mode), never created empty;
 - adopts a directory written before node identities (Raft state, no `node.identity`) once a
-  `-cluster-id` is given, unless it holds another node's `raft-<id>.log`.
+  `-cluster-id` is given, unless it holds another node's `raft-<id>.log`;
+- pins the node's **replica settings** in `node.identity` (audit H5): the settings every replica
+  must share — the session limits, and in `-cluster` mode the routing (`-shards`, `-rf`, the
+  sorted `-nodes`) — recorded at initialization; a start whose flags give others exits 2 naming
+  both. Peer addresses are not among them. `-shards/-rf/-nodes` outside `-cluster` mode are
+  refused;
+- opens the directory **before** the transport listens, and the transport handshake carries the
+  recorded cluster id and a SHA-256 digest of the pinned settings: a node of another cluster, or
+  one whose settings differ, is never connected to, both ways (`docs/TRANSPORT.md` §3,
+  `TestRealImpostorsNeverJoinTheGroup`).
 
 Each group's identity file (version 2) also records its node, and `raftnode` refuses a group's
 state recorded for another node; a version-1 file, written before, is still read. Evidence:

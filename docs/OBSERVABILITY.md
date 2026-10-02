@@ -104,7 +104,9 @@ Types: C counter, G gauge, H histogram (seconds; buckets 50 µs to about 26 s, d
 | `dkv_transport_frames_received_total`, `_bytes_received_total` | C | kind | Frames read whole. |
 | `dkv_transport_send_failures_total` | C | reason | `not_connected`, `closed`, `write`. |
 | `dkv_transport_connections_total` | C | dir | Connections established, `inbound` or `outbound`. |
-| `dkv_transport_dial_failures_total` | C | | Failed dials or handshake sends. |
+| `dkv_transport_dial_failures_total` | C | | Failed dials or handshakes. |
+| `dkv_transport_accept_failures_total` | C | | `Accept` errors (e.g. descriptors exhausted); the accept loop retries after a pause. |
+| `dkv_transport_handshakes_refused_total` | C | reason | `busy` (too many inbound handshakes in flight), `rejected` (another cluster, other replica settings, an unknown peer, the wrong dial direction, or another node than the one dialed; `docs/TRANSPORT.md` §3). |
 | `dkv_transport_peers` | G | state | Peers `known` and `connected`. |
 
 ### Process
