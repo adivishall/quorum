@@ -105,7 +105,9 @@ mutant() {
   if go test $pkg -run "$tests" -count=1 -timeout 300s >"$LOG" 2>&1; then
     echo "✗ $name: SURVIVED — killer tests [$tests] still PASSED with the rule broken."
     FAIL=$((FAIL + 1))
-  elif grep -qE '\[build failed\]|\[setup failed\]' "$LOG"; then
+  elif grep -qE '\[build failed\]|\[setup failed\]|go build dkvd: |lab: building dkvd: ' "$LOG"; then
+    # A test that builds dkvd itself (tests/integration, internal/lab) fails
+    # its test, not its package, when the mutant breaks dkvd's build.
     echo "✗ $name: the mutant does not compile — that is not a kill."
     grep -m 3 -E '\.go:[0-9]+' "$LOG"
     FAIL=$((FAIL + 1))

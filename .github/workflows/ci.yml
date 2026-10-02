@@ -29,7 +29,9 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # make race alone may take its full -timeout 30m; vet, staticcheck and
+    # govulncheck run besides it.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
