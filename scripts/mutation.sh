@@ -2114,7 +2114,7 @@ mutant "append-byte-budget" internal/raft/raft.go \
 
 # 245. An acknowledged batch of a cut backlog sends the next at once.
 mutant "cut-backlog-streams" internal/raft/raft.go \
-  '	if r.cut[peer] && match < r.log.LastIndex() {' \
+  '	if r.role == Leader && r.cut[peer] && match < r.log.LastIndex() {' \
   '	if false {' \
   ./internal/raft '^TestLaggingFollowerCatchesUpInBudgetedBatches$'
 
@@ -2321,5 +2321,9 @@ fi
 if [ "$FAIL" -ne 0 ]; then
   echo "MUTATION TESTING FAILED: $FAIL mutant(s) survived or could not be applied." >&2
   exit 1
+fi
+if [ -n "${DRY:-}" ]; then
+  echo "DRY RUN PASSED: every pattern applies ($TOTAL mutants); nothing was tested."
+  exit 0
 fi
 echo "MUTATION TESTING PASSED: every mutant was killed."
