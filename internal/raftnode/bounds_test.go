@@ -148,15 +148,11 @@ func isolatedLeader(t *testing.T) (*harness, *Node, *fault.Network) {
 	net := fault.NewNetwork()
 	h := startClusterWith(t, ctx, 3, func(tr transport.Transport) transport.Transport { return net.Wrap(tr) })
 	t.Cleanup(h.stop)
-	l := h.waitLeader(5 * time.Second)
-	if _, _, err := writeWithin(h.nodes[l], []byte("before"), 5*time.Second); err != nil {
+	l0 := h.waitLeader(5 * time.Second)
+	if _, _, err := writeWithin(h.nodes[l0], []byte("before"), 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	var members []string
-	for _, id := range h.ids {
-		members = append(members, string(id))
-	}
-	net.Isolate(string(l), members)
+	l := isolateTheLeader(t, h, net)
 	return h, h.nodes[l], net
 }
 
