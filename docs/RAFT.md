@@ -170,7 +170,8 @@ Commit advancement (leader or follower) is recorded in the `replication.Log` via
 driver then pulls `NextApply()` (= the log's `Unapplied()`, i.e. `(appliedIndex, commitIndex]`),
 applies each command to the state-machine seam **in order**, and only then calls `AppliedTo` (=
 `Apply`). An uncommitted entry is never applied (INV-R7), `appliedIndex ≤ commitIndex` always
-(Phase 8 enforces it), and an apply failure does not advance `appliedIndex`. Phase 9 drives a
+(Phase 8 enforces it), and an apply failure does not advance `appliedIndex` — it stops the node
+(§17). Phase 9 drives a
 minimal deterministic state machine to verify these semantics; it adds no dedup and claims no
 exactly-once client application (`docs/CONSISTENCY.md` C4). `appliedIndex` is **volatile**: a
 restart re-applies the whole recovered committed prefix from index 1, so application is
@@ -444,3 +445,55 @@ client contract instead states the limit that decides, the encoded entry (`docs/
 bounded only by the transport's 16 MiB frame and 65,536 entries (audit H4,
 `docs/ENGINEERING_ROADMAP.md`).
 
+## 17. Bounds on a leader's outstanding work, abandoned requests, apply failures
+
+**Bounds (audit M3).** A leader cut off from its quorum never commits, and — with no CheckQuorum —
+never steps down while nothing reaches it. Before these bounds, every request it accepted in that
+state stayed: an uncommitted, persisted entry resent on every broadcast and a client waiter, or a
+read awaiting a confirmation that never came. The core now bounds them (`raft.Config`):
+
+| Bound | Default | Beyond it |
+|---|---|---|
+| `MaxUncommittedEntries` — entries in the leader's `(commit, last]`, its no-op and inherited tail included | 1024 | `Propose` → `ErrBusy` |
+| `MaxUncommittedBytes` — their data bytes | 64 MiB | `Propose` → `ErrBusy`, unless the tail holds no data (so no entry within `MaxEntryDataLen` is refused forever) |
+| `MaxPendingReads` — reads registered and not yet confirmed | 1024 | `ReadIndex` → `ErrBusy` |
+
+`ErrBusy` is definite — nothing appended or registered — and the key-value server answers it
+`UNAVAILABLE` (`docs/API.md` §5). Healthy operation is far below the bounds: the uncommitted tail
+is about the writes in flight, and a read is confirmed within a heartbeat. The leader keeps the
+sizes of its uncommitted tail as it appends and commits (computed once from the log when it
+becomes leader), so a proposal's check costs nothing; every core test checks that bookkeeping
+against the log after every step (`assertUncommittedTail`). Configuration changes are not bounded:
+one is in progress at most. Tests: `TestIsolatedLeaderRefusesProposalsBeyondItsBound`,
+`TestUncommittedBytesBound`, `TestInheritedTailCountsTowardTheBound`,
+`TestIsolatedLeaderRefusesReadsBeyondItsBound` (core); `TestIsolatedLeaderRefusesWorkBeyondItsBounds`
+(three real drivers, 1,600 writes and reads at an isolated leader); `TestBusyFromBelowIsUnavailable`.
+
+**Abandoned requests.** A client whose deadline passes after its request was accepted tells the
+node's actor, which forgets the write's waiter or the unconfirmed read at once (`Waiters.Cancel`,
+`Reads.Cancel`); before, a waiter stayed until its index was applied — for an entry an isolated
+leader appended, possibly never, if the log that replaced it never grew that far. The notice is
+non-blocking and best-effort (a full buffer drops it, and the waiter is then released when its
+index is applied); it decides nothing — the entry, if it commits, is applied as before, and the
+outcome stays unknown to that client. A waiter is never completed early as `ErrLost` when its
+entry is truncated from this node's log: another leader that holds the entry may still commit it.
+`TestAbandonedRequestsLeaveNothingBehind`.
+
+**Apply failures (audit M4).** A state machine that returns an error from `Apply` for a committed
+entry refuses it on every replica and on every retry — a committed entry is the same everywhere.
+The node now fail-stops on it exactly as on a persistence failure: `event=raft_apply_failed`,
+`Node.Err()` wraps `ErrApply`, every waiting client learns the error, and `dkvd` exits 1 (`-raft`)
+or stops that group alone (`-cluster`). Before, the error was logged and retried every cycle,
+forever: the group stalled behind the entry while its leader went on accepting writes it could
+never apply. `appliedIndex` never passes the refused entry, so a restart refuses it again
+(`TestApplyFailureStopsTheNode`). **The contract for a state machine:** `Apply` either applies
+the command completely or returns an error with no effect at all — the key-value store's only
+error, an undecodable command, leaves it unchanged — and an error means the entry can never be
+applied. Recovering such a group needs an operator: a state machine that accepts the entry (a
+fixed binary), or restoring from a snapshot past it.
+
+Mutants 214–226 (`scripts/mutation.sh`) break each bound, the bookkeeping, each release of an
+abandoned request, the fail-stop and the `UNAVAILABLE` mapping; each is killed by its test.
+
+**Not done here.** PreVote and CheckQuorum — an isolated leader that steps down by itself —
+remain open (`docs/ENGINEERING_ROADMAP.md`); the bounds limit what it holds meanwhile.

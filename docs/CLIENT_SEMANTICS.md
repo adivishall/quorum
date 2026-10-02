@@ -138,7 +138,7 @@ must act on:
 | `OK` | definite, effect | executed — now, or earlier (a duplicate) | done |
 | `NOT_FOUND` | definite | a read found the key absent | done |
 | `NOT_LEADER` | definite, no effect | this node did not accept the request; `leader` names the one it believes in, if any | send the **same** request there |
-| `UNAVAILABLE` | definite, no effect | nothing was sent onward (the leader it would forward to is unreachable, or the node is not serving) | try elsewhere, same request |
+| `UNAVAILABLE` | definite, no effect | nothing was sent onward (the leader it would forward to is unreachable, or the node is not serving), or the leader refused it at its bound of uncommitted entries or pending reads (`docs/RAFT.md` §17) | try elsewhere, same request |
 | `INVALID_REQUEST` | definite, no effect | malformed or out-of-contract fields | a client bug |
 | `REQUEST_CONFLICT` | definite, no effect | this RequestID is taken by a different command | a client bug |
 | `REQUEST_STALE` | definite, no effect | below the session's AckedBelow | a client bug (or a very late network duplicate) |

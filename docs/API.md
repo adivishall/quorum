@@ -126,7 +126,7 @@ maximum (10 s; 0 means that maximum).
 | 0 | `OK` | definite, effect (now, or earlier when `duplicate`) |
 | 1 | `NOT_FOUND` | definite (a read found nothing) |
 | 2 | `NOT_LEADER` | definite, no effect; `leader` names a hint, if any — none when this node hosts no replica of the request's group |
-| 3 | `UNAVAILABLE` | definite, no effect: nothing was sent onward |
+| 3 | `UNAVAILABLE` | definite, no effect: nothing was sent onward, or the leader refused it at its bound of uncommitted entries or pending reads (it is probably cut off from its quorum; `docs/RAFT.md` §17) |
 | 4 | `INVALID_REQUEST` | definite, no effect |
 | 5 | `REQUEST_CONFLICT` | definite, no effect: the requestID is taken by a different command |
 | 6 | `REQUEST_STALE` | definite, no effect: below the session's watermark |
