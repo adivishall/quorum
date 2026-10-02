@@ -32,6 +32,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -134,6 +135,60 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	if *raftMode && *cluster {
+		fmt.Fprintln(stderr, "dkvd: -raft and -cluster are exclusive")
+		return 2
+	}
+	if (*clientAt != "" || *adminAt != "" || *joinArg != "" || *initDir || *clusterID != "") && !*raftMode && !*cluster {
+		fmt.Fprintln(stderr, "dkvd: -client-listen, -admin-listen, -join, -init and -cluster-id require -raft or -cluster")
+		return 2
+	}
+	// A node's durable state is the whole of its Raft safety: it is never a
+	// temporary directory that a restart would forget (audit H1).
+	if (*raftMode || *cluster) && *dataDir == "" {
+		fmt.Fprintln(stderr, "dkvd: -raft and -cluster require -data-dir")
+		return 2
+	}
+	// The routing flags define -cluster mode's groups; anywhere else they were
+	// silently ignored, so a node meant for a sharded cluster could run as
+	// something else unnoticed (audit H5/D5).
+	if !*cluster {
+		for _, name := range []string{"shards", "rf", "nodes"} {
+			if explicit[name] {
+				fmt.Fprintf(stderr, "dkvd: -%s applies to -cluster mode only\n", name)
+				return 2
+			}
+		}
+	}
+	join, err := parseGroups(*joinArg)
+	if err != nil || (*raftMode && (len(join) > 1 || len(join) == 1 && join[0] != 0)) {
+		fmt.Fprintf(stderr, "dkvd: bad -join %q (with -raft only group 0): %v\n", *joinArg, err)
+		return 2
+	}
+	var assign *multiraft.Assignment
+	var nodes []routing.NodeID
+	if *cluster {
+		nodes = []routing.NodeID{routing.NodeID(*id)}
+		for p := range peers {
+			nodes = append(nodes, routing.NodeID(p))
+		}
+		if *nodesArg != "" {
+			nodes = nil
+			for _, n := range strings.Split(*nodesArg, ",") {
+				nodes = append(nodes, routing.NodeID(strings.TrimSpace(n)))
+			}
+		}
+		assign, err = multiraft.NewAssignment(routing.Config{ShardCount: *shards, ReplicationFactor: *rf, Nodes: nodes})
+		if err != nil {
+			fmt.Fprintf(stderr, "dkvd: the cluster's routing: %v\n", err)
+			return 2
+		}
+	}
+	limits := kv.Limits{MaxSessions: *sessMax, MaxUnacked: *sessUnk}
+	if limits.MaxSessions < 1 || limits.MaxUnacked < 1 {
+		fmt.Fprintf(stderr, "dkvd: -session-max and -session-max-unacked must be at least 1, got %d and %d\n", limits.MaxSessions, limits.MaxUnacked)
+		return 2
+	}
 	// readIdle: a connection that has delivered no frame for this long is treated
 	// as dead and torn down, so the dialer reconnects. Without it a connection
 	// that is established but silently delivers nothing — a peer that vanished
@@ -160,84 +215,40 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 		defer stopMetrics()
 	}
-	tr, err := transport.NewTCPTransport(transport.Config{
+	tcfg := transport.Config{
 		NodeID:          transport.NodeID(*id),
 		ListenAddr:      *listen,
 		Peers:           peers,
 		Logf:            lg.logf,
 		ReadIdleTimeout: readIdle,
 		Metrics:         reg,
-	})
+	}
+	var settings string
+	var nd *nodedir.Dir
+	if *raftMode || *cluster {
+		// The data directory is opened before the transport listens: its
+		// identity names the cluster, and its pinned replica settings are the
+		// ones in force, so the transport admits only nodes that share both
+		// (audit H2, H5; docs/TRANSPORT.md §3).
+		settings = replicaSettings(*cluster, limits, *shards, *rf, nodes)
+		nd, err = openDataDir(*dataDir, *id, *clusterID, *initDir, settings, lg)
+		if err != nil {
+			fmt.Fprintf(stderr, "dkvd: -data-dir: %v\n", err)
+			return 2
+		}
+		defer nd.Close()
+		tcfg.ClusterID, tcfg.SettingsDigest = nd.ID.Cluster, settingsDigest(nd.ID.Settings)
+	}
+	tr, err := transport.NewTCPTransport(tcfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "dkvd: %v\n", err)
 		return 2
 	}
 	lg.logf("event=ready node=%s addr=%s peers=%d", *id, tr.LocalAddr(), len(peers))
 
-	if *raftMode && *cluster {
-		fmt.Fprintln(stderr, "dkvd: -raft and -cluster are exclusive")
-		_ = tr.Close()
-		return 2
-	}
-	if (*clientAt != "" || *adminAt != "" || *joinArg != "" || *initDir || *clusterID != "") && !*raftMode && !*cluster {
-		fmt.Fprintln(stderr, "dkvd: -client-listen, -admin-listen, -join, -init and -cluster-id require -raft or -cluster")
-		_ = tr.Close()
-		return 2
-	}
-	// A node's durable state is the whole of its Raft safety: it is never a
-	// temporary directory that a restart would forget (audit H1).
-	if (*raftMode || *cluster) && *dataDir == "" {
-		fmt.Fprintln(stderr, "dkvd: -raft and -cluster require -data-dir")
-		_ = tr.Close()
-		return 2
-	}
-	// The routing flags define -cluster mode's groups; anywhere else they were
-	// silently ignored, so a node meant for a sharded cluster could run as
-	// something else unnoticed (audit H5/D5).
-	if !*cluster {
-		for _, name := range []string{"shards", "rf", "nodes"} {
-			if explicit[name] {
-				fmt.Fprintf(stderr, "dkvd: -%s applies to -cluster mode only\n", name)
-				_ = tr.Close()
-				return 2
-			}
-		}
-	}
-	join, err := parseGroups(*joinArg)
-	if err != nil || (*raftMode && (len(join) > 1 || len(join) == 1 && join[0] != 0)) {
-		fmt.Fprintf(stderr, "dkvd: bad -join %q (with -raft only group 0): %v\n", *joinArg, err)
-		_ = tr.Close()
-		return 2
-	}
-	var assign *multiraft.Assignment
-	var nodes []routing.NodeID
-	if *cluster {
-		nodes = []routing.NodeID{routing.NodeID(*id)}
-		for p := range peers {
-			nodes = append(nodes, routing.NodeID(p))
-		}
-		if *nodesArg != "" {
-			nodes = nil
-			for _, n := range strings.Split(*nodesArg, ",") {
-				nodes = append(nodes, routing.NodeID(strings.TrimSpace(n)))
-			}
-		}
-		assign, err = multiraft.NewAssignment(routing.Config{ShardCount: *shards, ReplicationFactor: *rf, Nodes: nodes})
-		if err != nil {
-			fmt.Fprintf(stderr, "dkvd: the cluster's routing: %v\n", err)
-			_ = tr.Close()
-			return 2
-		}
-	}
-	limits := kv.Limits{MaxSessions: *sessMax, MaxUnacked: *sessUnk}
-	if limits.MaxSessions < 1 || limits.MaxUnacked < 1 {
-		fmt.Fprintf(stderr, "dkvd: -session-max and -session-max-unacked must be at least 1, got %d and %d\n", limits.MaxSessions, limits.MaxUnacked)
-		_ = tr.Close()
-		return 2
-	}
 	if *raftMode || *cluster {
-		r := raftRun{id: *id, listen: *listen, peers: peers, tr: tr, dataDir: *dataDir, init: *initDir, clusterID: *clusterID,
-			settings: replicaSettings(*cluster, limits, *shards, *rf, nodes), tick: *tickIvl, lg: lg, stderr: stderr, clientAddr: *clientAt, crash: crash,
+		r := raftRun{id: *id, listen: *listen, peers: peers, tr: tr, dataDir: *dataDir, nd: nd, init: *initDir, clusterID: *clusterID,
+			settings: settings, tick: *tickIvl, lg: lg, stderr: stderr, clientAddr: *clientAt, crash: crash,
 			limits: limits, redirectOnly: !*forward, snapshotEvery: *snapEv, snapshotRetain: *snapKeep,
 			assign: assign, join: join, adminAddr: *adminAt, metrics: reg}
 		if crash != nil {
@@ -379,8 +390,10 @@ type raftRun struct {
 	peers   map[transport.NodeID]string
 	tr      transport.Transport
 	dataDir string
-	// init and clusterID: -init and -cluster-id (internal/nodedir);
-	// settings: replicaSettings, which the data directory pins.
+	// nd: the data directory, opened and locked by the caller; nil opens it
+	// here from init, clusterID and settings (-init, -cluster-id and
+	// replicaSettings, which the data directory pins).
+	nd        *nodedir.Dir
 	init      bool
 	clusterID string
 	settings  string
@@ -437,13 +450,16 @@ func runRaft(ctx context.Context, r raftRun) int {
 	// identity), and a directory with no node is initialized only on request
 	// (-init): a node whose state was lost must not restart empty under its
 	// old id (audit H1, internal/nodedir).
-	nd, err := nodedir.Open(dataDir, nodedir.Options{Node: id, Cluster: r.clusterID, Init: r.init, Settings: r.settings})
-	if err != nil {
-		fmt.Fprintf(r.stderr, "dkvd: -data-dir: %v\n", err)
-		return 2
+	nd := r.nd
+	if nd == nil {
+		var err error
+		nd, err = openDataDir(dataDir, id, r.clusterID, r.init, r.settings, lg)
+		if err != nil {
+			fmt.Fprintf(r.stderr, "dkvd: -data-dir: %v\n", err)
+			return 2
+		}
+		defer nd.Close()
 	}
-	defer nd.Close()
-	lg.logf("event=data_dir node=%s dir=%s cluster=%s state=%s", id, dataDir, nd.ID.Cluster, nd.State)
 	limits := r.limits
 	if limits == (kv.Limits{}) {
 		limits = kv.DefaultLimits
@@ -874,6 +890,24 @@ func (c *crashConn) Write(b []byte) (int, error) {
 		c.cp.die()
 	}
 	return n, err
+}
+
+// openDataDir opens and locks the node's data directory (internal/nodedir).
+func openDataDir(dir, id, cluster string, init bool, settings string, lg *logger) (*nodedir.Dir, error) {
+	nd, err := nodedir.Open(dir, nodedir.Options{Node: id, Cluster: cluster, Init: init, Settings: settings})
+	if err != nil {
+		return nil, err
+	}
+	lg.logf("event=data_dir node=%s dir=%s cluster=%s state=%s", id, dir, nd.ID.Cluster, nd.State)
+	return nd, nil
+}
+
+// settingsDigest is what the transport handshake compares (docs/TRANSPORT.md
+// §3): the SHA-256 of the pinned replica settings, so nodes whose replicas
+// would decide entries differently never connect.
+func settingsDigest(settings string) []byte {
+	d := sha256.Sum256([]byte(settings))
+	return d[:]
 }
 
 // replicaSettings renders, canonically, the settings every replica of this
