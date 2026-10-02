@@ -68,10 +68,12 @@ func TestRealImpostorsNeverJoinTheGroup(t *testing.T) {
 		}
 	}
 
-	// The real n3 rejoins.
+	// The real n3 rejoins: the three settle on one leader — whichever wins;
+	// a restarted node may campaign before it hears the leader — with every
+	// link up.
 	c.dirs["n3"] = realDir
 	c.startPlain("n3")
-	c.waitFollows("n3", leader, term, 20*time.Second)
+	c.waitSettled(30 * time.Second)
 }
 
 // other is the survivor that is not id.
