@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -31,6 +32,7 @@ import (
 	"github.com/adivishall/quorum/internal/load"
 	"github.com/adivishall/quorum/internal/metrics"
 	"github.com/adivishall/quorum/internal/multiraft"
+	"github.com/adivishall/quorum/internal/nodedir"
 	"github.com/adivishall/quorum/internal/routing"
 )
 
@@ -259,10 +261,12 @@ func (c *Cluster) launch(n *Node, join []multiraft.GroupID) error {
 		}
 		args = append(args, "-join", strings.Join(gs, ","))
 	}
-	args = append(args, c.cfg.Extra...)
-	if err := os.MkdirAll(n.Dir, 0o755); err != nil {
-		return err
+	// A node's first start initializes its data directory (internal/nodedir):
+	// -init with the cluster's id, once; a restart passes neither.
+	if _, err := os.Stat(filepath.Join(n.Dir, nodedir.IdentityFile)); errors.Is(err, fs.ErrNotExist) {
+		args = append(args, "-init", "-cluster-id", "lab")
 	}
+	args = append(args, c.cfg.Extra...)
 	cmd := exec.Command(c.cfg.Bin, args...)
 	n.mu.Lock()
 	if n.out == nil {

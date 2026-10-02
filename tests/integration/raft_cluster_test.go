@@ -51,6 +51,7 @@ func TestThreeNodeRaftElectsLeaderOverTCP(t *testing.T) {
 		addrs[id] = freeTCPAddr(t)
 	}
 	dir := t.TempDir()
+	cluster := newClusterID()
 
 	var nodes []*dkvNode
 	for _, id := range ids {
@@ -61,10 +62,10 @@ func TestThreeNodeRaftElectsLeaderOverTCP(t *testing.T) {
 			}
 		}
 		buf := &safeBuf{}
-		cmd := exec.Command(bin,
+		cmd := exec.Command(bin, append([]string{
 			"-id", id, "-listen", addrs[id], "-peers", strings.Join(peers, ","),
 			"-raft", "-data-dir", filepath.Join(dir, id), "-tick-interval", "25ms",
-		)
+		}, initFlags(filepath.Join(dir, id), cluster)...)...)
 		cmd.Stdout = buf
 		cmd.Stderr = buf
 		if err := cmd.Start(); err != nil {
@@ -117,7 +118,7 @@ func TestRaftLogSurvivesSIGKILL(t *testing.T) {
 
 	launch := func() *dkvNode {
 		buf := &safeBuf{}
-		cmd := exec.Command(bin, "-id", "n0", "-listen", addr, "-raft", "-data-dir", dir, "-tick-interval", "25ms")
+		cmd := exec.Command(bin, append([]string{"-id", "n0", "-listen", addr, "-raft", "-data-dir", dir, "-tick-interval", "25ms"}, initFlags(dir, "itest")...)...)
 		cmd.Stdout = buf
 		cmd.Stderr = buf
 		if err := cmd.Start(); err != nil {
