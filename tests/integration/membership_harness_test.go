@@ -105,7 +105,7 @@ func (c *mcluster) start(id string, extra ...string) {
 	buf := &safeBuf{}
 	cmd := exec.Command(c.bin, args...)
 	cmd.Stdout, cmd.Stderr = buf, buf
-	if err := cmd.Start(); err != nil {
+	if err := startProc(c.t, cmd); err != nil {
 		c.t.Fatalf("start %s: %v", id, err)
 	}
 	c.procs[id] = &dkvNode{id: id, addr: c.addrs[id], cmd: cmd, out: buf}

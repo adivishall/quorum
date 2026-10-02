@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"github.com/adivishall/quorum/internal/testport"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -55,12 +54,8 @@ type dkvNode struct {
 }
 
 func TestThreeNodeClusterProbesAndShutsDownCleanly(t *testing.T) {
-	// Build the real cmd/dkvd binary.
-	bin := filepath.Join(t.TempDir(), "dkvd")
-	build := exec.Command("go", "build", "-o", bin, "github.com/adivishall/quorum/cmd/dkvd")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("go build dkvd: %v\n%s", err, out)
-	}
+	// The real cmd/dkvd binary.
+	bin := buildDkvd(t)
 
 	ids := []string{"node-1", "node-2", "node-3"}
 	addrs := map[string]string{}
@@ -86,7 +81,7 @@ func TestThreeNodeClusterProbesAndShutsDownCleanly(t *testing.T) {
 		)
 		cmd.Stdout = buf
 		cmd.Stderr = buf
-		if err := cmd.Start(); err != nil {
+		if err := startProc(t, cmd); err != nil {
 			t.Fatalf("start %s: %v", id, err)
 		}
 		nodes = append(nodes, &dkvNode{id: id, addr: addrs[id], cmd: cmd, out: buf})

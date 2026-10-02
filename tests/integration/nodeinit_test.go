@@ -55,7 +55,7 @@ func TestRealWipedNodeIsRefused(t *testing.T) {
 	buf := &safeBuf{}
 	cmd := exec.Command(c.bin, "-id", "n1", "-listen", freeTCPAddr(t), "-raft", "-data-dir", c.dirs["n1"], "-tick-interval", "25ms")
 	cmd.Stdout, cmd.Stderr = buf, buf
-	if err := cmd.Start(); err != nil {
+	if err := startProc(t, cmd); err != nil {
 		t.Fatal(err)
 	}
 	if err := waitExit(&dkvNode{id: "n1-second", cmd: cmd, out: buf}, 10*time.Second); err == nil || !strings.Contains(buf.String(), "in use by another process") {

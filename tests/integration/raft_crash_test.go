@@ -69,7 +69,7 @@ func (c *rcluster) launch(id string, extra []string) {
 		"-raft", "-data-dir", c.dirs[id], "-tick-interval", "25ms", "-client-listen", c.kvAddrs[id]}, append(append([]string(nil), c.every...), extra...)...)
 	cmd := exec.Command(c.bin, args...)
 	cmd.Stdout, cmd.Stderr = buf, buf
-	if err := cmd.Start(); err != nil {
+	if err := startProc(c.t, cmd); err != nil {
 		c.t.Fatalf("start %s: %v", id, err)
 	}
 	p := &dkvNode{id: id, addr: c.addrs[id], cmd: cmd, out: buf}
@@ -283,7 +283,7 @@ func TestRealCrashAtEveryEarlyPointIsRecoverable(t *testing.T) {
 			buf := &safeBuf{}
 			cmd := exec.Command(bin, append([]string{"-id", "n0", "-listen", addr, "-raft", "-data-dir", dir, "-tick-interval", "25ms", "-crash-at", spec}, initFlags(dir, "itest")...)...)
 			cmd.Stdout, cmd.Stderr = buf, buf
-			if err := cmd.Start(); err != nil {
+			if err := startProc(t, cmd); err != nil {
 				t.Fatal(err)
 			}
 			done := make(chan error, 1)

@@ -22,7 +22,7 @@ func launchRaftNode(t *testing.T, bin, addr, dir string) *dkvNode {
 	cmd := exec.Command(bin, append([]string{"-id", "n0", "-listen", addr, "-raft", "-data-dir", dir, "-tick-interval", "25ms"}, initFlags(dir, "itest")...)...)
 	cmd.Stdout = buf
 	cmd.Stderr = buf
-	if err := cmd.Start(); err != nil {
+	if err := startProc(t, cmd); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	return &dkvNode{id: "n0", addr: addr, cmd: cmd, out: buf}
