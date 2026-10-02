@@ -187,7 +187,7 @@ func (c Config) genesis() (replication.Configuration, bool, error) {
 }
 
 // identity reconciles the group identity file with the config (docs/MEMBERSHIP.md
-// §2): an existing file must name this group and, if the config names a
+// §2): an existing file must name this node (version 2), this group and, if the config names a
 // genesis, the same one; without a file there may be no durable state yet (a
 // log or snapshot without an identity is refused), and the config must name the
 // genesis, which is then recorded durably before anything else is written.
@@ -204,6 +204,9 @@ func (c Config) identity(files snapshot.Files) (Identity, error) {
 		return Identity{}, err
 	}
 	if found {
+		if id.Node != "" && id.Node != c.ID {
+			return Identity{}, fmt.Errorf("%w: %s holds node %q's state, this node is %q", ErrIdentity, c.LogPath, id.Node, c.ID)
+		}
 		if id.Group != c.Group {
 			return Identity{}, fmt.Errorf("%w: %s holds group %d, this node is configured for group %d", ErrIdentity, c.LogPath, id.Group, c.Group)
 		}
@@ -224,7 +227,7 @@ func (c Config) identity(files snapshot.Files) (Identity, error) {
 	if !named {
 		return Identity{}, fmt.Errorf("%w: a first start needs a genesis: Peers, Bootstrap or Join", ErrIdentity)
 	}
-	id = Identity{Group: c.Group, Genesis: gen}
+	id = Identity{Group: c.Group, Genesis: gen, Node: c.ID}
 	if err := writeIdentity(c.FS, c.LogPath, id); err != nil {
 		return Identity{}, err
 	}
@@ -547,6 +550,11 @@ type Status struct {
 // receive, and per-peer sender goroutines. The caller owns the transport's
 // lifecycle (Start does not close it); Close stops the driver and the durable log.
 func Start(ctx context.Context, cfg Config) (*Node, error) {
+	if cfg.TickInterval < 0 {
+		// time.NewTicker would panic in the actor, taking every group of the
+		// process down with it (audit M5): refuse it as configuration.
+		return nil, fmt.Errorf("raftnode: tick interval %s is negative", cfg.TickInterval)
+	}
 	if cfg.TickInterval == 0 {
 		cfg.TickInterval = DefaultTickInterval
 	}

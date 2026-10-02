@@ -147,6 +147,9 @@ func Start(ctx context.Context, cfg Config) (*Host, error) {
 	if cfg.ID == "" || cfg.DataDir == "" || cfg.Transport == nil || cfg.NewStateMachine == nil {
 		return nil, fmt.Errorf("multiraft: ID, DataDir, Transport and NewStateMachine are required")
 	}
+	if cfg.TickInterval < 0 {
+		return nil, fmt.Errorf("multiraft: tick interval %s is negative", cfg.TickInterval)
+	}
 	if cfg.InboxSize <= 0 {
 		cfg.InboxSize = DefaultInboxSize
 	}

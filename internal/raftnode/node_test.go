@@ -277,3 +277,18 @@ func TestGracefulRecovery(t *testing.T) {
 		t.Fatalf("recovered commit %d < %d (INV-R8: commit moved backward)", n2.CommitIndex(), commitBefore)
 	}
 }
+
+// TestStartRefusesANegativeTick (audit M5): a negative tick interval is a
+// configuration error from Start, before anything is recovered or any
+// goroutine runs — never a time.NewTicker panic inside the actor, which would
+// take down every group of the process.
+func TestStartRefusesANegativeTick(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "n0.log")
+	_, err := Start(context.Background(), Config{ID: "n0", Peers: []NodeID{"n0"}, LogPath: path, StateMachine: &recSM{}, TickInterval: -time.Millisecond})
+	if err == nil {
+		t.Fatal("Start accepted a negative tick interval")
+	}
+	if _, found, _ := LoadIdentity(nil, path); found {
+		t.Fatal("a refused Start recorded durable state")
+	}
+}
