@@ -78,6 +78,10 @@ type Node struct {
 	MetricsAddr string
 	Dir         string
 	Spare       bool
+	// join are the groups a spare was started to join: every later start of
+	// it passes them again, as dkvd requires of a joiner (its data directory
+	// records it joined, not that it was a genesis member).
+	join []multiraft.GroupID
 
 	mu   sync.Mutex
 	cmd  *exec.Cmd
@@ -219,7 +223,7 @@ func Start(ctx context.Context, cfg ClusterConfig) (*Cluster, error) {
 	}
 	for _, n := range c.nodes {
 		if !n.Spare {
-			if err := c.launch(n, nil); err != nil {
+			if err := c.launch(n); err != nil {
 				c.Close()
 				return nil, err
 			}
@@ -264,8 +268,10 @@ func (c *Cluster) Endpoints() []load.Endpoint {
 	return out
 }
 
-// launch starts n's process with the cluster's flags (join, for a spare).
-func (c *Cluster) launch(n *Node, join []multiraft.GroupID) error {
+// launch starts n's process with the cluster's flags (and, for a spare it
+// started, -join).
+func (c *Cluster) launch(n *Node) error {
+	join := n.join
 	var peers []string
 	for _, o := range c.nodes {
 		if o != n && !o.Spare {
@@ -334,7 +340,7 @@ func (c *Cluster) launch(n *Node, join []multiraft.GroupID) error {
 		}
 		select {
 		case <-done:
-			return fmt.Errorf("lab: %s exited during startup:\n%s", n.ID, n.Output())
+			return fmt.Errorf("lab: %s exited during startup: %s", n.ID, lastLines(n.Output(), 3))
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
@@ -384,7 +390,7 @@ func (c *Cluster) Restart(id string) error {
 	if n.Alive() {
 		return fmt.Errorf("lab: %s is running", id)
 	}
-	return c.launch(n, nil)
+	return c.launch(n)
 }
 
 // StartSpare starts a spare as a joiner of groups (it holds no configuration
@@ -394,7 +400,18 @@ func (c *Cluster) StartSpare(id string, groups []multiraft.GroupID) error {
 	if !n.Spare {
 		return fmt.Errorf("lab: %s is not a spare", id)
 	}
-	return c.launch(n, groups)
+	n.join = append([]multiraft.GroupID(nil), groups...)
+	return c.launch(n)
+}
+
+// lastLines returns the last n lines of s, joined by " | ": what a startup
+// error needs to show, where the whole output belongs in the node's log.
+func lastLines(s string, n int) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, " | ")
 }
 
 // Close kills every process, then closes every link proxy. It is safe to
