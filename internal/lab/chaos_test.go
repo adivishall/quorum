@@ -154,3 +154,12 @@ func TestScheduleRoundTrips(t *testing.T) {
 		t.Fatalf("chaos.json: %v, keys %v", err, whole)
 	}
 }
+
+// TestFirstLeaderIsNotAChange: a group's first leader, seen when sampling
+// starts, is recorded but not counted as a leader change.
+func TestFirstLeaderIsNotAChange(t *testing.T) {
+	res := &ChaosResult{Events: []ChaosEvent{{Kind: "first-leader", Node: "n1"}, {Kind: "inject", Node: "n1"}, {Kind: "leader", Node: "n2"}, {Kind: "leader", Node: "n3"}}}
+	if n := res.LeaderChanges(); n != 2 {
+		t.Fatalf("%d leader changes, want 2", n)
+	}
+}

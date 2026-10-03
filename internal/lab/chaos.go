@@ -209,7 +209,7 @@ type ChaosEvent struct {
 	At     time.Duration `json:"at"`
 	Pos    int64         `json:"pos"`
 	Fault  int           `json:"fault"` // the schedule index, or -1
-	Kind   string        `json:"kind"`  // inject, recover, skip, error, leader, converged
+	Kind   string        `json:"kind"`  // inject, recover, skip, error, leader (a change), first-leader, converged
 	Node   string        `json:"node,omitempty"`
 	Detail string        `json:"detail,omitempty"`
 }
@@ -275,7 +275,8 @@ func (r *ChaosResult) Errors() int {
 	return n
 }
 
-// LeaderChanges counts the events in which some group's leader changed.
+// LeaderChanges counts the events in which some group's leader changed (a
+// group's first leader, seen when sampling starts, is not a change).
 func (r *ChaosResult) LeaderChanges() int {
 	n := 0
 	for _, e := range r.Events {
@@ -684,6 +685,7 @@ func (r *chaosRun) sample() {
 	r.mu.Lock()
 	r.samples = append(r.samples, got...)
 	var changes []string
+	first := map[string]bool{}
 	var groups []multiraft.GroupID
 	for g := range best {
 		groups = append(groups, g)
@@ -694,13 +696,19 @@ func (r *chaosRun) sample() {
 		cur := [2]string{l.id, fmt.Sprint(l.term)}
 		if prev, ok := r.leaders[g]; !ok || prev != cur {
 			r.leaders[g] = cur
-			changes = append(changes, fmt.Sprintf("%d|%s|%d", g, l.id, l.term))
+			ch := fmt.Sprintf("%d|%s|%d", g, l.id, l.term)
+			changes = append(changes, ch)
+			first[ch] = !ok
 		}
 	}
 	r.mu.Unlock()
 	for _, ch := range changes {
 		parts := strings.Split(ch, "|")
-		r.event(-1, "leader", parts[1], "leads group %s in term %s", parts[0], parts[2])
+		kind := "leader"
+		if first[ch] {
+			kind = "first-leader"
+		}
+		r.event(-1, kind, parts[1], "leads group %s in term %s", parts[0], parts[2])
 	}
 }
 

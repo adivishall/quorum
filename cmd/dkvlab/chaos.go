@@ -138,7 +138,7 @@ func runChaos(ctx context.Context, base lab.Experiment, o chaosOpts, set map[str
 // printChaos writes one run's verdict, its faults and its client outcomes.
 func printChaos(w io.Writer, res *lab.ChaosResult) {
 	for _, e := range res.Events {
-		if e.Kind == "inject" || e.Kind == "skip" || e.Kind == "error" || e.Kind == "leader" {
+		if e.Kind == "inject" || e.Kind == "skip" || e.Kind == "error" || e.Kind == "leader" || e.Kind == "first-leader" {
 			fmt.Fprintf(w, "   %7s %-7s %-3s %s\n", e.At.Round(time.Millisecond), e.Kind, e.Node, e.Detail)
 		}
 	}
