@@ -503,9 +503,19 @@ func TestARetirementIsLoggedOnce(t *testing.T) {
 	before := strings.Count(c.log(victim), "event=group_retired")
 	slow.Store(true)
 	// The operator starts it again (admin start-group): it is retired again,
-	// once.
-	if _, err := c.hosts[victim].Open(1); err != nil {
-		t.Fatal(err)
+	// once. The group leaves the host's table before its retirement's stop
+	// has finished, and Open answers ErrGroupBusy until it has — transient,
+	// and retried, as an operator would.
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		_, err := c.hosts[victim].Open(1)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ErrGroupBusy) || time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	deadline = time.Now().Add(10 * time.Second)
 	for c.hosts[victim].Group(1) != nil {
