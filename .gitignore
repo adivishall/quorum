@@ -14,7 +14,8 @@
 coverage.out
 coverage.html
 
-# benchmark output
+# benchmark and chaos output
+/chaos-artifacts/
 /bench/results/*.json
 /bench/results/*.csv
 

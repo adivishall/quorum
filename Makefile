@@ -9,7 +9,7 @@ PKGS    := ./...
 UNIT    := ./internal/... ./cmd/...
 BIN     := bin
 
-.PHONY: all build test race vet fmt fmtcheck checkignore integration mutation faults fuzz bench benchsuite dkvbench tidy clean check
+.PHONY: all build test race vet fmt fmtcheck checkignore integration mutation faults fuzz bench benchsuite dkvbench tidy clean check chaos
 
 all: check
 
@@ -44,6 +44,14 @@ integration:
 ## mutates. See docs/RAFT.md §12a and docs/FAULTS.md.
 mutation:
 	./scripts/mutation.sh
+
+## chaos — real-process chaos under a recorded, linearizability-checked workload
+## (docs/CHAOS.md): CHAOS_SEEDS consecutive seeds from 1, every run's evidence
+## under CHAOS_DIR; fails if any run is not linearizable or does not converge.
+CHAOS_SEEDS ?= 5
+CHAOS_DIR   ?= chaos-artifacts
+chaos:
+	$(GO) run ./cmd/dkvlab -scenario chaos -seed 1 -runs $(CHAOS_SEEDS) -artifacts "$(CHAOS_DIR)"
 
 ## faults — Phase 10 deterministic fault schedules at a large seed budget (plain
 ## `go test` runs a small seed set), the Phase 11 crash matrix (a crash at every
