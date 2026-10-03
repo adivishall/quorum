@@ -5,7 +5,7 @@ A distributed key-value database built from scratch in Go.
 No Raft library, no embedded database, no consensus service — the storage engine and the
 consensus implementation are the project, and they were built in that order.
 
-> **Status: Phase 16 of 25, with Phase 19's load generator and first cluster baseline — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, a working Raft consensus core, deterministic fault injection, a proven crash-recovery model for the Raft node, client-visible linearizability of single-key operations per Raft group, safe client retries (request identity, deduplication at apply and request forwarding), snapshots with log compaction and follower installation, dynamic membership by joint consensus with one Raft group per shard, checked on real client histories; metrics from every layer, a load generator for real clusters, and reproducible cluster experiments with a measured performance report.**
+> **Status: Phase 16 of 25, with Phase 19's load generator and first cluster baseline — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, a working Raft consensus core, deterministic fault injection, a proven crash-recovery model for the Raft node, client-visible linearizability of single-key operations per Raft group, safe client retries (request identity, deduplication at apply and request forwarding), snapshots with log compaction and follower installation, dynamic membership by joint consensus with one Raft group per shard, checked on real client histories; metrics from every layer, a load generator for real clusters, and reproducible cluster experiments with a measured performance report; real-process chaos under a recorded, linearizability-checked workload, and an operator tool with health and readiness.**
 >
 > **Implemented:** a write-ahead log, an ordered memtable, immutable on-disk SSTables, Bloom
 > filters, size-tiered compaction, crash-safe MANIFEST-based file publication, and restart
@@ -446,6 +446,8 @@ it is being answered out of memory.
 | [CLUSTER_BENCHMARKS.md](docs/CLUSTER_BENCHMARKS.md) | The first cluster baseline: real `dkvd` processes at 1, 3 and 5 nodes, 1–16 groups, three read/write mixes, a leader kill, a rolling restart, a membership change and snapshots — medians and ranges, the environment, the raw results, and where the time goes |
 | [BENCHMARKS.md](docs/BENCHMARKS.md) | The single-node storage engine's measurements (Phase 5): methodology, hardware, variance |
 | [ENGINEERING_ROADMAP.md](docs/ENGINEERING_ROADMAP.md) | The audit of the system as built, its verified defects, and the ranked engineering work that follows |
+| [CHAOS.md](docs/CHAOS.md) | Real-process chaos: seeded fault schedules (kill, stop, crash at a driver point, pause, isolate, cut, snapshot, add-member) under a recorded workload checked for linearizability; what a seed reproduces and what it cannot; partitions; the evidence a failing run leaves |
+| [OPERATIONS.md](docs/OPERATIONS.md) | `dkvctl`: status, leaders, configurations, lag, health and readiness over the admin protocol; the exact health and readiness rules, what each cannot see, and the exit codes |
 | [LOAD_TESTING.md](docs/LOAD_TESTING.md) | How `dkvload` puts a real cluster under load: closed and open loop (coordinated omission accounted for), exact percentiles, outcome classes, the outage timeline, reproducibility, and the generator's measured ceiling |
 | [API.md](docs/API.md) | The client wire protocol v3: framing, messages, the request's group, operations, validation, status codes, forwarding and redirect-only mode, the session and sharded client libraries |
 | [SNAPSHOTS.md](docs/SNAPSHOTS.md) | Snapshot state and format, creation and compaction order, recovery's reconciliation, crash windows, follower installation, chunking, dedup preservation, corruption policy, measurements, and snapshots with membership |
@@ -463,15 +465,27 @@ make test
 make race
 make integration  # real-process tests (tests/integration, -race; dkvd race-built too): SIGKILL recovery, Raft over TCP, kill/stop/partition faults, linearizability, membership, metrics, load, the lab
 make faults       # the deterministic fault schedules and client workloads at a large seed budget (FAULT_SEEDS=200)
+make chaos        # real-process chaos under a recorded, checked workload (CHAOS_SEEDS=5; docs/CHAOS.md)
 make mutation     # mutation testing: every rule-violating edit must be caught
 make fuzz         # every fuzz target in the repository (FUZZTIME=10s each)
 make bench        # indicative WAL measurements
 ```
 
-Measure a real cluster (`docs/CLUSTER_BENCHMARKS.md`, `docs/LOAD_TESTING.md`):
+Operate a running cluster (`docs/OPERATIONS.md`) — exit codes 0 healthy/ready, 1 degraded, 3
+unavailable/not ready, 4 unreachable:
+
+```bash
+go build -o bin/dkvctl ./cmd/dkvctl
+bin/dkvctl -nodes n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 health
+bin/dkvctl -admin 127.0.0.1:9001 ready
+```
+
+Measure a real cluster (`docs/CLUSTER_BENCHMARKS.md`, `docs/LOAD_TESTING.md`), or put it through
+seeded chaos (`docs/CHAOS.md`):
 
 ```bash
 go build -o bin/dkvlab ./cmd/dkvlab && bin/dkvlab -scenario leader-kill -nodes 3 -runs 5 -rate 50 -out lk.json
+bin/dkvlab -scenario chaos -seed 1 -runs 5 -artifacts chaos-artifacts/
 go build -o bin/dkvload ./cmd/dkvload && bin/dkvload -endpoints n1=127.0.0.1:8001,n2=127.0.0.1:8002,n3=127.0.0.1:8003 -clients 16 -duration 30s
 ```
 

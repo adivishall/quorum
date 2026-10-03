@@ -48,7 +48,9 @@ probe showed it; where it is called *from the code*, it was read and traced but 
 - **Empty directories:** `internal/api`, `internal/cluster`, `internal/config`, `pkg/client`,
   `docker`, `dashboard` and `tests/chaos` hold no tracked files. The first five exist in
   ARCHITECTURE's layer map.
-- **No operator tool** beyond raw JSON lines to the admin port; no health or readiness endpoint.
+- **Operator tool: built** (the chaos-and-operability milestone). `dkvctl` reads the admin protocol
+  — status, leaders, configurations, lag, health and readiness, snapshots — with exit codes for
+  probes (`docs/OPERATIONS.md`). There is deliberately no HTTP health endpoint.
 
 ### 1.4 Verified defects
 
@@ -88,14 +90,16 @@ Ranked by what a single input can do.
   - rolling restart, membership change and snapshot costs under load;
   - persistence and replication traffic per write.
 - **Not measured:**
-  - partitions under load;
+  - the performance cost of partitions under load (the chaos runs check them for safety and
+    convergence, not for latency);
   - values larger than 100 bytes (D1 blocks values near the limit), and key skew;
   - more than 16 groups or 16 clients under load;
   - multi-host deployments;
   - restart time as the state grows.
 - **Not operationally visible:**
   - no storage-engine metrics (no engine on the path);
-  - no health or readiness endpoint;
+  - health and readiness only through `dkvctl` over the admin protocol, not as an HTTP route
+    (by choice, `docs/OPERATIONS.md`);
   - the transport logs a disconnect but not its reason (a frame too large, a bad checksum);
   - no aggregation; `/metrics` is per node.
 
@@ -323,15 +327,25 @@ log and more configuration on top of exactly these paths, so they must hold firs
 - **Benchmark:** `docs/CLUSTER_BENCHMARKS.md` §3 and §6.3 before and after, with variance.
 - **Risk:** medium; the crash matrices and fault schedules must stay green.
 
-### 7. Chaos under load, and the rest of Phase 19
+### 7. Chaos under load, and the rest of Phase 19 — mostly done
 
-- Simulator campaigns that combine clients, snapshots, membership, partitions and persistence
-  faults.
-- A real-process runner that replays a recorded fault schedule against `dkvd` under `dkvload`,
-  recording client history, metrics, faults and node events, and checking linearizability.
-- Partitions in `dkvlab`.
-- The open measurements: value sizes, key skew, more groups and clients, more runs.
-- The rolling-restart unknown outcomes explained, with an attempt-level trace.
+- **Done** (the chaos-and-operability milestone):
+  - **Partitions in the lab.** `internal/netproxy` is on every link; the lab can cut, isolate, heal
+    and pause.
+  - **A real-process chaos runner** (`docs/CHAOS.md`). Seeded schedules of kill, stop, crash at a
+    driver point, pause, isolate, cut, snapshot and add-member, one impairment at a time, replayable
+    exactly. It runs under a recorded workload whose history is checked, with every unknown outcome
+    kept. It records events, status samples, convergence and artifacts.
+  - **Measurement matrices.** `dkvlab` sweeps nodes, groups, clients, value size, read share and
+    attempt budget, and its summaries are never success-only.
+  - **The rolling-restart unknown outcomes explained** (`docs/CLUSTER_BENCHMARKS.md` §11). An
+    attempt budget runs out before the election the leader's stop forces, two attempts spent
+    instantly on stale connections. 30 attempts leave none unknown.
+- **Remaining:**
+  - simulator campaigns that combine every family with clients;
+  - black-hole and one-way partitions on real processes (kernel filtering);
+  - the open measurements published: value sizes, key skew, more groups and clients, more runs;
+  - the chaos campaign in CI.
 
 ### 8. PreVote, then CheckQuorum
 
@@ -351,15 +365,17 @@ log and more configuration on top of exactly these paths, so they must hold firs
   "as built" and "planned"; invariants for Phase 16 and #2.
 - **Timing:** best done after task 1, so the size rules are written once.
 
-### 10. Operator and client surface
+### 10. Operator and client surface — operator half done
 
-- **Problem:** there is no operator tool beyond raw JSON lines, and the `dkv` CLI is not a network
-  client.
-- **Architecture impact:**
-  - `dkvctl` over the admin protocol: status, leader, terms, indexes, lag, membership, snapshot,
-    health;
-  - health and readiness beside `/metrics`;
-  - `dkv` as a networked session client over the existing binary protocol.
+- **Done:** `dkvctl` over the admin protocol, which now also reports the node id, each leader's
+  follower match and the pending requests. Health and readiness are derived by `internal/health`
+  (`docs/OPERATIONS.md`) and served through `dkvctl`'s exit codes, not an HTTP route.
+- **Remaining:**
+  - `dkv` as a networked session client over the existing binary protocol;
+  - in the client library, measured by §11 of `docs/CLUSTER_BENCHMARKS.md`:
+    - redial a connection the peer has closed before sending on it, instead of spending an attempt
+      unknown;
+    - a retry budget sized in time, so it covers an election.
 - **HTTP:** an HTTP gateway only if a consumer needs one; the binary protocol already carries
   identity, retries and routing.
 
