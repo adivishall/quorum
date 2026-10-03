@@ -6,8 +6,12 @@
 //
 //	dkvlab -scenario leader-kill -nodes 3 -runs 5 -out leader-kill.json
 //	dkvlab -suite report -out report.json      # the matrix docs/CLUSTER_BENCHMARKS.md reports
+//	dkvlab -scenario chaos -seed 7 -runs 3 -artifacts chaos/   # docs/CHAOS.md
+//	dkvlab -scenario chaos -schedule chaos/seed-7/schedule.json  # replay one schedule
 //
-// Scenarios: steady, leader-kill, rolling-restart, membership, snapshots.
+// Scenarios: steady, leader-kill, rolling-restart, membership, snapshots,
+// chaos (a seeded fault schedule under a recorded, linearizability-checked
+// workload).
 package main
 
 import (
@@ -37,7 +41,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("dkvlab", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		scenario  = fs.String("scenario", "steady", "steady, leader-kill, rolling-restart, membership or snapshots")
+		scenario  = fs.String("scenario", "steady", "steady, leader-kill, rolling-restart, membership, snapshots or chaos")
 		suite     = fs.String("suite", "", "run a named matrix instead of one scenario: report")
 		mode      = fs.String("mode", "raft", "raft (one group) or cluster (one group per shard)")
 		nodes     = fs.Int("nodes", 3, "genesis nodes")
@@ -59,10 +63,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		out       = fs.String("out", "", "write every run and the summaries as JSON")
 		repo      = fs.String("repo", ".", "the repository to build dkvd from and record the commit of")
 		data      = fs.String("data", "", "where the nodes' data directories go (default: a temporary directory)")
+		del       = fs.Int("delete", 0, "load: percentage of DELETEs")
+		spares    = fs.Int("spares", 0, "extra nodes a scenario may add (chaos: 1, for add-member)")
+		chaosF    = chaosFlags(fs)
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
 	root := *data
 	if root == "" {
 		d, err := os.MkdirTemp("", "dkvlab-")
@@ -79,9 +88,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	base := lab.Experiment{
-		Cluster: lab.ClusterConfig{Bin: bin, Mode: *mode, Nodes: *nodes, Shards: *shards, RF: *rf, Tick: *tick, SnapshotEvery: *snapEv},
-		Load: load.Config{Clients: *clients, Duration: *duration, Warmup: *warmup, Rate: *rate, ReadPct: *read,
+		Cluster: lab.ClusterConfig{Bin: bin, Mode: *mode, Nodes: *nodes, Spares: *spares, Shards: *shards, RF: *rf, Tick: *tick, SnapshotEvery: *snapEv},
+		Load: load.Config{Clients: *clients, Duration: *duration, Warmup: *warmup, Rate: *rate, ReadPct: *read, DeletePct: *del,
 			Keys: *keys, ValueSize: *value, Seed: *seed, AttemptTimeout: *attempt},
+	}
+	if *scenario == "chaos" && *suite == "" {
+		return runChaos(ctx, base, chaosF, set, *runs, root, *repo, *out, stdout, stderr)
 	}
 	var exps []lab.Experiment
 	if *suite != "" {
