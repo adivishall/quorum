@@ -163,3 +163,18 @@ func TestFirstLeaderIsNotAChange(t *testing.T) {
 		t.Fatalf("%d leader changes, want 2", n)
 	}
 }
+
+// TestARunWithAnErrorFails: a run whose schedule could not be carried out —
+// an error event, such as a restart that failed — fails, however clean its
+// history and its convergence look.
+func TestARunWithAnErrorFails(t *testing.T) {
+	res := &ChaosResult{Converged: true, Check: CheckResult{Linearizable: true},
+		Load: &load.Result{Classes: map[string]int64{load.ClassOK: 10}}}
+	if !res.OK() {
+		t.Fatal("a clean run did not pass")
+	}
+	res.Events = append(res.Events, ChaosEvent{Kind: "error", Node: "n4", Detail: "restart: exited during startup"})
+	if res.OK() {
+		t.Fatal("a run with an error event passed")
+	}
+}

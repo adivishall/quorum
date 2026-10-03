@@ -114,6 +114,12 @@ func TestMajorityDown(t *testing.T) {
 	if h := Cluster([]Probe{down("n1"), down("n2")}, Options{}); h.Verdict != Unreachable {
 		t.Fatalf("nothing answered: %+v", h)
 	}
+	// A leader no other voter confirms — cut off, its peers unreachable — is
+	// not a quorum.
+	lone := Cluster([]Probe{probe("n1", leaderOf(100, nil)), down("n2"), down("n3")}, Options{})
+	if lone.Verdict != Unavailable || lone.Groups[0].Agreeing != 1 || lone.Groups[0].Leader != "n1" {
+		t.Fatalf("a lone leader: %+v", lone.Groups[0])
+	}
 }
 
 // TestLaggingFollower: a follower the leader holds 5,000 entries behind its
