@@ -33,7 +33,13 @@ scrapes every node's `/metrics` before and after the measured window. A run's nu
 
 - **from the clients:** throughput (operations completed with a definite answer inside the window,
   per second), exact latency percentiles per operation, outcomes by class (`ok`, `not_found`,
-  `refused`, `unknown`), and the longest run of 100 ms buckets with no success (the outage);
+  `refused`, `unknown`), and the longest run of 100 ms buckets with no success (the outage).
+  **The latency percentiles in the tables below are of successes only** (`ok`, `not_found`): the
+  runs were recorded before the generator also measured refused and unknown operations
+  (`docs/LOAD_TESTING.md`), and their durations were not stored, so the tables cannot be corrected
+  from the JSON. Where a scenario had unknown outcomes — the rolling restart, 10–14 per run — its
+  p99s leave out exactly those, the slowest operations: in `bench/cluster/rolling-restart.json`
+  run 0, 5 of 495 PUTs, so "PUT p99 280.7 ms" is the p99 of the other 490. A re-run reports both;
 - **from the nodes:** CPU per second, peak RSS, persists (fsyncs) and their mean duration, mean
   commit latency of a write, AppendEntries traffic and commit progress (§6.3 only), snapshots taken;
 - **from the lab:** each action's settle time — a kill to the next leader seen by the admin
@@ -141,9 +147,10 @@ interval with no backoff and no reset on an inbound attempt (a roadmap item, not
   three restarts in a run, the two followers' caught up in 24–37 ms: each had applied index 232–234
   and had missed nothing while it was down. The leader's took 529–594 ms, because its stop forces
   an election, and the 400–500 ms outage is of that size. Why some operations stayed unknown after
-  every retry, rather than being settled by a retry under the same identity, is **not yet
-  explained**. An unknown outcome is allowed by the contract (`docs/CLIENT_SEMANTICS.md` §6), but
-  this many is a finding, and §10 lists it.
+  every retry, rather than being settled by a retry under the same identity, is explained in §11.
+  The client spent its eight attempts before the new leader existed, two of them instantly on
+  connections to the followers that had just restarted. With 30 attempts the same scenario ends
+  with none unknown. An unknown outcome is allowed by the contract (`docs/CLIENT_SEMANTICS.md` §6).
 - **A membership change** under load caused no outage. The learner was added, caught up and
   promoted in 148 ms (median; 126–150 ms). The change does move write latency: PUT p99 was 33.2 ms
   in this series and 21.7 ms in the first suite run, against 18.6 ms with no change. Three runs
@@ -295,7 +302,9 @@ snapshot scenario takes snapshots. Mutants 168–172 break each of these and are
 2. **The leader resends every unacknowledged entry on every broadcast** (§6.3). Replication traffic
    per entry grows with the writes in flight, and no message has a byte budget.
 3. **A restarted node waits up to 500 ms for its peers' next redial** (§5.2).
-4. **A rolling restart leaves 10–15 operations per run unknown** (§5.3) — not yet explained.
+4. **A rolling restart leaves 10–15 operations per run unknown** (§5.3) — explained in §11: an
+   attempt budget counted in attempts, partly spent instantly on stale connections, runs out before
+   the election that the leader's stop forces.
 5. **The lab itself had two defects:**
    - the snapshot scenario's interval was too large, so it took no snapshot (found by checking the
      scenario's premise in its result);
@@ -303,3 +312,72 @@ snapshot scenario takes snapshots. Mutants 168–172 break each of these and are
 
    Both are fixed, and both now leave evidence in every result: snapshots per node, and the index
    each catch-up reached. Mutants 168–172 guard the lab's arithmetic.
+
+## 11. The rolling-restart unknown outcomes, explained
+
+§5.3 reported 10–15 unknown outcomes per rolling restart, against none for a leader SIGKILL at the
+same rate. This section says why. The experiment is a controlled one: the same scenario, with
+attempt traces (`load.Config.Trace`), at two attempt budgets.
+
+```bash
+dkvlab -scenario rolling-restart -nodes 3 -runs 3 -rate 50 -read 50 -trace -max-attempts 8,30
+```
+
+Commit `3b5654a`, a clean tree. Otherwise §2's setup: 16 clients, open loop at 50 ops/s, a 20 s
+window after a 3 s warmup. Raw results: `bench/cluster/rolling-restart-attempts.json`.
+
+| Attempts per request | Unknown outcomes per run | Success rate (median) | Every-outcome p99 (median) | Leader's restart, stop to caught up |
+|---|---|---|---|---|
+| 8 (the default) | 15, 12, 15 | 98.50% | 623 ms | 490–537 ms |
+| 30 | **0, 0, 0** | **100.00%** | 688 ms | 490–533 ms |
+
+All 42 unknown operations in the 8-attempt runs have the same shape (`ClassifyUnknown`:
+`unanswered-then-refused`). One of them, with times from the run's start:
+
+| Attempt | Node | At | Took | Answer |
+|---|---|---|---|---|
+| 1 | n3 | 8861 ms | 12.6 ms | EOF — the leader stopped with the request in flight: unknown |
+| 2 | n3 | 8874 | 0.1 | connection refused — nothing sent; back off 20 ms |
+| 3 | n1 | 8894 | 0.0 | EOF — a dead connection: unknown, no back-off |
+| 4 | n2 | 8894 | 0.0 | EOF — a dead connection: unknown, no back-off |
+| 5 | n3 | 8894 | 0.4 | NOT_LEADER, no leader named (restarted, not yet in an elected term); back off 40 ms |
+| 6 | n1 | 8936 | 0.4 | UNAVAILABLE, still naming n3; back off 80 ms |
+| 7 | n2 | 9016 | 0.6 | UNAVAILABLE, still naming n3; back off 160 ms |
+| 8 | n3 | 9178 | 0.2 | NOT_LEADER — the attempts are spent: the request ends unknown |
+
+The mechanism has three parts:
+1. **The leader's stop leaves its in-flight requests unknown.** The rolling restart stops the leader
+   last, and requests it had accepted see their connection close. That is correct: they may have
+   committed.
+2. **Attempts are spent instantly on stale connections.** A client keeps one connection per node.
+   The rolling restart restarted `n1` and `n2` moments before, so the client's connections to them
+   are dead. `kv.Client` finds a dead connection only by using it, and conservatively reports the
+   attempt unknown, because it cannot tell whether the request left (`internal/kv/wire.go`). Two
+   of the eight attempts go this way, and an unknown answer is retried without back-off.
+3. **The budget runs out before an election ends.** The remaining attempts are definite refusals:
+   no leader yet, or a follower still pointing at the stopped leader. They back off 20, 40, 80 and
+   160 ms, so the eighth attempt is made about 320 ms after the leader's stop. The election that the
+   stop forces, and the restarted leader's catch-up, take 490–537 ms. The request gives up with its
+   outcome still unknown, about 620 ms after it began.
+
+**Why a leader SIGKILL shows none.** Its followers were not just restarted, so no attempt is spent
+on a stale connection. The client's back-off ladder then runs its full length, about 1.3 s, which
+outlasts the election.
+
+**The control.** With 30 attempts the back-off grows to its 1 s cap. Every one of those requests
+reaches the new leader, its retry is deduplicated under its identity, and its outcome becomes
+known: 0 unknown in all three runs. That is causal evidence for the mechanism, not just for a
+correlation. The every-outcome p99 rises (623 → 688 ms) because those requests now wait for the new
+leader instead of giving up.
+
+**What it is not.** It is not a safety problem. Every unknown outcome is allowed by the contract,
+and the chaos runs check such histories (`docs/CHAOS.md`). It is a client's retry budget counted in
+attempts rather than in time, partly spent on connections it could have known were dead.
+
+**What would change it** (not done in this milestone; `docs/ENGINEERING_ROADMAP.md`):
+- **Redial a known-dead connection.** The client could redial a connection whose peer has closed it
+  before sending on it, so that attempt goes to the restarted process instead of being spent unknown.
+- **Size the budget in time.** A budget of at least an election plus catch-up, rather than eight
+  attempts, would cover the stop. Today it is a setting: `kv.SessionOptions.MaxAttempts`,
+  `dkvload -max-attempts`, `dkvlab -max-attempts`.
+

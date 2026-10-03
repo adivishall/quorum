@@ -631,9 +631,9 @@ func TestRealConcurrentRequestsFromOneSession(t *testing.T) {
 func TestRealRedirectOnlyModeWithSessions(t *testing.T) {
 	withPremise(t, func() {
 		c := newRClusterEvery(t, 3, []string{"-client-forwarding=false"})
-		l, _ := c.waitLeader(c.ids, 0, 20*time.Second)
+		c.waitLeader(c.ids, 0, 20*time.Second)
 		c.waitClientReady(20 * time.Second)
-		l, _ = c.waitStable(c.ids, 0, 30*time.Second)
+		l, _ := c.waitStable(c.ids, 0, 30*time.Second)
 		f := others(c.ids, l)[0]
 		r := newLinRun(t, c)
 		w := r.session("W", kv.SessionOptions{MaxAttempts: 8}, f)

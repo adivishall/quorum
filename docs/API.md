@@ -6,6 +6,10 @@ protocol over TCP; there is no HTTP API. `docs/CLIENT_SEMANTICS.md` is the contr
 every field and status *means*); `docs/DEDUP.md` is how the server keeps it; `docs/MULTI_RAFT.md` §6
 is how a request finds its group. Version 3 is version 2 (Phase 13) plus the request's **group**.
 
+This is the client protocol only. The operator's interface is the separate admin protocol
+(`-admin-listen`, JSON lines; `docs/MULTI_RAFT.md` §7), read by `dkvctl` (`docs/OPERATIONS.md`) —
+status, leaders, configurations, lag, health and readiness. Neither has an HTTP form.
+
 ---
 
 ## 1. Connection
@@ -21,6 +25,17 @@ is how a request finds its group. Version 3 is version 2 (Phase 13) plus the req
   (`kv.Client` does this; mutant 47).
 - A connection carries no identity. Sessions (§3) are named in every request, so a client may use
   any number of connections, to any nodes, over the life of one session.
+- **What a connection may cost is bounded** (`kv.ServeConfig`, audit M1): a node serves at most
+  1024 client connections at once — one beyond is closed as soon as it is accepted; a request
+  frame must arrive whole within 10 s of its first byte; a response must be taken within 10 s.
+  Either deadline missed closes the connection. An **idle** connection is never timed out: closing
+  one could race a request its client is sending, which the client would then have to report as
+  an unknown outcome. So 1024 idle connections hold every slot, and new clients are refused until
+  one closes: the cap bounds the cost of connections, not who holds them (there is no
+  authentication to tell clients apart, `docs/LIMITATIONS.md`). A frame's buffer grows with the bytes that arrive, never to the length a
+  header merely declares. Tests: `TestServeCapsItsConnections`,
+  `TestServeDropsAStalledFrameButKeepsAnIdleConnection`, `TestServeDropsAClientThatDoesNotRead`,
+  `TestServeSurvivesAcceptErrors`, `TestReadFrameGrowsWithTheBytesThatArrive`.
 
 Record kinds: **5 = request, 4 = response.** Kinds 1 and 2 were version 1 (Phase 12: no identity,
 six statuses) and kind 3 was version 2's request (Phase 13: no group); both versions are retired and
@@ -44,7 +59,7 @@ is a protocol error). Byte strings are a varint length followed by the bytes.
 | ackedBelow | varint | the client's watermark (0 when anonymous) |
 | timeoutMillis | varint | the client's budget for this attempt; 0 = the server default; more than fits a `time.Duration` (≈292 years): protocol error |
 | key | bytes | ≤ 4 KiB (longer: protocol error) |
-| value | bytes | **PUT only** — absent for every other op; ≤ 1 MiB |
+| value | bytes | **PUT only** — absent for every other op; ≤ 1 MiB, and the write's whole entry ≤ 1 MiB (§3) |
 
 **Response** (kind 4):
 
@@ -95,7 +110,18 @@ proposed. The rules (`Request.validate`; each pinned by
 - REGISTER carries no key, value, clientID, requestID or ackedBelow;
 - PUT/GET/DELETE: a non-empty key of at most 4 KiB; a value only on PUT, at most 1 MiB;
 - anonymous (clientID 0): requestID = ackedBelow = 0;
-- identified: requestID ≥ 1 and 1 ≤ ackedBelow ≤ requestID.
+- identified: requestID ≥ 1 and 1 ≤ ackedBelow ≤ requestID;
+- PUT/DELETE: the **log entry the write becomes** — its encoded command — is at most
+  `kv.MaxCommandLen` = 1 MiB (1,048,576 bytes), the system's one entry-size limit
+  (`raft.MaxEntryDataLen`, `docs/RAFT.md` §16). The encoding adds to the key and value an op
+  byte, the uvarint lengths of key and value and, for an identified write, its three identity
+  varints (1–10 bytes each), so **the largest value depends on the key and identity**: an
+  anonymous PUT of a 1-byte key carries up to 1,048,570 bytes of value, the longest key with the
+  largest identities leaves room for 1,044,444. A value of the full 1 MiB is therefore always
+  `INVALID_REQUEST`. The refusal is definite and comes before anything is proposed or forwarded
+  (`TestEncodedEntryLimitDecidesWriteAdmission`, `TestEntryLimitEndToEnd`, `TestRealEntryLimit`;
+  mutants 173–179). Until this rule (audit C1), such a write was proposed, persisted by the
+  leader as an entry every follower refused, and left that leader unable to restart.
 
 Anything that validates becomes a log command every replica can apply
 (`TestValidatedRequestsAlwaysApply`) — no client can get an entry proposed that replicas refuse.
@@ -115,7 +141,7 @@ maximum (10 s; 0 means that maximum).
 | 0 | `OK` | definite, effect (now, or earlier when `duplicate`) |
 | 1 | `NOT_FOUND` | definite (a read found nothing) |
 | 2 | `NOT_LEADER` | definite, no effect; `leader` names a hint, if any — none when this node hosts no replica of the request's group |
-| 3 | `UNAVAILABLE` | definite, no effect: nothing was sent onward |
+| 3 | `UNAVAILABLE` | definite, no effect: nothing was sent onward, or the leader refused it at its bound of uncommitted entries or pending reads (it is probably cut off from its quorum; `docs/RAFT.md` §17) |
 | 4 | `INVALID_REQUEST` | definite, no effect |
 | 5 | `REQUEST_CONFLICT` | definite, no effect: the requestID is taken by a different command |
 | 6 | `REQUEST_STALE` | definite, no effect: below the session's watermark |
@@ -140,6 +166,8 @@ the internal transport, and relays the answer with `via` set to itself:
   `NOT_LEADER` (no loops, whatever the nodes believe; mutant 70);
 - a forward is **sent at most once**; its answer is waited for within the client's budget:
   - not sent (the leader is not connected) → `UNAVAILABLE`;
+  - refused by the leader, which serves at most 256 forwards at once (audit M1) → `UNAVAILABLE`,
+    answered at once (`TestForwardsBeyondTheBoundAreRefusedUnavailable`);
   - sent, not answered in time → `UNKNOWN_OUTCOME` (the leader may have executed it; mutant 71);
   - no leader known → `NOT_LEADER` with no hint;
 - forward ids start at a random point per process, so a response to a previous incarnation's

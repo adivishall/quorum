@@ -38,7 +38,7 @@ func newMeteredRCluster(t *testing.T, n int) (*rcluster, map[string]string) {
 	t.Helper()
 	c := &rcluster{
 		t: t, bin: buildDkvd(t), addrs: map[string]string{}, kvAddrs: map[string]string{}, dirs: map[string]string{},
-		proxies: map[[2]string]*tcpProxy{}, procs: map[string]*dkvNode{},
+		proxies: map[[2]string]*tcpProxy{}, procs: map[string]*dkvNode{}, cluster: newClusterID(),
 	}
 	metricsAt := map[string]string{}
 	root := t.TempDir()

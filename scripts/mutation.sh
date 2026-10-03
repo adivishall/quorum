@@ -41,14 +41,20 @@ cd "$(dirname "$0")/.."
 # checks its own target file is clean before editing (below). Untracked files (e.g.
 # an as-yet-uncommitted copy of this script) do not affect revert safety.
 
-TOUCHED=()
-revert_all() {
-  local f
-  for f in "${TOUCHED[@]:-}"; do
-    [ -n "$f" ] && git checkout -- "$f" 2>/dev/null
-  done
+LOG="${TMPDIR:-/tmp}/mutation.$$.log"
+# CURRENT is the file a mutant has edited and not yet reverted: the only file
+# the exit trap may check out. (A list of every file any mutant touched made
+# the trap check out, at a normal exit, files reverted long before — losing
+# whatever a developer had edited in them during the run: a review of the
+# runner.)
+CURRENT=""
+revert_current() {
+  if [ -n "$CURRENT" ]; then
+    git checkout -- "$CURRENT" 2>/dev/null
+    CURRENT=""
+  fi
 }
-trap revert_all EXIT
+trap revert_current EXIT
 
 FAIL=0
 KILLED=0
@@ -62,44 +68,81 @@ mutant() {
   fi
   TOTAL=$((TOTAL + 1))
 
+  # Revert safety rests on git: the target must be tracked (git diff is blind
+  # to an untracked file, so a mutation of one went unnoticed and was never
+  # reverted — audit) and clean (a checkout must lose nothing).
+  if ! git ls-files --error-unmatch -- "$file" >/dev/null 2>&1; then
+    echo "✗ $name: $file is not tracked by git; refusing to mutate (revert safety)."
+    FAIL=$((FAIL + 1))
+    return
+  fi
   if ! git diff --quiet -- "$file"; then
     echo "✗ $name: $file has uncommitted changes; refusing to mutate (revert safety)."
     FAIL=$((FAIL + 1))
     return
   fi
+  local sites
+  sites=$(S="$search" perl -0ne '$n = () = /\Q$ENV{S}\E/g; print $n' "$file")
+  if [ "${sites:-0}" -gt 1 ]; then
+    echo "⚠ $name: the pattern matches $sites sites in $file; only the first is mutated."
+  fi
   # Only a file this mutant is about to edit — clean, so a checkout loses
-  # nothing — goes on the exit trap's revert list. (Recording it before the
-  # check above made the trap check out a refused, dirty file at exit,
-  # discarding its uncommitted changes: found in Phase 15.)
-  TOUCHED+=("$file")
+  # nothing — is the exit trap's to revert, until it is reverted. (Recording
+  # it before the check above made the trap check out a refused, dirty file
+  # at exit, discarding its uncommitted changes: found in Phase 15.)
+  CURRENT="$file"
 
   S="$search" R="$replace" perl -0pi -e 's/\Q$ENV{S}\E/$ENV{R}/' "$file"
   if git diff --quiet -- "$file"; then
     echo "✗ $name: PATTERN DID NOT MATCH in $file — cannot mutate (source changed?)."
     FAIL=$((FAIL + 1))
-    git checkout -- "$file" 2>/dev/null
+    revert_current
     return
   fi
 
   if [ -n "${DRY:-}" ]; then
     echo "· $name: pattern applies"
-    git checkout -- "$file" 2>/dev/null
+    revert_current
     return
   fi
 
   # shellcheck disable=SC2086 # $pkg is a deliberate word-split package list
-  if go test $pkg -run "$tests" -count=1 -timeout 300s >/tmp/mutation.$$.log 2>&1; then
+  if go test $pkg -run "$tests" -count=1 -timeout 300s >"$LOG" 2>&1; then
     echo "✗ $name: SURVIVED — killer tests [$tests] still PASSED with the rule broken."
     FAIL=$((FAIL + 1))
-  elif grep -qE '\[build failed\]|\[setup failed\]' /tmp/mutation.$$.log; then
+  elif grep -qE '\[build failed\]|\[setup failed\]|go build dkvd: |lab: building dkvd: ' "$LOG"; then
+    # A test that builds dkvd itself (tests/integration, internal/lab) fails
+    # its test, not its package, when the mutant breaks dkvd's build.
     echo "✗ $name: the mutant does not compile — that is not a kill."
-    grep -m 3 -E '\.go:[0-9]+' /tmp/mutation.$$.log
+    grep -m 3 -E '\.go:[0-9]+' "$LOG"
+    FAIL=$((FAIL + 1))
+  elif ! grep -qE -- '--- FAIL: |^panic: |^fatal error: ' "$LOG"; then
+    # Attribution (audit): a kill is a failing test — a test's FAIL, or the
+    # binary dying in one (a panic, a timeout). A run that failed without
+    # either failed somewhere else.
+    echo "✗ $name: the run failed without a failing test — not attributable to the mutant."
+    tail -n 5 "$LOG"
     FAIL=$((FAIL + 1))
   else
-    echo "✓ $name: killed by [$tests]."
+    revert_current
+    # Real-process killers run on real timing; with CONFIRM=1, every killer.
+    # A kill counts only if the same tests pass on the clean tree, so a
+    # flaky failure can never pass for one (audit).
+    if [ -n "${CONFIRM:-}" ] || [[ "$pkg" == *tests/integration* ]]; then
+      # shellcheck disable=SC2086
+      if ! go test $pkg -run "$tests" -count=1 -timeout 300s >"$LOG.clean" 2>&1; then
+        echo "✗ $name: [$tests] fail on the clean tree too — a flaky or broken test is not a kill."
+        tail -n 5 "$LOG.clean"
+        FAIL=$((FAIL + 1))
+        return
+      fi
+      echo "✓ $name: killed by [$tests] (they pass on the clean tree)."
+    else
+      echo "✓ $name: killed by [$tests]."
+    fi
     KILLED=$((KILLED + 1))
   fi
-  git checkout -- "$file" 2>/dev/null
+  revert_current
 }
 
 echo "== Raft mutation testing =="
@@ -316,12 +359,12 @@ mutant "dialer-backs-off-after-dead-conn" internal/transport/transport.go \
 # 24. Ignore the read idle deadline, so a silent (established-but-dead) connection
 #     blocks the reader forever and the peer is never reconnected (Phase 10, bug 6).
 mutant "read-idle-timeout-detects-dead-conn" internal/transport/transport.go \
-  '		if t.cfg.ReadIdleTimeout > 0 {
-			_ = c.nc.SetReadDeadline(time.Now().Add(t.cfg.ReadIdleTimeout))
-		}' \
-  '		if false {
-			_ = c.nc.SetReadDeadline(time.Time{})
-		}' \
+  '	if t.cfg.ReadIdleTimeout > 0 {
+		r = idleReader{c.nc, t.cfg.ReadIdleTimeout}
+	}' \
+  '	if false {
+		r = idleReader{c.nc, t.cfg.ReadIdleTimeout}
+	}' \
   ./internal/transport 'TestReaderIdleTimeoutReconnectsASilentConnection'
 
 # --- Phase 11: crash-recovery rules (docs/CRASH_RECOVERY.md §10) ---
@@ -460,8 +503,8 @@ mutant "readindex-at-least-the-noop" internal/raft/raft.go \
 # 36. Acknowledgements of a heartbeat sent BEFORE the read confirm it (a stale
 #     ReadIndex response accepted): a deposed leader serves its old state.
 mutant "readindex-ignores-acks-sent-before-the-read" internal/raft/raft.go \
-  'seq: r.hbSeq + 1})' \
   'seq: r.hbSeq})' \
+  'seq: r.hbSeq - 1})' \
   "./internal/raft ./internal/raftsim" 'TestAcksFromBeforeTheReadDoNotConfirmIt|TestKVStaleLeaderReadIsNeverServed'
 
 # 37. A ReadIndex confirmed without a quorum (the leader alone suffices).
@@ -607,8 +650,8 @@ mutant "readindex-needs-a-quorum (simulated history)" internal/raft/raft.go \
 # 56. Pre-read acknowledgements confirm the read: the simulated stale leader
 #     serves its old value once the delayed acks arrive.
 mutant "readindex-ignores-acks-sent-before-the-read (simulated history)" internal/raft/raft.go \
-  'seq: r.hbSeq + 1})' \
   'seq: r.hbSeq})' \
+  'seq: r.hbSeq - 1})' \
   ./internal/raftsim 'TestKVStaleLeaderReadIsNeverServed'
 
 # 57. No no-op rule: the new leader serves below its predecessor's last commit.
@@ -758,8 +801,8 @@ mutant "dkvd-applies-the-configured-session-limits" cmd/dkvd/main.go \
 #     above its RequestID is proposed, and every replica refuses the entry at
 #     apply as malformed.
 mutant "requests-are-validated-before-they-are-proposed" internal/kv/api.go \
-  '	if r.RequestID == 0 || r.AckedBelow == 0 || r.AckedBelow > r.RequestID {' \
-  '	if r.RequestID == 0 || r.AckedBelow == 0 {' \
+  '	} else if r.RequestID == 0 || r.AckedBelow == 0 || r.AckedBelow > r.RequestID {' \
+  '	} else if r.RequestID == 0 || r.AckedBelow == 0 {' \
   ./internal/kv 'TestRequestValidationRejectsEveryOutOfContractField|TestValidatedRequestsAlwaysApply'
 
 # 88. A duplicate is answered with its OWN entry's index instead of the
@@ -1474,7 +1517,7 @@ mutant "series-keys-are-unambiguous" internal/metrics/metrics.go \
 
 # 161. The front answers a request without counting it.
 mutant "the-front-counts-every-answer" internal/kv/front.go \
-  '	m.request(req, resp, start)' \
+  '	m.request(req, resp, start, f.Server(req.Group) != nil)' \
   '	_ = start' \
   ./internal/kv 'TestKVMetricsMatchTheResponses'
 
@@ -1568,8 +1611,1010 @@ mutant "lab-append-frames-by-kind" internal/lab/experiment.go \
   '	u.AppendFramesSent = delta("dkv_transport_frames_sent_total")' \
   ./internal/lab 'TestUsageFromScrapes'
 
+# --- The entry-size limit (C1, docs/RAFT.md §16): one bound, enforced at every
+#     boundary an entry crosses. Each mutant lets an entry one byte (or 1 MiB)
+#     over the limit through exactly one boundary; the test named for that
+#     boundary must catch it.
+
+# 173. The front admits a write whose ENCODED command exceeds the entry limit
+#      (raw key and value within their limits): the C1 bug's entry point.
+mutant "entry-limit-at-the-front" internal/kv/api.go \
+  '		if n := r.command().EncodedLen(); n > MaxCommandLen {' \
+  '		if n := r.command().EncodedLen(); n > 2*MaxCommandLen {' \
+  ./internal/kv '^TestEncodedEntryLimitDecidesWriteAdmission$'
+
+# 174. Command.Validate (and so Decode) accepts an over-limit command.
+mutant "entry-limit-in-the-command" internal/kv/command.go \
+  '	if n := c.EncodedLen(); n > MaxCommandLen {' \
+  '	if n := c.EncodedLen(); n > 2*MaxCommandLen {' \
+  ./internal/kv '^TestEncodedEntryLimitDecidesWriteAdmission$'
+
+# 175. Propose accepts an entry over the limit (a leader appends it; a
+#      follower answers not-leader instead of a definite refusal).
+mutant "entry-limit-at-propose" internal/raft/raft.go \
+  '	if len(data) > MaxEntryDataLen {' \
+  '	if len(data) > 2*MaxEntryDataLen {' \
+  ./internal/raft '^TestProposeOverTheEntryLimitIsRefused$'
+
+# 176. Step accepts an AppendEntries carrying an over-limit entry: its term is
+#      adopted and the follower answers it.
+mutant "entry-limit-in-step" internal/raft/raft.go \
+  '			if len(e.Data) > MaxEntryDataLen {' \
+  '			if len(e.Data) > 2*MaxEntryDataLen {' \
+  ./internal/raft '^TestStepRefusesAnOversizedAppendEntries$'
+
+# 177. The in-memory log holds an over-limit entry.
+mutant "entry-limit-in-the-log" internal/replication/log.go \
+  '		if len(e.Data) > MaxEntryDataLen {' \
+  '		if len(e.Data) > 2*MaxEntryDataLen {' \
+  ./internal/replication '^TestEntrySizeLimit$'
+
+# 178. The durable log persists an entry its own replay refuses to read (the
+#      node that wrote it could never restart).
+mutant "entry-limit-at-save" internal/raftlog/raftlog.go \
+  '		if len(e.Data) > MaxEntryDataLen {' \
+  '		if len(e.Data) > 2*MaxEntryDataLen {' \
+  ./internal/raftlog '^TestSaveRefusesAnEntryOverTheLimit$'
+
+# 179. A proposal refused as too large is answered UNKNOWN: the client cannot
+#      tell a definite refusal from a write that may have happened.
+mutant "entry-too-large-is-invalid" internal/kv/server.go \
+  '	case errors.Is(err, raft.ErrEntryTooLarge):' \
+  '	case false && errors.Is(err, raft.ErrEntryTooLarge):' \
+  ./internal/kv '^TestEntryTooLargeFromBelowIsInvalid$'
+
+# --- The data directory (audit H1, M5; internal/nodedir, docs/MULTI_RAFT.md §5):
+#     a node's durable state is its own, locked, and never silently empty.
+
+# 180. -raft/-cluster run without a data directory (the old temporary default).
+#      Since nodedir also refuses an empty path, the start still fails; the
+#      kill is that the operator is no longer told which flag is missing.
+mutant "data-dir-required" cmd/dkvd/main.go \
+  '	if (*raftMode || *cluster) && *dataDir == "" {' \
+  '	if false && (*raftMode || *cluster) && *dataDir == "" {' \
+  ./cmd/dkvd '^TestRunRequiresADataDirAndAPositiveTick$'
+
+# 181. A zero tick is accepted (the idle timeout disabled, the driver's
+#      default silently used).
+mutant "tick-must-be-positive" cmd/dkvd/main.go \
+  '	if *tickIvl <= 0 {' \
+  '	if *tickIvl < 0 {' \
+  ./cmd/dkvd '^TestRunRequiresADataDirAndAPositiveTick$'
+
+# 182. A negative tick reaches the actor's time.NewTicker.
+mutant "raftnode-negative-tick" internal/raftnode/node.go \
+  '	if cfg.TickInterval < 0 {' \
+  '	if false && cfg.TickInterval < 0 {' \
+  ./internal/raftnode '^TestStartRefusesANegativeTick$'
+
+# 183. An empty data directory starts as a new node without -init: a wiped
+#      member restarts empty under its old id.
+mutant "data-dir-needs-init" internal/nodedir/nodedir.go \
+  '	case !legacy && !opts.Init:' \
+  '	case false:' \
+  ./internal/nodedir '^TestFreshDirectoryNeedsInit$'
+
+# 184. A data directory recorded for another node is accepted.
+mutant "data-dir-belongs-to-its-node" internal/nodedir/nodedir.go \
+  '		case id.Node != opts.Node:' \
+  '		case false:' \
+  ./internal/nodedir '^TestIdentityMismatchIsRefused$'
+
+# 185. -init re-initializes an initialized directory (so it could live in a
+#      unit file, and a wiped directory would be re-initialized silently).
+mutant "data-dir-init-once" internal/nodedir/nodedir.go \
+  '		case id.Initialized && opts.Init:' \
+  '		case false:' \
+  ./internal/nodedir '^TestInitializationLifecycle$'
+
+# 186. Two processes share a data directory (a shared lock excludes nothing).
+mutant "data-dir-exclusive-lock" internal/nodedir/lock_unix.go \
+  'syscall.LOCK_EX|syscall.LOCK_NB' \
+  'syscall.LOCK_SH|syscall.LOCK_NB' \
+  ./internal/nodedir '^TestDataDirectoryIsLocked$'
+
+# 187. A group's state recorded for another node is run by this one.
+mutant "group-identity-names-its-node" internal/raftnode/node.go \
+  '		if id.Node != "" && id.Node != c.ID {' \
+  '		if false {' \
+  ./internal/raftnode '^TestIdentityFileNamesItsNode$'
+
+# 188. An initialized directory whose group state is gone creates it empty
+#      (-raft mode; mutant 266 is -cluster mode's).
+mutant "genesis-only-while-initializing" cmd/dkvd/main.go \
+  'hc.LogPathFor(c.g)); err != nil || !found {' \
+  'hc.LogPathFor(c.g)); (err != nil || !found) && false {' \
+  ./cmd/dkvd '^TestDataDirectoryRules$'
+
+# --- The group lifecycle (audit H3, docs/MULTI_RAFT.md §3): starts and stops of
+#     one group never overlap.
+
+# 189. A start does not see another start of its group in flight: both pass
+#      the existence check and two drivers open one log.
+mutant "lifecycle-one-start-at-a-time" internal/multiraft/host.go \
+  '	case h.busy[g] != "":' \
+  '	case false:' \
+  ./internal/multiraft '^TestAStartingGroupCannotBeStartedOrStoppedAgain$'
+
+# 190. A stop releases its group before its node is closed: an Open recovers
+#      the log under the still-running old node.
+mutant "lifecycle-stop-holds-the-group" internal/multiraft/host.go \
+  '	h.busy[g] = "stopping"' \
+  '	_ = "stopping"' \
+  ./internal/multiraft '^TestAStoppingGroupCannotBeStartedUntilItsNodeIsClosed$'
+
+# 191. A failed first start leaves its empty directory, reported as a failed
+#      group at every later start.
+mutant "failed-start-leaves-no-directory" internal/multiraft/host.go \
+  '			_ = os.Remove(GroupDir(h.cfg.DataDir, g))' \
+  '			_ = GroupDir(h.cfg.DataDir, g)' \
+  ./internal/multiraft '^TestAFailedFirstStartLeavesNoDirectory$'
+
+# --- Replica settings (audit H5): what the replicated state machine's definition
+#     depends on is pinned, and a node setting cannot be dropped on its way to
+#     the groups.
+
+# 192. A start with other replica settings than the directory recorded runs.
+mutant "replica-settings-pinned" internal/nodedir/nodedir.go \
+  '		case opts.Settings != id.Settings:' \
+  '		case false:' \
+  ./internal/nodedir '^TestSettingsArePinned$'
+
+# 193. dkvd does not hand its settings to the data directory.
+mutant "dkvd-pins-its-settings" cmd/dkvd/main.go \
+  'Init: init, Settings: settings})' \
+  'Init: init, Settings: ""})' \
+  ./cmd/dkvd '^TestReplicaSettingsArePinned$'
+
+# 194. Routing flags outside -cluster mode are silently ignored again.
+mutant "routing-flags-cluster-only" cmd/dkvd/main.go \
+  '			if explicit[name] {' \
+  '			if false {' \
+  ./cmd/dkvd '^TestRoutingFlagsBelongToClusterMode$'
+
+# 195. A node setting is dropped on its way to the hosted groups.
+mutant "host-forwards-every-setting" internal/multiraft/host.go \
+  '	nc.Metrics = h.nodeMetrics' \
+  '	_ = h.nodeMetrics' \
+  ./internal/multiraft '^TestHostForwardsEveryNodeSetting$'
+
+# 196. Every group of a node draws the node's election timeout sequence.
+mutant "groups-draw-their-own-seeds" internal/raftnode/node.go \
+  '	if g != 0 {' \
+  '	if false {' \
+  ./internal/raftnode '^TestGroupsDrawDifferentElectionSeeds$'
+
+# 197. The accepter refuses a dialer of another cluster (audit H2).
+mutant "accepter-checks-cluster" internal/transport/transport.go \
+  '	case h.cluster != t.self.cluster:
+		status = statusWrongCluster' \
+  '	case false:
+		status = statusWrongCluster' \
+  ./internal/transport '^(TestNodesOfAnotherClusterNeverConnect|TestTheAccepterRefusesAnotherClusterOrSettings)$'
+
+# 198. The accepter refuses a dialer with other replica settings (audit H5).
+mutant "accepter-checks-settings" internal/transport/transport.go \
+  '	case string(h.digest) != string(t.self.digest):
+		status = statusWrongSettings' \
+  '	case false:
+		status = statusWrongSettings' \
+  ./internal/transport '^(TestNodesWithOtherReplicaSettingsNeverConnect|TestTheAccepterRefusesAnotherClusterOrSettings)$'
+
+# 199. The dialer refuses an answer from another node than the one it dialed.
+mutant "dialer-checks-who-answered" internal/transport/transport.go \
+  '	case h.id != peer:' \
+  '	case false:' \
+  ./internal/transport '^TestDialerChecksTheAnswer$'
+
+# 200. The dialer refuses an accepter of another cluster.
+mutant "dialer-checks-cluster" internal/transport/transport.go \
+  '	case h.cluster != t.self.cluster:
+		t.m.handshakeRejected.Inc()' \
+  '	case false:
+		t.m.handshakeRejected.Inc()' \
+  ./internal/transport '^TestDialerChecksTheAnswer$'
+
+# 201. The dialer refuses an accepter with other replica settings.
+mutant "dialer-checks-settings" internal/transport/transport.go \
+  '	case string(h.digest) != string(t.self.digest):
+		t.m.handshakeRejected.Inc()' \
+  '	case false:
+		t.m.handshakeRejected.Inc()' \
+  ./internal/transport '^TestDialerChecksTheAnswer$'
+
+# 202. A known peer with the larger id never dials; its claim is refused.
+mutant "accepter-checks-direction" internal/transport/transport.go \
+  '	case h.id > t.cfg.NodeID:' \
+  '	case false:' \
+  ./internal/transport '^TestInboundFromTheWrongDirectionIsRefused$'
+
+# 203. A failed write closes the connection (audit M2).
+mutant "failed-write-closes-the-connection" internal/transport/conn.go \
+  '	if err != nil {
+		c.close()
+	}
+	return err' \
+  '	return err' \
+  ./internal/transport '^TestFailedWriteClosesTheConnection$'
+
+# 204. Send refuses a frame its peer would refuse (audit D2).
+mutant "send-refuses-an-oversized-frame" internal/transport/transport.go \
+  '	if len(payload) > MaxFrameSize {' \
+  '	if false {' \
+  ./internal/transport '^TestSendRefusesAFrameItsPeerWouldRefuse$'
+
+# 205. An Accept error is retried, not the end of the accept loop (audit D7).
+mutant "accept-loop-retries" internal/transport/transport.go \
+  '			if t.ctx.Err() != nil || errors.Is(err, net.ErrClosed) {' \
+  '			if true {' \
+  ./internal/transport '^TestAcceptLoopSurvivesAcceptErrors$'
+
+# 206. Connections in their handshake are bounded.
+mutant "pending-handshakes-bounded" internal/transport/transport.go \
+  '		handshake: make(chan struct{}, cfg.MaxPendingHandshakes),' \
+  '		handshake: make(chan struct{}, 1<<16),' \
+  ./internal/transport '^TestPendingHandshakesAreBounded$'
+
+# 207. A connection past its handshake gives its slot back.
+mutant "handshake-slot-released" internal/transport/transport.go \
+  '	release()
+	t.serve(h.id, nc, "inbound")' \
+  '	t.serve(h.id, nc, "inbound")' \
+  ./internal/transport '^TestPendingHandshakesAreBounded$'
+
+# 208. The dialer's handshake is bounded by the handshake timeout.
+mutant "dialer-handshake-timeout" internal/transport/transport.go \
+  '	_ = nc.SetDeadline(time.Now().Add(t.cfg.HandshakeTimeout))
+	stop := context.AfterFunc(ctx' \
+  '	stop := context.AfterFunc(ctx' \
+  ./internal/transport '^TestDialerDropsAPeerThatNeverAnswers$'
+
+# 209. Shutdown interrupts an outbound handshake waiting for its answer.
+mutant "close-interrupts-dial" internal/transport/transport.go \
+  '	stop := context.AfterFunc(ctx, func() { _ = nc.Close() })' \
+  '	stop := func() bool { return true }' \
+  ./internal/transport '^TestCloseInterruptsHandshakesInFlight$'
+
+# 210. Shutdown interrupts an inbound handshake being read.
+mutant "close-interrupts-inbound-handshake" internal/transport/transport.go \
+  '	stop := context.AfterFunc(t.ctx, func() { _ = nc.Close() })' \
+  '	stop := func() bool { return true }' \
+  ./internal/transport '^TestCloseInterruptsHandshakesInFlight$'
+
+# 211. The idle timeout measures silence, not a frame's size.
+mutant "idle-timeout-per-read" internal/transport/transport.go \
+  '		r = idleReader{c.nc, t.cfg.ReadIdleTimeout}
+	}
+	for {' \
+  '	}
+	for {
+		if t.cfg.ReadIdleTimeout > 0 {
+			_ = c.nc.SetReadDeadline(time.Now().Add(t.cfg.ReadIdleTimeout))
+		}' \
+  ./internal/transport '^TestSlowFrameIsNotCutByTheIdleTimeout$'
+
+# 212. A caller's deadline does not cut a started frame.
+mutant "caller-deadline-spares-a-started-frame" internal/transport/conn.go \
+  '		_ = c.nc.SetWriteDeadline(time.Now().Add(c.writeTimeout))' \
+  '		dl := time.Now().Add(c.writeTimeout)
+		if d, ok := ctx.Deadline(); ok && d.Before(dl) {
+			dl = d
+		}
+		_ = c.nc.SetWriteDeadline(dl)' \
+  ./internal/transport '^TestCallerDeadlineDoesNotCutAStartedFrame$'
+
+# 213. dkvd gives its transport the data directory's cluster id and settings.
+mutant "dkvd-transport-carries-identity" cmd/dkvd/main.go \
+  '		tcfg.ClusterID, tcfg.SettingsDigest = nd.ID.Cluster, settingsDigest(nd.ID.Settings)' \
+  '		_ = settingsDigest' \
+  ./tests/integration '^TestRealImpostorsNeverJoinTheGroup$'
+
+# 214. A leader's uncommitted entries are bounded (audit M3).
+mutant "uncommitted-entries-bounded" internal/raft/raft.go \
+  '	if len(r.uncommitted) >= r.maxUncommittedEntries ||' \
+  '	if false && len(r.uncommitted) >= r.maxUncommittedEntries ||' \
+  ./internal/raft '^TestIsolatedLeaderRefusesProposalsBeyondItsBound$'
+
+# 215. ... and their bytes.
+mutant "uncommitted-bytes-bounded" internal/raft/raft.go \
+  '		r.uncommittedBytes > 0 && r.uncommittedBytes+len(data) > r.maxUncommittedBytes {' \
+  '		false {' \
+  ./internal/raft '^TestUncommittedBytesBound$'
+
+# 216. A proposal on a tail holding no data is always admitted.
+mutant "dataless-tail-admits" internal/raft/raft.go \
+  '		r.uncommittedBytes > 0 && r.uncommittedBytes+len(data) > r.maxUncommittedBytes {' \
+  '		r.uncommittedBytes+len(data) > r.maxUncommittedBytes {' \
+  ./internal/raft '^TestUncommittedBytesBound$'
+
+# 217. A new leader's inherited tail counts toward its bound.
+mutant "inherited-tail-counts" internal/raft/raft.go \
+  '		for _, e := range tail {
+			r.trackUncommitted(len(e.Data))
+		}' \
+  '		_ = tail' \
+  ./internal/raft '^TestInheritedTailCountsTowardTheBound$'
+
+# 218. Committing shrinks the leader's tracked tail.
+mutant "commit-shrinks-the-tail" internal/raft/raft.go \
+  '		if r.role == Leader {
+			n := min(int(idx-old), len(r.uncommitted))' \
+  '		if false {
+			n := min(int(idx-old), len(r.uncommitted))' \
+  ./internal/raft '^TestIsolatedLeaderRefusesProposalsBeyondItsBound$'
+
+# 219. Reads awaiting confirmation are bounded.
+mutant "pending-reads-bounded" internal/raft/raft.go \
+  '	if len(r.pending) >= r.maxPendingReads {' \
+  '	if false {' \
+  ./internal/raft '^TestIsolatedLeaderRefusesReadsBeyondItsBound$'
+
+# 220. An apply failure stops the node (audit M4).
+mutant "apply-failure-fail-stops" internal/raftnode/node.go \
+  '		return err // ErrApply, or a crash point fired' \
+  '		if !errors.Is(err, ErrApply) {
+			return err
+		}' \
+  ./internal/raftnode '^TestApplyFailureStopsTheNode$'
+
+# 221. A write whose client gave up is forgotten.
+mutant "abandoned-write-forgotten" internal/raftnode/node.go \
+  '		n.abandon(abandoned{index: acc.index, ch: acc.done})' \
+  '		_ = abandoned{}' \
+  ./internal/raftnode '^TestAbandonedRequestsLeaveNothingBehind$'
+
+# 222. A read whose client gave up is forgotten.
+mutant "abandoned-read-forgotten" internal/raftnode/node.go \
+  '		n.abandon(abandoned{readID: acc.id, ch: acc.done})' \
+  '		_ = abandoned{}' \
+  ./internal/raftnode '^TestAbandonedRequestsLeaveNothingBehind$'
+
+# 223. Cancel removes the waiter.
+mutant "waiters-cancel" internal/raftnode/waiters.go \
+  '		if wt.ch == ch {' \
+  '		if wt.ch == nil {' \
+  ./internal/raftnode '^(TestAbandonedRequestsLeaveNothingBehind|TestForgetReleasesWhatTheActorHolds)$'
+
+# 224. A write abandoned before its acceptance was read is forgotten too.
+mutant "abandoned-before-acceptance" internal/raftnode/node.go \
+  '			if acc.err == nil {
+				n.waiters.Cancel(acc.index, acc.done)
+			}' \
+  '			_ = acc' \
+  ./internal/raftnode '^TestForgetReleasesWhatTheActorHolds$'
+
+# 225. Cancel removes only the abandoned waiter, not another at its index.
+mutant "cancel-only-the-abandoned" internal/raftnode/waiters.go \
+  '	if len(ws) == 0 {
+		delete(w.byIndex, index)' \
+  '	if true {
+		w.n -= len(ws)
+		delete(w.byIndex, index)' \
+  ./internal/raftnode '^TestForgetReleasesWhatTheActorHolds$'
+
+# 226. ErrBusy is a definite refusal: UNAVAILABLE, never UNKNOWN.
+mutant "busy-is-unavailable" internal/kv/server.go \
+  '	case errors.Is(err, raft.ErrBusy):' \
+  '	case false:' \
+  ./internal/kv '^TestBusyFromBelowIsUnavailable$'
+
+# 227. The client port caps its connections (audit M1).
+mutant "kv-conns-capped" internal/kv/wire.go \
+  '	slots := make(chan struct{}, cfg.MaxConns)' \
+  '	slots := make(chan struct{}, 1<<20)' \
+  ./internal/kv '^TestServeCapsItsConnections$'
+
+# 228. A request frame, once begun, must complete within FrameTimeout.
+mutant "kv-frame-deadline" internal/kv/wire.go \
+  '	_ = c.SetReadDeadline(time.Now().Add(timeout))
+	return readFrame' \
+  '	return readFrame' \
+  ./internal/kv '^TestServeDropsAStalledFrameButKeepsAnIdleConnection$'
+
+# 229. ... and an idle connection is never timed out.
+mutant "kv-idle-not-timed-out" internal/kv/wire.go \
+  '	_ = c.SetReadDeadline(time.Time{})
+	var first [1]byte' \
+  '	_ = c.SetReadDeadline(time.Now().Add(timeout))
+	var first [1]byte' \
+  ./internal/kv '^TestServeDropsAStalledFrameButKeepsAnIdleConnection$'
+
+# 230. A response must be written within WriteTimeout.
+mutant "kv-write-deadline" internal/kv/wire.go \
+  '		_ = c.SetWriteDeadline(time.Now().Add(cfg.WriteTimeout))' \
+  '		_ = cfg.WriteTimeout' \
+  ./internal/kv '^TestServeDropsAClientThatDoesNotRead$'
+
+# 231. An Accept error does not end the client port.
+mutant "kv-accept-retries" internal/kv/wire.go \
+  '			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			logf("event=kv_accept_failed' \
+  '			if true {
+				return
+			}
+			logf("event=kv_accept_failed' \
+  ./internal/kv '^TestServeSurvivesAcceptErrors$'
+
+# 232. A frame's buffer grows with the bytes that arrive.
+mutant "kv-frame-grows" internal/kv/wire.go \
+  '	frame := make([]byte, record.HeaderSize, record.HeaderSize+min(int(length), readChunk))' \
+  '	frame := make([]byte, record.HeaderSize, record.HeaderSize+int(length))' \
+  ./internal/kv '^TestReadFrameGrowsWithTheBytesThatArrive$'
+
+# 233. Inbound forwards are bounded; beyond, UNAVAILABLE.
+mutant "kv-forwards-bounded" internal/kv/server.go \
+  '		select {
+		case s.fwdSlots <- struct{}{}:
+		default:
+			s.refuse(peer, fid)
+			return
+		}' \
+  '		s.fwdSlots <- struct{}{}' \
+  ./internal/kv '^TestForwardsBeyondTheBoundAreRefusedUnavailable$'
+
+# 234. A request naming an unhosted group is labelled "other" (audit M7).
+mutant "kv-unhosted-group-label" internal/kv/front.go \
+  '	m.request(req, resp, start, f.Server(req.Group) != nil)' \
+  '	m.request(req, resp, start, true)' \
+  ./internal/kv '^TestClientsCannotCreateMetricSeries$'
+
+# 235. The admin port caps its connections.
+mutant "admin-conns-capped" internal/multiraft/admin.go \
+  '	slots := make(chan struct{}, MaxAdminConns)' \
+  '	slots := make(chan struct{}, 1<<20)' \
+  ./internal/multiraft '^TestAdminCapsItsConnections$'
+
+# 236. An Accept error does not end the admin port.
+mutant "admin-accept-retries" internal/multiraft/admin.go \
+  '			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {' \
+  '			if true {' \
+  ./internal/multiraft '^TestAdminSurvivesAcceptErrors$'
+
+# 237. An idle admin connection is closed.
+mutant "admin-idle-deadline" internal/multiraft/admin.go \
+  '		_ = c.SetReadDeadline(time.Now().Add(adminIdle))' \
+  '		_ = adminIdle' \
+  ./internal/multiraft '^TestAdminDropsAnIdleConnection$'
+
+# 238. An admin request's timeout is clamped.
+mutant "admin-timeout-clamped" internal/multiraft/admin.go \
+  '	case ms >= int(MaxAdminTimeout/time.Millisecond): // also before ms×1e6 could overflow' \
+  '	case false:' \
+  ./internal/multiraft '^TestAdminTimeoutIsClamped$'
+
+# 239. Admin log fields from the client are quoted.
+mutant "admin-log-quoted" internal/multiraft/admin.go \
+  '				logf("event=admin node=%s op=%q group=%d id=%q ok=%v err=%q", h.cfg.ID, req.Op, req.Group, req.ID, resp.OK, resp.Error)' \
+  '				logf("event=admin node=%s op=%s group=%d id=%s ok=%v err=%q", h.cfg.ID, req.Op, req.Group, req.ID, resp.OK, resp.Error)' \
+  ./internal/multiraft '^TestAdminLogLinesCannotBeForged$'
+
+# 240. dkvd keeps the admin port on loopback unless allowed (audit H6).
+mutant "dkvd-admin-loopback" cmd/dkvd/main.go \
+  '	if *adminAt != "" && !*adminAny && !isLoopback(*adminAt) {' \
+  '	if false && !*adminAny {' \
+  ./cmd/dkvd '^TestAdminListensOnLoopbackUnlessAllowed$'
+
+# 241. A snapshot's state buffer is sized by the bytes that exist.
+mutant "snapshot-decode-allocation" internal/snapshot/snapshot.go \
+  '	data := make([]byte, 0, min(dataLen, uint64(len(b))))' \
+  '	data := make([]byte, 0, dataLen)' \
+  ./internal/snapshot '^TestDecodeAllocatesNoMoreThanItsInput$'
+
+# 242. The metrics server bounds its connections.
+mutant "metrics-server-idle" cmd/dkvd/main.go \
+  '		IdleTimeout:       60 * time.Second,' \
+  '		IdleTimeout:       0,' \
+  ./cmd/dkvd '^TestMetricsServerBoundsItsConnections$'
+
+# 243. An AppendEntries carries at most MaxEntriesPerMsg entries (audit H4).
+mutant "append-entry-budget" internal/raft/raft.go \
+  '	hi := min(last+1, next+uint64(r.maxEntriesPerMsg))' \
+  '	hi := last + 1' \
+  ./internal/raft '^TestEntryBudgetBindsABacklogOfSmallEntries$'
+
+# 244. ... and at most MaxSizePerMsg bytes of entries.
+mutant "append-byte-budget" internal/raft/raft.go \
+  '	entries, _ := r.log.SliceBounded(next, hi, r.maxSizePerMsg)' \
+  '	entries, _ := r.log.Slice(next, hi)' \
+  ./internal/raft '^TestLaggingFollowerCatchesUpInBudgetedBatches$'
+
+# 245. An acknowledged batch of a cut backlog sends the next at once.
+mutant "cut-backlog-streams" internal/raft/raft.go \
+  '	if r.role == Leader && r.cut[peer] && match < r.log.LastIndex() {' \
+  '	if false {' \
+  ./internal/raft '^TestLaggingFollowerCatchesUpInBudgetedBatches$'
+
+# 246. ... which needs the cut recorded.
+mutant "cut-recorded" internal/raft/raft.go \
+  '	r.cut[peer] = next+uint64(len(entries)) <= last' \
+  '	r.cut[peer] = false' \
+  ./internal/raft '^TestLaggingFollowerCatchesUpInBudgetedBatches$'
+
+# 247. Reads registered in one cycle share one round.
+mutant "reads-share-a-round" internal/raft/raft.go \
+  '	if !r.roundUnsent {' \
+  '	if true {' \
+  ./internal/raft '^TestReadsInOneCycleShareOneRound$'
+
+# 248. A read never joins a round already sent.
+mutant "read-never-joins-a-sent-round" internal/raft/ready.go \
+  '	r.roundUnsent = false // its messages are sent' \
+  '	_ = r.roundUnsent' \
+  ./internal/raft '^TestAReadNeverJoinsARoundAlreadySent$'
+
+# 249. A read round is entry-less heartbeats, not the unacknowledged tail.
+mutant "read-round-entry-less" internal/raft/raft.go \
+  '				r.sendHeartbeat(p)' \
+  '				r.sendAppend(p)' \
+  ./internal/raft '^TestReadsInOneCycleShareOneRound$'
+
+# 250. A broadcast is a round a read can join.
+mutant "broadcast-is-a-round" internal/raft/raft.go \
+  'func (r *Raft) broadcastAppend(retransmit bool) {
+	r.hbSeq++
+	r.roundUnsent = true' \
+  'func (r *Raft) broadcastAppend(retransmit bool) {
+	r.hbSeq++' \
+  ./internal/raft '^TestReadsInOneCycleShareOneRound$'
+
+# 251. The driver takes the reads waiting together, so they share a round.
+mutant "driver-batches-reads" internal/raftnode/node.go \
+  '			for i := 1; i < maxReadsPerCycle; i++ {' \
+  '			for i := 1; i < 1; i++ {' \
+  ./internal/raftnode '^TestConcurrentReadsShareRounds$'
+
+# 252. One vote per term: a voter refuses a second candidate in its term — the
+#      check that once skipped itself on every run (audit H.1).
+mutant "restarted-voter-refuses-same-term" internal/raft/raft.go \
+  '	if (r.votedFor == "" || r.votedFor == m.From) && r.candidateUpToDate(m.LastLogIndex, m.LastLogTerm) {' \
+  '	if r.candidateUpToDate(m.LastLogIndex, m.LastLogTerm) {' \
+  ./internal/raftsim '^TestVoterCrashAroundPersistingItsVote$'
+
+# 253–255. The second and third sites of two durability rules (the patterns of
+#      fsync-before-reply and durability-failure-latches match several sites
+#      and mutate only the first, Save's — audit): Install fsyncs its boundary
+#      before reporting it, and Install and Compact refuse to run on a failed
+#      log.
+mutant "install-fsyncs-its-boundary" internal/raftlog/raftlog.go \
+  '	if l.sync {
+		if err := l.f.Sync(); err != nil {
+			return l.fail(err)
+		}
+	}
+	l.boundary = Boundary{index, term}' \
+  '	if false && l.sync {
+		if err := l.f.Sync(); err != nil {
+			return l.fail(err)
+		}
+	}
+	l.boundary = Boundary{index, term}' \
+  ./internal/raftlog '^(TestInstallSurvivesEveryCrash|TestInstallIsDurableWhenItReturns)$'
+
+mutant "install-refuses-a-failed-log" internal/raftlog/raftlog.go \
+  'func (l *Log) Install(index, term uint64) error {
+	if l.failed != nil {' \
+  'func (l *Log) Install(index, term uint64) error {
+	if false && l.failed != nil {' \
+  ./internal/raftlog '^TestAFailedLogRefusesInstallAndCompact$'
+
+mutant "compact-refuses-a-failed-log" internal/raftlog/raftlog.go \
+  'func (l *Log) Compact(index, term uint64) error {
+	if l.failed != nil {' \
+  'func (l *Log) Compact(index, term uint64) error {
+	if false && l.failed != nil {' \
+  ./internal/raftlog '^TestAFailedLogRefusesInstallAndCompact$'
+
+# 256. Install never deletes a manifest CURRENT may name (audit M11).
+mutant "install-keeps-a-manifest-current-may-name" internal/storage/manifest/manifest.go \
+  '		if !errors.Is(err, ErrFailed) {
+			_ = FS.Remove(path) // CURRENT was never touched
+		}' \
+  '		_ = FS.Remove(path)' \
+  ./internal/storage/manifest '^TestInstallUnderEveryFault$'
+
+# 257. A failed manifest Writer refuses every later edit.
+mutant "manifest-writer-latches" internal/storage/manifest/manifest.go \
+  '	if w.failed != nil {
+		return w.failed
+	}' \
+  '	if false {
+		return w.failed
+	}' \
+  ./internal/storage/manifest '^TestAppendUnderEveryFault$'
+
+# 258. A compaction's output survives an ambiguous manifest edit.
+mutant "ambiguous-compaction-keeps-its-output" internal/storage/lsmcompact.go \
+  '		if produced && !errors.Is(err, manifest.ErrFailed) {' \
+  '		if produced && !errors.Is(err, nil) {' \
+  ./internal/storage '^TestAnAmbiguousCompactionEditKeepsItsOutput$'
+
+# 259. A latched compaction failure stops the compactor.
+mutant "latched-compactor-stops" internal/storage/lsmcompact.go \
+  '			if s.CompactionError() != nil {' \
+  '			if false {' \
+  ./internal/storage '^TestALatchedCompactionErrorStopsTheCompactor$'
+
+# 260. A flush makes the WAL durable before its manifest edit (audit D10).
+mutant "flush-syncs-the-wal-first" internal/storage/lsmstore.go \
+  '		if err := s.w.Sync(); err != nil {
+			_ = r.Close()' \
+  '		if err := error(nil); err != nil {
+			_ = r.Close()' \
+  ./internal/storage '^TestAFlushMakesTheWALDurableBeforeItsEdit$'
+
+# 261. A failed WAL append latches.
+mutant "wal-append-failure-latches" internal/storage/wal/wal.go \
+  '		w.syncErr = fmt.Errorf("wal: appending to %s: %w", segmentName(w.seg), err)
+		return w.syncErr' \
+  '		return fmt.Errorf("wal: appending to %s: %w", segmentName(w.seg), err)' \
+  ./internal/storage/wal '^TestATornAppendLatches$'
+
+# 262. Close after a failed flush reports it and does not flush again.
+mutant "wal-close-reports-the-latch" internal/storage/wal/wal.go \
+  '	syncErr := w.syncErr' \
+  '	var syncErr error' \
+  ./internal/storage/wal '^TestCloseAfterAFailedFlushReportsItAndDoesNotFlushAgain$'
+
+# 263. A flush during replay at open, before the store has a WAL, does not
+# sync a WAL that does not exist.
+mutant "replay-flush-has-no-wal-to-sync" internal/storage/lsmstore.go \
+  '	if s.w != nil && s.opts.WAL.SyncMode != wal.SyncOff {
+		if err := s.w.Sync(); err != nil {' \
+  '	if s.opts.WAL.SyncMode != wal.SyncOff {
+		if err := s.w.Sync(); err != nil {' \
+  ./internal/storage '^TestAReplayThatFlushesOpens$'
+
+# 264. Close after a failed WRITE still flushes the records acknowledged before it.
+mutant "wal-close-flushes-after-a-failed-write" internal/storage/wal/wal.go \
+  '	if !w.flushFailed && w.opts.SyncMode != SyncOff {' \
+  '	if w.syncErr == nil && w.opts.SyncMode != SyncOff {' \
+  ./internal/storage/wal '^TestCloseAfterAFailedWriteStillFlushes$'
+
+# 265. A failed flush is remembered as one, so Close does not flush again.
+mutant "wal-failed-flush-is-remembered" internal/storage/wal/wal.go \
+  '		w.flushFailed = true
+' \
+  '' \
+  ./internal/storage/wal '^TestCloseAfterAFailedFlushReportsItAndDoesNotFlushAgain$'
+
+# 266. In -cluster mode, a -join group whose state was lost from an
+# initialized directory is reported, not created again empty (audit H1).
+mutant "lost-join-group-is-not-recreated" cmd/dkvd/main.go \
+  '		} else {
+			what := "genesis group"' \
+  '		} else if c.boot != nil {
+			what := "genesis group"' \
+  ./cmd/dkvd '^TestALostJoinGroupIsReportedNotRecreated$'
+
+# 267. A leader's configuration change re-checks its pending reads: when it
+# alone becomes the quorum, no reply would ever confirm them.
+mutant "conf-change-confirms-pending-reads" internal/raft/membership.go \
+  '		// ever come to confirm it otherwise.
+		r.confirmReads()' \
+  '		// ever come to confirm it otherwise.' \
+  ./internal/raft '^TestReadsPendingWhenTheLeaderBecomesItsOwnQuorumAreConfirmed$'
+
+# 268. A leader stepped down by its own removal's commit continues no backlog.
+mutant "stepped-down-leader-continues-nothing" internal/raft/raft.go \
+  '	if r.role == Leader && r.cut[peer] && match < r.log.LastIndex() {' \
+  '	if r.cut[peer] && match < r.log.LastIndex() {' \
+  ./internal/raft '^TestARemovedLeaderSendsNothingOnceItStepsDown$'
+
+# 269. A snapshot offer ends a cut backlog: its acknowledgement sends the next
+# batch once.
+mutant "snapshot-offer-ends-the-cut" internal/raft/raft.go \
+  '		delete(r.cut, peer)
+		if r.snapPending[peer] == 0 {' \
+  '		if r.snapPending[peer] == 0 {' \
+  ./internal/raft '^TestASnapshotInstallSendsTheNextBatchOnce$'
+
+# 270. An apply failure publishes the Status covering the entries applied
+# before it, whose writes complete.
+mutant "apply-failure-publishes-status" internal/raftnode/node.go \
+  '		// first, as a cycle that succeeds does.
+		n.snapshotStatus()
+' \
+  '		// first, as a cycle that succeeds does.
+' \
+  ./internal/raftnode '^TestApplyFailureStopsTheNode$'
+
+# 271. A proposal sends a peer with a cut batch in flight a heartbeat, not
+# the batch again (review of PR #10).
+mutant "proposal-does-not-resend-the-batch-in-flight" internal/raft/raft.go \
+  '		if r.cut[p] && !retransmit {' \
+  '		if false {' \
+  ./internal/raft '^TestABatchInFlightIsNotResentWithEveryProposal$'
+
+# 272. ... but the heartbeat tick does, so a lost batch is not stranded.
+mutant "heartbeat-tick-resends-the-batch" internal/raft/raft.go \
+  '			r.heartbeatElapsed = 0
+			r.broadcastAppend(true)' \
+  '			r.heartbeatElapsed = 0
+			r.broadcastAppend(false)' \
+  ./internal/raft '^TestABatchInFlightIsNotResentWithEveryProposal$'
+
+# 273. An acknowledgement never moves nextIndex back.
+mutant "ack-never-lowers-next-index" internal/raft/raft.go \
+  '	r.nextIndex[peer] = max(r.nextIndex[peer], match+1)' \
+  '	r.nextIndex[peer] = match + 1' \
+  ./internal/raft '^TestAReadDoesNotMoveNextIndexBack$'
+
+# 274. Abandon notices are never dropped: a burst of clients giving up at
+# once leaves nothing behind (review of PR #10).
+mutant "abandon-notices-are-never-dropped" internal/raftnode/node.go \
+  '	n.abandonList = append(n.abandonList, a)' \
+  '	if len(n.abandonList) < 4 {
+		n.abandonList = append(n.abandonList, a)
+	}' \
+  ./internal/raftnode '^TestABurstOfAbandonedRequestsLeavesNothingBehind$'
+
+# 275. A periodic snapshot's failure publishes Status before the cycle's
+# writes complete.
+mutant "snapshot-failure-publishes-status" internal/raftnode/node.go \
+  '			n.snapshotStatus() // the cycle'"'"'s applied writes complete (deferred): Status first
+' \
+  '' \
+  ./internal/raftnode '^TestASnapshotFailurePublishesStatusFirst$'
+
+# 276. The admin refuses a member id or address that could forge log lines.
+mutant "admin-checks-member-ids" internal/multiraft/admin.go \
+  '		if err := checkMember(req.ID, req.Addr); err != nil {' \
+  '		if err := error(nil); err != nil {' \
+  ./internal/multiraft '^TestAMemberIDCannotForgeLogLines$'
+
+# 277. ... the genesis voters of create-group too.
+mutant "admin-checks-genesis-voters" internal/multiraft/admin.go \
+  '				if err := checkMember(m.ID, m.Addr); err != nil {' \
+  '				if err := error(nil); err != nil {' \
+  ./internal/multiraft '^TestAMemberIDCannotForgeLogLines$'
+
+# 278. A refused handshake logs the claimed (unauthenticated) id quoted.
+mutant "handshake-failure-quotes-the-claimed-id" internal/transport/transport.go \
+  'peer=%q cluster=%q err=%v", h.id' \
+  'peer=%s cluster=%q err=%v", h.id' \
+  ./internal/transport '^TestAnUnauthenticatedIDCannotForgeLogLines$'
+
+# 279. A retirement is announced only once its stop is certain.
+mutant "retirement-announced-once" internal/multiraft/host.go \
+  '	if what := h.busy[g]; what != "" {
+		h.mu.Unlock()
+		return fmt.Errorf("%w: group %d is %s", ErrGroupBusy, g, what)
+	}
+	hg, ok := h.groups[g]' \
+  '	if what := h.busy[g]; what != "" {
+		h.mu.Unlock()
+		if announce != nil {
+			announce()
+		}
+		return fmt.Errorf("%w: group %d is %s", ErrGroupBusy, g, what)
+	}
+	hg, ok := h.groups[g]' \
+  ./internal/multiraft '^TestARetirementIsLoggedOnce$'
+
+# 280. An initialization that cannot record a group runs nothing: it exits
+# before any group starts (review of PR #10, audit H1).
+mutant "unfinished-init-runs-no-group" cmd/dkvd/main.go \
+  'the next start resumes the initialization)\n", c.g, dataDir, err)
+				return 2' \
+  'the next start resumes the initialization)\n", c.g, dataDir, err)
+				continue' \
+  ./cmd/dkvd '^TestAnUnfinishedInitRunsNoGroup$'
+
+# 281. A node that would host no group is refused from its flags, before the
+# data directory records anything.
+mutant "flag-only-refusal-records-nothing" cmd/dkvd/main.go \
+  '		if *initDir && assign != nil && len(join) == 0 && len(assign.GenesisGroups(multiraft.NodeID(*id))) == 0 {' \
+  '		if false {' \
+  ./cmd/dkvd '^TestAnInitRefusedByItsFlagsRecordsNothing$'
+
+# 282. An unfinished initialization with no group state takes new settings.
+mutant "unfinished-init-without-groups-repins" internal/nodedir/nodedir.go \
+  '		if !legacy {
+			id.Settings = opts.Settings' \
+  '		if legacy && false {
+			id.Settings = opts.Settings' \
+  ./internal/nodedir '^TestAnUnfinishedInitWithNoGroupStateTakesNewFlags$'
+
+# 283. A legacy log is matched by its whole name.
+mutant "legacy-log-whole-name" internal/nodedir/nodedir.go \
+  '			if name != own && !strings.HasPrefix(name, own+".") {' \
+  '			if !strings.HasPrefix(name, own) {' \
+  ./internal/nodedir '^TestALegacyLogIsMatchedByItsWholeName$'
+
+# 284. Every return of run closes the transport.
+mutant "run-closes-its-transport" cmd/dkvd/main.go \
+  '	defer func() { _ = tr.Close() }() // on every return; Close is idempotent
+' \
+  '' \
+  ./cmd/dkvd '^TestAStartupErrorClosesTheTransport$'
+
+# 285. The metrics port caps its connections.
+mutant "metrics-port-caps-connections" cmd/dkvd/main.go \
+  '	ln = capListener(ln, maxMetricsConns)' \
+  '' \
+  ./cmd/dkvd '^TestMetricsPortCapsItsConnections$'
+
+# 286. Open sweeps orphans only against the durable fresh manifest
+# (review of PR #10, audit M11).
+mutant "open-sweeps-after-the-fresh-manifest" internal/storage/lsmstore.go \
+  '	if err := s.installManifest(state); err != nil {
+		s.closeManifest()' \
+  '	if err := s.sweepOrphans(files); err != nil {
+		return nil, err
+	}
+	if err := s.installManifest(state); err != nil {
+		s.closeManifest()' \
+  ./internal/storage '^TestOpenSweepsOnlyAgainstADurableManifest$'
+
+# 287. A failed open closes the manifest it installed.
+mutant "failed-open-closes-its-manifest" internal/storage/lsmstore.go \
+  '	if err := s.installManifest(state); err != nil {
+		s.closeManifest()
+		s.closeAllReaders()' \
+  '	if err := s.installManifest(state); err != nil {
+		s.closeAllReaders()' \
+  ./internal/storage '^TestAFailedOpenClosesItsManifest$'
+
+# 288. An explicit compaction honours the latch.
+mutant "explicit-compaction-honours-the-latch" internal/storage/lsmcompact.go \
+  '	if err := s.CompactionError(); err != nil {
+		return false, classify("compact"' \
+  '	if err := s.CompactionError(); err != nil && false {
+		return false, classify("compact"' \
+  ./internal/storage '^TestAnExplicitCompactionAfterAFailureRunsNothing$'
+
+# 289. SyncOff never fsyncs the WAL, a flush included.
+mutant "syncoff-flush-does-not-fsync" internal/storage/lsmstore.go \
+  '	if s.w != nil && s.opts.WAL.SyncMode != wal.SyncOff {' \
+  '	if s.w != nil {' \
+  ./internal/storage '^TestSyncOffNeverFsyncsTheWAL$'
+
+# 290. The options bound a put to what one WAL record holds.
+mutant "options-bound-a-put-by-the-wal-record" internal/storage/store.go \
+  '	if int64(o.MaxKeySize)+int64(o.MaxValueSize) > maxKeyValueBytes {' \
+  '	if false {' \
+  ./internal/storage '^TestAPutAlwaysFitsAWALRecord$'
+
+# 291. An oversized record is refused before anything is written, unlatched.
+mutant "oversized-record-latches-nothing" internal/storage/wal/wal.go \
+  '	if len(payload) > record.MaxRecordSize {' \
+  '	if false {' \
+  ./internal/storage/wal '^TestAnOversizedRecordLatchesNothing$'
+
+# 292. A failed write does not stop the batch syncer.
+mutant "failed-write-keeps-the-batch-flush" internal/storage/wal/wal.go \
+  '				if !w.closed && !w.flushFailed {' \
+  '				if !w.closed && w.syncErr == nil {' \
+  ./internal/storage/wal '^TestAFailedWriteDoesNotStopTheBatchFlush$'
+
+# 293. Sync after a failed write flushes.
+mutant "sync-after-a-failed-write-flushes" internal/storage/wal/wal.go \
+  '	if w.flushFailed {
+		return w.syncErr
+	}
+	if err := w.syncLocked(); err != nil {' \
+  '	if w.syncErr != nil {
+		return w.syncErr
+	}
+	if err := w.syncLocked(); err != nil {' \
+  ./internal/storage/wal '^TestSyncAfterAFailedWriteFlushes$'
+
+# 294. The actor takes the reads waiting together, a cycle's worth at once:
+# taking a few per cycle costs a round each few (review of PR #10; the
+# killer holds the actor while the reads queue, so the count is exact).
+mutant "reads-taken-a-cycle-at-once" internal/raftnode/node.go \
+  '			for i := 1; i < maxReadsPerCycle; i++ {' \
+  '			for i := 1; i < 8; i++ {' \
+  ./internal/raftnode '^TestConcurrentReadsShareRounds$'
+
+# 295. A child's race report fails its integration test.
+mutant "race-report-fails-the-test" tests/integration/launch_test.go \
+  '				t.Errorf("%s reported a data race:\n%s", filepath.Base(cmd.Path), report)' \
+  '				_ = report' \
+  ./tests/integration '^TestARaceReportFailsItsTest$'
+
+# 296. The host refuses a negative tick at Start.
+mutant "host-refuses-a-negative-tick" internal/multiraft/host.go \
+  '	if cfg.TickInterval < 0 {
+		return nil, fmt.Errorf("multiraft: tick interval %s is negative", cfg.TickInterval)' \
+  '	if false {
+		return nil, fmt.Errorf("multiraft: tick interval %s is negative", cfg.TickInterval)' \
+  ./internal/multiraft '^TestHostRefusesANegativeTick$'
+
+# 297. The lab starts every process through the launcher it is given, so an
+# integration test's lab processes are race-scanned and die with the test.
+mutant "lab-starts-through-its-launcher" internal/lab/cluster.go \
+  '	if err := start(cmd); err != nil {' \
+  '	if err := cmd.Start(); err != nil {' \
+  ./tests/integration '^TestALabProcessDiesWithItsTest$'
+
+echo "== the chaos-and-operability milestone (docs/CHAOS.md, docs/OPERATIONS.md) =="
+
+# 298. Cut leaves live connections up: a "partition" that only refuses new
+#      connections, while the existing link keeps flowing.
+mutant "proxy-cut-closes-live-connections" internal/netproxy/proxy.go \
+  '	p.cut = true
+	for c := range p.conns {
+		_ = c.Close()
+	}' \
+  '	p.cut = true' \
+  ./internal/netproxy '^TestProxyForwardsCutsAndHeals$'
+
+# 299. The lab puts the proxy on the wrong side of a link: the dialer reaches
+#      its peer directly, and cutting the link cuts nothing.
+mutant "lab-proxy-on-the-dialing-side" internal/lab/cluster.go \
+  '	if p, ok := c.links[[2]string{from, o.ID}]; ok {' \
+  '	if p, ok := c.links[[2]string{o.ID, from}]; ok {' \
+  ./internal/lab '^TestLinksFollowTheDialer$'
+
+# 300. The next fault is scheduled from the previous one's start, not its
+#      recovery: impairments overlap, and two at once can take a quorum.
+mutant "chaos-one-impairment-at-a-time" internal/lab/chaos.go \
+  '		t += f.Hold + between(cc.Every)' \
+  '		t += between(cc.Every)' \
+  ./internal/lab '^TestPlanChaosKeepsOneImpairmentAtATime$'
+
+# 301. A chaos run whose schedule failed (a restart that did not happen)
+#      passes on its history and convergence alone.
+mutant "chaos-error-fails-the-run" internal/lab/chaos.go \
+  '	return r.Errors() == 0 && r.Check.Linearizable' \
+  '	return r.Check.Linearizable' \
+  ./internal/lab '^TestARunWithAnErrorFails$'
+
+# 302. A node that knows no leader is ready.
+mutant "readiness-needs-a-leader" internal/health/health.go \
+  '		case gs.Leader == "":' \
+  '		case false:' \
+  ./internal/health '^(TestLeaderLost|TestNodeReadinessReasons)$'
+
+# 303. A leader is accepted without a quorum confirming it: a cut-off leader
+#      counts as a working group.
+mutant "health-needs-a-confirming-quorum" internal/health/health.go \
+  '		case gh.Agreeing < gh.Quorum:' \
+  '		case gh.Agreeing < 1:' \
+  ./internal/health '^TestMajorityDown$'
+
+# 304. dkvctl health exits 0 on a degraded cluster: a probe sees nothing wrong.
+mutant "dkvctl-degraded-is-not-ok" internal/ctl/ctl.go \
+  '	code := map[string]int{health.Healthy: ExitOK, health.Degraded: ExitDegraded, health.Unavailable: ExitUnavailable,' \
+  '	code := map[string]int{health.Healthy: ExitOK, health.Degraded: ExitOK, health.Unavailable: ExitUnavailable,' \
+  ./internal/ctl '^TestUnhealthyStatesExitNonZero$'
+
+# 305. An unknown outcome is recorded as a refusal: the checker is told a
+#      write that may have taken effect did not.
+mutant "history-keeps-unknown-as-incomplete" internal/load/load.go \
+  '			h.End(hid, lincheck.Incomplete, nil, "", 0, 0)' \
+  '			h.End(hid, lincheck.Rejected, nil, "", 0, 0)' \
+  ./internal/load '^TestTracesKeepEveryUnknownOperation$'
+
+# 306. Every recorded write carries the same value: the checker cannot tell
+#      which write a read saw.
+mutant "history-values-are-distinct" internal/load/load.go \
+  '	if c.cfg.History == nil {
+		return c.value
+	}' \
+  '	if true {
+		return c.value
+	}' \
+  ./internal/load '^TestHistoryRecordsEveryOperation$'
+
+# 307. An UNAVAILABLE answer is not counted a refusal: the rolling restart's
+#      unknown outcomes are misclassified.
+mutant "unknown-cause-counts-unavailable" internal/lab/unknowns.go \
+  '	case "UNAVAILABLE", "NOT_LEADER", "LOST", "SESSION_LIMIT":' \
+  '	case "NOT_LEADER", "LOST", "SESSION_LIMIT":' \
+  ./internal/lab '^TestClassifyUnknown$'
+
+# 308. Status omits the leader's follower match: lag cannot be read.
+mutant "status-reports-follower-match" internal/multiraft/admin.go \
+  '			if len(st.FollowerMatch) > 0 {' \
+  '			if false {' \
+  ./internal/multiraft '^TestAdminStatusNamesItsNodeAndTheLeadersFollowers$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
-rm -f /tmp/mutation.$$.log
+rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then
   echo "MUTATION TESTING FAILED: no mutant matched ONLY=${ONLY:-}; nothing was tested." >&2
   exit 1
@@ -1577,5 +2622,9 @@ fi
 if [ "$FAIL" -ne 0 ]; then
   echo "MUTATION TESTING FAILED: $FAIL mutant(s) survived or could not be applied." >&2
   exit 1
+fi
+if [ -n "${DRY:-}" ]; then
+  echo "DRY RUN PASSED: every pattern applies ($TOTAL mutants); nothing was tested."
+  exit 0
 fi
 echo "MUTATION TESTING PASSED: every mutant was killed."

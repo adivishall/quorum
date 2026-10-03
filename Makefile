@@ -9,7 +9,7 @@ PKGS    := ./...
 UNIT    := ./internal/... ./cmd/...
 BIN     := bin
 
-.PHONY: all build test race vet fmt fmtcheck checkignore integration mutation faults fuzz bench benchsuite dkvbench tidy clean check
+.PHONY: all build test race vet fmt fmtcheck checkignore integration mutation faults fuzz bench benchsuite dkvbench tidy clean check chaos
 
 all: check
 
@@ -23,11 +23,11 @@ test:
 
 ## race — unit tests under the race detector (required before every phase commit)
 race:
-	$(GO) test -race $(UNIT)
+	$(GO) test -race -count=1 -timeout 30m $(UNIT)
 
 ## integration — multi-process tests, including real SIGKILL crash recovery
 integration:
-	$(GO) test -race -count=1 -v ./tests/integration/
+	$(GO) test -race -count=1 -v -timeout 40m ./tests/integration/
 
 ## mutation — mutation testing (Phase 9 Raft rules, Phase 10 failure handling and
 ## fault-model fidelity, Phase 11 crash-recovery rules, Phase 12 client-visible
@@ -35,12 +35,23 @@ integration:
 ## forwarding and the session client, Phase 14 snapshots and log compaction,
 ## Phase 15 membership and multi-Raft, Phase 16 observability, the load generator, the lab;
 ## ONLY='a|b' runs the mutants whose names match the regex alone, and fails if none does).
-## DRY=1 checks every mutant still applies without running tests. Applies deliberate rule-violating edits to the source,
+## DRY=1 checks every mutant still applies without running tests; CONFIRM=1 re-runs every
+## killer on the clean tree and counts a kill only if it passes there (always done for
+## real-process killers). A kill must be a failing test; a target must be tracked by git.
+## Applies deliberate rule-violating edits to the source,
 ## runs the tests that must catch each, and requires every mutant to be killed
 ## (edits are reverted via git). Needs a clean working tree for the files it
 ## mutates. See docs/RAFT.md §12a and docs/FAULTS.md.
 mutation:
 	./scripts/mutation.sh
+
+## chaos — real-process chaos under a recorded, linearizability-checked workload
+## (docs/CHAOS.md): CHAOS_SEEDS consecutive seeds from 1, every run's evidence
+## under CHAOS_DIR; fails if any run is not linearizable or does not converge.
+CHAOS_SEEDS ?= 5
+CHAOS_DIR   ?= chaos-artifacts
+chaos:
+	$(GO) run ./cmd/dkvlab -scenario chaos -seed 1 -runs $(CHAOS_SEEDS) -artifacts "$(CHAOS_DIR)"
 
 ## faults — Phase 10 deterministic fault schedules at a large seed budget (plain
 ## `go test` runs a small seed set), the Phase 11 crash matrix (a crash at every

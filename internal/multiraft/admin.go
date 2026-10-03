@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/replication"
@@ -44,7 +45,7 @@ type AdminRequest struct {
 	Addr    string   `json:"addr,omitempty"`
 	Join    bool     `json:"join,omitempty"`
 	Voters  []Member `json:"voters,omitempty"`
-	Timeout int      `json:"timeout_ms,omitempty"` // default 10s
+	Timeout int      `json:"timeout_ms,omitempty"` // default 10s, at most 60s
 }
 
 // Member is a member in an admin request or response.
@@ -57,6 +58,7 @@ type Member struct {
 type AdminResponse struct {
 	OK     bool              `json:"ok"`
 	Error  string            `json:"error,omitempty"`
+	Node   string            `json:"node,omitempty"`   // status: the answering node's id
 	Leader string            `json:"leader,omitempty"` // not the leader: the one this node believes in
 	Conf   *ConfStatus       `json:"conf,omitempty"`   // a membership change: the configuration reached
 	Index  uint64            `json:"index,omitempty"`  // ... and its entry's index
@@ -87,6 +89,13 @@ type GroupStatus struct {
 	ConfPending bool       `json:"conf_pending"`
 	Voter       bool       `json:"voter"`
 	Removed     bool       `json:"removed"`
+	// FollowerMatch is, on the leader only, each other member's match index:
+	// the highest entry the leader knows that member holds (its lag is
+	// LastIndex minus it). Pending counts the writes and reads the node has
+	// accepted and not yet answered.
+	FollowerMatch map[string]uint64 `json:"follower_match,omitempty"`
+	PendingWrites int               `json:"pending_writes,omitempty"`
+	PendingReads  int               `json:"pending_reads,omitempty"`
 }
 
 func confStatus(c replication.Configuration) ConfStatus {
@@ -116,79 +125,149 @@ func IDs(ms []Member) []string {
 	return out
 }
 
-// MaxAdminLine bounds one admin request line.
-const MaxAdminLine = 64 << 10
+// Bounds of the admin port (audit M1, L): what one connection may cost.
+const (
+	// MaxAdminLine bounds one admin request line.
+	MaxAdminLine = 64 << 10
+	// MaxAdminConns bounds the admin connections served at once; one beyond
+	// it is closed as soon as it is accepted. The admin port serves an
+	// operator's occasional command, one per connection.
+	MaxAdminConns = 16
+	// AdminIdleTimeout bounds the wait for a connection's next request line,
+	// and AdminWriteTimeout the writing of an answer.
+	AdminIdleTimeout  = 30 * time.Second
+	AdminWriteTimeout = 10 * time.Second
+	// DefaultAdminTimeout is a request's timeout when it names none, and
+	// MaxAdminTimeout the most it may name.
+	DefaultAdminTimeout = 10 * time.Second
+	MaxAdminTimeout     = 60 * time.Second
+)
 
 // ServeAdmin answers admin requests on ln for host h until ctx ends or ln is
-// closed. logf may be nil.
+// closed. logf may be nil. An Accept error is logged and retried after a
+// growing pause, never the end of the loop.
 func ServeAdmin(ctx context.Context, ln net.Listener, h *Host, logf func(string, ...any)) {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
 	var wg sync.WaitGroup
+	defer wg.Wait()
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
 	}()
+	slots := make(chan struct{}, MaxAdminConns)
+	backoff := 5 * time.Millisecond
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			wg.Wait()
-			return
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			logf("event=admin_accept_failed node=%s err=%v retry_in=%s", h.cfg.ID, err, backoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			backoff = min(2*backoff, time.Second)
+			continue
+		}
+		backoff = 5 * time.Millisecond
+		select {
+		case slots <- struct{}{}:
+		default:
+			_ = c.Close()
+			continue
 		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer c.Close()
-			cctx, cancel := context.WithCancel(ctx)
-			defer cancel()
-			go func() {
-				<-cctx.Done()
-				_ = c.Close()
-			}()
-			sc := bufio.NewScanner(c)
-			sc.Buffer(make([]byte, 4096), MaxAdminLine)
-			enc := json.NewEncoder(c)
-			for sc.Scan() {
-				var req AdminRequest
-				var resp AdminResponse
-				if err := json.Unmarshal(sc.Bytes(), &req); err != nil {
-					resp = AdminResponse{Error: "malformed request: " + err.Error()}
-				} else {
-					resp = h.Admin(cctx, req)
-					if logf != nil && req.Op != "status" {
-						logf("event=admin node=%s op=%s group=%d id=%s ok=%v err=%q", h.cfg.ID, req.Op, req.Group, req.ID, resp.OK, resp.Error)
-					}
-				}
-				if err := enc.Encode(resp); err != nil {
-					return
-				}
-			}
+			defer func() { <-slots }()
+			serveAdminConn(ctx, c, h, logf)
 		}()
 	}
 }
 
+func serveAdminConn(ctx context.Context, c net.Conn, h *Host, logf func(string, ...any)) {
+	defer c.Close()
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		<-cctx.Done()
+		_ = c.Close()
+	}()
+	sc := bufio.NewScanner(c)
+	sc.Buffer(make([]byte, 4096), MaxAdminLine)
+	enc := json.NewEncoder(c)
+	for {
+		_ = c.SetReadDeadline(time.Now().Add(adminIdle))
+		if !sc.Scan() {
+			return
+		}
+		var req AdminRequest
+		var resp AdminResponse
+		if err := json.Unmarshal(sc.Bytes(), &req); err != nil {
+			resp = AdminResponse{Error: "malformed request: " + err.Error()}
+		} else {
+			resp = h.Admin(cctx, req)
+			if req.Op != "status" {
+				// Quoted: the op and id are the client's, and a newline in
+				// either would otherwise forge log lines.
+				logf("event=admin node=%s op=%q group=%d id=%q ok=%v err=%q", h.cfg.ID, req.Op, req.Group, req.ID, resp.OK, resp.Error)
+			}
+		}
+		_ = c.SetWriteDeadline(time.Now().Add(AdminWriteTimeout))
+		if err := enc.Encode(resp); err != nil {
+			return
+		}
+	}
+}
+
+// adminIdle is AdminIdleTimeout, a variable so tests can shorten it.
+var adminIdle = AdminIdleTimeout
+
+// adminTimeout is a request's timeout: its own, clamped to MaxAdminTimeout,
+// or DefaultAdminTimeout.
+func adminTimeout(ms int) time.Duration {
+	switch {
+	case ms <= 0:
+		return DefaultAdminTimeout
+	case ms >= int(MaxAdminTimeout/time.Millisecond): // also before ms×1e6 could overflow
+		return MaxAdminTimeout
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 // Admin executes one admin request against this host.
 func (h *Host) Admin(ctx context.Context, req AdminRequest) AdminResponse {
-	timeout := 10 * time.Second
-	if req.Timeout > 0 {
-		timeout = time.Duration(req.Timeout) * time.Millisecond
-	}
+	timeout := adminTimeout(req.Timeout)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	g := GroupID(req.Group)
 	fail := func(err error) AdminResponse { return AdminResponse{Error: err.Error()} }
 	switch req.Op {
 	case "status":
-		resp := AdminResponse{OK: true, Groups: []GroupStatus{}}
+		resp := AdminResponse{OK: true, Node: string(h.cfg.ID), Groups: []GroupStatus{}}
 		for _, id := range h.Groups() {
 			grp := h.Group(id)
 			if grp == nil {
 				continue
 			}
 			st := grp.Node.Status()
-			resp.Groups = append(resp.Groups, GroupStatus{
+			gs := GroupStatus{
 				Group: uint32(id), Role: st.Role.String(), Term: st.Term, Leader: string(st.Leader),
 				Commit: st.Commit, Applied: st.Applied, LastIndex: st.LastIndex, Boundary: st.Boundary, Snapshot: st.Snapshot,
 				Conf: confStatus(st.Conf), ConfIndex: st.ConfIndex, ConfPending: st.ConfPending, Voter: st.Voter, Removed: st.Removed,
-			})
+				PendingWrites: st.PendingWrites, PendingReads: st.PendingReads,
+			}
+			if len(st.FollowerMatch) > 0 {
+				gs.FollowerMatch = map[string]uint64{}
+				for p, m := range st.FollowerMatch {
+					gs.FollowerMatch[string(p)] = m
+				}
+			}
+			resp.Groups = append(resp.Groups, gs)
 		}
 		if failed := h.Failed(); len(failed) > 0 {
 			resp.Failed = map[string]string{}
@@ -204,6 +283,9 @@ func (h *Host) Admin(ctx context.Context, req AdminRequest) AdminResponse {
 		}
 		if req.ID == "" {
 			return fail(errors.New("an id is required"))
+		}
+		if err := checkMember(req.ID, req.Addr); err != nil {
+			return fail(err)
 		}
 		cc := raft.ConfChange{Member: raft.Member{ID: NodeID(req.ID), Addr: req.Addr}}
 		switch req.Op {
@@ -236,6 +318,9 @@ func (h *Host) Admin(ctx context.Context, req AdminRequest) AdminResponse {
 		case !req.Join && len(req.Voters) > 0:
 			var voters []replication.Member
 			for _, m := range req.Voters {
+				if err := checkMember(m.ID, m.Addr); err != nil {
+					return fail(err)
+				}
 				voters = append(voters, replication.Member{ID: NodeID(m.ID), Addr: m.Addr})
 			}
 			sort.Slice(voters, func(i, j int) bool { return voters[i].ID < voters[j].ID })
@@ -302,4 +387,18 @@ func AdminCall(ctx context.Context, addr string, req AdminRequest) (AdminRespons
 		return AdminResponse{}, err
 	}
 	return resp, nil
+}
+
+// checkMember refuses a member id or address holding whitespace or a control
+// character. A member enters the replicated configuration — every replica
+// holds it, across restarts — and its id and address are logged as
+// key=value fields: a newline in one forged event lines on every node that
+// sent to the member (quoting only the admin's own line did not stop that).
+func checkMember(id, addr string) error {
+	for _, f := range []struct{ name, v string }{{"id", id}, {"address", addr}} {
+		if strings.IndexFunc(f.v, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+			return fmt.Errorf("a member %s may not hold whitespace or control characters: %q", f.name, f.v)
+		}
+	}
+	return nil
 }

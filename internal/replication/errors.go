@@ -82,4 +82,9 @@ var (
 	// ErrStaleSnapshot means a snapshot at or below the commit index was offered
 	// for installation: the log already covers it.
 	ErrStaleSnapshot = errors.New("snapshot at or below the commit index")
+
+	// ErrEntryTooLarge means an entry's Data exceeds MaxEntryDataLen. No layer
+	// creates, holds, persists, sends or accepts such an entry: the proposal
+	// that would create one is refused before anything is appended.
+	ErrEntryTooLarge = errors.New("log entry exceeds the maximum entry size")
 )

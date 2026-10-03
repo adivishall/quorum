@@ -276,7 +276,7 @@ func (r *Raft) ProposeConfChange(cc ConfChange) error {
 		return err
 	}
 	r.appendConf(next)
-	r.broadcastAppend()
+	r.broadcastAppend(false)
 	r.maybeCommit()
 	return nil
 }
@@ -284,10 +284,12 @@ func (r *Raft) ProposeConfChange(cc ConfChange) error {
 // appendConf appends a configuration entry (the leader's own) and adopts it.
 func (r *Raft) appendConf(c Configuration) {
 	idx := r.log.LastIndex() + 1
-	if err := r.log.Append(Entry{Index: idx, Term: r.currentTerm, Data: replication.EncodeConfiguration(c), Type: replication.EntryConfig}); err != nil {
+	data := replication.EncodeConfiguration(c)
+	if err := r.log.Append(Entry{Index: idx, Term: r.currentTerm, Data: data, Type: replication.EntryConfig}); err != nil {
 		panic("raft: leader append rejected by log: " + err.Error())
 	}
 	r.markUnstable(idx)
+	r.trackUncommitted(len(data))
 	r.setConf(c, idx)
 }
 
@@ -300,6 +302,11 @@ func (r *Raft) setConf(c Configuration, idx uint64) {
 	r.peers = r.conf.Members()
 	if r.role == Leader {
 		r.syncProgress()
+		// The quorum that confirms reads changed with the configuration. A
+		// read may already have its acknowledgements under the new one — or
+		// need none, if this leader alone is its quorum — and no reply may
+		// ever come to confirm it otherwise.
+		r.confirmReads()
 	}
 	if r.role == Candidate {
 		if prev, ok := r.campaignRule(); !ok {
@@ -374,6 +381,7 @@ func (r *Raft) syncProgress() {
 			delete(r.snapPending, p)
 			delete(r.snapWait, p)
 			delete(r.ackSeq, p)
+			delete(r.cut, p)
 		}
 	}
 }
@@ -419,7 +427,7 @@ func (r *Raft) afterCommit() {
 	}
 	if r.conf.Joint() {
 		r.appendConf(Final(r.conf))
-		r.broadcastAppend()
+		r.broadcastAppend(false)
 		// When the leader alone is a quorum of the final configuration — the
 		// removal of all voters but it — no acknowledgement will ever come to
 		// retry the commit: try now (found by the bounded membership model).

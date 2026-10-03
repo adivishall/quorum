@@ -170,7 +170,8 @@ Commit advancement (leader or follower) is recorded in the `replication.Log` via
 driver then pulls `NextApply()` (= the log's `Unapplied()`, i.e. `(appliedIndex, commitIndex]`),
 applies each command to the state-machine seam **in order**, and only then calls `AppliedTo` (=
 `Apply`). An uncommitted entry is never applied (INV-R7), `appliedIndex ≤ commitIndex` always
-(Phase 8 enforces it), and an apply failure does not advance `appliedIndex`. Phase 9 drives a
+(Phase 8 enforces it), and an apply failure does not advance `appliedIndex` — it stops the node
+(§17). Phase 9 drives a
 minimal deterministic state machine to verify these semantics; it adds no dedup and claims no
 exactly-once client application (`docs/CONSISTENCY.md` C4). `appliedIndex` is **volatile**: a
 restart re-applies the whole recovered committed prefix from index 1, so application is
@@ -326,6 +327,21 @@ its crash-recovery rules (`docs/CRASH_RECOVERY.md` §11); Phase 12 adds 27 for R
 completion, the client protocol and policy, the state machine, the codecs and the checker
 (`docs/LINEARIZABILITY.md` §11); `make mutation` runs all 60.
 
+**What counts as a kill** (since the audit hardening, mutants 173–270 cover its fixes): a target
+must be tracked by git and clean, or it is not mutated (`git diff` is blind to an untracked file, so
+its mutation went unnoticed and was never reverted). A kill must be a failing test — a `--- FAIL`
+line, or the test binary dying in a test (a panic, a timeout); a run that fails otherwise is not
+attributable to the mutant and fails the runner, and so does a mutant that does not compile —
+including one that breaks only `dkvd`, which a real-process test builds itself and reports as its
+own failure. For real-process killers, whose timing is real,
+the same tests are re-run on the clean tree and the kill counts only if they pass there, so a flaky
+failure cannot pass for one; `CONFIRM=1` does this for every mutant. A pattern matching several
+sites is reported, since only the first is mutated. The exit trap reverts only the file a mutant
+has edited and not yet reverted: it used to check out every file any mutant had touched, losing an
+edit a developer made to one of them during the run. `DRY=1` checks every pattern still applies
+without running tests — a whole-suite dry run after this branch's changes found six mutants whose
+code had moved, now re-targeted.
+
 ## 13. Multi-Raft and membership (Phase 15)
 
 *Phases 9–14:* membership was static (ADR-005) and quorum was `⌊n/2⌋+1` over a fixed peer list.
@@ -407,3 +423,146 @@ an unanswered offer re-offered, a matching suffix kept, a covered snapshot ignor
 below a boundary, compaction needing the applied index, back-up stopping at the boundary) and 40
 randomized schedules with compaction; `internal/replication`'s differential test against a
 reference log with `Compact` and `InstallSnapshot`; everything in `docs/SNAPSHOTS.md`.
+
+## 16. The entry-size limit
+
+One constant bounds an entry's bytes everywhere: `replication.MaxEntryDataLen` = 1 MiB, aliased as
+`raft.MaxEntryDataLen` and `raftlog.MaxEntryDataLen` and, at the client, `kv.MaxCommandLen`. It is
+the bound every on-disk and on-wire decoder has always read an entry by; what was missing was its
+enforcement where entries are **created** and **written**. The invariant:
+
+> No code path creates, holds, persists, transmits or accepts a Raft entry whose data exceeds
+> `MaxEntryDataLen`.
+
+| Boundary | Enforcement | Test (mutant) |
+|---|---|---|
+| Client front (`kv.Request.validate`) | the **encoded** command, not the raw key and value, must fit: `INVALID_REQUEST`, before anything is proposed or forwarded | `TestEncodedEntryLimitDecidesWriteAdmission` (173) |
+| Command (`kv.Command.Validate`, so `Decode`) | an over-limit command is malformed | same (174) |
+| Proposal (`raft.Propose`) | `ErrEntryTooLarge` on any node, checked before the role: definite, nothing appended | `TestProposeOverTheEntryLimitIsRefused` (175) |
+| In-memory log (`replication.MemoryLog`) | `Append`/`TruncateAndAppend` refuse it, leaving the log unchanged | `TestEntrySizeLimit` (177) |
+| Receipt (`raft.Step`; the AppendEntries codec) | an AppendEntries carrying one is malformed and has no effect, not even its term; the codec never decodes one | `TestStepRefusesAnOversizedAppendEntries` (176), `TestCodecEntryLimit` |
+| Persistence (`raftlog.Save`) | checked for every entry before any byte is written; the log fails (it cannot claim durability for what its caller holds) but the file is untouched and reopens | `TestSaveRefusesAnEntryOverTheLimit` (178) |
+| Recovery (`raftlog` replay) | refuses a longer entry, as before — now the same bound `Save` writes by | `TestSaveAndReplayAtTheEntryLimit` |
+| Driver and server (`raftnode.Node.Write`, `kv.Server`) | `raft.ErrEntryTooLarge` is a definite refusal: `INVALID_REQUEST`, never `UNKNOWN` | `TestEntryTooLargeFromBelowIsInvalid` (179) |
+
+A configuration entry always fits (`replication.MaxEncodedConfiguration` is checked against the
+limit at compile time); the election no-op is empty. End to end, `TestEntryLimitEndToEnd` (three
+real drivers) and `TestRealEntryLimit` (three `dkvd` processes, a full-cluster SIGKILL) commit an
+entry of exactly the limit on every node, refuse one byte more at every node, read every node's
+durable log to confirm nothing over the limit reached it, and restart every node from its own log.
+
+**Why the limit was not raised instead.** A 1 MiB value plus its key and framing could have been
+made to fit by raising the entry limit by a few KiB. That would have widened what every decoder
+accepts on disk and on the wire — a format change — to keep a value size that never worked; the
+client contract instead states the limit that decides, the encoded entry (`docs/API.md` §3).
+
+**What bounds a message.** The limit bounds one entry; an AppendEntries carrying many is bounded
+by the core's per-message budgets (§18).
+
+## 17. Bounds on a leader's outstanding work, abandoned requests, apply failures
+
+**Bounds (audit M3).** A leader cut off from its quorum never commits, and — with no CheckQuorum —
+never steps down while nothing reaches it. Before these bounds, every request it accepted in that
+state stayed: an uncommitted, persisted entry resent on every broadcast and a client waiter, or a
+read awaiting a confirmation that never came. The core now bounds them (`raft.Config`):
+
+| Bound | Default | Beyond it |
+|---|---|---|
+| `MaxUncommittedEntries` — entries in the leader's `(commit, last]`, its no-op and inherited tail included | 1024 | `Propose` → `ErrBusy` |
+| `MaxUncommittedBytes` — their data bytes | 64 MiB | `Propose` → `ErrBusy`, unless the tail holds no data (so no entry within `MaxEntryDataLen` is refused forever) |
+| `MaxPendingReads` — reads registered and not yet confirmed | 1024 | `ReadIndex` → `ErrBusy` |
+
+`ErrBusy` is definite — nothing appended or registered — and the key-value server answers it
+`UNAVAILABLE` (`docs/API.md` §5). Healthy operation is far below the bounds: the uncommitted tail
+is about the writes in flight, and a read is confirmed within a heartbeat. The leader keeps the
+sizes of its uncommitted tail as it appends and commits (computed once from the log when it
+becomes leader), so a proposal's check costs nothing; every core test checks that bookkeeping
+against the log after every step (`assertUncommittedTail`). Configuration changes are not bounded:
+one is in progress at most. Tests: `TestIsolatedLeaderRefusesProposalsBeyondItsBound`,
+`TestUncommittedBytesBound`, `TestInheritedTailCountsTowardTheBound`,
+`TestIsolatedLeaderRefusesReadsBeyondItsBound` (core); `TestIsolatedLeaderRefusesWorkBeyondItsBounds`
+(three real drivers, 1,600 writes and reads at an isolated leader); `TestBusyFromBelowIsUnavailable`.
+
+**Abandoned requests.** A client whose deadline passes after its request was accepted tells the
+node's actor, which forgets the write's waiter or the unconfirmed read at once (`Waiters.Cancel`,
+`Reads.Cancel`); before, a waiter stayed until its index was applied — for an entry an isolated
+leader appended, possibly never, if the log that replaced it never grew that far. The notice
+never waits on the actor and is never dropped: it joins a list the actor takes whole (a buffered
+channel of 256 used to drop the rest of a burst — clients sharing one deadline — and about 600 of
+1000 waiters stayed; `TestABurstOfAbandonedRequestsLeavesNothingBehind`); it decides nothing — the entry, if it commits, is applied as before, and the
+outcome stays unknown to that client. A waiter is never completed early as `ErrLost` when its
+entry is truncated from this node's log: another leader that holds the entry may still commit it.
+`TestAbandonedRequestsLeaveNothingBehind`.
+
+**Apply failures (audit M4).** A state machine that returns an error from `Apply` for a committed
+entry refuses it on every replica and on every retry — a committed entry is the same everywhere.
+The node now fail-stops on it exactly as on a persistence failure: `event=raft_apply_failed`,
+`Node.Err()` wraps `ErrApply`, every waiting client learns the error, and `dkvd` exits 1 (`-raft`)
+or stops that group alone (`-cluster`). Before, the error was logged and retried every cycle,
+forever: the group stalled behind the entry while its leader went on accepting writes it could
+never apply. `appliedIndex` never passes the refused entry, so a restart refuses it again; the
+entries applied before it in the failing cycle complete, and the published `Status` covers them
+(`TestApplyFailureStopsTheNode`; so does a periodic snapshot's I/O failure,
+`TestASnapshotFailurePublishesStatusFirst`). **The contract for a state machine:** `Apply` either applies
+the command completely or returns an error with no effect at all — the key-value store's only
+error, an undecodable command, leaves it unchanged — and an error means the entry can never be
+applied. Recovering such a group needs an operator: a state machine that accepts the entry (a
+fixed binary), or restoring from a snapshot past it.
+
+Mutants 214–226, 270 and 274–275 (`scripts/mutation.sh`) break each bound, the bookkeeping, each release of an
+abandoned request, the fail-stop and the `UNAVAILABLE` mapping; each is killed by its test.
+
+**Not done here.** PreVote and CheckQuorum — an isolated leader that steps down by itself —
+remain open (`docs/ENGINEERING_ROADMAP.md`); the bounds limit what it holds meanwhile.
+
+## 18. Replication flow control (audit H4)
+
+Before this section, `sendAppend` sent a follower every entry from its `nextIndex` to the end of
+the log, and `nextIndex` moves only on a response — so every broadcast (a heartbeat, a proposal, a
+read) resent the whole unacknowledged tail, and a backlog beyond the transport's 16 MiB frame or
+the decoder's 65,536 entries could never be sent: the follower stayed behind until a snapshot
+moved past it, or for good with snapshots off. Three changes:
+
+- **Budgets.** One AppendEntries carries at most `MaxEntriesPerMsg` entries (default 4096, at most
+  `MaxEntriesPerMessage`) and `MaxSizePerMsg` bytes of entry data (default 1 MiB, at most 8 MiB);
+  an entry larger than the byte budget travels alone, so no entry is ever unsendable
+  (`replication.Log.SliceBounded` copies nothing past the budget). A message therefore always
+  fits what its receiver accepts, however far behind the follower is.
+- **Streaming a backlog.** When the budget cut a peer's last batch, an acknowledgement that
+  advances it sends the next batch at once, so a lagging follower catches up at the speed of round
+  trips rather than one batch per heartbeat. While that batch is in flight, a proposal sends the
+  peer an entry-less heartbeat rather than the batch again: copies of it queued ahead of the next
+  batch, so a follower behind under load fell further behind the more clients wrote (an 18 MB
+  backlog took 5.8 s under 8 writers, 267 ms idle; `TestABatchInFlightIsNotResentWithEveryProposal`).
+  A lost batch is resent by the next heartbeat tick, from `nextIndex`. A snapshot offer ends the stream (its acknowledgement resumes
+  replication once, `TestASnapshotInstallSendsTheNextBatchOnce`), and a leader that the
+  acknowledgement steps down — the commit of its own removal — sends nothing more
+  (`TestARemovedLeaderSendsNothingOnceItStepsDown`).
+- **Read rounds.** A read no longer broadcasts the tail: it joins a round still unsent, or starts
+  one of entry-less heartbeats (`docs/LINEARIZABILITY.md` §5.1). Reads registered in one cycle —
+  and the driver takes the reads waiting together, up to 256 per cycle — are confirmed together.
+  A leader's configuration change re-checks the reads pending: a leader that becomes its own
+  quorum (the change removing its last peer) confirms them, where before no reply would ever come
+  to and they filled `MaxPendingReads` (`TestReadsPendingWhenTheLeaderBecomesItsOwnQuorumAreConfirmed`).
+  A round's heartbeat goes at the peer's match index (or the boundary), so its acknowledgement can
+  report less than `nextIndex` assumes; an acknowledgement never moves `nextIndex` back — only a
+  rejection does — or a new leader re-sent a peer entries it held (`TestAReadDoesNotMoveNextIndexBack`).
+
+Safety is unchanged: what a follower accepts and how it answers are untouched; the leader sends
+less per message and more often. Evidence: `TestLaggingFollowerCatchesUpInBudgetedBatches`,
+`TestEntryBudgetBindsABacklogOfSmallEntries`, `TestAnEntryLargerThanTheByteBudgetIsSentAlone`,
+`TestReadsInOneCycleShareOneRound`, `TestAReadNeverJoinsARoundAlreadySent` (core);
+`TestFollowerBehindByMoreThanAFrameCatchesUp` (three real drivers: a follower 18 MB behind, snapshots
+off, catches up — before, never), `TestConcurrentReadsShareRounds` (512 reads queued for a held actor cost 8 messages — two
+rounds; taken 8 per cycle they cost 260); `TestBudgetedReplicationUnderFaults` (every simulator profile over three seeds with
+budgets of 2 entries and 32 bytes: every invariant and linearizability hold, with tens of
+thousands of batches cut, under every fault the simulator injects); mutants 243–251, 267–269, 271–273.
+
+**Still open.** `nextIndex` still moves only on an acknowledgement — there is no optimistic
+pipelining — so while a batch is unacknowledged, every heartbeat tick resends it, and a peer whose
+unacknowledged tail fits one batch gets it again with every proposal. That
+redundancy is now bounded by the budgets (at most one batch per peer per broadcast) but not removed;
+removing it means tracking batches in flight per peer (etcd's probe/replicate states), a larger
+change to the core's loss recovery left for a later phase. Snapshots and bulk appends still share
+one connection with every group's heartbeats.
+

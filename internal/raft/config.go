@@ -14,6 +14,33 @@ const (
 	DefaultHeartbeatTicks = 2
 )
 
+// Default bounds on a leader's outstanding work (audit M3). A leader that
+// cannot reach a quorum — partitioned, its followers down — never commits, and
+// without CheckQuorum it does not step down; every request it accepts until
+// then stays: an uncommitted, persisted entry resent on every broadcast and a
+// waiting client, or a read awaiting confirmation. These bound them; beyond a
+// bound the leader refuses (ErrBusy, definite) instead of accepting work it
+// can only hold. Healthy operation stays far below them: the uncommitted tail
+// is about the writes in flight, and a read is confirmed within a heartbeat.
+const (
+	DefaultMaxUncommittedEntries = 1024
+	DefaultMaxUncommittedBytes   = 64 << 20
+	DefaultMaxPendingReads       = 1024
+)
+
+// Default budgets of one AppendEntries (audit H4): a leader sends a follower's
+// backlog in messages of at most this many entries and bytes of entry data —
+// one entry more than the byte budget when that entry alone exceeds it — so a
+// message always fits what its receiver accepts (MaxEntriesPerMessage entries,
+// the transport's frame), however far behind the follower is.
+const (
+	DefaultMaxEntriesPerMsg = 4096
+	DefaultMaxSizePerMsg    = 1 << 20
+	// MaxSizePerMsgLimit bounds MaxSizePerMsg: with one entry of
+	// MaxEntryDataLen beyond it, a message stays under 10 MiB of entry data.
+	MaxSizePerMsgLimit = 8 << 20
+)
+
 // Config constructs a Raft core. The membership it starts from is Conf — the
 // configuration at log index ConfIndex (a snapshot's, at the snapshot's index;
 // or the group's genesis, at 0) — or, when Conf is nil, the fixed voter set
@@ -60,6 +87,22 @@ type Config struct {
 	// Term and Vote are the recovered durable HardState (zero for a fresh node).
 	Term uint64
 	Vote NodeID
+
+	// MaxUncommittedEntries and MaxUncommittedBytes bound a leader's
+	// uncommitted log tail, its election no-op included; at either, Propose
+	// refuses with ErrBusy. A proposal is admitted whenever the tail holds no
+	// data, so no entry within MaxEntryDataLen is refused forever.
+	// MaxPendingReads bounds the reads awaiting confirmation; at it, ReadIndex
+	// refuses with ErrBusy. Zero means the default; negative is invalid.
+	MaxUncommittedEntries int
+	MaxUncommittedBytes   int
+	MaxPendingReads       int
+
+	// MaxEntriesPerMsg and MaxSizePerMsg are the budgets of one AppendEntries
+	// (at most MaxEntriesPerMessage and MaxSizePerMsgLimit). Zero means the
+	// default; negative or over the limit is invalid.
+	MaxEntriesPerMsg int
+	MaxSizePerMsg    int
 }
 
 func (c *Config) withDefaults() {
@@ -71,6 +114,21 @@ func (c *Config) withDefaults() {
 	}
 	if c.HeartbeatTicks == 0 {
 		c.HeartbeatTicks = DefaultHeartbeatTicks
+	}
+	if c.MaxUncommittedEntries == 0 {
+		c.MaxUncommittedEntries = DefaultMaxUncommittedEntries
+	}
+	if c.MaxUncommittedBytes == 0 {
+		c.MaxUncommittedBytes = DefaultMaxUncommittedBytes
+	}
+	if c.MaxPendingReads == 0 {
+		c.MaxPendingReads = DefaultMaxPendingReads
+	}
+	if c.MaxEntriesPerMsg == 0 {
+		c.MaxEntriesPerMsg = DefaultMaxEntriesPerMsg
+	}
+	if c.MaxSizePerMsg == 0 {
+		c.MaxSizePerMsg = DefaultMaxSizePerMsg
 	}
 }
 
@@ -93,6 +151,11 @@ func (c *Config) validate() (replication.Configuration, error) {
 	}
 	if c.ElectionTicks <= 0 || c.HeartbeatTicks <= 0 || c.ElectionTicks <= c.HeartbeatTicks {
 		return none, ErrInvalidTicks
+	}
+	if c.MaxUncommittedEntries < 0 || c.MaxUncommittedBytes < 0 || c.MaxPendingReads < 0 ||
+		c.MaxEntriesPerMsg < 0 || c.MaxEntriesPerMsg > MaxEntriesPerMessage ||
+		c.MaxSizePerMsg < 0 || c.MaxSizePerMsg > MaxSizePerMsgLimit {
+		return none, ErrInvalidBounds
 	}
 	var base replication.Configuration
 	if c.Conf != nil {

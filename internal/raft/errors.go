@@ -1,6 +1,10 @@
 package raft
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/adivishall/quorum/internal/replication"
+)
 
 // Sentinel errors. Callers branch with errors.Is, never on strings — the same
 // discipline as internal/storage and internal/routing.
@@ -12,6 +16,11 @@ var (
 	// ErrStopped means the core has been closed and rejects further input. (The
 	// core itself has no lifecycle; the driver uses this when appropriate.)
 	ErrStopped = errors.New("raft: stopped")
+
+	// ErrEntryTooLarge means Propose was given more than MaxEntryDataLen bytes.
+	// Nothing was appended: the refusal is definite. It is the replication
+	// layer's sentinel, so errors.Is matches it at every layer.
+	ErrEntryTooLarge = replication.ErrEntryTooLarge
 
 	// --- configuration ---
 
@@ -32,6 +41,17 @@ var (
 	// election timeout was not strictly greater than the heartbeat (an election
 	// timeout at or below the heartbeat interval prevents stable leadership).
 	ErrInvalidTicks = errors.New("raft: invalid tick configuration")
+
+	// ErrInvalidBounds means a MaxUncommitted* or MaxPendingReads bound was
+	// negative, or a per-message budget negative or beyond its limit.
+	ErrInvalidBounds = errors.New("raft: invalid bound on uncommitted entries or pending reads")
+
+	// ErrBusy means a leader refused a proposal or a read because its bound on
+	// uncommitted entries or on reads awaiting confirmation is reached
+	// (Config.MaxUncommittedEntries, MaxUncommittedBytes, MaxPendingReads) —
+	// usually because it cannot reach a quorum. Nothing was appended or
+	// registered: the refusal is definite; retry later or at another node.
+	ErrBusy = errors.New("raft: busy: too many uncommitted entries or reads awaiting confirmation")
 
 	// ErrNoRand means Config.Rand was nil. Randomness is injected so elections are
 	// deterministic under a seed (ADR-002).

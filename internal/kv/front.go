@@ -123,7 +123,7 @@ func (f *Front) Do(ctx context.Context, req Request) (Response, error) {
 	m.inflight.Inc()
 	resp, err := f.do(ctx, req)
 	m.inflight.Dec()
-	m.request(req, resp, start)
+	m.request(req, resp, start, f.Server(req.Group) != nil)
 	return resp, err
 }
 

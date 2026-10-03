@@ -3,6 +3,8 @@ package lab
 import (
 	"fmt"
 	"io"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/adivishall/quorum/internal/bench"
@@ -106,17 +108,34 @@ func Suite(name string, base Experiment, faultRate float64) ([]Experiment, error
 
 // Summary is one configuration's numbers across its runs.
 type Summary struct {
-	Name          string `json:"name"`
-	Runs          int    `json:"runs"`
-	Failed        int    `json:"failed_runs"` // runs that returned no result
-	OKPerSec      Stat   `json:"ok_per_sec"`
-	GetP50Us      Stat   `json:"get_p50_us"`
-	GetP99Us      Stat   `json:"get_p99_us"`
-	PutP50Us      Stat   `json:"put_p50_us"`
-	PutP99Us      Stat   `json:"put_p99_us"`
-	Unknown       Stat   `json:"unknown_ops"`
-	Refused       Stat   `json:"refused_ops"`
-	LongestOutage Stat   `json:"longest_outage_ms"`
+	Name     string `json:"name"`
+	Runs     int    `json:"runs"`
+	Failed   int    `json:"failed_runs"` // runs that returned no result
+	OKPerSec Stat   `json:"ok_per_sec"`
+	// Ops are the operations due in the window, every outcome; SuccessRate
+	// the fraction that ended ok or not_found.
+	Ops         Stat `json:"ops"`
+	SuccessRate Stat `json:"success_rate"`
+	// The Get/Put percentiles are of the successes only; the All ones are of
+	// every operation, each to its definite answer or to the client giving
+	// up, and Excluded counts what the success-only ones leave out
+	// (docs/LOAD_TESTING.md). A failure scenario's tail is in the All ones.
+	GetP50Us      Stat `json:"get_p50_us"`
+	GetP95Us      Stat `json:"get_p95_us"`
+	GetP99Us      Stat `json:"get_p99_us"`
+	PutP50Us      Stat `json:"put_p50_us"`
+	PutP95Us      Stat `json:"put_p95_us"`
+	PutP99Us      Stat `json:"put_p99_us"`
+	AllP50Us      Stat `json:"all_outcomes_p50_us"`
+	AllP95Us      Stat `json:"all_outcomes_p95_us"`
+	AllP99Us      Stat `json:"all_outcomes_p99_us"`
+	Excluded      Stat `json:"excluded_from_latency"`
+	Unknown       Stat `json:"unknown_ops"`
+	Refused       Stat `json:"refused_ops"`
+	LongestOutage Stat `json:"longest_outage_ms"`
+	// UnknownCauses classifies every traced unknown outcome of every run
+	// (load.Config.Trace; ClassifyUnknown).
+	UnknownCauses map[string]int `json:"unknown_causes,omitempty"`
 	// Settle is each action's settle time in milliseconds (elections for
 	// kill-leader, catch-up for restarts and additions), across runs.
 	Settle        map[string]Stat `json:"settle_ms,omitempty"`
@@ -137,16 +156,36 @@ type Report struct {
 // Add summarizes one configuration's runs into the report.
 func (r *Report) Add(e Experiment, results []*RunResult) {
 	s := Summary{Name: e.Name, Runs: len(results), Failed: r.Runs - len(results), Settle: map[string]Stat{}}
-	var ok, g50, g99, p50, p99, unk, ref, outage, cpu, rss, gen, lag []float64
+	var ok, g50, g95, g99, p50, p95, p99, a50, a95, a99, excl, nops, rate, unk, ref, outage, cpu, rss, gen, lag []float64
 	settle := map[string][]float64{}
 	for _, res := range results {
 		l := res.Load
 		ok = append(ok, l.OKPerSec)
+		var total int64
+		for _, n := range l.Classes {
+			total += n
+		}
+		nops = append(nops, float64(total))
+		if total > 0 {
+			rate = append(rate, float64(l.Classes["ok"]+l.Classes["not_found"])/float64(total))
+		}
 		if o, found := l.Ops["get"]; found && o.Latency.Count > 0 {
-			g50, g99 = append(g50, o.Latency.P50), append(g99, o.Latency.P99)
+			g50, g95, g99 = append(g50, o.Latency.P50), append(g95, o.Latency.P95), append(g99, o.Latency.P99)
 		}
 		if o, found := l.Ops["put"]; found && o.Latency.Count > 0 {
-			p50, p99 = append(p50, o.Latency.P50), append(p99, o.Latency.P99)
+			p50, p95, p99 = append(p50, o.Latency.P50), append(p95, o.Latency.P95), append(p99, o.Latency.P99)
+		}
+		if l.AllOutcomes.Count > 0 {
+			a50, a95, a99 = append(a50, l.AllOutcomes.P50), append(a95, l.AllOutcomes.P95), append(a99, l.AllOutcomes.P99)
+		}
+		excl = append(excl, float64(l.Excluded))
+		for _, t := range l.Traces {
+			if t.Class == "unknown" {
+				if s.UnknownCauses == nil {
+					s.UnknownCauses = map[string]int{}
+				}
+				s.UnknownCauses[ClassifyUnknown(t)]++
+			}
 		}
 		unk = append(unk, float64(l.Classes["unknown"]))
 		ref = append(ref, float64(l.Classes["refused"]))
@@ -173,6 +212,8 @@ func (r *Report) Add(e Experiment, results []*RunResult) {
 		}
 	}
 	s.OKPerSec, s.GetP50Us, s.GetP99Us, s.PutP50Us, s.PutP99Us = Summarize(ok), Summarize(g50), Summarize(g99), Summarize(p50), Summarize(p99)
+	s.GetP95Us, s.PutP95Us, s.AllP50Us, s.AllP95Us, s.AllP99Us = Summarize(g95), Summarize(p95), Summarize(a50), Summarize(a95), Summarize(a99)
+	s.Ops, s.SuccessRate, s.Excluded = Summarize(nops), Summarize(rate), Summarize(excl)
 	s.Unknown, s.Refused, s.LongestOutage = Summarize(unk), Summarize(ref), Summarize(outage)
 	s.NodeCPU, s.NodeMaxRSSMiB, s.GeneratorCPU, s.MaxLag = Summarize(cpu), Summarize(rss), Summarize(gen), Summarize(lag)
 	for k, v := range settle {
@@ -182,15 +223,33 @@ func (r *Report) Add(e Experiment, results []*RunResult) {
 	r.Results = append(r.Results, results...)
 }
 
-// PrintReport writes the summaries as a table.
+// PrintReport writes the summaries as a table: medians over each
+// configuration's runs. The latencies are of every outcome (µs), so a failure
+// scenario's slowest operations are in them; the success-only percentiles
+// and every other figure are in the JSON.
 func PrintReport(w io.Writer, r *Report) {
-	fmt.Fprintf(w, "\n%-40s %4s %10s %8s %8s %8s %8s %9s %s\n", "configuration", "runs", "ok/s", "get p50", "get p99", "put p50", "put p99", "outage ms", "settle ms (median)")
+	fmt.Fprintf(w, "\n%-44s %4s %9s %8s %5s %5s %9s %9s %9s %9s %s\n", "configuration", "runs", "ok/s", "success", "unk", "ref",
+		"p50 all", "p95 all", "p99 all", "outage ms", "settle ms (median)")
 	for _, s := range r.Summaries {
-		settle := ""
-		for k, v := range s.Settle {
-			settle += fmt.Sprintf("%s %.0f ", k, v.Median)
+		var keys []string
+		for k := range s.Settle {
+			keys = append(keys, k)
 		}
-		fmt.Fprintf(w, "%-40s %4d %10.0f %8.0f %8.0f %8.0f %8.0f %9.0f %s\n", s.Name, s.Runs, s.OKPerSec.Median,
-			s.GetP50Us.Median, s.GetP99Us.Median, s.PutP50Us.Median, s.PutP99Us.Median, s.LongestOutage.Median, settle)
+		sort.Strings(keys)
+		settle := ""
+		for _, k := range keys {
+			settle += fmt.Sprintf("%s %.0f ", k, s.Settle[k].Median)
+		}
+		fmt.Fprintf(w, "%-44s %4d %9.0f %7.2f%% %5.0f %5.0f %9.0f %9.0f %9.0f %9.0f %s\n", s.Name, s.Runs, s.OKPerSec.Median,
+			100*s.SuccessRate.Median, s.Unknown.Median, s.Refused.Median, s.AllP50Us.Median, s.AllP95Us.Median, s.AllP99Us.Median,
+			s.LongestOutage.Median, settle)
+		if len(s.UnknownCauses) > 0 {
+			var causes []string
+			for k, n := range s.UnknownCauses {
+				causes = append(causes, fmt.Sprintf("%s %d", k, n))
+			}
+			sort.Strings(causes)
+			fmt.Fprintf(w, "%-44s unknown outcomes by cause, all runs: %s\n", "", strings.Join(causes, ", "))
+		}
 	}
 }

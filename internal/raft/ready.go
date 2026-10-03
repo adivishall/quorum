@@ -82,4 +82,5 @@ func (r *Raft) Advance() {
 	r.unstable = 0
 	r.readStates = nil
 	r.installed = nil
+	r.roundUnsent = false // its messages are sent
 }

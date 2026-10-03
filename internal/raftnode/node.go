@@ -100,6 +100,11 @@ type Config struct {
 	TickInterval   time.Duration
 	ElectionTicks  int
 	HeartbeatTicks int
+	// MaxEntriesPerMsg and MaxSizePerMsg are the core's budgets of one
+	// AppendEntries (raft.Config; zero: the core's defaults). Tests and the
+	// simulator lower them so every backlog travels in batches.
+	MaxEntriesPerMsg int
+	MaxSizePerMsg    int
 
 	// DisableSync turns OFF the fsync of the durable Raft log on every Save. It is
 	// UNSAFE and exists only for tests and benchmarks where durability is not under
@@ -187,7 +192,7 @@ func (c Config) genesis() (replication.Configuration, bool, error) {
 }
 
 // identity reconciles the group identity file with the config (docs/MEMBERSHIP.md
-// §2): an existing file must name this group and, if the config names a
+// §2): an existing file must name this node (version 2), this group and, if the config names a
 // genesis, the same one; without a file there may be no durable state yet (a
 // log or snapshot without an identity is refused), and the config must name the
 // genesis, which is then recorded durably before anything else is written.
@@ -204,6 +209,9 @@ func (c Config) identity(files snapshot.Files) (Identity, error) {
 		return Identity{}, err
 	}
 	if found {
+		if id.Node != "" && id.Node != c.ID {
+			return Identity{}, fmt.Errorf("%w: %s holds node %q's state, this node is %q", ErrIdentity, c.LogPath, id.Node, c.ID)
+		}
 		if id.Group != c.Group {
 			return Identity{}, fmt.Errorf("%w: %s holds group %d, this node is configured for group %d", ErrIdentity, c.LogPath, id.Group, c.Group)
 		}
@@ -224,7 +232,7 @@ func (c Config) identity(files snapshot.Files) (Identity, error) {
 	if !named {
 		return Identity{}, fmt.Errorf("%w: a first start needs a genesis: Peers, Bootstrap or Join", ErrIdentity)
 	}
-	id = Identity{Group: c.Group, Genesis: gen}
+	id = Identity{Group: c.Group, Genesis: gen, Node: c.ID}
 	if err := writeIdentity(c.FS, c.LogPath, id); err != nil {
 		return Identity{}, err
 	}
@@ -378,6 +386,7 @@ func Recover(cfg Config) (*Recovered, error) {
 	core, err := raft.New(raft.Config{
 		ID: cfg.ID, Conf: &base, ConfIndex: baseIndex, Rand: cfg.Rand, Log: mlog,
 		ElectionTicks: cfg.ElectionTicks, HeartbeatTicks: cfg.HeartbeatTicks,
+		MaxEntriesPerMsg: cfg.MaxEntriesPerMsg, MaxSizePerMsg: cfg.MaxSizePerMsg,
 		Term: rec.HardState.Term, Vote: rec.HardState.Vote,
 	})
 	if err != nil {
@@ -410,12 +419,19 @@ type Node struct {
 	proposeCh chan proposal
 	writeCh   chan writeReq
 	readCh    chan readReq
-	confCh    chan confReq
-	snapCh    chan chan error
-	outboxes  map[NodeID]*outbox // actor-owned; one per peer it has sent to
-	waiters   *Waiters           // requests waiting for an apply (actor-owned)
-	reads     *Reads             // unconfirmed ReadIndex requests (actor-owned)
-	changes   []*confWait        // membership changes awaiting completion (actor-owned)
+	// Requests whose clients gave up (audit M3): appended by any client
+	// goroutine, taken whole by the actor when kicked. A list, not a buffered
+	// channel: a burst of clients sharing one deadline overflowed a buffer of
+	// 256, and every notice it dropped left a waiter behind.
+	abandonMu   sync.Mutex
+	abandonList []abandoned
+	abandonKick chan struct{} // one slot: notices await the actor
+	confCh      chan confReq
+	snapCh      chan chan error
+	outboxes    map[NodeID]*outbox // actor-owned; one per peer it has sent to
+	waiters     *Waiters           // requests waiting for an apply (actor-owned)
+	reads       *Reads             // unconfirmed ReadIndex requests (actor-owned)
+	changes     []*confWait        // membership changes awaiting completion (actor-owned)
 
 	// Phase 15: the configuration last reported (actor-owned), for the
 	// raft_conf and raft_removed events and for retiring outboxes.
@@ -505,8 +521,26 @@ type readReq struct {
 }
 
 type readAccepted struct {
+	id   uint64 // the core's read id
 	done <-chan Outcome
 	err  error
+}
+
+// abandoned is a request whose client stopped waiting (its context ended)
+// after the actor accepted it: a write's waiter at index, or an unconfirmed
+// read. The actor forgets it, so a client that gives up leaves nothing behind
+// (audit M3). Nothing is decided by it: the write's entry, if it commits, is
+// applied as before, and the outcome stays unknown to that client.
+type abandoned struct {
+	index  uint64 // a write's index (readID 0)
+	readID uint64 // a read's id
+	ch     <-chan Outcome
+	// A client that gave up after the actor took its request but before it
+	// read the acceptance hands over the acceptance channel instead: the
+	// actor answered it in the same event it took the request, so by the
+	// time the actor reads this notice the acceptance is there.
+	write chan writeAccepted
+	read  chan readAccepted
 }
 
 // Status is one consistent snapshot of a node's Raft state, taken by the actor
@@ -547,11 +581,16 @@ type Status struct {
 // receive, and per-peer sender goroutines. The caller owns the transport's
 // lifecycle (Start does not close it); Close stops the driver and the durable log.
 func Start(ctx context.Context, cfg Config) (*Node, error) {
+	if cfg.TickInterval < 0 {
+		// time.NewTicker would panic in the actor, taking every group of the
+		// process down with it (audit M5): refuse it as configuration.
+		return nil, fmt.Errorf("raftnode: tick interval %s is negative", cfg.TickInterval)
+	}
 	if cfg.TickInterval == 0 {
 		cfg.TickInterval = DefaultTickInterval
 	}
 	if cfg.Rand == nil {
-		cfg.Rand = rand.New(rand.NewSource(seedFromID(cfg.ID)))
+		cfg.Rand = rand.New(rand.NewSource(seedFor(cfg.ID, cfg.Group)))
 	}
 	rc, err := Recover(cfg)
 	if err != nil {
@@ -562,19 +601,20 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 	n := &Node{
 		cfg: cfg, core: rc.Core, log: rc.Log, dur: rc.Durable, tr: cfg.Transport, sm: cfg.StateMachine,
 		ctx: nctx, cancel: cancel, done: make(chan struct{}),
-		recvCh:    make(chan raft.Message, 256),
-		chunkCh:   make(chan inChunk, 16),
-		sending:   map[NodeID]bool{},
-		proposeCh: make(chan proposal),
-		writeCh:   make(chan writeReq),
-		readCh:    make(chan readReq),
-		confCh:    make(chan confReq),
-		snapCh:    make(chan chan error),
-		outboxes:  map[NodeID]*outbox{},
-		waiters:   NewWaiters(),
-		reads:     NewReads(),
-		m:         cfg.Metrics.forGroup(cfg.Group),
-		inflight:  map[uint64]inflightWrite{},
+		recvCh:      make(chan raft.Message, 256),
+		chunkCh:     make(chan inChunk, 16),
+		sending:     map[NodeID]bool{},
+		proposeCh:   make(chan proposal),
+		writeCh:     make(chan writeReq),
+		readCh:      make(chan readReq),
+		abandonKick: make(chan struct{}, 1),
+		confCh:      make(chan confReq),
+		snapCh:      make(chan chan error),
+		outboxes:    map[NodeID]*outbox{},
+		waiters:     NewWaiters(),
+		reads:       NewReads(),
+		m:           cfg.Metrics.forGroup(cfg.Group),
+		inflight:    map[uint64]inflightWrite{},
 	}
 	n.store = n.dur
 	if n.m.enabled() {
@@ -608,8 +648,11 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 // entry is in the leader's log AND durably persisted there (so Status already
 // reflects it); raft.ErrNotLeader if this node is not the leader; the persistence
 // failure (wrapping raftlog.ErrFailed) if the entry could not be made durable, in
-// which case the node has fail-stopped; and raft.ErrStopped once the node has
-// stopped. It does not wait for commitment (there is no client commit-wait yet).
+// which case the node has fail-stopped; a state-machine failure (ErrApply) if the
+// node fail-stopped applying an earlier entry in the same cycle — this entry may
+// then be durable and sent, its outcome unknown; and raft.ErrStopped once the
+// node has stopped. It does not wait for commitment (there is no client
+// commit-wait yet).
 //
 // If ctx ends first, Propose returns ctx.Err() — and the outcome is then UNKNOWN:
 // the node may already have appended the entry. That is the same ambiguity any
@@ -644,12 +687,17 @@ func (n *Node) Propose(ctx context.Context, data []byte) error {
 //
 //   - raft.ErrNotLeader: this node did not accept the proposal; nothing was
 //     appended. The client should retry at the leader (LeaderID). Definite.
+//   - raft.ErrEntryTooLarge: data exceeds raft.MaxEntryDataLen; nothing was
+//     appended, on any node. Definite, and retrying cannot help.
+//   - raft.ErrBusy: the leader's uncommitted tail is at its bound (it is
+//     probably cut off from a quorum); nothing was appended. Definite.
 //   - ErrLost: the entry was appended but a DIFFERENT entry was committed at its
 //     index (this node lost leadership first). The write had no effect. Definite.
 //   - ctx.Err(): the outcome is UNKNOWN — the entry may still commit and apply.
 //     A client must treat it exactly as a timeout (docs/CONSISTENCY.md C4).
-//   - raft.ErrStopped, or a persistence failure: the node stopped. If the
-//     proposal had been accepted the outcome is likewise unknown.
+//   - raft.ErrStopped, or a persistence or state-machine failure (ErrApply):
+//     the node stopped. If the proposal had been accepted the outcome is
+//     likewise unknown.
 func (n *Node) Write(ctx context.Context, data []byte) (index, term uint64, result any, err error) {
 	req := writeReq{data: append([]byte(nil), data...), result: make(chan writeAccepted, 1)}
 	select {
@@ -665,6 +713,7 @@ func (n *Node) Write(ctx context.Context, data []byte) (index, term uint64, resu
 	case <-n.ctx.Done():
 		return 0, 0, nil, raft.ErrStopped
 	case <-ctx.Done():
+		n.abandon(abandoned{write: req.result})
 		return 0, 0, nil, ctx.Err()
 	}
 	if acc.err != nil {
@@ -674,7 +723,66 @@ func (n *Node) Write(ctx context.Context, data []byte) (index, term uint64, resu
 	case out := <-acc.done:
 		return acc.index, acc.term, out.Result, out.Err
 	case <-ctx.Done():
+		n.abandon(abandoned{index: acc.index, ch: acc.done})
 		return acc.index, acc.term, nil, ctx.Err()
+	}
+}
+
+// maxReadsPerCycle bounds the reads the actor takes in one cycle, so a flood
+// of reads cannot starve its other events.
+const maxReadsPerCycle = 256
+
+// acceptRead registers a ReadIndex with the core and answers its caller.
+func (n *Node) acceptRead(r readReq) {
+	rs, err := n.core.ReadIndex()
+	if err != nil {
+		r.result <- readAccepted{err: err}
+		return
+	}
+	r.result <- readAccepted{id: rs.ID, done: n.reads.Add(rs.ID, n.core.Term())}
+}
+
+// forget drops what the actor holds for an abandoned request. A read is
+// forgotten only while unconfirmed (the core drops it when it is confirmed or
+// its term ends); once confirmed it is a barrier, released as soon as its
+// index is applied.
+func (n *Node) forget(a abandoned) {
+	switch {
+	case a.write != nil:
+		select {
+		case acc := <-a.write:
+			if acc.err == nil {
+				n.waiters.Cancel(acc.index, acc.done)
+			}
+		default:
+		}
+	case a.read != nil:
+		select {
+		case acc := <-a.read:
+			if acc.err == nil {
+				n.reads.Cancel(acc.id)
+			}
+		default:
+		}
+	case a.readID != 0:
+		n.reads.Cancel(a.readID)
+	default:
+		n.waiters.Cancel(a.index, a.ch)
+	}
+}
+
+// abandon tells the actor a client stopped waiting, without ever waiting on
+// the actor.
+func (n *Node) abandon(a abandoned) {
+	if n.ctx.Err() != nil {
+		return // stopped: the actor has released everything (FailAll)
+	}
+	n.abandonMu.Lock()
+	n.abandonList = append(n.abandonList, a)
+	n.abandonMu.Unlock()
+	select {
+	case n.abandonKick <- struct{}{}:
+	default: // a kick is already pending; it takes this notice too
 	}
 }
 
@@ -684,8 +792,9 @@ func (n *Node) Write(ctx context.Context, data []byte) (index, term uint64, resu
 // after the read was registered, and the state machine has applied through it.
 // The returned index is that read index. Errors: raft.ErrNotLeader (this node is
 // not the leader, or stopped leading before the read was confirmed — retry at
-// the leader; a read has no effect either way), ctx.Err() (give up; no effect),
-// raft.ErrStopped.
+// the leader; a read has no effect either way), raft.ErrBusy (the leader has
+// its bound of reads awaiting confirmation; retry later), ctx.Err() (give up;
+// no effect), raft.ErrStopped.
 func (n *Node) ReadIndex(ctx context.Context) (uint64, error) {
 	req := readReq{result: make(chan readAccepted, 1)}
 	select {
@@ -701,6 +810,7 @@ func (n *Node) ReadIndex(ctx context.Context) (uint64, error) {
 	case <-n.ctx.Done():
 		return 0, raft.ErrStopped
 	case <-ctx.Done():
+		n.abandon(abandoned{read: req.result})
 		return 0, ctx.Err()
 	}
 	if acc.err != nil {
@@ -710,6 +820,7 @@ func (n *Node) ReadIndex(ctx context.Context) (uint64, error) {
 	case out := <-acc.done:
 		return out.Index, out.Err
 	case <-ctx.Done():
+		n.abandon(abandoned{readID: acc.id, ch: acc.done})
 		return 0, ctx.Err()
 	}
 }
@@ -822,11 +933,25 @@ func (n *Node) actorLoop() {
 				w.result <- writeAccepted{index: idx, term: term, done: n.waiters.Add(idx, term, n.core.AppliedIndex())}
 			}
 		case r := <-n.readCh:
-			rs, err := n.core.ReadIndex()
-			if err != nil {
-				r.result <- readAccepted{err: err}
-			} else {
-				r.result <- readAccepted{done: n.reads.Add(rs.ID, n.core.Term())}
+			n.acceptRead(r)
+			// Reads already waiting join this cycle: the core confirms all
+			// of them with one round (audit H4), not a round each.
+		more:
+			for i := 1; i < maxReadsPerCycle; i++ {
+				select {
+				case r := <-n.readCh:
+					n.acceptRead(r)
+				default:
+					break more
+				}
+			}
+		case <-n.abandonKick:
+			n.abandonMu.Lock()
+			list := n.abandonList
+			n.abandonList = nil
+			n.abandonMu.Unlock()
+			for _, a := range list {
+				n.forget(a)
 			}
 		case c := <-n.confCh:
 			if err := n.core.ProposeConfChange(c.cc); err != nil {
@@ -879,8 +1004,13 @@ func (n *Node) actorLoop() {
 // (fsync), then hand messages to the outboxes (DrainReadyAt) — then applies
 // committed entries (ApplyCommitted) and publishes a status snapshot. A persistence
 // failure is returned before anything of that Ready is sent or applied; so is a
-// crash-point abort (Config.Hook). A state-machine failure is logged and left for
-// the next cycle: appliedIndex does not advance past it, and the node keeps running.
+// crash-point abort (Config.Hook). So is a state-machine failure (ErrApply), and
+// the node fail-stops on it as on a persistence failure (audit M4): a committed
+// entry is the same on every replica, so a state machine that refuses it refuses
+// it on every replica and every retry — retrying each cycle stalled the group
+// forever behind it while its leader went on accepting writes it could never
+// apply. appliedIndex never advances past the refused entry, and the entries
+// applied before it in the cycle still complete their waiters.
 func (n *Node) processReady() error {
 	defer n.dur.Snap.Unstage() // a staged snapshot lives for one cycle at most
 	// Writes applied in this cycle complete when it ends — after the Status
@@ -894,10 +1024,11 @@ func (n *Node) processReady() error {
 	}
 	n.trackCommitted()
 	if err := ApplyCommitted(n.core, n.sm, n.cfg.Hook, n.applied); err != nil {
-		if !errors.Is(err, ErrApply) {
-			return err // a crash point fired
-		}
-		n.logf("event=raft_apply_failed node=%s group=%d err=%v", n.cfg.ID, n.cfg.Group, err)
+		// The entries applied before the failure complete all the same
+		// (completeApplied, deferred): publish the Status that covers them
+		// first, as a cycle that succeeds does.
+		n.snapshotStatus()
+		return err // ErrApply, or a crash point fired
 	}
 	n.trackApplied()
 	// Phase 14: snapshot and compact when the trigger says so. A state too
@@ -907,6 +1038,7 @@ func (n *Node) processReady() error {
 	snapStart := time.Now()
 	if err := n.dur.MaybeSnapshot(n.core, n.cfg.Hook); err != nil {
 		if !errors.Is(err, snapshot.ErrTooLarge) && !errors.Is(err, raft.ErrConfUnknown) {
+			n.snapshotStatus() // the cycle's applied writes complete (deferred): Status first
 			return err
 		}
 		n.logf("event=raft_snapshot_skipped node=%s applied=%d group=%d err=%v", n.cfg.ID, n.core.AppliedIndex(), n.cfg.Group, err)
@@ -957,16 +1089,21 @@ func (n *Node) completeApplied() {
 	n.completed = n.completed[:0]
 }
 
-// fail records a persistence failure and stops every goroutine of the node. The
-// actor has already sent nothing of the failed Ready and will not run again; the
-// durable log refuses further writes on its own (raftlog's latch).
+// fail records a persistence or state-machine failure and stops every
+// goroutine of the node. The actor has already sent nothing of the failed Ready
+// and will not run again; the durable log refuses further writes on its own
+// (raftlog's latch).
 func (n *Node) fail(err error) {
 	n.mu.Lock()
 	if n.err == nil {
 		n.err = err
 	}
 	n.mu.Unlock()
-	n.logf("event=raft_persist_failed node=%s group=%d err=%v", n.cfg.ID, n.cfg.Group, err)
+	event := "raft_persist_failed"
+	if errors.Is(err, ErrApply) {
+		event = "raft_apply_failed"
+	}
+	n.logf("event=%s node=%s group=%d err=%v", event, n.cfg.ID, n.cfg.Group, err)
 	n.waiters.FailAll(err)
 	n.reads.FailAll(err)
 	n.cancel()
@@ -1220,6 +1357,22 @@ func (n *Node) logf(format string, args ...any) {
 
 // seedFromID derives a deterministic rand seed from a node id, so different nodes
 // get different election timeouts without a global clock.
+// seedFor is the default election-timeout seed of a node's group: the node's,
+// mixed with the group's id so that the groups one node hosts draw different
+// timeout sequences — sharing one, they would time out and campaign together
+// after every disturbance (audit F13). Group 0, the single-group deployment,
+// keeps the node's seed.
+func seedFor(id NodeID, g replication.GroupID) int64 {
+	s := seedFromID(id)
+	if g != 0 {
+		s ^= int64(uint64(g) * 0x9E3779B97F4A7C15 >> 1)
+		if s <= 0 {
+			s = -s + 1
+		}
+	}
+	return s
+}
+
 func seedFromID(id NodeID) int64 {
 	var h int64 = 1469598103934665603 // FNV-1a 64 offset basis (low bits)
 	for _, b := range []byte(id) {

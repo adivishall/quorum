@@ -26,12 +26,18 @@ import (
 // runs with is the latest configuration entry in its log, else its snapshot's,
 // else this genesis (Raft §6).
 //
-//	one record (kind 1): magic "QGRP" | version | group | len | genesis configuration
+//	one record (kind 1): magic "QGRP" | version | group | [len | node id] | len | genesis configuration
 //
 // Integers are canonical uvarints; the configuration is
 // replication.EncodeConfiguration's bytes. A joiner's genesis is the empty
 // configuration: it knows nothing of its group until the leader that adds it
 // replicates to it.
+//
+// Version 2 (audit H1) records the node the state belongs to, and a node
+// configured as another refuses it: a group's term, vote and log are one
+// node's, and the genesis alone cannot tell — it is the same on every member.
+// Version 1, with no node id, is still read (a group created before version 2)
+// and is not rewritten; every new identity is version 2.
 
 // ErrIdentity wraps a group identity file that is corrupt, absent where the
 // node's durable state requires one, or contradicted by the node's
@@ -39,16 +45,19 @@ import (
 var ErrIdentity = errors.New("raftnode: group identity")
 
 const (
-	identityMagic   = "QGRP"
-	identityVersion = 1
-	identityKind    = record.Kind(1)
-	maxIdentityFile = 4 + 3*binary.MaxVarintLen64 + replication.MaxEncodedConfiguration + record.HeaderSize
+	identityMagic     = "QGRP"
+	identityVersionV1 = 1 // no node id
+	identityVersion   = 2
+	identityKind      = record.Kind(1)
+	maxIdentityFile   = 4 + 4*binary.MaxVarintLen64 + replication.MaxMemberLen + replication.MaxEncodedConfiguration + record.HeaderSize
 )
 
 // Identity is a group's durable identity on one node.
 type Identity struct {
 	Group   replication.GroupID
 	Genesis replication.Configuration
+	// Node is the node whose state this is; empty only in a version-1 file.
+	Node NodeID
 }
 
 func identityPath(logPath string) string    { return logPath + ".group" }
@@ -59,9 +68,19 @@ func EncodeIdentity(id Identity) ([]byte, error) {
 	if err := id.Genesis.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: genesis: %v", ErrIdentity, err)
 	}
+	if len(id.Node) > replication.MaxMemberLen {
+		return nil, fmt.Errorf("%w: node id of %d bytes", ErrIdentity, len(id.Node))
+	}
 	p := []byte(identityMagic)
-	p = binary.AppendUvarint(p, identityVersion)
-	p = binary.AppendUvarint(p, uint64(id.Group))
+	if id.Node == "" {
+		p = binary.AppendUvarint(p, identityVersionV1)
+		p = binary.AppendUvarint(p, uint64(id.Group))
+	} else {
+		p = binary.AppendUvarint(p, identityVersion)
+		p = binary.AppendUvarint(p, uint64(id.Group))
+		p = binary.AppendUvarint(p, uint64(len(id.Node)))
+		p = append(p, id.Node...)
+	}
 	conf := replication.EncodeConfiguration(id.Genesis)
 	p = binary.AppendUvarint(p, uint64(len(conf)))
 	p = append(p, conf...)
@@ -99,12 +118,21 @@ func DecodeIdentity(b []byte) (Identity, error) {
 		return v, true
 	}
 	v, ok := uint()
-	if !ok || v != identityVersion {
-		return bad("version %d (this build reads %d)", v, identityVersion)
+	if !ok || (v != identityVersion && v != identityVersionV1) {
+		return bad("version %d (this build reads %d and %d)", v, identityVersionV1, identityVersion)
 	}
 	g, ok := uint()
 	if !ok || g > uint64(^uint32(0)) {
 		return bad("group id")
+	}
+	var node NodeID
+	if v == identityVersion {
+		l, ok := uint()
+		if !ok || l == 0 || l > replication.MaxMemberLen || l > uint64(len(p)) {
+			return bad("node id")
+		}
+		node = NodeID(p[:l])
+		p = p[l:]
 	}
 	n, ok := uint()
 	if !ok || n > uint64(len(p)) || n > replication.MaxEncodedConfiguration {
@@ -117,7 +145,7 @@ func DecodeIdentity(b []byte) (Identity, error) {
 	if err != nil {
 		return bad("genesis: %v", err)
 	}
-	return Identity{Group: replication.GroupID(g), Genesis: c}, nil
+	return Identity{Group: replication.GroupID(g), Genesis: c, Node: node}, nil
 }
 
 // LoadIdentity reads the identity file beside logPath. found is false when
@@ -197,4 +225,15 @@ func exists(fsys vfs.FS, name string) (bool, error) {
 		return false, nil
 	}
 	return false, err
+}
+
+// Prepare records the identity of a group's first start — cfg's ID, Group and
+// genesis (Peers, Bootstrap or Join), beside cfg.LogPath — without starting
+// it; a later Start finds it as if its own first start had written it. An
+// identity already recorded is checked as Start checks it, and kept. A node
+// initializing its data directory prepares every group before any runs
+// (cmd/dkvd, audit H1).
+func Prepare(cfg Config) error {
+	_, err := cfg.identity(cfg.snapshotFiles())
+	return err
 }

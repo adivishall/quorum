@@ -36,6 +36,11 @@ type Raft struct {
 	heartbeatTicks     int
 	snapshotRetryTicks int
 
+	// Bounds on a leader's outstanding work (Config, audit M3), and the
+	// budgets of one AppendEntries (audit H4).
+	maxUncommittedEntries, maxUncommittedBytes, maxPendingReads int
+	maxEntriesPerMsg, maxSizePerMsg                             int
+
 	// Persistent (durable) state.
 	role        Role
 	currentTerm uint64
@@ -53,6 +58,17 @@ type Raft struct {
 	// Leader state.
 	nextIndex  map[NodeID]uint64
 	matchIndex map[NodeID]uint64
+	// uncommitted holds the data size of each entry in (commit, last], oldest
+	// first, and uncommittedBytes their sum: the leader's uncommitted tail,
+	// computed when it becomes leader and kept by its own appends and commits
+	// (a leader's log changes no other way). Not maintained off the leader.
+	uncommitted      []int
+	uncommittedBytes int
+	// cut is the peers whose last AppendEntries the budget cut short: a
+	// success from one that is still behind sends the next batch at once
+	// (audit H4) — a lagging follower catches up at the speed of round trips,
+	// not one batch per heartbeat.
+	cut map[NodeID]bool
 	// Snapshot transfers (Phase 14, docs/SNAPSHOTS.md §8): the index of the
 	// snapshot offered to each peer still being answered, and the ticks since.
 	snapPending map[NodeID]uint64
@@ -69,12 +85,17 @@ type Raft struct {
 	lastPersistedCommit uint64 // to detect a commit change worth persisting
 
 	// ReadIndex state (Phase 12, docs/DESIGN.md §8.5), leader only.
-	hbSeq      uint64            // sequence carried by the next AppendEntries this leader sends
+	hbSeq      uint64            // sequence of this leader's latest round of AppendEntries to every peer
 	ackSeq     map[NodeID]uint64 // highest sequence each peer has echoed in the current term
 	termStart  uint64            // index of this leader's election no-op
 	nextReadID uint64
 	pending    []pendingRead // registered reads awaiting a quorum of post-registration acks, FIFO
 	readStates []ReadState   // confirmed reads, drained by Ready/Advance
+	// roundUnsent: a round under hbSeq went to every peer since the last
+	// Advance — its messages are still in msgs, unsent — so a read registered
+	// now can wait for that round's acknowledgements instead of starting its
+	// own (audit H4): reads are confirmed together, not one round each.
+	roundUnsent bool
 
 	// counters record what this core did, for observability (Phase 16): plain
 	// integers nothing in the core reads.
@@ -120,6 +141,13 @@ func New(cfg Config) (*Raft, error) {
 		baseConf:           base.Clone(),
 		nextIndex:          map[NodeID]uint64{},
 		matchIndex:         map[NodeID]uint64{},
+		cut:                map[NodeID]bool{},
+
+		maxUncommittedEntries: cfg.MaxUncommittedEntries,
+		maxUncommittedBytes:   cfg.MaxUncommittedBytes,
+		maxPendingReads:       cfg.MaxPendingReads,
+		maxEntriesPerMsg:      cfg.MaxEntriesPerMsg,
+		maxSizePerMsg:         cfg.MaxSizePerMsg,
 	}
 	if len(base.Voters) == 0 && (!base.Empty() || cfg.ConfIndex > 0) {
 		// Only a joiner's genesis is voterless, and then empty and at index 0;
@@ -234,7 +262,7 @@ func (r *Raft) Tick() {
 		r.heartbeatElapsed++
 		if r.heartbeatElapsed >= r.heartbeatTicks {
 			r.heartbeatElapsed = 0
-			r.broadcastAppend()
+			r.broadcastAppend(true)
 		}
 		return
 	}
@@ -249,13 +277,25 @@ func (r *Raft) Tick() {
 }
 
 // Propose appends a client command to the leader's log and replicates it. It
-// returns ErrNotLeader on a non-leader.
+// returns ErrEntryTooLarge for a command longer than MaxEntryDataLen — on any
+// node, before anything is appended, so no node ever holds, persists or sends an
+// entry its peers or its own recovery would refuse — ErrNotLeader on a
+// non-leader, and ErrBusy when the leader's uncommitted tail is at its bound
+// (Config.MaxUncommittedEntries, MaxUncommittedBytes; audit M3). All three
+// refusals are definite.
 func (r *Raft) Propose(data []byte) error {
+	if len(data) > MaxEntryDataLen {
+		return fmt.Errorf("%w: a proposal of %d bytes, the limit is %d", ErrEntryTooLarge, len(data), MaxEntryDataLen)
+	}
 	if r.role != Leader {
 		return ErrNotLeader
 	}
+	if len(r.uncommitted) >= r.maxUncommittedEntries ||
+		r.uncommittedBytes > 0 && r.uncommittedBytes+len(data) > r.maxUncommittedBytes {
+		return fmt.Errorf("%w: %d uncommitted entries of %d bytes", ErrBusy, len(r.uncommitted), r.uncommittedBytes)
+	}
 	r.appendEntry(data)
-	r.broadcastAppend()
+	r.broadcastAppend(false)
 	r.maybeCommit() // a single-node leader (self is the quorum) commits at once
 	return nil
 }
@@ -268,9 +308,10 @@ func (r *Raft) Propose(data []byte) error {
 // until its own no-op commits, and every earlier entry is committed by then.
 //
 // The read is NOT yet safe to serve. The leader must first confirm it is still
-// the leader: it advances its heartbeat sequence and broadcasts AppendEntries
-// carrying it, and the read is confirmed only when a quorum (itself included,
-// if it is a voter) has echoed a sequence at least that high — acknowledgements
+// the leader: the read joins a round of messages not yet sent, or starts one of
+// entry-less heartbeats under a new heartbeat sequence, and is confirmed only
+// when a quorum (itself included, if it is a voter) has echoed a sequence at
+// least that high — acknowledgements
 // that were in flight before the read was registered do not count, because they
 // prove leadership only up to the time they were sent. A confirmed read appears
 // in Ready.ReadStates; the driver serves it once it has applied through its
@@ -281,6 +322,9 @@ func (r *Raft) ReadIndex() (ReadState, error) {
 	if r.role != Leader {
 		return ReadState{}, ErrNotLeader
 	}
+	if len(r.pending) >= r.maxPendingReads {
+		return ReadState{}, fmt.Errorf("%w: %d reads awaiting confirmation", ErrBusy, len(r.pending))
+	}
 	r.nextReadID++
 	rs := ReadState{ID: r.nextReadID, Index: r.log.CommitIndex()}
 	if r.termStart > rs.Index {
@@ -290,11 +334,37 @@ func (r *Raft) ReadIndex() (ReadState, error) {
 		r.readStates = append(r.readStates, rs)
 		return rs, nil
 	}
-	// The broadcast below carries hbSeq+1; only acks of that or a later sequence
-	// confirm this read.
-	r.pending = append(r.pending, pendingRead{id: rs.ID, index: rs.Index, seq: r.hbSeq + 1})
-	r.broadcastAppend()
+	// The read is confirmed by acks of a round of messages sent AFTER it was
+	// registered. A round created since the last Advance qualifies: its
+	// messages are still unsent, and every later message carries its sequence
+	// or a higher one. Otherwise the read starts a round — entry-less
+	// heartbeats, not the unacknowledged tail: the round only asks every peer
+	// to acknowledge this leader.
+	if !r.roundUnsent {
+		r.hbSeq++
+		r.roundUnsent = true
+		for _, p := range r.peers {
+			if p != r.id {
+				r.sendHeartbeat(p)
+			}
+		}
+	}
+	r.pending = append(r.pending, pendingRead{id: rs.ID, index: rs.Index, seq: r.hbSeq})
 	return rs, nil
+}
+
+// sendHeartbeat sends peer an entry-less AppendEntries under the current
+// sequence, at the index the peer is known to hold (its match, or the
+// boundary, below which nothing can be named), so it succeeds unless the peer
+// has yet to install a snapshot — and either answer acknowledges the round.
+func (r *Raft) sendHeartbeat(peer NodeID) {
+	prev := r.matchIndex[peer]
+	if base, _ := r.log.Boundary(); prev < base {
+		prev = base
+	}
+	prevTerm, _ := r.log.Term(prev)
+	r.send(Message{Type: MsgAppendRequest, To: peer, Term: r.currentTerm,
+		PrevLogIndex: prev, PrevLogTerm: prevTerm, LeaderCommit: r.log.CommitIndex(), Seq: r.hbSeq})
 }
 
 // confirmReads moves every pending read whose sequence a quorum has echoed into
@@ -330,6 +400,19 @@ func (r *Raft) Compact(index uint64) error {
 
 // Step handles one inbound message. It is the only entry point for peer traffic.
 func (r *Raft) Step(m Message) error {
+	// An AppendEntries carrying an entry larger than MaxEntryDataLen is not a
+	// message any correct leader sends (Propose refuses such an entry), and the
+	// codec refuses to decode one; a message that reaches Step without the codec
+	// is refused here too, before it has any effect — not even its term is
+	// adopted — so the log never holds an entry its own durable log would refuse
+	// to persist.
+	if m.Type == MsgAppendRequest {
+		for _, e := range m.Entries {
+			if len(e.Data) > MaxEntryDataLen {
+				return fmt.Errorf("%w: %w: entry %d of %d bytes, the limit is %d", ErrMalformedMessage, ErrEntryTooLarge, e.Index, len(e.Data), MaxEntryDataLen)
+			}
+		}
+	}
 	// A node outside this node's configuration (docs/MEMBERSHIP.md §5): its
 	// responses are dropped, and its vote request is refused — its term never
 	// adopted — unless its log is at least as up to date as this node's. A
@@ -450,15 +533,22 @@ func (r *Raft) becomeLeader() {
 	r.snapPending = map[NodeID]uint64{}
 	r.snapWait = map[NodeID]int{}
 	r.ackSeq = map[NodeID]uint64{}
+	r.cut = map[NodeID]bool{}
 	r.syncProgress() // nextIndex = last+1, matchIndex = 0 for every member
 	// The no-op entry in the current term is mandatory (docs/DESIGN.md §8.2,
 	// §5.4.2): without it a new leader cannot commit entries from prior terms —
 	// and a ReadIndex may not be served below it.
 	r.termStart = r.log.LastIndex() + 1
 	r.pending = nil
+	r.uncommitted, r.uncommittedBytes = r.uncommitted[:0], 0
+	if tail, err := r.log.Slice(r.log.CommitIndex()+1, r.termStart); err == nil {
+		for _, e := range tail {
+			r.trackUncommitted(len(e.Data))
+		}
+	}
 	r.appendEntry(nil)
 	r.heartbeatElapsed = 0
-	r.broadcastAppend()
+	r.broadcastAppend(true)
 	r.maybeCommit() // a single-node leader commits the no-op at once
 }
 
@@ -604,12 +694,21 @@ func (r *Raft) progress(peer NodeID, match uint64) {
 		return
 	}
 	r.matchIndex[peer] = match
-	r.nextIndex[peer] = match + 1
+	// Never backward: an acknowledgement of a read round's heartbeat, sent at
+	// the match index or the boundary, can report less than nextIndex already
+	// assumes, and lowering it re-sent entries the peer holds. A rejection
+	// moves nextIndex back when the peer truly lacks them.
+	r.nextIndex[peer] = max(r.nextIndex[peer], match+1)
 	if s := r.snapPending[peer]; s != 0 && match >= s {
 		delete(r.snapPending, peer)
 		delete(r.snapWait, peer)
 	}
 	r.maybeCommit()
+	// maybeCommit may have stepped this node down: the commit of its own
+	// removal's final entry. A follower sends no entries.
+	if r.role == Leader && r.cut[peer] && match < r.log.LastIndex() {
+		r.sendAppend(peer) // the next batch of a backlog the budget cut
+	}
 }
 
 // handleSnapshot is a follower offered the leader's snapshot (Raft §7). The
@@ -683,6 +782,13 @@ func (r *Raft) appendEntry(data []byte) {
 		panic("raft: leader append rejected by log: " + err.Error())
 	}
 	r.markUnstable(idx)
+	r.trackUncommitted(len(data))
+}
+
+// trackUncommitted records a leader's own append in its uncommitted tail.
+func (r *Raft) trackUncommitted(size int) {
+	r.uncommitted = append(r.uncommitted, size)
+	r.uncommittedBytes += size
 }
 
 // appendFollowerEntries installs the leader's entries after prevIndex, keeping any
@@ -795,6 +901,9 @@ func (r *Raft) sendAppend(peer NodeID) {
 	// answered or withdrawn (Tick), only heartbeat the peer — at the boundary, so
 	// the heartbeat succeeds as soon as the peer has installed the snapshot.
 	if base, baseTerm := r.log.Boundary(); next <= base {
+		// No batch is in flight now: the snapshot's acknowledgement resumes
+		// replication (handleSnapshotResponse), not a cut backlog's.
+		delete(r.cut, peer)
 		if r.snapPending[peer] == 0 {
 			r.snapPending[peer], r.snapWait[peer] = base, 0
 			r.send(Message{Type: MsgSnapshot, To: peer, Term: r.currentTerm,
@@ -807,7 +916,12 @@ func (r *Raft) sendAppend(peer NodeID) {
 	}
 	prevIndex := next - 1
 	prevTerm, _ := r.log.Term(prevIndex)
-	entries, _ := r.log.Slice(next, r.log.LastIndex()+1)
+	// At most the per-message budgets (audit H4): a backlog beyond them is
+	// sent batch by batch, each acknowledged batch sending the next.
+	last := r.log.LastIndex()
+	hi := min(last+1, next+uint64(r.maxEntriesPerMsg))
+	entries, _ := r.log.SliceBounded(next, hi, r.maxSizePerMsg)
+	r.cut[peer] = next+uint64(len(entries)) <= last
 	r.send(Message{
 		Type: MsgAppendRequest, To: peer, Term: r.currentTerm,
 		PrevLogIndex: prevIndex, PrevLogTerm: prevTerm,
@@ -818,10 +932,23 @@ func (r *Raft) sendAppend(peer NodeID) {
 // broadcastAppend sends AppendEntries (a heartbeat when there is nothing to
 // replicate) to every member — voters of both sets and learners — under a fresh
 // heartbeat sequence.
-func (r *Raft) broadcastAppend() {
+//
+// A peer streaming a backlog the budget cut has a batch in flight, and that
+// batch's acknowledgement sends the next (progress). Sending the batch again
+// with every proposal only queued copies of it ahead of the next one: the more
+// clients wrote, the further a lagging follower fell behind. Such a peer gets
+// an entry-less heartbeat instead — the round's sequence and the commit index
+// — unless retransmit is set: the heartbeat tick, which resends a batch that
+// may have been lost.
+func (r *Raft) broadcastAppend(retransmit bool) {
 	r.hbSeq++
+	r.roundUnsent = true
 	for _, p := range r.peers {
 		if p == r.id {
+			continue
+		}
+		if r.cut[p] && !retransmit {
+			r.sendHeartbeat(p)
 			continue
 		}
 		r.sendAppend(p)
@@ -872,8 +999,15 @@ func (r *Raft) commitTo(idx uint64) {
 	if last := r.log.LastIndex(); idx > last {
 		idx = last
 	}
-	if idx > r.log.CommitIndex() {
+	if old := r.log.CommitIndex(); idx > old {
 		_ = r.log.Commit(idx) // monotonic; guarded above, cannot error
+		if r.role == Leader {
+			n := min(int(idx-old), len(r.uncommitted))
+			for _, size := range r.uncommitted[:n] {
+				r.uncommittedBytes -= size
+			}
+			r.uncommitted = append(r.uncommitted[:0], r.uncommitted[n:]...)
+		}
 	}
 }
 

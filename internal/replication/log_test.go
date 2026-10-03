@@ -344,3 +344,75 @@ func TestEmptyAndNilDataArePreserved(t *testing.T) {
 		t.Errorf("empty Data became %v", b.Data)
 	}
 }
+
+// TestEntrySizeLimit: the log holds an entry of exactly MaxEntryDataLen bytes
+// and refuses one byte more — by Append and by a suffix replacement alike —
+// leaving the log unchanged (the system's one entry-size limit, C1).
+func TestEntrySizeLimit(t *testing.T) {
+	l := NewMemoryLog()
+	mustAppend(t, l, ent(1, 1))
+	atLimit := Entry{Index: 2, Term: 1, Data: bytes.Repeat([]byte{'v'}, MaxEntryDataLen)}
+	over := Entry{Index: 2, Term: 1, Data: bytes.Repeat([]byte{'v'}, MaxEntryDataLen+1)}
+
+	if err := l.Append(over); !errors.Is(err, ErrEntryTooLarge) {
+		t.Fatalf("Append of a %d-byte entry = %v, want ErrEntryTooLarge", len(over.Data), err)
+	}
+	if err := l.TruncateAndAppend(over); !errors.Is(err, ErrEntryTooLarge) {
+		t.Fatalf("TruncateAndAppend of a %d-byte entry = %v, want ErrEntryTooLarge", len(over.Data), err)
+	}
+	// A refused batch has no effect, even when an acceptable entry precedes the
+	// oversized one.
+	if err := l.Append(ent(2, 1), Entry{Index: 3, Term: 1, Data: over.Data}); !errors.Is(err, ErrEntryTooLarge) {
+		t.Fatalf("Append of a batch ending in an oversized entry = %v, want ErrEntryTooLarge", err)
+	}
+	if l.LastIndex() != 1 {
+		t.Fatalf("LastIndex() = %d after refused appends, want 1", l.LastIndex())
+	}
+
+	mustAppend(t, l, atLimit)
+	got, err := l.At(2)
+	if err != nil || len(got.Data) != MaxEntryDataLen {
+		t.Fatalf("At(2) = %d bytes, %v; want the %d-byte entry", len(got.Data), err, MaxEntryDataLen)
+	}
+}
+
+// TestSliceBounded: the longest prefix within the byte budget — and at least
+// one entry, whatever its size — with the range checks of Slice.
+func TestSliceBounded(t *testing.T) {
+	l := NewMemoryLog()
+	for i, n := range []int{10, 10, 50, 10} {
+		if err := l.Append(Entry{Index: uint64(i + 1), Term: 1, Data: make([]byte, n)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		lo, hi uint64
+		max    int
+		want   int
+	}{
+		{1, 5, 20, 2},   // 10+10; the 50 would pass the budget
+		{1, 5, 19, 1},   // only the first fits
+		{3, 5, 20, 1},   // the 50 alone: never empty
+		{1, 5, 1000, 4}, // everything
+		{1, 3, 1000, 2}, // never past hi
+		{2, 2, 1000, 0}, // an empty range is empty
+	} {
+		es, err := l.SliceBounded(tc.lo, tc.hi, tc.max)
+		if err != nil || len(es) != tc.want {
+			t.Fatalf("SliceBounded(%d, %d, %d) = %d entries, %v; want %d", tc.lo, tc.hi, tc.max, len(es), err, tc.want)
+		}
+		for i, e := range es {
+			if e.Index != tc.lo+uint64(i) {
+				t.Fatalf("SliceBounded(%d, %d, %d): entry %d has index %d", tc.lo, tc.hi, tc.max, i, e.Index)
+			}
+		}
+	}
+	if _, err := l.SliceBounded(2, 6, 100); err != ErrOutOfRange {
+		t.Fatalf("past the end: %v, want ErrOutOfRange", err)
+	}
+	es, _ := l.SliceBounded(1, 2, 100)
+	es[0].Data[0] = 7
+	if e, _ := l.At(1); e.Data[0] != 0 {
+		t.Fatal("SliceBounded returned the log's own bytes, not a copy")
+	}
+}

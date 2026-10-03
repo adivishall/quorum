@@ -414,9 +414,10 @@ A linearizable read does **not** go through the log. It does this:
 2. Leader confirms it is still leader by exchanging heartbeats with a **quorum**. *(Phase 12: the
    heartbeat carries a sequence number `Seq`, incremented per broadcast; every AppendEntries
    response — success or rejection — echoes it; the read is confirmed only when a quorum,
-   the leader included, has echoed a sequence at least that of the broadcast sent when the read
-   was registered. An acknowledgement of an earlier heartbeat proves leadership only up to when it
-   was sent and does not count. A leader that steps down drops every unconfirmed read.)*
+   the leader included, has echoed a sequence at least that of a round sent after the read was
+   registered — one still unsent when it registered, which it joins, or one it starts. An
+   acknowledgement of an earlier heartbeat proves leadership only up to when it was sent and does
+   not count. A leader that steps down drops every unconfirmed read.)*
 3. Leader waits until `appliedIndex >= readIndex`.
 4. Read from the state machine.
 
@@ -456,7 +457,9 @@ offset  size  field
 
 Handshake on connect: `"DKV1"` magic + 4-byte protocol version + length-prefixed node ID, so a
 misdirected or wrong-version connection fails immediately instead of being interpreted as a
-frame. Exact grammar, sizes, and timeouts: `docs/TRANSPORT.md` §3.
+frame. Since version 2 it also carries the cluster id and the replica-settings digest and is
+answered, so a node of another cluster, or with other settings, is refused both ways. Exact
+grammar, sizes, and timeouts: `docs/TRANSPORT.md` §3.
 
 Message types: `Probe` and `ProbeResponse` (liveness) are implemented in Phase 7. `RequestVote`,
 `AppendEntries` and their responses are **implemented in Phase 9** — the codec lives in

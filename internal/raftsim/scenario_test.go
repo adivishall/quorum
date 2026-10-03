@@ -464,6 +464,13 @@ func TestStaleSuccessDoesNotRegressReplication(t *testing.T) {
 	// Deliver the NEWER first, then the stale one.
 	s.do(Event{Kind: Deliver, From: "n2", To: "n1", Pos: 1})
 	s.do(Event{Kind: Deliver, From: "n2", To: "n1", Pos: 0})
+	// The leader's record of n2 stays at 3: a match index that went back
+	// would count n2 toward a quorum it is past, and probe it below its log.
+	// (Since an acknowledgement never lowers nextIndex, the heartbeat below
+	// alone no longer shows a regressed match.)
+	if m := s.nodes["n1"].core.Progress()["n2"]; m != 3 {
+		t.Fatalf("after a stale ack the leader's match index for n2 is %d, want 3 (progress regressed)", m)
+	}
 	s.dropAll(func(m raft.Message) bool { return m.To == "n2" })
 	s.tick("n1", raft.DefaultHeartbeatTicks)
 

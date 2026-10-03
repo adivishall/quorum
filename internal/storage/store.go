@@ -11,7 +11,9 @@ package storage
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/adivishall/quorum/internal/record"
 	"github.com/adivishall/quorum/internal/storage/bloom"
 	"github.com/adivishall/quorum/internal/storage/sstable"
 	"github.com/adivishall/quorum/internal/storage/wal"
@@ -162,6 +164,11 @@ func (o *Options) applyLSMDefaults() {
 	}
 }
 
+// maxKeyValueBytes is the most key and value bytes one put may carry: a WAL
+// record's maximum, less a one-operation batch's framing (a count, a kind and
+// two lengths, each at most a 10-byte varint).
+const maxKeyValueBytes = record.MaxRecordSize - 64
+
 // validate reports whether the options are usable.
 func (o Options) validate() error {
 	if o.MaxKeySize <= 0 {
@@ -169,6 +176,11 @@ func (o Options) validate() error {
 	}
 	if o.MaxValueSize < 0 {
 		return opErr("open", nil, ErrInvalidOptions)
+	}
+	// A put is one WAL record: the largest key and value, framed as a batch,
+	// must fit the record format, or a valid put would be refused by the log.
+	if int64(o.MaxKeySize)+int64(o.MaxValueSize) > maxKeyValueBytes {
+		return opErr("open", nil, fmt.Errorf("%w: MaxKeySize + MaxValueSize exceeds %d bytes, the largest a WAL record holds", ErrInvalidOptions, maxKeyValueBytes))
 	}
 	if o.MemTableSize < 0 || o.BlockSize < 0 {
 		return opErr("open", nil, ErrInvalidOptions)

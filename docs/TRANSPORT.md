@@ -3,7 +3,7 @@
 Status: **implemented and verified (Phase 7).** This document specifies the internal transport
 precisely enough to reimplement or fuzz, and binds each guarantee to a test in
 `internal/transport` and `tests/integration`. It is the reference for `internal/transport`,
-`cmd/dkvd`, ADR-013, ADR-014, and invariants INV-T1..T6 (`docs/INVARIANTS.md`).
+`cmd/dkvd`, ADR-013, ADR-014, and invariants INV-T1..T7 (`docs/INVARIANTS.md`).
 
 The transport moves opaque messages between nodes over framed TCP. It does **not** know Raft,
 shards, storage, or key/value semantics — it carries bytes tagged with a message kind and
@@ -72,35 +72,68 @@ travels in chunks of at most 1 MiB — `docs/SNAPSHOTS.md` §9.)
 
 ## 3. Handshake
 
-Exactly once per connection, before any frame, the **dialer sends** and the **accepter reads**:
+Exactly once per connection, before any frame, the **dialer sends its hello** and the
+**accepter answers** with a status and its own hello (version 2; audit H2, H5):
 
 ```
-offset  size  field
-0       4     magic     "DKV1"  (0x44 0x4B 0x56 0x31)
-4       4     version   uint32 little-endian   (current: 1)
-8       2     idLen     uint16 little-endian   (1 .. MaxNodeIDLen)
-10      idLen nodeID    the sender's node id, opaque bytes
+dialer -> accepter                       accepter -> dialer
+offset  size  field                      offset  size  field
+0       4     magic "DKV1"               0       4     magic "DKV1"
+4       4     version u32 LE (2)         4       4     version u32 LE (2)
+                                         8       1     status
+8       2     idLen u16 LE               9       2     idLen u16 LE
+10      idLen node id                    11      idLen node id
+.       2     clusterLen u16 LE          .       2     clusterLen u16 LE
+.       len   cluster id                 .       len   cluster id
+.       1     digestLen u8               .       1     digestLen u8
+.       len   settings digest            .       len   settings digest
 ```
 
-The handshake is **one-way**: the dialer announces itself, the accepter validates and either
-keeps or closes the connection. The accepter already knows its own identity and the peer it
-expects on that dial direction (§4), so no reply handshake is needed; the first valid framed
-message confirms the channel end to end.
+Each side announces **who it is** (its node id), **which cluster it belongs to** (the cluster id
+its data directory records, `docs/MULTI_RAFT.md` §5) and **the digest of its replica settings**
+(`cmd/dkvd`: the SHA-256 of the settings its data directory pins — the session limits, and in
+`-cluster` mode the routing — which every replica of a group must share). A connection is used
+only if both sides agree on both:
+
+- A **node of another cluster** — a wrong `-peers` entry, a recycled address, a copied unit file —
+  is never heard as a peer (audit H2). Before version 2 any process that announced a configured
+  peer's id was that peer: its votes and acknowledgements counted as the real node's.
+- **Nodes whose replica settings differ** never exchange a frame (audit H5): their replicas would
+  decide the same entries differently and diverge.
+- The **dialer checks who answered**: an accepter announcing another id than the peer dialed (a
+  stale address now serving another node) is dropped (`ErrWrongPeer`), as is one of another
+  cluster or other settings — the check is made on both sides, so neither relies on the other's.
+
+Accepter statuses: `0` accepted, `1` unknown peer, `2` another cluster, `3` other settings, `4`
+self-connection, `5` wrong direction (a known peer with the LARGER id dialed; the smaller id
+dials, §4 — such a claim never comes from that peer, so it may not take its slot). Any status but
+`0` closes the connection on both sides and is logged on both (`event=handshake_failed`, the
+claimed id quoted: it is unauthenticated, `TestAnUnauthenticatedIDCannotForgeLogLines`); the
+dialer retries at its interval, so a node whose cluster or settings are fixed connects again.
+Cluster ids and digests are opaque here: empty values are equal only to empty values (the
+in-process library tests set neither).
 
 - **No checksum.** The magic gates a wrong service, the version gates a wrong protocol, and the
-  bounded lengths gate a malformed preamble; the node id is opaque either way. Every subsequent
-  frame is checksummed.
-- `MaxNodeIDLen = 256` bytes. `idLen == 0` is rejected (`ErrEmptyNodeID`).
-- **Handshake timeout:** the whole handshake must complete within `HandshakeTimeout`
-  (default 5 s) or the connection is closed (`ErrHandshakeTimeout`).
+  bounded lengths gate a malformed preamble. Every subsequent frame is checksummed.
+- Bounds: `MaxNodeIDLen = 256`, `MaxClusterIDLen = 256`, `MaxDigestLen = 64` bytes; every length
+  is checked before anything is allocated. `idLen == 0` is rejected (`ErrEmptyNodeID`).
+- **Handshake timeout:** each side's whole handshake must complete within `HandshakeTimeout`
+  (default 5 s) or the connection is closed (`ErrHandshakeTimeout`): an accepter that never
+  answers is dropped and redialled, never registered.
+- **Bounded pending handshakes:** at most `MaxPendingHandshakes` (default 64) inbound
+  connections may be in their handshake at once; beyond it a new one is closed at once
+  (`dkv_transport_handshakes_refused_total{reason="busy"}`), so unauthenticated connections cannot
+  each hold a descriptor and a goroutine for the timeout without bound.
 - **Rejections** (all close the connection): wrong magic → `ErrBadMagic`; unknown version →
-  `ErrVersionMismatch`; `idLen` out of range → `ErrHandshakeTooLarge`; short read →
-  `ErrTruncatedHandshake`.
-- **Self-connection:** a handshake whose node id equals the local node id is rejected
-  (`ErrSelfConnection`).
-- **Unknown peer:** a handshake from an id that is not a configured peer is rejected
-  (`ErrUnknownPeer`). A peer must not exchange application messages until its handshake
-  succeeds (INV-T3).
+  `ErrVersionMismatch`; a length out of range → `ErrHandshakeTooLarge`; short read →
+  `ErrTruncatedHandshake`; unknown reply status → `ErrMalformedHandshake`. A peer must not
+  exchange application messages until its handshake succeeds (INV-T3).
+- **Compatibility:** version 1 (a one-way hello with no cluster or settings) is refused
+  (`ErrVersionMismatch`): every node of a cluster must run a version-2 binary; a rolling upgrade
+  from a version-1 binary is not supported.
+
+This is **identity and configuration agreement, not authentication** (§10): a process that
+knows the cluster id and the settings can still claim any configured id.
 
 ## 4. Connection model (ADR-014)
 
@@ -195,8 +228,17 @@ All bounded; none is an arbitrary huge value. Defaults, all configurable:
 |---|---|---|
 | dial timeout | 3 s | dial fails, dial loop retries |
 | handshake timeout | 5 s | connection closed |
-| write deadline (per frame) | 5 s | write fails → connection torn down |
+| write deadline (per frame) | 5 s | write fails → connection closed at once (audit M2): a frame cut off part-way has left part of itself on the wire, so nothing more may be written into that stream; its reader loop deregisters it and the dialer reconnects |
 | read idle deadline | 0 in the library (disabled); `cmd/dkvd` sets ~120 ticks | a connection that delivers no frame for this long is treated as dead and torn down, so the dialer reconnects |
+
+A caller's context bounds only the wait for a connection's writer: once a frame has started,
+only the write deadline bounds it, so one group's cancelled request never cuts a frame short on
+the connection every group of the node shares. `Send` refuses a payload over `MaxFrameSize` before
+writing anything (`ErrFrameTooLarge`), since the peer would refuse it and drop the connection.
+An `Accept` error (descriptors exhausted) is logged (`event=accept_failed`, counted in
+`dkv_transport_accept_failures_total`) and retried after a pause growing to 1 s; before, the accept
+loop returned for good while the listener stayed open, so peers connected into its backlog and
+were silently black-holed.
 
 Correctness does not depend on any of these firing (safety is not timing-dependent,
 `docs/FAILURE_MODEL.md` §2); they exist so nothing blocks forever. Shutdown unblocks a blocked
@@ -224,9 +266,11 @@ in-process transport test asserts no goroutine leak across construct/exchange/cl
 
 ## 10. Security boundary
 
-Phase 7 transport is **unauthenticated plaintext TCP**. No TLS, no authentication. The handshake
+The transport is **unauthenticated plaintext TCP**. No TLS, no authentication. The handshake
 node id is a protocol-level label, not a cryptographic identity — a peer on the network could
-present any id. What is enforced regardless: bounded frame size, bounded handshake, bounded node
+present any id, and the cluster id and settings digest (§3) are not secrets: they stop a
+misconfigured or misaddressed node of another cluster, never a malicious one. What is enforced
+regardless: bounded frame size, bounded handshake, bounded node
 id, bounded allocations, and rejection (never a panic) on any malformed input. Authentication
 and transport encryption are out of scope for v1 (`docs/LIMITATIONS.md`).
 
@@ -269,10 +313,17 @@ connection (`TestAddPeerConnectsAndRemovePeerDisconnects`). `Probe` is a livenes
 |---|---|---|
 | INV-T1 | Frame parsing is bounded and explicit: a declared length over `MaxFrameSize` is rejected before allocation, and a frame is read with `io.ReadFull`-discipline regardless of TCP fragmentation. | `TestFrameTooLargeIsRejectedBeforeAlloc`, `TestFrameReassembledFromFragments`, `TestConcatenatedFramesDecodeIndividually`, `FuzzFrameDecode` |
 | INV-T2 | Malformed transport input is rejected as a protocol error and the connection is closed — never repaired, resynchronised, or interpreted as valid data (a socket is not a WAL). | `TestTruncatedFrameIsError`, `TestBadChecksumIsError`, `TestUnknownKindIsError`, `TestHandshakeBadMagicRejected`, `TestHandshakeVersionMismatchRejected`, `TestProbeMalformedRejected`, `FuzzFrameDecode`, `FuzzHandshakeDecode`, `FuzzProbeDecode` |
-| INV-T3 | A successful handshake precedes any application message; a connection that fails the handshake exchanges no frames. | `TestSelfConnectionRejected`, `TestUnknownPeerRejected`, `TestHandshakeTimeoutClosesConnection`, `TestBadMagicClosesConnection`, `TestHandshakeTruncatedRejected` |
+| INV-T3 | A successful handshake precedes any application message; a connection that fails the handshake exchanges no frames. Both sides must agree on the cluster id and the settings digest, and the dialer must have reached the peer it dialed. | `TestSelfConnectionRejected`, `TestUnknownPeerRejected`, `TestHandshakeTimeoutClosesConnection`, `TestBadMagicClosesConnection`, `TestHandshakeTruncatedRejected`, `TestNodesOfAnotherClusterNeverConnect`, `TestNodesWithOtherReplicaSettingsNeverConnect`, `TestDialerChecksTheAnswer`, `TestInboundFromTheWrongDirectionIsRefused`, `TestDialerDropsAPeerThatNeverAnswers`, and the real-process `TestRealImpostorsNeverJoinTheGroup` |
 | INV-T4 | Each received message is attributed to the peer identity established by the handshake on its connection, never to a value carried in the payload. | `TestTCPHandshakeAndProbe`, `TestPayloadCannotSpoofSender` |
 | INV-T5 | Frames on a single connection are delivered in send order, and a frame is written in full (even across short writes) so its bytes never interleave or truncate. | `TestPerConnectionOrderPreserved`, `TestConcurrentSendersDoNotInterleave`, `TestFrameSurvivesPartialWrites`, `TestWriteErrorAfterPartialWriteIsReturned`, `TestZeroProgressWriterDoesNotLoopForever` |
 | INV-T6 | Node shutdown terminates all transport resources: accept loop, dial loops, reader and writer paths, and connections; repeated shutdown is safe; no goroutine leak. | `TestCloseIsIdempotent`, `TestNoGoroutineLeakAfterClose`, `TestSendAfterCloseFails`, and the three-process `TestThreeNodeClusterProbesAndShutsDownCleanly` |
+| INV-T7 | A connection whose write failed or timed out is never written to again: it is closed at once and redialled. A frame the peer would refuse is never written. Accept errors never stop the accept loop, and connections in their handshake are bounded. | `TestFailedWriteClosesTheConnection`, `TestSendRefusesAFrameItsPeerWouldRefuse`, `TestAcceptLoopSurvivesAcceptErrors`, `TestPendingHandshakesAreBounded` |
+
+Mutants 197–213 (`scripts/mutation.sh`) break each rule of INV-T3's checks and INV-T7 in turn —
+each side's cluster, settings, peer and direction checks, closing after a failed write, the frame
+size check, the accept retry, the handshake bound and its release, the handshake deadlines and
+their interruption by shutdown, the per-read idle timeout, and `dkvd` passing its identity to the
+transport — and each is killed by the test named for it.
 
 INV-C4 (Phase 6) is **VERIFIED** since Phase 15, when routing was integrated into request serving
 (`docs/INVARIANTS.md`, `docs/MULTI_RAFT.md` §6). Phase 7 added no Raft invariant; INV-R1..R10 were established in Phase 9 (`docs/RAFT.md`) and re-verified

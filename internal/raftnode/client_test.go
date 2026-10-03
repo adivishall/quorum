@@ -106,20 +106,11 @@ func TestIsolatedLeaderCannotServeAReadOrCompleteAWrite(t *testing.T) {
 	net := fault.NewNetwork()
 	h := startClusterWith(t, ctx, 3, func(tr transport.Transport) transport.Transport { return net.Wrap(tr) })
 	defer h.stop()
-	l := h.waitLeader(5 * time.Second)
-	if _, _, err := writeWithin(h.nodes[l], []byte("before"), 5*time.Second); err != nil {
+	l0 := h.waitLeader(5 * time.Second)
+	if _, _, err := writeWithin(h.nodes[l0], []byte("before"), 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	var members []string
-	for _, id := range h.ids {
-		members = append(members, string(id))
-	}
-	net.Isolate(string(l), members)
-	// Give the isolation a moment to take effect for in-flight acks, then ask.
-	time.Sleep(100 * time.Millisecond)
-	if h.nodes[l].Status().Role != raft.Leader {
-		t.Skip("the isolated node already stepped down (timing); nothing to prove here")
-	}
+	l := isolateTheLeader(t, h, net)
 	if ri, err := readWithin(h.nodes[l], 600*time.Millisecond); !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, raft.ErrNotLeader) {
 		t.Fatalf("an isolated leader served a read at %d (err=%v): a stale read", ri, err)
 	}
@@ -158,15 +149,7 @@ func TestWriteReportsLostWhenItsEntryIsOverwritten(t *testing.T) {
 	if _, _, err := writeWithin(h.nodes[l], []byte("base"), 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	var members []string
-	for _, id := range h.ids {
-		members = append(members, string(id))
-	}
-	net.Isolate(string(l), members)
-	time.Sleep(50 * time.Millisecond)
-	if h.nodes[l].Status().Role != raft.Leader {
-		t.Skip("the leader stepped down before the isolated write (timing)")
-	}
+	l = isolateTheLeader(t, h, net)
 	// The isolated leader accepts a write it can never commit; the client waits
 	// on it with a long deadline while the rest of the group moves on.
 	type res struct {
@@ -242,4 +225,32 @@ func TestWriteCompletionFollowsItsStatus(t *testing.T) {
 			t.Fatalf("write %d completed at index %d while the node's Status says applied %d", i, idx, st.Applied)
 		}
 	}
+}
+
+// isolateTheLeader cuts the current leader off from every other node and
+// returns it, still leading. Once isolated nothing reaches it, and with no
+// CheckQuorum it leads until it hears a higher term; but a follower may time
+// out — the leader's heartbeats delayed — just before the isolation took
+// effect, and depose it. Then the isolation is undone and tried again with
+// the new leader, so the tests that need an isolated leader never skip on
+// that timing.
+func isolateTheLeader(t *testing.T, h *harness, net *fault.Network) NodeID {
+	t.Helper()
+	var members []string
+	for _, id := range h.ids {
+		members = append(members, string(id))
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		l := h.waitLeader(10 * time.Second)
+		net.Isolate(string(l), members)
+		// In-flight messages, a vote request among them, are delivered or lost
+		// within this.
+		time.Sleep(100 * time.Millisecond)
+		if h.nodes[l].Status().Role == raft.Leader {
+			return l
+		}
+		net.HealAll()
+	}
+	t.Fatal("the leader was deposed just before each of 5 isolations")
+	return ""
 }

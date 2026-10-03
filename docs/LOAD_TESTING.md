@@ -16,8 +16,18 @@ For each run, from the clients' side:
 - **Late operations:** those due in the window that completed after it. Any at all means the
   offered rate exceeded what the cluster sustained, and the latencies include the backlog. The
   summary prints a warning.
-- **Latency per operation:** exact nearest-rank percentiles (p50, p90, p95, p99, p99.9, max) over
-  every completed operation of the window. No histogram, no sampling, no interpolation.
+- **Latency per operation:** exact nearest-rank percentiles (p50, p90, p95, p99, p99.9, max). No
+  histogram, no sampling, no interpolation. Two populations, both over the operations due in the
+  window:
+  - `latency` — the **successes** (`ok`, `not_found`) only;
+  - `latency_all_outcomes` — **every** operation, each measured to its definite answer or to the
+    client giving up, with `excluded_from_latency` counting what `latency` leaves out.
+
+  The refused and unknown operations are usually the slowest — they waited out their retries — so
+  in a failure scenario the success-only percentiles understate the tail; the summary prints the
+  every-outcome rows (`put*`) whenever anything was excluded (`TestFailedOperationsAreNotHiddenFromLatency`).
+  Before this distinction (audit), only the successes' durations were recorded, though this
+  section said every completed operation counted.
 - **Outcomes, by the class a client must act on** (`docs/CLIENT_SEMANTICS.md` §6):
   - `ok`;
   - `not_found`;
@@ -71,6 +81,71 @@ For a `-cluster` deployment add the cluster's routing (`-shards -rf -nodes`, exa
 `dkvd` was started); without it every key is group 0. The JSON records the configuration, the
 environment (CPU model and count, memory, OS and version, Go version, git commit and dirty flag)
 and every number in the summary.
+
+## 4a. Evidence, not only statistics: histories and traces
+
+Two options make a run leave a record of each operation, not only aggregates. Neither is on the
+default path, so a run without them measures exactly what it did before.
+
+**`Config.History`** is a `lincheck.Recorder`. Every operation the run issues, the warmup's
+included, is recorded for the linearizability checker:
+- the client and the kind, key and value;
+- the session identity `(group << 48 | session id, request id)`, since session ids are local to a
+  group (`docs/MULTI_RAFT.md` §6);
+- every attempt, with the node it went to and the answer it got;
+- the outcome. An unknown one is recorded **Incomplete**, never dropped.
+
+Each PUT's value begins `c<client>.<seq>.`, padded to `-value`, so every write is distinguishable.
+The chaos runner (`docs/CHAOS.md`) records its workload this way and checks the history.
+`TestHistoryRecordsEveryOperation` pins three things against an in-process linearizable server
+with sessions:
+- every issued operation is in the history;
+- writes whose first answer was lost are settled by a retry and recorded once, with both attempts;
+- the history checks.
+
+**`Config.Trace`** (`dkvload`/`dkvlab -trace`) keeps, for every operation that ended refused or
+unknown, its attempt-by-attempt trace: node, offset, duration, status or error, the leader it
+named. At most 5,000 traces are kept per run; the result counts the rest.
+`TestTracesKeepEveryUnknownOperation` pins that every unknown outcome is traced and recorded
+Incomplete. `lab.ClassifyUnknown` reads a trace's cause:
+
+| Cause | Meaning |
+|---|---|
+| `unanswered-then-refused` | an attempt went unanswered (the request may have taken effect), and every attempt after it was a definite refusal that reached no leader, until the attempts ran out |
+| `unanswered-at-give-up` | the last attempt itself was unanswered |
+| `cancelled` | the run's context ended |
+| `other` | none of these |
+
+Applied to the rolling restart, this explained its unknown outcomes (`docs/CLUSTER_BENCHMARKS.md`
+§11).
+
+## 4b. Experiment matrices (`dkvlab`)
+
+`dkvlab`'s cluster and workload flags take comma lists, and it runs every combination, `-runs`
+times each:
+- cluster: `-nodes`, `-shards` (groups, in `-mode cluster`);
+- workload: `-clients`, `-read`, `-value`, `-max-attempts`.
+
+```bash
+dkvlab -scenario steady -nodes 1,3,5 -read 5,50,95 -runs 3 -out matrix.json
+dkvlab -scenario steady -mode cluster -shards 1,4,16 -clients 4,16 -value 100,1024 -out groups.json
+```
+
+Also: `-delete`, `-keys`, `-dist uniform|zipf`, `-seed`, `-duration`, `-warmup`, `-rate`. The fault
+schedule is the scenario: `leader-kill`, `rolling-restart`, `membership`, `snapshots`, or `chaos`
+with its seed. A dimension that varies is named in each configuration's name (`/c16`, `/v1024`,
+`/a30`).
+
+**A configuration's summary is never success-only.** For each configuration, over its runs
+(median, range and spread; p95 at 10 or more runs):
+- operations, success rate, and refused and unknown counts;
+- every-outcome p50, p95 and p99: each operation measured to its definite answer or to its client
+  giving up;
+- the success-only percentiles beside them, with how many operations they exclude;
+- throughput, the longest outage, each action's settle time (election or catch-up);
+- with `-trace`, the unknown outcomes by cause.
+
+The printed table leads with the every-outcome percentiles. The JSON holds every run in full.
 
 ## 5. What a result does not mean
 

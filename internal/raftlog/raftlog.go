@@ -64,10 +64,12 @@ const (
 	// normal entries keep their encoding; only typed ones use this kind.
 	kindEntryTyped record.Kind = 4
 
-	// MaxEntryDataLen bounds one entry's opaque bytes on disk (the 1 MiB value
-	// limit, docs/DESIGN.md §1), so a corrupt length cannot drive a wild alloc
-	// beyond what record.MaxRecordSize already bounds.
-	MaxEntryDataLen = 1 << 20
+	// MaxEntryDataLen bounds one entry's opaque bytes on disk: the system's one
+	// entry-size limit, replication.MaxEntryDataLen. Save refuses to write a
+	// larger entry and replay refuses to read one — the same bound on both
+	// sides, so the log never persists what its own recovery would refuse — and
+	// a corrupt length cannot drive a wild allocation.
+	MaxEntryDataLen = replication.MaxEntryDataLen
 	// MaxVoteLen bounds a persisted votedFor id.
 	MaxVoteLen = 256
 )
@@ -361,9 +363,21 @@ func InspectFS(fsys vfs.FS, path string) (*Recovered, error) {
 // If any write or the fsync fails, the Log is failed from then on: this and every
 // later Save return an error wrapping ErrFailed and the original cause, and no
 // further byte is written (INV-F1).
+//
+// An entry longer than MaxEntryDataLen — which replay would refuse to read — is
+// never written: Save checks every entry before writing any byte, and refuses
+// the whole Save with an error wrapping replication.ErrEntryTooLarge. That fails
+// the Log too, because its caller already holds the entry and cannot go on as
+// if it were durable; but nothing reached the file, so the log on disk stays
+// exactly what it was and the node restarts from it.
 func (l *Log) Save(hs *HardState, entries []Entry) error {
 	if l.failed != nil {
 		return l.failed
+	}
+	for _, e := range entries {
+		if len(e.Data) > MaxEntryDataLen {
+			return l.fail(fmt.Errorf("%w: entry %d of %d bytes, the limit is %d", replication.ErrEntryTooLarge, e.Index, len(e.Data), MaxEntryDataLen))
+		}
 	}
 	lead, trail := SavePlan(l.hs, hs, entries)
 	if lead != nil {

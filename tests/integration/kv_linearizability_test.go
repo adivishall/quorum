@@ -226,7 +226,7 @@ func (r *linRun) check() lincheck.Result {
 // output — to a directory that outlives the test and fails with its path.
 func (r *linRun) fail(format string, args ...any) {
 	r.t.Helper()
-	dir, err := os.MkdirTemp("", "dkv-lin-"+strings.ReplaceAll(r.t.Name(), "/", "_")+"-")
+	dir, err := os.MkdirTemp(artifactRoot(), "dkv-lin-"+strings.ReplaceAll(r.t.Name(), "/", "_")+"-")
 	msg := fmt.Sprintf(format, args...)
 	if err == nil {
 		r.mu.Lock()

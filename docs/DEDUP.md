@@ -79,7 +79,10 @@ replica decides every entry identically; the simulator checks exactly that at ev
 
 The **limits are part of the state machine's definition**. Two replicas with different limits
 decide differently and diverge; `dkvd -session-max/-session-max-unacked` must be identical on
-every node of a group, restarts included. Nothing detects a mismatch today (a limitation, §10).
+every node of a group, restarts included. `dkvd` enforces it: a node's data directory pins the
+limits it was initialized with and refuses a start with others, and the transport handshake
+carries a digest of them, so nodes whose limits differ never connect (`docs/MULTI_RAFT.md` §5,
+`docs/TRANSPORT.md` §3; audit H5).
 
 ## 4. Durability and recovery: the log is the persistence
 
@@ -235,7 +238,9 @@ killers.
   INV-SN5; mutants 101 and 120 leave the table out and are killed). A write whose index a follower
   replaced by installing a snapshot before applying it is **unknown** (`ErrSuperseded`, status
   `UNKNOWN_OUTCOME`), to be retried under its identity.
-- **Limits are configuration that must agree**, and nothing checks that they do.
+- **Limits are configuration that must agree.** `dkvd` refuses to change them on a restart and
+  never connects nodes whose limits differ (§3), but they cannot be changed for a running group:
+  doing so needs a new cluster (limits carried in the log would lift this).
 - **No authentication.** A client presenting another client's ClientID is that client
   (CLIENT_SEMANTICS §2).
 - **No time-based expiry.** An idle session lives until 1024 newer sessions have been used after

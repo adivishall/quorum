@@ -17,7 +17,7 @@ startup error. One registry per process holds every layer's families, so a node 
 reports each group as its own series (label `group`).
 
 ```bash
-dkvd -id n1 -listen 127.0.0.1:7001 -peers n2=...,n3=... -raft -data-dir d1 \
+dkvd -id n1 -listen 127.0.0.1:7001 -peers n2=...,n3=... -raft -data-dir d1 -init -cluster-id demo \
      -client-listen 127.0.0.1:8001 -metrics-listen 127.0.0.1:9101
 curl -s http://127.0.0.1:9101/metrics
 ```
@@ -51,12 +51,12 @@ Types: C counter, G gauge, H histogram (seconds; buckets 50 µs to about 26 s, d
 
 | Metric | Type | Labels | Meaning | Produced by |
 |---|---|---|---|---|
-| `dkv_kv_requests_total` | C | group, op, status | Client requests this node's front answered, by the status it returned. A request relayed from a forward is counted here with the leader's status. | `Front.Do` |
+| `dkv_kv_requests_total` | C | group, op, status | Client requests this node's front answered, by the status it returned. A request relayed from a forward is counted here with the leader's status. A request naming a group this node does not host is counted under `group="other"`: the group is the client's choice, and labelling it as named let any client create series without bound (audit M7, `TestClientsCannotCreateMetricSeries`). | `Front.Do` |
 | `dkv_kv_request_seconds` | H | op | Server-side duration: the front receiving the decoded request to its response being ready. Network time excluded. | `Front.Do` |
 | `dkv_kv_duplicate_responses_total` | C | group | OK responses for a retry answered from the session table. | `Front.Do` |
 | `dkv_kv_inflight_requests` | G | | Requests the front is working on. | `Front.Do` |
 | `dkv_kv_forwards_total` | C | group, result | Forwards to the group's leader, by outcome: `answered`, `not_sent` (no connection: definite no effect), `send_unknown`, `timeout`. | `Server.forward` |
-| `dkv_kv_forwarded_requests_total` | C | group, op, status | Requests forwarded to this node by a peer and served here. | `Server.onApp` |
+| `dkv_kv_forwarded_requests_total` | C | group, op, status | Requests forwarded to this node by a peer and served here, labelled with the serving group (never the group the peer's request names). | `Server.onApp` |
 | `dkv_kv_apply_decisions_total` | C | group, decision | State-machine decisions this replica made applying committed commands: `registered`, `executed`, `duplicate`, `conflict`, `stale`, `expired`, `limit`, and `evicted` sessions. | `Store.ApplyResult` via `Metrics.Observe` |
 
 ### Raft driver (`internal/raftnode`), per group
@@ -104,7 +104,9 @@ Types: C counter, G gauge, H histogram (seconds; buckets 50 µs to about 26 s, d
 | `dkv_transport_frames_received_total`, `_bytes_received_total` | C | kind | Frames read whole. |
 | `dkv_transport_send_failures_total` | C | reason | `not_connected`, `closed`, `write`. |
 | `dkv_transport_connections_total` | C | dir | Connections established, `inbound` or `outbound`. |
-| `dkv_transport_dial_failures_total` | C | | Failed dials or handshake sends. |
+| `dkv_transport_dial_failures_total` | C | | Failed dials or handshakes. |
+| `dkv_transport_accept_failures_total` | C | | `Accept` errors (e.g. descriptors exhausted); the accept loop retries after a pause. |
+| `dkv_transport_handshakes_refused_total` | C | reason | `busy` (too many inbound handshakes in flight), `rejected` (another cluster, other replica settings, an unknown peer, the wrong dial direction, or another node than the one dialed; `docs/TRANSPORT.md` §3). |
 | `dkv_transport_peers` | G | state | Peers `known` and `connected`. |
 
 ### Process
@@ -133,6 +135,10 @@ both Darwin and Linux. `process_start_time_seconds` is also reported.
   re-applications after a restart; it counts work done, not requests.
 - **Gauges are sampled at the scrape.** They read each node's latest published Status, which the
   actor publishes after every cycle, so they are at most one cycle old.
+- **A metric is not a health verdict.** `dkv_raft_has_leader` is one node's belief. An isolated
+  leader keeps reporting itself leader (there is no CheckQuorum). Health and readiness are derived
+  across nodes from the admin protocol's status by `dkvctl health` / `dkvctl ready`, with the rules
+  in `docs/OPERATIONS.md`; the metrics endpoint serves no health or readiness route.
 - **No storage-engine metrics.** The LSM engine is not behind the node yet
   (`docs/ENGINEERING_ROADMAP.md` task 5); `dkv_raft_log_bytes` is the Raft log, not an engine WAL.
 - **The endpoint is unauthenticated plaintext HTTP.** It reveals node ids, peer counts, group

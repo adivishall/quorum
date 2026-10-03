@@ -80,4 +80,23 @@ var (
 
 	// ErrInvalidConfig means the transport Config failed validation.
 	ErrInvalidConfig = errors.New("transport: invalid config")
+
+	// ErrClusterMismatch: the other side of a connection belongs to another
+	// cluster (audit H2). The connection is refused, both ways.
+	ErrClusterMismatch = errors.New("transport: the peer belongs to another cluster")
+
+	// ErrSettingsMismatch: the other side's replica settings digest differs
+	// from this node's (audit H5). The connection is refused, both ways.
+	ErrSettingsMismatch = errors.New("transport: the peer's replica settings differ from this node's")
+
+	// ErrWrongDirection: a peer dialed this node although the node with the
+	// smaller id dials (ADR-014); the claim is refused (audit F16).
+	ErrWrongDirection = errors.New("transport: the peer dialed in the wrong direction")
+
+	// ErrWrongPeer: the node a dialer reached announced another id than the
+	// peer it dialed — a wrong or recycled address.
+	ErrWrongPeer = errors.New("transport: reached another node than the peer dialed")
+
+	// ErrMalformedHandshake: a handshake reply with an unknown status.
+	ErrMalformedHandshake = errors.New("transport: malformed handshake")
 )

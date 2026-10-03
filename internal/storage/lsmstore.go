@@ -239,15 +239,23 @@ func OpenLSMStore(dir string, opts Options) (*LSMStore, error) {
 	}
 	s.recovery.MaxFlushedSeq = s.cur.maxFlushedSeq()
 
-	if err := s.sweepOrphans(files); err != nil {
-		s.closeAllReaders()
-		return nil, classify("open", nil, err)
-	}
-
 	// A fresh manifest holding a snapshot of the recovered state. Installing it
 	// here, before replay, means a flush triggered during replay records itself
 	// through exactly the same path as one during normal operation.
 	if err := s.installManifest(state); err != nil {
+		s.closeManifest()
+		s.closeAllReaders()
+		return nil, classify("open", nil, err)
+	}
+
+	// Orphans are swept only now, against the state the fresh manifest made
+	// durable. The recovered state may include an edit that was written but
+	// never fsynced (a compaction whose manifest fsync failed); sweeping the
+	// files it deleted before that state was durable left them gone, and a
+	// power loss then left a manifest naming them: a store that never opened
+	// again.
+	if err := s.sweepOrphans(files); err != nil {
+		s.closeManifest()
 		s.closeAllReaders()
 		return nil, classify("open", nil, err)
 	}
@@ -887,6 +895,19 @@ func (s *LSMStore) flushLocked() error {
 	edit.AddFile(fm)
 	edit.SetNextFileNum(s.nextNum)
 	edit.SetLastSequence(s.seq)
+	// The edit declares everything through s.seq persisted in a table; the
+	// WAL must hold it durably first. In batch mode it may not yet, and a
+	// power loss would then leave the manifest ahead of the durable WAL — a
+	// state the next open refuses (audit D10). A flush during replay at open
+	// has no WAL yet: its records come from the segments on disk, which this
+	// does not sync (docs/WAL.md §5). SyncOff promises no durability and
+	// never fsyncs.
+	if s.w != nil && s.opts.WAL.SyncMode != wal.SyncOff {
+		if err := s.w.Sync(); err != nil {
+			_ = r.Close()
+			return fmt.Errorf("lsm: syncing the WAL before recording %s: %w", sstName(num), err)
+		}
+	}
 	if err := s.manifest.Append(&edit); err != nil {
 		_ = r.Close()
 		return fmt.Errorf("lsm: recording %s in the manifest: %w", sstName(num), err)

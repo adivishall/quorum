@@ -3,6 +3,7 @@ package wal
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -73,6 +74,11 @@ const (
 
 // ErrClosed is returned by operations on a closed WAL.
 var ErrClosed = errors.New("wal: closed")
+
+// ErrRecordTooLarge is returned for an append whose record exceeds the
+// framing's maximum (record.MaxRecordSize). Nothing was written and the log
+// is unaffected.
+var ErrRecordTooLarge = errors.New("wal: record too large")
 
 // Options configures a WAL.
 type Options struct {
@@ -163,6 +169,9 @@ type WAL struct {
 	// response — the caller would keep acknowledging writes that may not
 	// survive. Every subsequent append fails with this error.
 	syncErr error
+	// flushFailed is set when the latched failure is a failed flush, rather
+	// than a failed write: Close must not flush again after one (see Close).
+	flushFailed bool
 
 	// fullSyncOK records whether the platform's strongest flush is available
 	// on this file. See supportsFullSync.
@@ -171,6 +180,14 @@ type WAL struct {
 	stopSyncer chan struct{}
 	syncerDone sync.WaitGroup
 }
+
+// Seams for this package's own tests: how a segment is flushed, and the
+// writer its records reach the file through. Production uses fullSync and the
+// file itself; a test fails a flush, or tears a write, at an exact point.
+var (
+	syncFile   = fullSync
+	segmentOut = func(f *os.File) io.Writer { return f }
+)
 
 // Create opens the WAL in dir for appending, creating dir if necessary.
 //
@@ -231,7 +248,7 @@ func (w *WAL) openSegment(seg uint64, isNew bool) error {
 	}
 
 	w.f = f
-	w.w = record.NewWriter(f)
+	w.w = record.NewWriter(segmentOut(f))
 	w.seg = seg
 	w.segBytes = info.Size()
 	w.fullSyncOK = supportsFullSync(f)
@@ -266,6 +283,14 @@ func (w *WAL) append(kind record.Kind, payload []byte) error {
 		return w.syncErr
 	}
 
+	// A record the framing cannot hold is refused before anything is written:
+	// a caller error, not a failure of the log, so it latches nothing. (The
+	// framing's own refusal comes after the call that latches.)
+	if len(payload) > record.MaxRecordSize {
+		return fmt.Errorf("%w: a record of %d bytes exceeds the %d-byte maximum; nothing was written",
+			ErrRecordTooLarge, len(payload), record.MaxRecordSize)
+	}
+
 	// Rotate before writing, never in the middle: a record is never split
 	// across segments, so replay can treat each segment independently.
 	if w.segBytes > 0 && w.segBytes >= w.opts.SegmentSize {
@@ -279,9 +304,12 @@ func (w *WAL) append(kind record.Kind, payload []byte) error {
 	w.unsynced += int64(n)
 	if err != nil {
 		// The file may now hold a partial record. That is recoverable — it is
-		// precisely the torn tail the reader detects — but the caller must not
-		// be told the write succeeded.
-		return fmt.Errorf("wal: appending to %s: %w", segmentName(w.seg), err)
+		// precisely the torn tail the reader detects — as long as nothing is
+		// ever written after it: a later record would turn the torn tail into
+		// damage mid-file, which recovery refuses. So the failure latches
+		// (audit D10), and the caller is not told the write succeeded.
+		w.syncErr = fmt.Errorf("wal: appending to %s: %w", segmentName(w.seg), err)
+		return w.syncErr
 	}
 
 	switch w.opts.SyncMode {
@@ -321,9 +349,13 @@ func (w *WAL) syncLocked() error {
 	if w.unsynced == 0 {
 		return nil
 	}
-	if err := fullSync(w.f); err != nil {
-		w.syncErr = fmt.Errorf("wal: flushing %s: %w", segmentName(w.seg), err)
-		return w.syncErr
+	if err := syncFile(w.f); err != nil {
+		ferr := fmt.Errorf("wal: flushing %s: %w", segmentName(w.seg), err)
+		if w.syncErr == nil {
+			w.syncErr = ferr // a failed write latched first stays the cause
+		}
+		w.flushFailed = true
+		return ferr
 	}
 	w.unsynced = 0
 	w.syncs++ // count fsyncs so a benchmark can prove a batch flush happened
@@ -337,10 +369,16 @@ func (w *WAL) Sync() error {
 	if w.closed {
 		return ErrClosed
 	}
-	if w.syncErr != nil {
+	// After a failed write the records before it are still owed their flush
+	// (only a failed flush forbids another); the latched failure is reported
+	// all the same, since the log takes no more appends.
+	if w.flushFailed {
 		return w.syncErr
 	}
-	return w.syncLocked()
+	if err := w.syncLocked(); err != nil {
+		return err
+	}
+	return w.syncErr
 }
 
 // startSyncer runs the periodic flush for SyncBatch mode.
@@ -357,9 +395,10 @@ func (w *WAL) startSyncer() {
 				return
 			case <-t.C:
 				w.mu.Lock()
-				if !w.closed && w.syncErr == nil {
+				if !w.closed && !w.flushFailed {
 					// A failure latches into w.syncErr and is surfaced on the
-					// next append; it is not logged and forgotten.
+					// next append; it is not logged and forgotten. A failed
+					// write does not stop the flush of what came before it.
 					_ = w.syncLocked()
 				}
 				w.mu.Unlock()
@@ -391,9 +430,15 @@ func (w *WAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	var syncErr error
-	if w.opts.SyncMode != SyncOff {
-		if err := fullSync(w.f); err != nil {
+	// After a failed flush, no fsync: a second fsync can succeed once the
+	// kernel has dropped the pages the first failed to write, and reporting
+	// that as durability is the fsyncgate error (audit M11). After a failed
+	// write, the records acknowledged before it are still owed their flush;
+	// a partial record it makes durable is a torn tail recovery repairs.
+	// Either way Close reports the latched failure.
+	syncErr := w.syncErr
+	if !w.flushFailed && w.opts.SyncMode != SyncOff {
+		if err := syncFile(w.f); err != nil && syncErr == nil {
 			syncErr = fmt.Errorf("wal: flushing %s on close: %w", segmentName(w.seg), err)
 		}
 	}

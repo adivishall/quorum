@@ -26,26 +26,32 @@ func newConn(peer NodeID, nc net.Conn, writeTimeout time.Duration) *conn {
 	return &conn{peer: peer, nc: nc, writeTimeout: writeTimeout}
 }
 
-// send writes one frame in full under the writer lock. The write deadline is the
-// sooner of the configured write timeout and any deadline on ctx, so a blocked
-// write cannot hang forever and honours caller cancellation; closing the conn
-// (shutdown) also unblocks it.
+// send writes one frame in full under the writer lock. ctx is honoured until
+// the frame starts; a started frame is bounded by the write timeout alone —
+// never by a caller's deadline, which could cut it short on a connection every
+// group of the node shares. A write that fails or times out may have left part
+// of the frame on the wire, after which every later frame would be read as
+// garbage; so any failure closes the connection (audit M2): its reader loop
+// deregisters it and the dialer reconnects, and nothing more is written into
+// a stream whose state is unknown. Closing the conn (shutdown) also unblocks a
+// blocked write.
 func (c *conn) send(ctx context.Context, kind MsgKind, payload []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-
+	if err := ctx.Err(); err != nil {
+		return err // ended while waiting for the writer: nothing was written
+	}
 	if c.writeTimeout > 0 {
-		dl := time.Now().Add(c.writeTimeout)
-		if d, ok := ctx.Deadline(); ok && d.Before(dl) {
-			dl = d
-		}
-		_ = c.nc.SetWriteDeadline(dl)
+		_ = c.nc.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	}
 	buf, err := writeFrame(c.nc, c.writeBuf, kind, payload)
 	c.writeBuf = buf
+	if err != nil {
+		c.close()
+	}
 	return err
 }
 

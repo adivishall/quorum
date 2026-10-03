@@ -190,43 +190,67 @@ func TestReconnectAfterConnectionDrop(t *testing.T) {
 // after the connection dies, not redial at CPU speed. Without that backoff the
 // dialer reconnects roughly every 250µs (measured against a resetting proxy),
 // burning an ephemeral port and two log lines per cycle.
+//
+// Since the handshake is answered (version 2), a peer that closes before
+// answering fails the dial itself: only a peer that answers and then closes
+// reaches the connection's own death. Both are checked; the first is the
+// backoff after a connection dies.
 func TestDialerBacksOffWhenPeerKeepsClosingConnections(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	var accepted atomic.Int64
-	go func() {
-		for {
-			c, err := ln.Accept()
+	for _, tc := range []struct {
+		name   string
+		answer bool
+	}{
+		{"after the handshake is answered", true},
+		{"before the handshake is answered", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
-				return
+				t.Fatal(err)
 			}
-			accepted.Add(1)
-			_ = c.Close()
-		}
-	}()
+			defer ln.Close()
+			var accepted, answered atomic.Int64
+			go func() {
+				for {
+					c, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					accepted.Add(1)
+					if tc.answer {
+						if _, err := readHandshake(c); err == nil && writeReply(c, statusAccepted, hello{id: "b"}) == nil {
+							answered.Add(1)
+						}
+					}
+					_ = c.Close()
+				}
+			}()
 
-	a, err := NewTCPTransport(Config{
-		NodeID: "a", ListenAddr: "127.0.0.1:0",
-		Peers:             map[NodeID]string{"b": ln.Addr().String()},
-		DialRetryInterval: 100 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer a.Close()
+			a, err := NewTCPTransport(Config{
+				NodeID: "a", ListenAddr: "127.0.0.1:0",
+				Peers:             map[NodeID]string{"b": ln.Addr().String()},
+				DialRetryInterval: 100 * time.Millisecond,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer a.Close()
 
-	time.Sleep(650 * time.Millisecond)
-	got := accepted.Load()
-	if got == 0 {
-		t.Fatal("the dialer never attempted a connection; the test proved nothing")
-	}
-	// At one attempt per 100ms interval, 650ms allows ~7 attempts; 15 leaves
-	// slack for scheduling. A dialer without the backoff makes thousands.
-	if got > 15 {
-		t.Fatalf("%d connection attempts in 650ms with a 100ms retry interval: the dialer must back off after a connection dies, not spin", got)
+			time.Sleep(650 * time.Millisecond)
+			got := accepted.Load()
+			if got == 0 {
+				t.Fatal("the dialer never attempted a connection; the test proved nothing")
+			}
+			if tc.answer && answered.Load() == 0 {
+				t.Fatal("no handshake was answered: no connection was established to die")
+			}
+			// At one attempt per 100ms interval, 650ms allows ~7 attempts; 15
+			// leaves slack for scheduling. A dialer without the backoff makes
+			// hundreds.
+			if got > 15 {
+				t.Fatalf("%d connection attempts in 650ms with a 100ms retry interval: the dialer must back off after a connection dies, not spin", got)
+			}
+		})
 	}
 }
 
@@ -261,7 +285,13 @@ func TestReaderIdleTimeoutReconnectsASilentConnection(t *testing.T) {
 				return
 			}
 			accepts.Add(1)
-			held = append(held, c) // hold open: never read, never send, never close
+			// Complete the handshake as b, then fall silent: hold open, never
+			// read, never send, never close — an ESTABLISHED connection that
+			// delivers nothing.
+			if _, err := readHandshake(c); err == nil {
+				_ = writeReply(c, statusAccepted, hello{id: "b"})
+			}
+			held = append(held, c)
 		}
 	}()
 
@@ -361,10 +391,13 @@ func rawExpectClosed(t *testing.T, addr string, write func(net.Conn)) {
 		write(c)
 	}
 	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	// The accepter may answer a refused handshake with its reply before it
+	// closes: read until the connection ends.
 	buf := make([]byte, 16)
-	if _, err := c.Read(buf); err == nil {
-		t.Fatal("connection was not closed by the accepter")
-	} else if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+	for err == nil {
+		_, err = c.Read(buf)
+	}
+	if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 		// A reset or EOF are both acceptable evidence the accepter closed it.
 		var ne net.Error
 		if errors.As(err, &ne) && ne.Timeout() {
@@ -376,14 +409,14 @@ func rawExpectClosed(t *testing.T, addr string, write func(net.Conn)) {
 func TestSelfConnectionRejected(t *testing.T) {
 	a := newTransport(t, "a", map[NodeID]string{"b": "127.0.0.1:1"})
 	rawExpectClosed(t, a.LocalAddr().String(), func(c net.Conn) {
-		_ = writeHandshake(c, "a") // announce a's own id
+		_ = writeHandshake(c, hello{id: "a"}) // announce a's own id
 	})
 }
 
 func TestUnknownPeerRejected(t *testing.T) {
 	a := newTransport(t, "a", map[NodeID]string{"b": "127.0.0.1:1"})
 	rawExpectClosed(t, a.LocalAddr().String(), func(c net.Conn) {
-		_ = writeHandshake(c, "stranger") // not a configured peer
+		_ = writeHandshake(c, hello{id: "stranger"}) // not a configured peer
 	})
 }
 
@@ -419,7 +452,7 @@ func TestBadMagicClosesConnection(t *testing.T) {
 func TestAddPeerConnectsAndRemovePeerDisconnects(t *testing.T) {
 	a := newTransport(t, "a", nil)
 	c := newTransport(t, "c", nil)
-	rawExpectClosed(t, a.LocalAddr().String(), func(nc net.Conn) { _ = writeHandshake(nc, "c") })
+	rawExpectClosed(t, a.LocalAddr().String(), func(nc net.Conn) { _ = writeHandshake(nc, hello{id: "c"}) })
 
 	if err := c.AddPeer("a", a.LocalAddr().String()); err != nil {
 		t.Fatal(err)
