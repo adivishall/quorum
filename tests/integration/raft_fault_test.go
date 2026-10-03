@@ -501,7 +501,7 @@ func (c *rcluster) outputs() string {
 		}
 	}
 	for k, p := range c.proxies {
-		fmt.Fprintf(&b, "--- proxy %s->%s (listen %s target %s) ---\n%s\n", k[0], k[1], p.Addr(), p.target, p.debugLog())
+		fmt.Fprintf(&b, "--- proxy %s->%s (listen %s target %s) ---\n%s\n", k[0], k[1], p.Addr(), p.Target(), p.Log())
 	}
 	return b.String()
 }
