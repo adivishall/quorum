@@ -2,12 +2,14 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"testing"
 	"time"
 
 	"github.com/adivishall/quorum/internal/lab"
 	"github.com/adivishall/quorum/internal/load"
+	"github.com/adivishall/quorum/internal/multiraft"
 )
 
 // labStart is the integration launcher for a lab cluster's processes: they
@@ -109,4 +111,100 @@ func TestALabProcessDiesWithItsTest(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// labGroupStatus reads node id's status of group 0.
+func labGroupStatus(t *testing.T, c *lab.Cluster, id string) (multiraft.GroupStatus, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	resp, err := c.Admin(ctx, id, multiraft.AdminRequest{Op: "status"})
+	if err != nil {
+		return multiraft.GroupStatus{}, err
+	}
+	for _, gs := range resp.Groups {
+		if gs.Group == 0 {
+			return gs, nil
+		}
+	}
+	return multiraft.GroupStatus{}, fmt.Errorf("%s hosts no group 0", id)
+}
+
+// waitFollowing waits until node id reports following leader in a term of at
+// least term.
+func waitFollowing(t *testing.T, c *lab.Cluster, id, leader string, term uint64) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		gs, err := labGroupStatus(t, c, id)
+		if err == nil && gs.Role == "Follower" && gs.Leader == leader && gs.Term >= term {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never followed %s at term >= %d (last: %+v, %v)\n%s", id, leader, term, gs, err, c.Node(id).Output())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestLabPartitionsAndPausesARealCluster: a lab cluster started with Links can
+// be partitioned and frozen. Isolating the leader makes the other two elect a
+// new one in a higher term; healing makes the old leader follow it. Freezing
+// the new leader (SIGSTOP) does the same, and resuming it makes it follow.
+// The cluster's Close — registered first, so it runs even when the test fails
+// — kills the processes and closes the proxies.
+func TestLabPartitionsAndPausesARealCluster(t *testing.T) {
+	bin := buildDkvd(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	c, err := lab.Start(ctx, lab.ClusterConfig{Bin: bin, Mode: "raft", Nodes: 3, Tick: 25 * time.Millisecond, DataRoot: t.TempDir(),
+		PortBase: 25000, Start: labStart(t), Links: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Close)
+
+	old, term, err := c.Leader(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Isolate(old); err != nil {
+		t.Fatal(err)
+	}
+	if cuts := c.Cuts(); len(cuts) != 2 {
+		t.Fatalf("isolating %s cut %v, want its two links", old, cuts)
+	}
+	next, _, err := c.WaitLeader(ctx, 0, old, 20*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nt, err := labGroupStatus(t, c, next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nt.Term <= term {
+		t.Fatalf("%s leads in term %d, not above the isolated leader's %d", next, nt.Term, term)
+	}
+	c.HealAll()
+	if cuts := c.Cuts(); len(cuts) != 0 {
+		t.Fatalf("links still cut after HealAll: %v", cuts)
+	}
+	waitFollowing(t, c, old, next, nt.Term)
+
+	if err := c.Pause(next); err != nil {
+		t.Fatal(err)
+	}
+	third, _, err := c.WaitLeader(ctx, 0, next, 20*time.Second)
+	if err != nil {
+		_ = c.Resume(next)
+		t.Fatal(err)
+	}
+	if err := c.Resume(next); err != nil {
+		t.Fatal(err)
+	}
+	tt, err := labGroupStatus(t, c, third)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFollowing(t, c, next, third, tt.Term)
 }

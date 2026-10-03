@@ -7,7 +7,10 @@
 //
 // Nothing is simulated: every node is a dkvd process with its own data
 // directory, talking TCP on loopback. Times are real; the workload's random
-// choices are seeded.
+// choices are seeded. With ClusterConfig.Links every node-to-node link runs
+// through a proxy (internal/netproxy), so a run can partition the cluster;
+// Chaos (chaos.go) runs a seeded fault schedule against it under a recorded,
+// linearizability-checked workload.
 package lab
 
 import (
@@ -32,6 +35,7 @@ import (
 	"github.com/adivishall/quorum/internal/load"
 	"github.com/adivishall/quorum/internal/metrics"
 	"github.com/adivishall/quorum/internal/multiraft"
+	"github.com/adivishall/quorum/internal/netproxy"
 	"github.com/adivishall/quorum/internal/nodedir"
 	"github.com/adivishall/quorum/internal/routing"
 )
@@ -51,6 +55,13 @@ type ClusterConfig struct {
 	SnapshotEvery uint64        `json:"snapshot_every"`
 	PortBase      int           `json:"-"`
 	Extra         []string      `json:"extra,omitempty"`
+	// Links routes every link between genesis nodes through a proxy
+	// (internal/netproxy) on the dialing side, so the run can partition the
+	// cluster (Cut, Isolate, Heal, HealAll). Off by default: the proxy adds a
+	// loopback hop, and the baseline measurements were taken without one. A
+	// spare's links are direct — its address enters the group configuration,
+	// which every dialer shares — so partitions cover the genesis nodes only.
+	Links bool `json:"links,omitempty"`
 	// Start starts a node's process, a restart's included; nil is
 	// (*exec.Cmd).Start. A test passes its own launcher, so the lab's
 	// processes are race-scanned and die with the test like every other
@@ -105,6 +116,11 @@ type Cluster struct {
 	nodes []*Node // genesis first, then spares
 	byID  map[string]*Node
 	route *multiraft.Assignment
+	// links holds one proxy per genesis pair, keyed (dialer, accepter): the
+	// transport's smaller id dials (ADR-014), so the dialer's peer address
+	// for the accepter is the proxy, and the accepter's for the dialer is a
+	// real address it never dials.
+	links map[[2]string]*netproxy.Proxy
 }
 
 // Build compiles dkvd from the repository at repo into dir and returns its
@@ -185,6 +201,22 @@ func Start(ctx context.Context, cfg ClusterConfig) (*Cluster, error) {
 			return nil, err
 		}
 	}
+	if cfg.Links {
+		c.links = map[[2]string]*netproxy.Proxy{}
+		for _, a := range c.nodes {
+			for _, b := range c.nodes {
+				if a.Spare || b.Spare || a.ID >= b.ID {
+					continue
+				}
+				p, err := netproxy.Start(b.Addr)
+				if err != nil {
+					c.Close()
+					return nil, err
+				}
+				c.links[[2]string{a.ID, b.ID}] = p
+			}
+		}
+	}
 	for _, n := range c.nodes {
 		if !n.Spare {
 			if err := c.launch(n, nil); err != nil {
@@ -237,7 +269,7 @@ func (c *Cluster) launch(n *Node, join []multiraft.GroupID) error {
 	var peers []string
 	for _, o := range c.nodes {
 		if o != n && !o.Spare {
-			peers = append(peers, o.ID+"="+o.Addr)
+			peers = append(peers, o.ID+"="+c.peerAddr(n.ID, o))
 		}
 	}
 	args := []string{"-id", n.ID, "-listen", n.Addr, "-data-dir", n.Dir, "-tick-interval", c.cfg.Tick.String(),
@@ -365,13 +397,128 @@ func (c *Cluster) StartSpare(id string, groups []multiraft.GroupID) error {
 	return c.launch(n, groups)
 }
 
-// Close kills every process.
+// Close kills every process, then closes every link proxy. It is safe to
+// call more than once, and on a cluster Start failed to finish.
 func (c *Cluster) Close() {
 	for _, n := range c.nodes {
 		if n.Alive() {
 			_ = c.Kill(n.ID)
 		}
 	}
+	for _, p := range c.links {
+		p.Close()
+	}
+}
+
+// peerAddr is the address node from dials to reach o: the link's proxy when
+// from is the dialing side of a proxied link, o's own address otherwise.
+func (c *Cluster) peerAddr(from string, o *Node) string {
+	if p, ok := c.links[[2]string{from, o.ID}]; ok {
+		return p.Addr()
+	}
+	return o.Addr
+}
+
+// link returns the proxy on the link between a and b, in either order.
+func (c *Cluster) link(a, b string) (*netproxy.Proxy, error) {
+	if c.links == nil {
+		return nil, errors.New("lab: the cluster was started without Links: it cannot be partitioned")
+	}
+	if b < a {
+		a, b = b, a
+	}
+	p, ok := c.links[[2]string{a, b}]
+	if !ok {
+		return nil, fmt.Errorf("lab: no proxied link between %s and %s (partitions cover genesis nodes only)", a, b)
+	}
+	return p, nil
+}
+
+// Cut severs the link between a and b: both sides see their connection die,
+// and new connections are refused until Heal. The nodes keep running and
+// keep serving their clients — only the node-to-node link is cut.
+func (c *Cluster) Cut(a, b string) error {
+	p, err := c.link(a, b)
+	if err != nil {
+		return err
+	}
+	p.Cut()
+	return nil
+}
+
+// Heal restores the link between a and b; the dialer reconnects on its next
+// retry (the transport's DialRetryInterval).
+func (c *Cluster) Heal(a, b string) error {
+	p, err := c.link(a, b)
+	if err != nil {
+		return err
+	}
+	p.Heal()
+	return nil
+}
+
+// Isolate cuts every link between id and the other genesis nodes.
+func (c *Cluster) Isolate(id string) error {
+	if c.links == nil {
+		return errors.New("lab: the cluster was started without Links: it cannot be partitioned")
+	}
+	if n, ok := c.byID[id]; !ok || n.Spare {
+		return fmt.Errorf("lab: %s is not a genesis node", id)
+	}
+	for k, p := range c.links {
+		if k[0] == id || k[1] == id {
+			p.Cut()
+		}
+	}
+	return nil
+}
+
+// HealAll restores every link.
+func (c *Cluster) HealAll() {
+	for _, p := range c.links {
+		p.Heal()
+	}
+}
+
+// Cuts lists the links that are cut now, each as (smaller id, larger id),
+// sorted.
+func (c *Cluster) Cuts() [][2]string {
+	var out [][2]string
+	for k, p := range c.links {
+		if p.IsCut() {
+			out = append(out, k)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i][0] != out[j][0] {
+			return out[i][0] < out[j][0]
+		}
+		return out[i][1] < out[j][1]
+	})
+	return out
+}
+
+// Pause freezes node id's process (SIGSTOP): it holds its connections and its
+// state but answers nothing, as a node in a long GC pause or a stalled VM
+// would. Resume (SIGCONT) lets it continue.
+func (c *Cluster) Pause(id string) error { return c.send(id, syscall.SIGSTOP) }
+
+// Resume continues a paused node (SIGCONT).
+func (c *Cluster) Resume(id string) error { return c.send(id, syscall.SIGCONT) }
+
+// send delivers sig to node id's process without waiting for it to exit.
+func (c *Cluster) send(id string, sig syscall.Signal) error {
+	n, ok := c.byID[id]
+	if !ok {
+		return fmt.Errorf("lab: no node %s", id)
+	}
+	n.mu.Lock()
+	cmd := n.cmd
+	n.mu.Unlock()
+	if cmd == nil || !n.Alive() {
+		return fmt.Errorf("lab: %s is not running", id)
+	}
+	return cmd.Process.Signal(sig)
 }
 
 // Admin sends one admin request to node id.

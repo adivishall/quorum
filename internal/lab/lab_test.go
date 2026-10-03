@@ -6,6 +6,7 @@ import (
 
 	"github.com/adivishall/quorum/internal/load"
 	"github.com/adivishall/quorum/internal/metrics"
+	"github.com/adivishall/quorum/internal/netproxy"
 )
 
 // TestSummarize: median of odd and even counts, spread, and p95 only once
@@ -101,5 +102,66 @@ func TestUsageFromScrapes(t *testing.T) {
 	u = usage(before, after, 2*time.Second, true)
 	if u.CPUPerSec != 3 || u.Persists != 110 || u.CommitAdvance != 50 {
 		t.Fatalf("restarted: %+v (the commit index is durable: its advance is a difference even across a restart)", u)
+	}
+}
+
+// TestLinksFollowTheDialer: with Links, the dialing side of each pair (the
+// smaller id, ADR-014) reaches the other through the pair's proxy and the
+// accepting side keeps the real address it never dials; Cut and Heal name a
+// link in either order; Isolate cuts exactly the links touching its node;
+// Cuts lists them sorted; HealAll restores everything; a cluster without
+// Links refuses to partition.
+func TestLinksFollowTheDialer(t *testing.T) {
+	c := &Cluster{byID: map[string]*Node{}, links: map[[2]string]*netproxy.Proxy{}}
+	for _, id := range []string{"n1", "n2", "n3"} {
+		n := &Node{ID: id, Addr: "127.0.0.1:1" + id[1:]}
+		c.nodes = append(c.nodes, n)
+		c.byID[id] = n
+	}
+	for _, k := range [][2]string{{"n1", "n2"}, {"n1", "n3"}, {"n2", "n3"}} {
+		p, err := netproxy.Start(c.byID[k[1]].Addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.links[k] = p
+	}
+	defer c.Close()
+	if got := c.peerAddr("n1", c.byID["n2"]); got != c.links[[2]string{"n1", "n2"}].Addr() {
+		t.Fatalf("n1 dials n2 at %s, not through the link's proxy", got)
+	}
+	if got := c.peerAddr("n2", c.byID["n1"]); got != c.byID["n1"].Addr {
+		t.Fatalf("n2's entry for n1 is %s, want n1's own address (never dialed)", got)
+	}
+	if err := c.Cut("n3", "n2"); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Cuts(); len(got) != 1 || got[0] != [2]string{"n2", "n3"} {
+		t.Fatalf("cuts after Cut(n3, n2): %v", got)
+	}
+	if err := c.Heal("n2", "n3"); err != nil || len(c.Cuts()) != 0 {
+		t.Fatalf("heal: %v, cuts %v", err, c.Cuts())
+	}
+	if err := c.Isolate("n2"); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Cuts(); len(got) != 2 || got[0] != [2]string{"n1", "n2"} || got[1] != [2]string{"n2", "n3"} {
+		t.Fatalf("cuts after Isolate(n2): %v", got)
+	}
+	c.HealAll()
+	if got := c.Cuts(); len(got) != 0 {
+		t.Fatalf("cuts after HealAll: %v", got)
+	}
+	if err := c.Cut("n1", "n9"); err == nil {
+		t.Fatal("a link to a node that does not exist was cut")
+	}
+	if err := c.Isolate("n9"); err == nil {
+		t.Fatal("a node that does not exist was isolated")
+	}
+	bare := &Cluster{byID: c.byID, nodes: c.nodes}
+	if err := bare.Cut("n1", "n2"); err == nil {
+		t.Fatal("a cluster started without Links was partitioned")
+	}
+	if err := bare.Isolate("n1"); err == nil {
+		t.Fatal("a cluster started without Links isolated a node")
 	}
 }
