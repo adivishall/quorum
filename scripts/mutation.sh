@@ -2530,6 +2530,89 @@ mutant "lab-starts-through-its-launcher" internal/lab/cluster.go \
   '	if err := cmd.Start(); err != nil {' \
   ./tests/integration '^TestALabProcessDiesWithItsTest$'
 
+echo "== the chaos-and-operability milestone (docs/CHAOS.md, docs/OPERATIONS.md) =="
+
+# 298. Cut leaves live connections up: a "partition" that only refuses new
+#      connections, while the existing link keeps flowing.
+mutant "proxy-cut-closes-live-connections" internal/netproxy/proxy.go \
+  '	p.cut = true
+	for c := range p.conns {
+		_ = c.Close()
+	}' \
+  '	p.cut = true' \
+  ./internal/netproxy '^TestProxyForwardsCutsAndHeals$'
+
+# 299. The lab puts the proxy on the wrong side of a link: the dialer reaches
+#      its peer directly, and cutting the link cuts nothing.
+mutant "lab-proxy-on-the-dialing-side" internal/lab/cluster.go \
+  '	if p, ok := c.links[[2]string{from, o.ID}]; ok {' \
+  '	if p, ok := c.links[[2]string{o.ID, from}]; ok {' \
+  ./internal/lab '^TestLinksFollowTheDialer$'
+
+# 300. The next fault is scheduled from the previous one's start, not its
+#      recovery: impairments overlap, and two at once can take a quorum.
+mutant "chaos-one-impairment-at-a-time" internal/lab/chaos.go \
+  '		t += f.Hold + between(cc.Every)' \
+  '		t += between(cc.Every)' \
+  ./internal/lab '^TestPlanChaosKeepsOneImpairmentAtATime$'
+
+# 301. A chaos run whose schedule failed (a restart that did not happen)
+#      passes on its history and convergence alone.
+mutant "chaos-error-fails-the-run" internal/lab/chaos.go \
+  '	return r.Errors() == 0 && r.Check.Linearizable' \
+  '	return r.Check.Linearizable' \
+  ./internal/lab '^TestARunWithAnErrorFails$'
+
+# 302. A node that knows no leader is ready.
+mutant "readiness-needs-a-leader" internal/health/health.go \
+  '		case gs.Leader == "":' \
+  '		case false:' \
+  ./internal/health '^(TestLeaderLost|TestNodeReadinessReasons)$'
+
+# 303. A leader is accepted without a quorum confirming it: a cut-off leader
+#      counts as a working group.
+mutant "health-needs-a-confirming-quorum" internal/health/health.go \
+  '		case gh.Agreeing < gh.Quorum:' \
+  '		case gh.Agreeing < 1:' \
+  ./internal/health '^TestMajorityDown$'
+
+# 304. dkvctl health exits 0 on a degraded cluster: a probe sees nothing wrong.
+mutant "dkvctl-degraded-is-not-ok" internal/ctl/ctl.go \
+  '	code := map[string]int{health.Healthy: ExitOK, health.Degraded: ExitDegraded, health.Unavailable: ExitUnavailable,' \
+  '	code := map[string]int{health.Healthy: ExitOK, health.Degraded: ExitOK, health.Unavailable: ExitUnavailable,' \
+  ./internal/ctl '^TestUnhealthyStatesExitNonZero$'
+
+# 305. An unknown outcome is recorded as a refusal: the checker is told a
+#      write that may have taken effect did not.
+mutant "history-keeps-unknown-as-incomplete" internal/load/load.go \
+  '			h.End(hid, lincheck.Incomplete, nil, "", 0, 0)' \
+  '			h.End(hid, lincheck.Rejected, nil, "", 0, 0)' \
+  ./internal/load '^TestTracesKeepEveryUnknownOperation$'
+
+# 306. Every recorded write carries the same value: the checker cannot tell
+#      which write a read saw.
+mutant "history-values-are-distinct" internal/load/load.go \
+  '	if c.cfg.History == nil {
+		return c.value
+	}' \
+  '	if true {
+		return c.value
+	}' \
+  ./internal/load '^TestHistoryRecordsEveryOperation$'
+
+# 307. An UNAVAILABLE answer is not counted a refusal: the rolling restart's
+#      unknown outcomes are misclassified.
+mutant "unknown-cause-counts-unavailable" internal/lab/unknowns.go \
+  '	case "UNAVAILABLE", "NOT_LEADER", "LOST", "SESSION_LIMIT":' \
+  '	case "NOT_LEADER", "LOST", "SESSION_LIMIT":' \
+  ./internal/lab '^TestClassifyUnknown$'
+
+# 308. Status omits the leader's follower match: lag cannot be read.
+mutant "status-reports-follower-match" internal/multiraft/admin.go \
+  '			if len(st.FollowerMatch) > 0 {' \
+  '			if false {' \
+  ./internal/multiraft '^TestAdminStatusNamesItsNodeAndTheLeadersFollowers$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then
