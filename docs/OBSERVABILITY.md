@@ -135,6 +135,10 @@ both Darwin and Linux. `process_start_time_seconds` is also reported.
   re-applications after a restart; it counts work done, not requests.
 - **Gauges are sampled at the scrape.** They read each node's latest published Status, which the
   actor publishes after every cycle, so they are at most one cycle old.
+- **A metric is not a health verdict.** `dkv_raft_has_leader` is one node's belief. An isolated
+  leader keeps reporting itself leader (there is no CheckQuorum). Health and readiness are derived
+  across nodes from the admin protocol's status by `dkvctl health` / `dkvctl ready`, with the rules
+  in `docs/OPERATIONS.md`; the metrics endpoint serves no health or readiness route.
 - **No storage-engine metrics.** The LSM engine is not behind the node yet
   (`docs/ENGINEERING_ROADMAP.md` task 5); `dkv_raft_log_bytes` is the Raft log, not an engine WAL.
 - **The endpoint is unauthenticated plaintext HTTP.** It reveals node ids, peer counts, group

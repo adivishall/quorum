@@ -202,7 +202,7 @@ request and per answer, acting on this node's groups only:
 
 | Op | Arguments | Effect |
 |---|---|---|
-| `status` | | every hosted group's role, term, leader, commit, applied, boundary, snapshot, configuration, pending change; the groups that failed to recover |
+| `status` | | the answering node's id (`node`); every hosted group's role, term, leader, commit, applied, last index, boundary, snapshot, configuration and its index, pending change, voter, removed, the writes and reads accepted and not yet answered (`pending_writes`, `pending_reads`), and — on the group's leader — every other member's match index (`follower_match`, from which its lag follows); the groups that failed to recover |
 | `add-learner` | group, id, addr | add a non-voting member (only the group's leader accepts; others name it) |
 | `promote` | group, id | a learner becomes a voter, by joint consensus |
 | `remove-voter` | group, id | by joint consensus |
@@ -213,7 +213,11 @@ request and per answer, acting on this node's groups only:
 | `snapshot` | group | snapshot the group's state machine now |
 
 A membership operation completes only when the group's log says so (`docs/MEMBERSHIP.md` §7). The
-protocol never decides membership (`TestAdminDrivesMembershipThroughTheLog`).
+protocol never decides membership (`TestAdminDrivesMembershipThroughTheLog`). `dkvctl` is its
+operator client — status, leaders, configurations, lag, health and readiness — and
+`docs/OPERATIONS.md` defines the health verdicts it derives from `status`
+(`TestAdminStatusNamesItsNodeAndTheLeadersFollowers` pins the node id and the leader's follower
+match).
 
 **The port is unauthenticated plaintext**, and anyone who reaches it can remove voters and stop
 groups. So `dkvd` refuses an `-admin-listen` address other than loopback unless

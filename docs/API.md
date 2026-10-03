@@ -6,6 +6,10 @@ protocol over TCP; there is no HTTP API. `docs/CLIENT_SEMANTICS.md` is the contr
 every field and status *means*); `docs/DEDUP.md` is how the server keeps it; `docs/MULTI_RAFT.md` §6
 is how a request finds its group. Version 3 is version 2 (Phase 13) plus the request's **group**.
 
+This is the client protocol only. The operator's interface is the separate admin protocol
+(`-admin-listen`, JSON lines; `docs/MULTI_RAFT.md` §7), read by `dkvctl` (`docs/OPERATIONS.md`) —
+status, leaders, configurations, lag, health and readiness. Neither has an HTTP form.
+
 ---
 
 ## 1. Connection
