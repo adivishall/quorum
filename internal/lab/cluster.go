@@ -51,6 +51,11 @@ type ClusterConfig struct {
 	SnapshotEvery uint64        `json:"snapshot_every"`
 	PortBase      int           `json:"-"`
 	Extra         []string      `json:"extra,omitempty"`
+	// Start starts a node's process, a restart's included; nil is
+	// (*exec.Cmd).Start. A test passes its own launcher, so the lab's
+	// processes are race-scanned and die with the test like every other
+	// process it starts.
+	Start func(*exec.Cmd) error `json:"-"`
 }
 
 // Node is one dkvd process slot.
@@ -274,7 +279,11 @@ func (c *Cluster) launch(n *Node, join []multiraft.GroupID) error {
 	}
 	w := &lockedWriter{mu: &n.mu, b: n.out}
 	cmd.Stdout, cmd.Stderr = w, w
-	if err := cmd.Start(); err != nil {
+	start := c.cfg.Start
+	if start == nil {
+		start = (*exec.Cmd).Start
+	}
+	if err := start(cmd); err != nil {
 		n.mu.Unlock()
 		return err
 	}

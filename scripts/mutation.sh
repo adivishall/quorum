@@ -2523,6 +2523,13 @@ mutant "host-refuses-a-negative-tick" internal/multiraft/host.go \
 		return nil, fmt.Errorf("multiraft: tick interval %s is negative", cfg.TickInterval)' \
   ./internal/multiraft '^TestHostRefusesANegativeTick$'
 
+# 297. The lab starts every process through the launcher it is given, so an
+# integration test's lab processes are race-scanned and die with the test.
+mutant "lab-starts-through-its-launcher" internal/lab/cluster.go \
+  '	if err := start(cmd); err != nil {' \
+  '	if err := cmd.Start(); err != nil {' \
+  ./tests/integration '^TestALabProcessDiesWithItsTest$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then

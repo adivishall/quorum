@@ -170,9 +170,10 @@ Phase 19 row, and LIMITATIONS' status, metrics and measurement statements.
   report in its output fails the test (a SIGKILLed process never exits with the detector's
   status, so its output is the evidence); every job has a timeout; the mutation runner confirms
   real-process kills on the clean tree, attributes kills to a failing test, refuses a build
-  failure, and covers the storage engine. Still open: macOS in CI; the lab (`internal/lab`)
-  launches `dkvd` itself, outside the integration launcher, so its processes are neither
-  race-scanned nor guaranteed to die with a timed-out test binary.
+  failure, and covers the storage engine. The lab (`internal/lab`) starts its processes through
+  the launcher it is given (`ClusterConfig.Start`), so under the integration tests they are
+  race-scanned and die with their test, as every other `dkvd` there does
+  (`TestALabProcessDiesWithItsTest`). Still open: macOS in CI.
 
 ### 1.9 Out of scope, deliberately
 
