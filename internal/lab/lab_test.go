@@ -165,3 +165,30 @@ func TestLinksFollowTheDialer(t *testing.T) {
 		t.Fatal("a cluster started without Links isolated a node")
 	}
 }
+
+// TestClassifyUnknown: the cause is read from the trace — the last attempt
+// that left the request in doubt, and what every attempt after it got.
+func TestClassifyUnknown(t *testing.T) {
+	eof := load.AttemptTrace{Node: "n3", Err: "kv: outcome unknown: EOF"}
+	refused := load.AttemptTrace{Node: "n3", Err: "kv: node unavailable: dial tcp: connect: connection refused"}
+	noLeader := load.AttemptTrace{Node: "n1", Status: "UNAVAILABLE"}
+	notLeader := load.AttemptTrace{Node: "n2", Status: "NOT_LEADER", Leader: "n3"}
+	timeout := load.AttemptTrace{Node: "n2", Err: "kv: outcome unknown: i/o timeout"}
+	ok := load.AttemptTrace{Node: "n2", Status: "OK"}
+	for _, c := range []struct {
+		attempts []load.AttemptTrace
+		err      string
+		want     string
+	}{
+		{[]load.AttemptTrace{eof, refused, noLeader, noLeader, refused, noLeader, notLeader, refused}, "kv: outcome unknown", CauseRefusedUntilGiveUp},
+		{[]load.AttemptTrace{noLeader, eof, timeout}, "kv: outcome unknown", CauseUnansweredAtGiveUp},
+		{[]load.AttemptTrace{{Node: "n1", Status: "UNKNOWN_OUTCOME"}, noLeader}, "kv: outcome unknown", CauseRefusedUntilGiveUp},
+		{[]load.AttemptTrace{eof, ok}, "", CauseOther},
+		{[]load.AttemptTrace{refused}, "kv: outcome unknown", CauseOther},
+		{[]load.AttemptTrace{eof}, "context deadline exceeded", CauseCancelled},
+	} {
+		if got := ClassifyUnknown(load.OpTrace{Class: "unknown", Attempts: c.attempts, Err: c.err}); got != c.want {
+			t.Fatalf("%+v: %s, want %s", c.attempts, got, c.want)
+		}
+	}
+}
