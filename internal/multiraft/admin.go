@@ -58,6 +58,7 @@ type Member struct {
 type AdminResponse struct {
 	OK     bool              `json:"ok"`
 	Error  string            `json:"error,omitempty"`
+	Node   string            `json:"node,omitempty"`   // status: the answering node's id
 	Leader string            `json:"leader,omitempty"` // not the leader: the one this node believes in
 	Conf   *ConfStatus       `json:"conf,omitempty"`   // a membership change: the configuration reached
 	Index  uint64            `json:"index,omitempty"`  // ... and its entry's index
@@ -88,6 +89,13 @@ type GroupStatus struct {
 	ConfPending bool       `json:"conf_pending"`
 	Voter       bool       `json:"voter"`
 	Removed     bool       `json:"removed"`
+	// FollowerMatch is, on the leader only, each other member's match index:
+	// the highest entry the leader knows that member holds (its lag is
+	// LastIndex minus it). Pending counts the writes and reads the node has
+	// accepted and not yet answered.
+	FollowerMatch map[string]uint64 `json:"follower_match,omitempty"`
+	PendingWrites int               `json:"pending_writes,omitempty"`
+	PendingReads  int               `json:"pending_reads,omitempty"`
 }
 
 func confStatus(c replication.Configuration) ConfStatus {
@@ -240,18 +248,26 @@ func (h *Host) Admin(ctx context.Context, req AdminRequest) AdminResponse {
 	fail := func(err error) AdminResponse { return AdminResponse{Error: err.Error()} }
 	switch req.Op {
 	case "status":
-		resp := AdminResponse{OK: true, Groups: []GroupStatus{}}
+		resp := AdminResponse{OK: true, Node: string(h.cfg.ID), Groups: []GroupStatus{}}
 		for _, id := range h.Groups() {
 			grp := h.Group(id)
 			if grp == nil {
 				continue
 			}
 			st := grp.Node.Status()
-			resp.Groups = append(resp.Groups, GroupStatus{
+			gs := GroupStatus{
 				Group: uint32(id), Role: st.Role.String(), Term: st.Term, Leader: string(st.Leader),
 				Commit: st.Commit, Applied: st.Applied, LastIndex: st.LastIndex, Boundary: st.Boundary, Snapshot: st.Snapshot,
 				Conf: confStatus(st.Conf), ConfIndex: st.ConfIndex, ConfPending: st.ConfPending, Voter: st.Voter, Removed: st.Removed,
-			})
+				PendingWrites: st.PendingWrites, PendingReads: st.PendingReads,
+			}
+			if len(st.FollowerMatch) > 0 {
+				gs.FollowerMatch = map[string]uint64{}
+				for p, m := range st.FollowerMatch {
+					gs.FollowerMatch[string(p)] = m
+				}
+			}
+			resp.Groups = append(resp.Groups, gs)
 		}
 		if failed := h.Failed(); len(failed) > 0 {
 			resp.Failed = map[string]string{}
