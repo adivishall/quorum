@@ -3,7 +3,6 @@ package integration
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -37,7 +36,7 @@ func requireChaosOK(t *testing.T, res *lab.ChaosResult, err error) {
 	if err == nil && res.OK() {
 		return
 	}
-	dir, derr := os.MkdirTemp(artifactRoot(), "dkv-chaos-"+strings.ReplaceAll(t.Name(), "/", "_")+"-")
+	dir, derr := artifactDir("dkv-chaos-", t.Name())
 	if derr == nil {
 		derr = lab.WriteArtifacts(dir, res)
 	}

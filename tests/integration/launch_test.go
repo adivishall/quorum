@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -157,4 +158,60 @@ func artifactRoot() string {
 		}
 	}
 	return ""
+}
+
+// artifactDir creates a fresh directory under artifactRoot for a failing
+// test's evidence, named prefix, then the test's name made portable
+// (artifactName), then a random suffix.
+func artifactDir(prefix, testName string) (string, error) {
+	return os.MkdirTemp(artifactRoot(), prefix+artifactName(testName)+"-")
+}
+
+// artifactName makes a test's name safe as a file name everywhere the evidence
+// goes. CI uploads it, and GitHub's artifact upload refuses a path holding any
+// of " : < > | * ? or a line break (as Windows does), so a subtest named for
+// its crash point, "after-reply:1", lost its evidence exactly when it failed.
+// ':' becomes '@' — "after-reply@1", the point at its occurrence — '/' and
+// every other character outside [A-Za-z0-9._-] become '_'. The exact name is
+// kept inside the evidence: history.txt's first line.
+func artifactName(name string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == ':':
+			return '@'
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			return r
+		default:
+			return '_'
+		}
+	}, name)
+}
+
+// TestArtifactNamesAreUploadable: every name a failing test's evidence can be
+// filed under is one GitHub's artifact upload accepts, and the crash-window
+// subtests keep distinct, readable names.
+func TestArtifactNamesAreUploadable(t *testing.T) {
+	for name, want := range map[string]string{
+		"TestRealWriteCrashWindows/after-reply:1":    "TestRealWriteCrashWindows_after-reply@1",
+		"TestRealWriteCrashWindows/after-save:2":     "TestRealWriteCrashWindows_after-save@2",
+		"TestChaosSeedsAreLinearizable/seed-3":       "TestChaosSeedsAreLinearizable_seed-3",
+		"TestX/a\"b<c>d|e*f?g\r\nh\\i j":             "TestX_a_b_c_d_e_f_g__h_i_j",
+		"TestRealSessionRetryAcrossCrashWindows/é:1": "TestRealSessionRetryAcrossCrashWindows__@1",
+	} {
+		got := artifactName(name)
+		if got != want {
+			t.Errorf("artifactName(%q) = %q, want %q", name, got, want)
+		}
+		if strings.ContainsAny(got, "\":<>|*?\r\n/\\") {
+			t.Errorf("artifactName(%q) = %q holds a character the upload refuses", name, got)
+		}
+	}
+	dir, err := artifactDir("dkv-lin-", "TestRealWriteCrashWindows/after-reply:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	if base := filepath.Base(dir); !strings.HasPrefix(base, "dkv-lin-TestRealWriteCrashWindows_after-reply@1-") {
+		t.Fatalf("artifact directory %q", base)
+	}
 }
