@@ -5,7 +5,51 @@ version of this document audited `b401edf`, after Phase 15, and planned a first 
 (#1), a load generator (#2) and cluster experiments (#3). That wave is done (§2). This audit checked
 every claim against the code, not the documents. Where a defect is called *reproduced*, a test or
 probe showed it; where it is called *from the code*, it was read and traced but not yet run.
-`docs/ROADMAP.md` is the phase table.
+`docs/ROADMAP.md` is the phase table. §0, added after PR #10, reframes the project around one
+problem and four layers, and sets the order the remaining work follows.
+
+---
+
+## 0. Thesis, and the four layers
+
+**Quorum is a correctness-first distributed key-value database built from scratch.** Consensus,
+durability, failure handling and client semantics are each implemented independently, then
+connected. The project's defining engineering problem is integrating the durable LSM engine with
+the replicated state machine without weakening the guarantees already proven.
+
+The project is no longer a sequence of phases that each add a primitive. The primitives exist. The
+work is organized into four layers, and **a lower layer takes priority over a higher one:**
+
+| Layer | What it holds | State (after PR #10) |
+|---|---|---|
+| **1. Correctness foundation** | Raft, its durable log and crash recovery; linearizability; sessions and deduplication; snapshots; membership; Multi-Raft. Verified by the simulator, the crash matrices, the linearizability checker, real-process fault and chaos tests, mutation testing and fuzzing. | **Built and verified** (§1.5) |
+| **2. Durable storage integration** | The LSM engine as the replicated state machine: atomic apply with a durable applied index, exactly-once recovery, snapshots as engine checkpoints, the two-log decision | **Not started.** The engine is built and benchmarked standalone; `dkvd` replicates an in-memory `kv.Store`. The design and its first milestone are in `docs/STORAGE_INTEGRATION.md`. |
+| **3. Distributed performance** | Group commit, replication pipelining, batched apply, each measured before and after | **Baseline measured** (`docs/CLUSTER_BENCHMARKS.md`); nothing optimized |
+| **4. Operational and demo surface** | `dkvctl`, health and readiness, the chaos and load labs; then a network client, Docker Compose, a dashboard, the demo and the write-ups | Operator tool and labs **built**; the rest waits for layers 2 and 3 |
+
+The order of §3 follows from that:
+1. **Layer 2**, in the milestones of `docs/STORAGE_INTEGRATION.md` §6 (S1–S6). S1 is §3's item 3,
+   cut to its smallest piece. S2–S5 are items 4 and 5, and the two-log decision.
+2. **Layer 3**, item 6, measured against the integrated system rather than the in-memory one.
+3. **End-to-end chaos** on the storage-backed system (item 7, rerun), then **PreVote and
+   CheckQuorum** (item 8), each measured before and after.
+4. **Layer 4** (items 10 and 11), and the delivery documents.
+
+The project is done when it can demonstrate:
+1. a real multi-node Raft cluster;
+2. the durable engine behind the replicated state machine;
+3. linearizable client-visible operations;
+4. deduplication of identified requests across restarts;
+5. snapshot and restore from durable engine state;
+6. dynamic membership;
+7. reproducible crash and chaos testing;
+8. reproducible benchmarks, with before-and-after measurements of each optimization;
+9. an explanation of every important trade-off;
+10. clean CI;
+11. no stale documentation, and no unproven guarantee stated as a fact.
+
+Points 2 and 5 are not yet true. Point 4 holds today because a restarted node rebuilds its session
+table by replaying the log (`docs/DEDUP.md` §4); it must keep holding once the engine is hosted.
 
 ---
 
@@ -216,7 +260,7 @@ storage engine. D1 lets one valid request disable a node, and D3–D5 let a conf
 break safety or make replicas diverge. The engine integration adds a durable apply path, a second
 log and more configuration on top of exactly these paths, so they must hold first.
 
-### 1. Input and replication bounds (D1, D2) — next
+### 1. Input and replication bounds (D1, D2) — done, except D2's pipelining (item 6)
 
 - **Status:** D1 done — the entry budget is enforced at the front, at `raft.Propose`, in the
   in-memory log, at `Step` and at `raftlog.Save` (`docs/RAFT.md` §16). D2 is mostly fixed (row
@@ -240,7 +284,7 @@ log and more configuration on top of exactly these paths, so they must hold firs
 - **Benchmark:** the §6.3 concurrency series before and after.
 - **Docs:** API, DESIGN §1, RAFT, LIMITATIONS.
 
-### 2. `dkvd` configuration and lifecycle safety (D3–D8)
+### 2. `dkvd` configuration and lifecycle safety (D3–D8) — done
 
 - **Problem:** the operator can make a node forget its votes, run two drivers on one log, or run
   replicas that decide differently.
@@ -258,7 +302,11 @@ log and more configuration on top of exactly these paths, so they must hold firs
   the start path; mutants.
 - **Docs:** MULTI_RAFT, DEDUP, LIMITATIONS, a configuration reference.
 
-### 3. Storage-engine prerequisites (§1.6)
+### 3. Storage-engine prerequisites (§1.6) — next, as S1
+
+The first piece is `docs/STORAGE_INTEGRATION.md` §7 (S1): atomic apply batches with a durable
+applied index, proven by a crash and power-loss matrix, inside the engine. The rest of this item is
+spread over S2–S5 there.
 
 - **Problem:** the engine cannot host the replicated state machine, and cannot be tested under the
   faults the node is.

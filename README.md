@@ -5,6 +5,20 @@ A distributed key-value database built from scratch in Go.
 No Raft library, no embedded database, no consensus service — the storage engine and the
 consensus implementation are the project, and they were built in that order.
 
+**Thesis.** Quorum is a correctness-first distributed key-value database built from scratch.
+Consensus, durability, failure handling and client semantics are implemented independently and
+then connected. The defining engineering problem is integrating the durable LSM engine with the
+replicated state machine without weakening the guarantees already proven.
+
+| Layer | State |
+|---|---|
+| 1. Correctness foundation: Raft, crash recovery, linearizability, sessions, snapshots, membership, Multi-Raft | built, and verified by simulation, crash matrices, recorded histories, real-process chaos, mutation and fuzzing |
+| 2. Durable storage integration: the LSM engine as the replicated state machine | **not started.** `dkvd` replicates an in-memory `kv.Store`; the engine is built and benchmarked standalone. Design: [`docs/STORAGE_INTEGRATION.md`](docs/STORAGE_INTEGRATION.md) |
+| 3. Distributed performance | baseline measured ([`docs/CLUSTER_BENCHMARKS.md`](docs/CLUSTER_BENCHMARKS.md)); nothing optimized yet |
+| 4. Operational and demo surface | `dkvctl`, health and readiness, chaos and load labs; the rest waits for layers 2 and 3 |
+
+A lower layer comes first ([`docs/ENGINEERING_ROADMAP.md`](docs/ENGINEERING_ROADMAP.md) §0).
+
 > **Status: Phase 16 of 25, with Phase 19's load generator and first cluster baseline — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, a working Raft consensus core, deterministic fault injection, a proven crash-recovery model for the Raft node, client-visible linearizability of single-key operations per Raft group, safe client retries (request identity, deduplication at apply and request forwarding), snapshots with log compaction and follower installation, dynamic membership by joint consensus with one Raft group per shard, checked on real client histories; metrics from every layer, a load generator for real clusters, and reproducible cluster experiments with a measured performance report; real-process chaos under a recorded, linearizability-checked workload, and an operator tool with health and readiness.**
 >
 > **Implemented:** a write-ahead log, an ordered memtable, immutable on-disk SSTables, Bloom
@@ -448,6 +462,7 @@ it is being answered out of memory.
 | [ENGINEERING_ROADMAP.md](docs/ENGINEERING_ROADMAP.md) | The audit of the system as built, its verified defects, and the ranked engineering work that follows |
 | [CHAOS.md](docs/CHAOS.md) | Real-process chaos: seeded fault schedules (kill, stop, crash at a driver point, pause, isolate, cut, snapshot, add-member) under a recorded workload checked for linearizability; what a seed reproduces and what it cannot; partitions; the evidence a failing run leaves |
 | [OPERATIONS.md](docs/OPERATIONS.md) | `dkvctl`: status, leaders, configurations, lag, health and readiness over the admin protocol; the exact health and readiness rules, what each cannot see, and the exit codes |
+| [STORAGE_INTEGRATION.md](docs/STORAGE_INTEGRATION.md) | The design for making the LSM engine the replicated state machine (not yet implemented): who owns order, apply results and the applied index; one apply cycle and its crash windows; exactly-once recovery; the two-log options and what decides between them; snapshots as checkpoints; milestones S1–S6 |
 | [LOAD_TESTING.md](docs/LOAD_TESTING.md) | How `dkvload` puts a real cluster under load: closed and open loop (coordinated omission accounted for), exact percentiles, outcome classes, the outage timeline, reproducibility, and the generator's measured ceiling |
 | [API.md](docs/API.md) | The client wire protocol v3: framing, messages, the request's group, operations, validation, status codes, forwarding and redirect-only mode, the session and sharded client libraries |
 | [SNAPSHOTS.md](docs/SNAPSHOTS.md) | Snapshot state and format, creation and compaction order, recovery's reconciliation, crash windows, follower installation, chunking, dedup preservation, corruption policy, measurements, and snapshots with membership |

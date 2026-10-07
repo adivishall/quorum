@@ -3,6 +3,11 @@
 The build order is not arbitrary. Each phase exists because the next one cannot be tested
 honestly without it.
 
+Since PR #10 the remaining work is organized by the thesis and the four layers of
+`docs/ENGINEERING_ROADMAP.md` §0: correctness foundation, durable storage integration, distributed
+performance, operational surface. This table records the phases as built; the rows still open are
+scheduled there, the storage integration first (`docs/STORAGE_INTEGRATION.md`).
+
 Rules that apply to every phase:
 - No phase is complete while a core-correctness test is failing.
 - Every feature ships with: implementation, tests, defined failure behavior, documentation.

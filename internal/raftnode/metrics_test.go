@@ -168,6 +168,7 @@ func TestMetricsMatchWhatTheClusterDid(t *testing.T) {
 	}
 
 	c.converged(c.ids)
+	var createdAnywhere float64
 	for _, id := range c.ids {
 		st := c.nodes[id].Status()
 		if n := metricOf(t, reg(id), "dkv_raft_persisted_entries_total", "group", "0"); n < float64(succeeded) {
@@ -180,7 +181,11 @@ func TestMetricsMatchWhatTheClusterDid(t *testing.T) {
 			t.Fatalf("%s: applied gauge %v, Status %d", id, v, st.Applied)
 		}
 		// Snapshots every 20 entries: each node published at least one, and
-		// counted and timed each one it published.
+		// counted and timed each one it published, under how it got it. A
+		// node creates its own once it has applied 20 entries — unless it fell
+		// behind the leader's compaction first (CI's load did that once), in
+		// which case the leader's snapshot brought it up to date: installed,
+		// not created.
 		if st.Snapshot == 0 {
 			t.Fatalf("%s published no snapshot", id)
 		}
@@ -188,9 +193,14 @@ func TestMetricsMatchWhatTheClusterDid(t *testing.T) {
 			t.Fatalf("%s: snapshot gauge %v, Status %d", id, v, st.Snapshot)
 		}
 		created := metricOf(t, reg(id), "dkv_raft_snapshots_created_total", "group", "0", "trigger", "periodic")
-		if timed := metricOf(t, reg(id), "dkv_raft_snapshot_create_seconds_count", "group", "0"); created < 1 || created != timed {
-			t.Fatalf("%s: %v snapshots counted, %v timed", id, created, timed)
+		installed := metricOf(t, reg(id), "dkv_raft_snapshots_installed_total", "group", "0")
+		createTimed := metricOf(t, reg(id), "dkv_raft_snapshot_create_seconds_count", "group", "0")
+		installTimed := metricOf(t, reg(id), "dkv_raft_snapshot_install_seconds_count", "group", "0")
+		if created+installed < 1 || created != createTimed || installed != installTimed {
+			t.Fatalf("%s published snapshot %d: %v created (%v timed), %v installed (%v timed)",
+				id, st.Snapshot, created, createTimed, installed, installTimed)
 		}
+		createdAnywhere += created
 		// The log's size is its file's length (quiescent: nothing is saved
 		// between two heartbeats of a converged group).
 		info, err := os.Stat(filepath.Join(c.dir, string(id)+".log"))
@@ -200,6 +210,12 @@ func TestMetricsMatchWhatTheClusterDid(t *testing.T) {
 		if v := metricOf(t, reg(id), "dkv_raft_log_bytes", "group", "0"); v != float64(info.Size()) {
 			t.Fatalf("%s: log bytes %v, the file holds %d", id, v, info.Size())
 		}
+	}
+
+	// Whoever led through the writes created a snapshot of its own: no node
+	// can install one nobody created.
+	if createdAnywhere < 1 {
+		t.Fatal("no node counted a periodic snapshot created")
 	}
 
 	// Lag: a stopped follower falls behind whatever leads by at least what was
