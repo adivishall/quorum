@@ -81,11 +81,33 @@ func TestDecodeApplyBatchRefusesMalformedPayloads(t *testing.T) {
 		"truncated last op":     good[:len(good)-1],
 		"count 0 with an op":    append(header(1, 5, 2), 0x00, 0x00, 0x01, 'k'),
 		"count 2 with only one": append(header(1, 5, 2), 0x02, 0x00, 0x01, 'k'),
+		// Found by FuzzDecodeApplyBatchIsTotal: a count or length written in
+		// more bytes than it needs is a second encoding of the same batch.
+		"overlong count":      append(header(1, 5, 2), 0x80, 0x00),
+		"overlong key length": append(header(1, 5, 2), 0x01, 0x01, 0x81, 0x00, 'k', 0x01, 'v'),
 	}
 	for name, p := range cases {
 		if _, err := wal.DecodeApplyBatch(p); !errors.Is(err, wal.ErrCorrupt) {
 			t.Errorf("%s: err = %v, want ErrCorrupt", name, err)
 		}
+	}
+}
+
+// TestDecodeBatchRefusesOverlongVarints: the same canonical-encoding rule
+// holds for the WriteBatch the two record kinds share their operations with.
+func TestDecodeBatchRefusesOverlongVarints(t *testing.T) {
+	good := wal.Batch{put("k", "v")}.AppendTo(nil) // 01 01 01 6b 01 76
+	for name, p := range map[string][]byte{
+		"overlong count":        append([]byte{0x81, 0x00}, good[1:]...),
+		"overlong key length":   {0x01, 0x01, 0x81, 0x00, 'k', 0x01, 'v'},
+		"overlong value length": {0x01, 0x01, 0x01, 'k', 0x81, 0x00, 'v'},
+	} {
+		if _, err := wal.DecodeBatch(p); !errors.Is(err, wal.ErrCorrupt) {
+			t.Errorf("%s: err = %v, want ErrCorrupt", name, err)
+		}
+	}
+	if _, err := wal.DecodeBatch(good); err != nil {
+		t.Fatalf("the canonical encoding: %v", err)
 	}
 }
 
