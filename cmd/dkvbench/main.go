@@ -45,7 +45,7 @@ type harness struct {
 
 func main() {
 	var (
-		suite   = flag.String("suite", "all", "which suite: put,get,delete,mixed,scaling,wal,compaction,writeamp,readamp,startup,manifest,concurrency,all")
+		suite   = flag.String("suite", "all", "which suite: put,get,delete,mixed,scaling,wal,apply,compaction,writeamp,readamp,startup,manifest,concurrency,all")
 		dataset = flag.Int("dataset", 100_000, "base dataset size (keys)")
 		value   = flag.Int("value", 100, "value size in bytes for the general suites")
 		conc    = flag.Int("concurrency", 1, "writer/reader goroutines for single-config suites")
@@ -118,6 +118,8 @@ func (h *harness) dispatch(suite string) error {
 		return h.suiteScaling()
 	case "wal":
 		return h.suiteWAL()
+	case "apply":
+		return h.suiteApply()
 	case "compaction":
 		return h.suiteCompaction()
 	case "writeamp":
@@ -133,7 +135,7 @@ func (h *harness) dispatch(suite string) error {
 	case "all":
 		for _, fn := range []func() error{
 			h.suitePut, h.suiteGet, h.suiteDelete, h.suiteMixed,
-			h.suiteWAL, h.suiteCompaction, h.suiteWriteAmp, h.suiteReadAmp,
+			h.suiteWAL, h.suiteApply, h.suiteCompaction, h.suiteWriteAmp, h.suiteReadAmp,
 			h.suiteStartup, h.suiteManifest, h.suiteConcurrency, h.suiteScaling,
 		} {
 			if err := fn(); err != nil {
