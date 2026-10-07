@@ -101,7 +101,8 @@ type LSMStore struct {
 	mu  sync.RWMutex
 	cur *version
 
-	applied AppliedIndex
+	applied    AppliedIndex // the last applied index recorded; mu (written under writeMu too)
+	appliedSeq uint64       // the sequence of the last mutation the last apply batch held; mu
 
 	w        *wal.WAL
 	recovery LSMRecovery
@@ -141,6 +142,7 @@ type LSMRecovery struct {
 	BytesScanned    int64
 	RecordsApplied  int64
 	BatchesApplied  int64
+	ApplyBatches    int64 // apply records replayed (S1)
 	OpsReplayed     int64
 	OpsSkipped      int64 // already durable in an SSTable
 	FlushesOnReplay int
@@ -148,6 +150,10 @@ type LSMRecovery struct {
 	// Sequence is the last sequence number assigned during replay, which is the
 	// total number of mutations the WAL holds.
 	Sequence uint64
+
+	// SyncedNewestSegment reports that the newest WAL segment was fsynced
+	// before replay, so everything recovered is durable (S1).
+	SyncedNewestSegment bool
 
 	// Truncated reports a repaired torn tail in the WAL.
 	Truncated       bool
@@ -610,35 +616,47 @@ func (s *LSMStore) closeManifest() {
 func (s *LSMStore) replayWAL() error {
 	maxFlushed := s.recovery.MaxFlushedSeq
 
-	rec, err := wal.Recover(filepath.Join(s.dir, walDirName), wal.Handler{
-		Batch: func(b wal.Batch) error {
-			for _, op := range b {
-				s.seq++
-				if s.seq <= maxFlushed {
-					s.recovery.OpsSkipped++
-					continue
-				}
-				kind := ikey.KindValue
-				if op.Kind == wal.OpDelete {
-					kind = ikey.KindTombstone
-				}
-				s.cur.mem.Add(s.seq, kind, op.Key, op.Value)
-				s.recovery.OpsReplayed++
-
-				// Flush during replay for the same reason as during normal
-				// operation: without it, recovering a log larger than memory
-				// would need memory proportional to the whole log.
-				if s.cur.mem.ApproxSize() >= s.opts.MemTableSize {
-					if err := s.flushLocked(); err != nil {
-						return err
-					}
-					s.recovery.FlushesOnReplay++
-				}
+	replay := func(b wal.Batch) error {
+		for _, op := range b {
+			s.seq++
+			if s.seq <= maxFlushed {
+				s.recovery.OpsSkipped++
+				continue
 			}
-			return nil
-		},
+			kind := ikey.KindValue
+			if op.Kind == wal.OpDelete {
+				kind = ikey.KindTombstone
+			}
+			s.cur.mem.Add(s.seq, kind, op.Key, op.Value)
+			s.recovery.OpsReplayed++
+
+			// Flush during replay for the same reason as during normal
+			// operation: without it, recovering a log larger than memory
+			// would need memory proportional to the whole log.
+			if s.cur.mem.ApproxSize() >= s.opts.MemTableSize {
+				if err := s.flushLocked(); err != nil {
+					return err
+				}
+				s.recovery.FlushesOnReplay++
+			}
+		}
+		return nil
+	}
+	rec, err := wal.RecoverWith(filepath.Join(s.dir, walDirName), s.opts.WAL, wal.Handler{
+		Batch: replay,
 		Applied: func(a wal.AppliedIndex) error {
 			s.applied = AppliedIndex{Index: a.Index, Term: a.Term}
+			return nil
+		},
+		// An apply batch replays as the unit it was written as (S1): its
+		// mutations, numbered exactly as Apply numbered them, then its index —
+		// never one without the other.
+		Apply: func(ab wal.ApplyBatch) error {
+			if err := replay(ab.Ops); err != nil {
+				return err
+			}
+			s.applied = AppliedIndex{Index: ab.Applied.Index, Term: ab.Applied.Term}
+			s.appliedSeq = s.seq
 			return nil
 		},
 	})
@@ -660,6 +678,8 @@ func (s *LSMStore) replayWAL() error {
 	s.recovery.BytesScanned = rec.BytesScanned
 	s.recovery.RecordsApplied = rec.RecordsApplied
 	s.recovery.BatchesApplied = rec.BatchesApplied
+	s.recovery.ApplyBatches = rec.ApplyBatches
+	s.recovery.SyncedNewestSegment = rec.SyncedNewest
 	s.recovery.Sequence = s.seq
 	s.recovery.Truncated = rec.Truncated
 	s.recovery.TruncatedFile = rec.TruncatedFile

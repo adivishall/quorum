@@ -127,7 +127,7 @@ func OpenWALStore(dir string, opts Options) (*WALStore, error) {
 	}
 	walDir := filepath.Join(dir, walDirName)
 
-	rec, err := wal.Recover(walDir, wal.Handler{
+	rec, err := wal.RecoverWith(walDir, opts.WAL, wal.Handler{
 		Batch: func(b wal.Batch) error {
 			// Single-threaded here — the store is not published yet — but the
 			// lock is taken anyway so that replay and the live write path go
@@ -144,6 +144,12 @@ func OpenWALStore(dir string, opts Options) (*WALStore, error) {
 			defer s.mu.Unlock()
 			s.applied = AppliedIndex{Index: a.Index, Term: a.Term}
 			return nil
+		},
+		// WALStore never writes an apply batch (S1 is LSMStore's): one in its
+		// log means the directory is not a WALStore's, and replaying around it
+		// would drop its mutations.
+		Apply: func(wal.ApplyBatch) error {
+			return fmt.Errorf("walstore: holds no apply batches; this log was written by another engine: %w", ErrCorrupt)
 		},
 	})
 	if err != nil {
