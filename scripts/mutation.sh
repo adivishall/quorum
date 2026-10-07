@@ -2839,7 +2839,7 @@ mutant "lsm-engine-index-follows-the-cycle" internal/kv/lsm.go \
   '	m.engine = m.last
 	m.resetCycle()' \
   '	m.resetCycle()' \
-  ./internal/kv '^TestLSMMachineRestoresASnapshot$'
+  ./internal/kv '^TestLSMMachineMatchesTheStoreOnAScript$'
 
 # 336. S2: a session a decision touched is not rewritten.
 mutant "lsm-touched-session-recorded" internal/kv/lsm.go \

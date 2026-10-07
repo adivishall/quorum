@@ -133,6 +133,11 @@ func (p *pair) cycle(cmds ...[]byte) {
 		p.t.Fatalf("the cycle through %d took %d sequence numbers: %d writes, %d sessions changed, %d evicted want %d",
 			p.next-1, got, writes, changed, removed, want)
 	}
+	// The engine holds the cycle: the machine's record of it, and the index
+	// its snapshot would name, are the cycle's last entry.
+	if e, want := p.lsm.EngineApplied(), (storage.AppliedIndex{Index: p.next - 1, Term: p.term}); e != want {
+		p.t.Fatalf("after the cycle through %d the engine is recorded at %+v, want %+v", p.next-1, e, want)
+	}
 	p.same("after the cycle through " + fmt.Sprint(p.next-1))
 }
 
@@ -238,6 +243,13 @@ func TestLSMMachineMatchesTheStoreOnAScript(t *testing.T) {
 	p.cycle(idPut(14, 1, 1, "a", "again"), idPut(14, 1, 1, "a", "again")) // 16 executed, 17 duplicate in one cycle
 	p.reopen()
 	p.cycle(nil, nil, nil) // 18-20 no-ops only: the index still advances
+	// Without a reopen, the machine's snapshot is the store's, at the
+	// cycle's index.
+	gi, gd, err := p.lsm.EncodeSnapshot()
+	ri, rd, _ := p.mem.EncodeSnapshot()
+	if err != nil || gi != 20 || gi != ri || !bytes.Equal(gd, rd) {
+		t.Fatalf("the machine's snapshot at %d differs from the store's at %d (%v)", gi, ri, err)
+	}
 	p.reopen()
 	if st := addStats(p.total, p.lsm.Stats()); st.Executed == 0 || st.Duplicate == 0 || st.Conflict == 0 || st.Stale == 0 || st.Expired == 0 || st.Limit == 0 || st.Registered == 0 || st.Evicted == 0 {
 		t.Fatalf("the script did not reach every decision: %+v", st)
