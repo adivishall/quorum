@@ -100,7 +100,10 @@ order of operations. The WAL is still never truncated (`docs/LIMITATIONS.md`).
 **`SetApplied` is recorded, but the WAL remains the authority** for the applied index, as in Phases
 2 and 3. The snapshot written at each open records the recovered value so the field is meaningful
 and round-trips, but nothing reads it back in preference to the log. Two authorities for one number
-would be worse than having the wrong one.
+would be worse than having the wrong one. S1 kept it that way on purpose: its apply batches carry
+the index in the WAL record with their data (`docs/STORAGE_INTEGRATION.md` §7.1). The MANIFEST
+becomes the authority for the applied index and the last sequence only in S3, together with the WAL
+truncation that first needs it.
 
 ## 5. The publication protocol
 

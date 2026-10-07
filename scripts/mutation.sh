@@ -2622,6 +2622,178 @@ mutant "deposed-leader-answers-lost" internal/kv/server.go \
 		resp.Status = StatusUnknown' \
   ./tests/integration '^TestRealDeposedLeaderAnswersLostThenDies$'
 
+# 310. S1: an apply batch's mutations and its index written as two records — a
+#      crash between them recovers the data without its index (R1).
+mutant "apply-batch-is-one-record" internal/storage/wal/wal.go \
+  '	return w.append(KindApplyBatch, a.AppendTo(nil))' \
+  '	if len(a.Ops) > 0 {
+		if err := w.append(KindWriteBatch, a.Ops.AppendTo(nil)); err != nil {
+			return err
+		}
+	}
+	return w.append(KindApplyBatch, ApplyBatch{Applied: a.Applied}.AppendTo(nil))' \
+  ./internal/storage '^(TestApplyCrashMatrix|TestTheLegacyPairSplitsAndApplyDoesNot)$'
+
+# 311. S1: the index written before, and apart from, the mutations — a crash
+#      between them recovers an index without its data (R1).
+mutant "apply-index-never-without-data" internal/storage/wal/wal.go \
+  '	return w.append(KindApplyBatch, a.AppendTo(nil))' \
+  '	if err := w.append(KindApplyBatch, ApplyBatch{Applied: a.Applied}.AppendTo(nil)); err != nil {
+		return err
+	}
+	if len(a.Ops) == 0 {
+		return nil
+	}
+	return w.append(KindWriteBatch, a.Ops.AppendTo(nil))' \
+  ./internal/storage '^TestApplyCrashMatrix$'
+
+# 312. S1: the index published before the append — a failed Apply leaves an index
+#      nothing in the log records.
+mutant "apply-index-published-after-the-append" internal/storage/apply.go \
+  '		if err := s.w.AppendApply(ab); err != nil {' \
+  '		s.applied = applied
+		if err := s.w.AppendApply(ab); err != nil {' \
+  ./internal/storage '^TestAFailedApplyPublishesNothing$'
+
+# 313. S1: the index published before the mutations — a reader sees an index whose
+#      data it cannot yet read.
+mutant "apply-data-visible-before-index" internal/storage/apply.go \
+  '		s.mu.RLock()
+		mem := s.cur.mem
+		s.mu.RUnlock()
+		for _, o := range ops {' \
+  '		s.mu.Lock()
+		s.applied = applied
+		s.mu.Unlock()
+		s.mu.RLock()
+		mem := s.cur.mem
+		s.mu.RUnlock()
+		for _, o := range ops {' \
+  ./internal/storage '^TestPublicationOrder$'
+
+# 314. S1: replay does not restore an apply batch's index — the recovered index lags
+#      the recovered data.
+mutant "replay-restores-the-apply-index" internal/storage/lsmstore.go \
+  '			s.applied = AppliedIndex{Index: ab.Applied.Index, Term: ab.Applied.Term}
+			s.appliedSeq = s.seq' \
+  '			s.appliedSeq = s.seq' \
+  ./internal/storage '^(TestApplyBatchesAndRecovery|TestApplyCrashMatrix)$'
+
+# 315. S1: replay restores the index before the batch's mutations — the index
+#      covers a sequence its data has not reached.
+mutant "replay-index-after-its-mutations" internal/storage/lsmstore.go \
+  '			if err := replay(ab.Ops); err != nil {
+				return err
+			}
+			s.applied = AppliedIndex{Index: ab.Applied.Index, Term: ab.Applied.Term}
+			s.appliedSeq = s.seq' \
+  '			s.applied = AppliedIndex{Index: ab.Applied.Index, Term: ab.Applied.Term}
+			s.appliedSeq = s.seq
+			if err := replay(ab.Ops); err != nil {
+				return err
+			}' \
+  ./internal/storage '^(TestApplyBatchesAndRecovery|TestApplyCrashMatrix)$'
+
+# 316. S1: replay skips an empty apply batch — a no-op entry's index is lost.
+mutant "replay-keeps-an-empty-batch-index" internal/storage/lsmstore.go \
+  '		Apply: func(ab wal.ApplyBatch) error {
+			if err := replay(ab.Ops); err != nil {' \
+  '		Apply: func(ab wal.ApplyBatch) error {
+			if len(ab.Ops) == 0 {
+				return nil
+			}
+			if err := replay(ab.Ops); err != nil {' \
+  ./internal/storage '^(TestAnEmptyBatchIsRecoveredAsTheIndex|TestApplyCrashMatrix)$'
+
+# 317. S1: Apply accepts an index that does not advance.
+mutant "apply-index-must-advance" internal/storage/apply.go \
+  '		if applied.Index == 0 || applied.Term == 0 || !ab.Advances(cur) {' \
+  '		if applied.Index == 0 || applied.Term == 0 {' \
+  ./internal/storage '^TestTheAppliedIndexMustAdvance$'
+
+# 318. S1: the term is not part of advancing — an index in an older term is accepted,
+#      live and at replay.
+mutant "apply-term-must-not-fall" internal/storage/wal/batch.go \
+  '	return a.Applied.Index > prev.Index && a.Applied.Term >= prev.Term' \
+  '	return a.Applied.Index > prev.Index' \
+  "./internal/storage ./internal/storage/wal" '^(TestTheAppliedIndexMustAdvance|TestRecoverReplaysApplyBatchesAsUnits)$'
+
+# 319. S1: replay accepts an apply record that does not advance — a log the writer
+#      never produces is replayed as though it had.
+mutant "replay-refuses-a-non-advancing-batch" internal/storage/wal/recover.go \
+  '		if !ab.Advances(rec.AppliedIndex) {' \
+  '		if false {' \
+  "./internal/storage ./internal/storage/wal" '^(TestRecoverReplaysApplyBatchesAsUnits|TestApplyReplayRefusesAnIndexThatDoesNotAdvance)$'
+
+# 320. S1: the applied index takes a sequence number — the live numbering drifts
+#      from what replay reproduces.
+mutant "apply-index-takes-no-sequence" internal/storage/apply.go \
+  '		s.mu.Lock()
+		s.applied = applied
+		s.appliedSeq = s.seq' \
+  '		s.seq++
+		s.mu.Lock()
+		s.applied = applied
+		s.appliedSeq = s.seq' \
+  ./internal/storage '^TestApplyBatchesAndRecovery$'
+
+# 321. S1: replay numbers an apply batch differently from Apply — the recovered
+#      sequence is not the one assigned.
+mutant "replay-numbers-apply-batches-as-apply-did" internal/storage/lsmstore.go \
+  '			s.applied = AppliedIndex{Index: ab.Applied.Index, Term: ab.Applied.Term}
+			s.appliedSeq = s.seq' \
+  '			s.seq++
+			s.applied = AppliedIndex{Index: ab.Applied.Index, Term: ab.Applied.Term}
+			s.appliedSeq = s.seq' \
+  ./internal/storage '^(TestApplyBatchesAndRecovery|TestApplyCrashMatrix)$'
+
+# 322. S1 gap (a): a new WAL directory's parent is not fsynced — a power loss takes
+#      the directory and every synced segment in it.
+mutant "wal-directory-is-durable" internal/storage/wal/wal.go \
+  '		if err := fsys.SyncDir(filepath.Dir(filepath.Clean(dir))); err != nil {' \
+  '		if _, err := filepath.Dir(filepath.Clean(dir)), error(nil); err != nil {' \
+  "./internal/storage ./internal/storage/wal" '^(TestANewWALDirectoryIsDurable|TestApplyCrashMatrix)$'
+
+# 323. S1 gap (b): recovery does not fsync the newest segment — what it replays, and
+#      what a replay flush records, can be lost to a power loss after open.
+mutant "recovery-syncs-the-newest-segment" internal/storage/wal/recover.go \
+  '			if err := syncSegment(fsys, segmentPath(dir, seg)); err != nil {' \
+  '			if err := error(nil); err != nil {' \
+  "./internal/storage ./internal/storage/wal" '^(TestRecoverSyncsTheNewestSegment|TestApplyCrashMatrix)$'
+
+# 324. S1: the decoder accepts an apply record of an unknown version.
+mutant "apply-record-version-checked" internal/storage/wal/batch.go \
+  '	if v := payload[0]; v != applyBatchVersion {' \
+  '	if v := payload[0]; v == 0 && v != applyBatchVersion {' \
+  ./internal/storage/wal '^TestDecodeApplyBatchRefusesMalformedPayloads$'
+
+# 325. S1: the decoder accepts an apply record at index or term zero, which no
+#      applied entry has.
+mutant "apply-record-names-an-entry" internal/storage/wal/batch.go \
+  '	if applied.Index == 0 || applied.Term == 0 {' \
+  '	if false {' \
+  ./internal/storage/wal '^TestDecodeApplyBatchRefusesMalformedPayloads$'
+
+# 326. S1: WALStore replays around an apply batch — its mutations are silently lost.
+mutant "walstore-refuses-apply-batches" internal/storage/walstore.go \
+  '			return fmt.Errorf("walstore: holds no apply batches; this log was written by another engine: %w", ErrCorrupt)' \
+  '			return nil' \
+  ./internal/storage '^TestWALStoreRefusesApplyBatches$'
+
+# 327. S1: MemFS keeps files under a directory a power loss should take — the model
+#      would hide gap (a).
+mutant "memfs-power-loss-takes-undurable-directories" internal/fault/memfs.go \
+  '		if !m.undurable(name) {' \
+  '		if true {' \
+  ./internal/fault '^TestAMadeDirectoryIsDurableOnlyOnceItsParentIsSynced$'
+
+# 328. S1: the WAL decoders accept a count or length written in more bytes than
+#      it needs — one batch, two encodings (found by fuzzing apply batches).
+mutant "wal-varints-are-canonical" internal/storage/wal/batch.go \
+  '	if n > 0 && n != len(binary.AppendUvarint(nil, v)) {' \
+  '	if false {' \
+  ./internal/storage/wal '^(TestDecodeBatchRefusesOverlongVarints|TestDecodeApplyBatchRefusesMalformedPayloads)$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then

@@ -26,6 +26,7 @@ const (
 	OpSyncDir
 	OpRename // Phase 14: an injection's Path matches the rename's DESTINATION
 	OpRemove
+	OpMkdir // S1: MkdirAll; an injection's Path matches the directory named
 )
 
 func (o Op) String() string {
@@ -44,6 +45,8 @@ func (o Op) String() string {
 		return "rename"
 	case OpRemove:
 		return "remove"
+	case OpMkdir:
+		return "mkdir"
 	default:
 		return "op(?)"
 	}
@@ -249,6 +252,15 @@ func (f *InjectFS) Rename(oldname, newname string) error {
 func (f *InjectFS) Remove(name string) error {
 	name = filepath.Clean(name)
 	return f.dirOp(OpRemove, name, func() error { return f.base.Remove(name) })
+}
+
+// ReadDir forwards to the base filesystem: a read, never failed or logged.
+func (f *InjectFS) ReadDir(dir string) ([]fs.DirEntry, error) { return f.base.ReadDir(dir) }
+
+// MkdirAll forwards to the base filesystem unless an OpMkdir fault fires.
+func (f *InjectFS) MkdirAll(dir string, perm fs.FileMode) error {
+	dir = filepath.Clean(dir)
+	return f.dirOp(OpMkdir, dir, func() error { return f.base.MkdirAll(dir, perm) })
 }
 
 // dirOp is the common path of an operation that has no file handle: an armed

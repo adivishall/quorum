@@ -65,6 +65,7 @@ been read, and a corrupt length would otherwise drive a wild allocation.
 |---|---|
 | `0x01` | `WriteBatch` |
 | `0x02` | `AppliedIndex` |
+| `0x03` | `ApplyBatch`: a state-machine application's mutations **and** its applied index, one record (S1) |
 
 **WriteBatch payload**
 
@@ -89,12 +90,32 @@ single-key mutations — the multi-operation form exists and is tested because c
 Raft apply will use it.
 
 **AppliedIndex payload**: `raftIndex u64`, `raftTerm u64`. Exactly 16 bytes; any other length
-is corruption, not a newer format.
+is corruption, not a newer format. It is a record of its own, so `Put` followed by
+`SetAppliedIndex` is two records, and a crash between them keeps the data without its index.
+
+**ApplyBatch payload** (S1, `docs/STORAGE_INTEGRATION.md` §7.3):
+
+```
+version    u8          = 1
+raftIndex  u64         >= 1
+raftTerm   u64         >= 1
+count      uvarint     may be 0: an applied entry with no effect on the data
+count × { ... }        exactly the WriteBatch operations above
+```
+
+One checksum covers the mutations and the index, so recovery sees both or neither. Replay
+also refuses an `ApplyBatch` whose index does not exceed the applied index in effect before
+it, or whose term is lower: the writer never produces one. A binary from before S1 refuses a
+log holding `0x03` as an unknown kind; it never skips it.
 
 ### Decoding is strict
 
 Every length is checked against the bytes that actually remain. Unknown operation kinds,
-empty keys, zero operation counts, and leftover trailing bytes are all errors. A lenient
+empty keys, zero operation counts in a `WriteBatch`, and leftover trailing bytes are all
+errors. Since S1, so is a count or length written in more bytes than it needs (`0` as
+`0x80 0x00`): fuzzing apply batches found that the decoders accepted it, giving one batch two
+encodings. The encoder has only ever written the minimal form, so no log it wrote is refused
+(`TestDecodeBatchRefusesOverlongVarints`, mutant 328). A lenient
 decoder in a write-ahead log turns corruption into plausible-looking state, which is worse
 than refusing to start: the operator gets a database that came up fine and is quietly wrong.
 
@@ -167,12 +188,14 @@ would not fit one (`TestAPutAlwaysFitsAWALRecord`).
 
 The LSM store syncs the WAL before a flush records its table in the manifest — except in `SyncOff`,
 which never fsyncs (`TestSyncOffNeverFsyncsTheWAL`) — so the manifest never runs ahead of the
-durable log (`TestAFlushMakesTheWALDurableBeforeItsEdit`, mutant 260). The exception is a
-flush during replay at open: its records come from segments an earlier process wrote, and open
-does not sync them. If that process was killed with records still in the page cache, and the
-machine then loses power after the replay flush but before the kernel writes those pages back, the
-manifest is ahead of the log and the next open refuses it (`ErrCorrupt`). This is a limitation (§10).
-(`TestAReplayThatFlushesOpens`, mutant 263, covers a replay flush itself.)
+durable log (`TestAFlushMakesTheWALDurableBeforeItsEdit`, mutant 260). A flush during
+replay at open used to be the exception: its records come from segments an earlier process
+wrote, and open did not sync them, so a power loss after the replay flush could leave the
+manifest ahead of the log. Since S1, `RecoverWith` fsyncs the newest segment before replaying it
+(not in `off` mode), so every record replay hands to the engine is durable before a flush can
+record it. After open, what was recovered is durable (`TestRecoverSyncsTheNewestSegment`; the
+crash matrix's second power loss; mutant 323). `TestAReplayThatFlushesOpens` and mutant 263
+cover a replay flush itself.
 
 ### The cost, measured
 
@@ -320,9 +343,23 @@ deliberately corrupting files in unit tests, and **is not covered by any real-cr
 It is correct as far as those tests go, and its real-world trigger is a scenario we cannot
 reproduce here.
 
-**Not tested, and therefore not claimed:** power-loss durability in any mode. That needs the
-data to have reached the physical device, which no userspace test on a laptop can verify. See
-`docs/FAILURE_MODEL.md` §4.
+**Not tested, and therefore not claimed:** power-loss durability on a real device, in any mode.
+That needs the data to have reached the physical device, which no userspace test on a laptop
+can verify (`docs/FAILURE_MODEL.md` §4).
+
+**What S1 added: the power-loss MODEL.** Since S1 every WAL file operation goes through
+`internal/vfs` (`Options.FS`). The S1 crash matrix (`TestApplyCrashMatrix`,
+`docs/STORAGE_INTEGRATION.md` §7.7) runs the WAL on `fault.MemFS`. In that crash-consistent
+model only fsynced bytes, and directory entries whose directory was fsynced, survive a power
+loss. The matrix crashes at every WAL operation, with torn appends and torn unsynced tails, in
+`sync` and `batch` mode.
+
+That is evidence that the WAL issues its writes and fsyncs in an order that keeps every promise
+under the model: `sync` keeps every acknowledged record, and `batch` keeps every record a flush
+covered. It is not evidence about a disk. The matrix found two gaps, both fixed:
+- a new WAL directory's entry was never fsynced into its parent, so a power loss could take
+  every segment, synced or not;
+- open did not fsync the newest segment before a replay flush (§5).
 
 ---
 
@@ -336,5 +373,6 @@ data to have reached the physical device, which no userspace test on a laptop ca
 | Segments missing from the *start* of the sequence are undetectable | Phase 4 (MANIFEST log number) |
 | Mis-classification possible if a length field is corrupted within range | inherent to this framing; see §8 |
 | `sync` mode serialises writers behind the flush | Phase 5 may add group commit, if measured to matter |
-| Power-loss durability untested in every mode | not testable here |
-| Open does not sync the recovered segments before a replay flush records a table (§5) | open |
+| Power-loss durability untested on a real device, in every mode (modeled since S1, §9) | not testable here |
+| The current sequence and applied index are derived from the whole log; nothing deletes a segment, and S3 must make both authoritative in the MANIFEST before truncating (`docs/STORAGE_INTEGRATION.md` §7.4) | S3 |
+| ~~Open does not sync the recovered segments before a replay flush records a table (§5)~~ | **fixed in S1**: `RecoverWith` fsyncs the newest segment before replaying it (older ones were fsynced at rotation), except in `off` mode |

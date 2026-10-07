@@ -3,11 +3,12 @@ package wal
 import (
 	"errors"
 	"io"
-	"os"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/adivishall/quorum/internal/vfs"
 )
 
 // A WAL that failed a write or a flush never writes again (audit D10, M11).
@@ -39,8 +40,8 @@ func batchOf(k string) Batch { return Batch{{Kind: OpPut, Key: []byte(k), Value:
 // mid-segment that recovery refuses.
 func TestATornAppendLatches(t *testing.T) {
 	writes := 0
-	defer func(prev func(*os.File) io.Writer) { segmentOut = prev }(segmentOut)
-	segmentOut = func(f *os.File) io.Writer { return tearNth{w: f, n: &writes, nth: 2, short: 5} }
+	defer func(prev func(vfs.File) io.Writer) { segmentOut = prev }(segmentOut)
+	segmentOut = func(f vfs.File) io.Writer { return tearNth{w: f, n: &writes, nth: 2, short: 5} }
 
 	dir := t.TempDir()
 	opts := DefaultOptions()
@@ -85,8 +86,8 @@ func TestATornAppendLatches(t *testing.T) {
 // and Close used to report that as durability (the fsyncgate error).
 func TestCloseAfterAFailedFlushReportsItAndDoesNotFlushAgain(t *testing.T) {
 	calls := 0
-	defer func(prev func(*os.File) error) { syncFile = prev }(syncFile)
-	syncFile = func(f *os.File) error {
+	defer func(prev func(vfs.File) error) { syncFile = prev }(syncFile)
+	syncFile = func(f vfs.File) error {
 		calls++
 		if calls == 1 {
 			return syscall.EIO
@@ -117,10 +118,10 @@ func TestCloseAfterAFailedFlushReportsItAndDoesNotFlushAgain(t *testing.T) {
 // used to skip it after any failure.
 func TestCloseAfterAFailedWriteStillFlushes(t *testing.T) {
 	writes, syncs := 0, 0
-	defer func(prev func(*os.File) io.Writer) { segmentOut = prev }(segmentOut)
-	segmentOut = func(f *os.File) io.Writer { return tearNth{w: f, n: &writes, nth: 2, short: 5} }
-	defer func(prev func(*os.File) error) { syncFile = prev }(syncFile)
-	syncFile = func(f *os.File) error {
+	defer func(prev func(vfs.File) io.Writer) { segmentOut = prev }(segmentOut)
+	segmentOut = func(f vfs.File) io.Writer { return tearNth{w: f, n: &writes, nth: 2, short: 5} }
+	defer func(prev func(vfs.File) error) { syncFile = prev }(syncFile)
+	syncFile = func(f vfs.File) error {
 		syncs++
 		return f.Sync()
 	}
@@ -181,10 +182,10 @@ func TestAFailedWriteDoesNotStopTheBatchFlush(t *testing.T) {
 	writes := 0
 	var mu sync.Mutex
 	syncs := 0
-	defer func(prev func(*os.File) io.Writer) { segmentOut = prev }(segmentOut)
-	segmentOut = func(f *os.File) io.Writer { return tearNth{w: f, n: &writes, nth: 2, short: 5} }
-	defer func(prev func(*os.File) error) { syncFile = prev }(syncFile)
-	syncFile = func(f *os.File) error {
+	defer func(prev func(vfs.File) io.Writer) { segmentOut = prev }(segmentOut)
+	segmentOut = func(f vfs.File) io.Writer { return tearNth{w: f, n: &writes, nth: 2, short: 5} }
+	defer func(prev func(vfs.File) error) { syncFile = prev }(syncFile)
+	syncFile = func(f vfs.File) error {
 		mu.Lock()
 		syncs++
 		mu.Unlock()
@@ -228,10 +229,10 @@ func TestAFailedWriteDoesNotStopTheBatchFlush(t *testing.T) {
 // failure. It refused without flushing.
 func TestSyncAfterAFailedWriteFlushes(t *testing.T) {
 	writes, syncs := 0, 0
-	defer func(prev func(*os.File) io.Writer) { segmentOut = prev }(segmentOut)
-	segmentOut = func(f *os.File) io.Writer { return tearNth{w: f, n: &writes, nth: 2, short: 5} }
-	defer func(prev func(*os.File) error) { syncFile = prev }(syncFile)
-	syncFile = func(f *os.File) error {
+	defer func(prev func(vfs.File) io.Writer) { segmentOut = prev }(segmentOut)
+	segmentOut = func(f vfs.File) io.Writer { return tearNth{w: f, n: &writes, nth: 2, short: 5} }
+	defer func(prev func(vfs.File) error) { syncFile = prev }(syncFile)
+	syncFile = func(f vfs.File) error {
 		syncs++
 		return f.Sync()
 	}

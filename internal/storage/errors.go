@@ -50,6 +50,16 @@ var (
 	// a missing WAL segment.
 	ErrCorrupt = record.ErrCorrupt
 
+	// ErrInvalidBatch means an apply batch was refused before anything was
+	// written: a mutation of unknown kind, a delete carrying a value, or a batch
+	// too large for one WAL record (S1, docs/STORAGE_INTEGRATION.md §7.2).
+	ErrInvalidBatch = errors.New("invalid apply batch")
+
+	// ErrAppliedIndex means an apply batch's applied index does not advance the
+	// store's: its index is not above the current one, its term is below the
+	// current one, or either is zero. Nothing was written.
+	ErrAppliedIndex = errors.New("applied index does not advance")
+
 	// ErrIO means the filesystem failed. The underlying error is preserved in
 	// the message; it is not part of the API, because the set of errors a
 	// filesystem can produce is open-ended and platform-specific.

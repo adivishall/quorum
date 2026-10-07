@@ -23,7 +23,7 @@ work is organized into four layers, and **a lower layer takes priority over a hi
 | Layer | What it holds | State (after PR #10) |
 |---|---|---|
 | **1. Correctness foundation** | Raft, its durable log and crash recovery; linearizability; sessions and deduplication; snapshots; membership; Multi-Raft. Verified by the simulator, the crash matrices, the linearizability checker, real-process fault and chaos tests, mutation testing and fuzzing. | **Built and verified** (§1.5) |
-| **2. Durable storage integration** | The LSM engine as the replicated state machine: atomic apply with a durable applied index, exactly-once recovery, snapshots as engine checkpoints, the two-log decision | **Not started.** The engine is built and benchmarked standalone; `dkvd` replicates an in-memory `kv.Store`. The design and its first milestone are in `docs/STORAGE_INTEGRATION.md`. |
+| **2. Durable storage integration** | The LSM engine as the replicated state machine: atomic apply with a durable applied index, exactly-once recovery, snapshots as engine checkpoints, the two-log decision | **S1 done:** the engine records an application's mutations and applied index as one recovery unit, proven by a crash and power-loss matrix (`docs/STORAGE_INTEGRATION.md` §7). `dkvd` still replicates an in-memory `kv.Store`; S2 puts the engine behind it. |
 | **3. Distributed performance** | Group commit, replication pipelining, batched apply, each measured before and after | **Baseline measured** (`docs/CLUSTER_BENCHMARKS.md`); nothing optimized |
 | **4. Operational and demo surface** | `dkvctl`, health and readiness, the chaos and load labs; then a network client, Docker Compose, a dashboard, the demo and the write-ups | Operator tool and labs **built**; the rest waits for layers 2 and 3 |
 
@@ -302,11 +302,18 @@ log and more configuration on top of exactly these paths, so they must hold firs
   the start path; mutants.
 - **Docs:** MULTI_RAFT, DEDUP, LIMITATIONS, a configuration reference.
 
-### 3. Storage-engine prerequisites (§1.6) — next, as S1
+### 3. Storage-engine prerequisites (§1.6) — S1 done; S2 next
 
-The first piece is `docs/STORAGE_INTEGRATION.md` §7 (S1): atomic apply batches with a durable
-applied index, proven by a crash and power-loss matrix, inside the engine. The rest of this item is
-spread over S2–S5 there.
+S1 (`docs/STORAGE_INTEGRATION.md` §7) is done:
+- atomic apply batches with their applied index, inside the engine;
+- the WAL on `vfs`;
+- two power-loss gaps closed;
+- a crash and power-loss matrix.
+
+Still open from §1.6, spread over S2–S5 there:
+- durable sequence numbers and WAL truncation (S3);
+- an ordered iterator and a consistent checkpoint, ingest (S4);
+- SSTables on `vfs` (S4).
 
 - **Problem:** the engine cannot host the replicated state machine, and cannot be tested under the
   faults the node is.

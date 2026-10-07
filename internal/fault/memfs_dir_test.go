@@ -267,3 +267,90 @@ func TestCorruptFlipsBothViews(t *testing.T) {
 		t.Fatal("Corrupt of a missing file reported success")
 	}
 }
+
+// TestAMadeDirectoryIsDurableOnlyOnceItsParentIsSynced pins S1's directory
+// model (docs/STORAGE_INTEGRATION.md §7.6): a directory made with MkdirAll is
+// there at once and survives a process crash, but a power loss removes it —
+// and every file in it, however well synced — until its parent is fsynced.
+func TestAMadeDirectoryIsDurableOnlyOnceItsParentIsSynced(t *testing.T) {
+	for _, parentSynced := range []bool{false, true} {
+		m := NewMemFS()
+		writeSynced(t, m, "/db/MANIFEST", []byte("m")) // /db exists implicitly
+		if err := m.MkdirAll("/db/wal", 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeSynced(t, m, "/db/wal/000001.log", []byte("record")) // synced, and bound in /db/wal
+		if info, err := m.Stat("/db/wal"); err != nil || !info.IsDir() {
+			t.Fatalf("Stat of a made directory: %v, %v", info, err)
+		}
+		if parentSynced {
+			if err := m.SyncDir("/db"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if got := m.FullySynced("/db/wal/000001.log"); got != parentSynced {
+			t.Fatalf("parent synced %v: FullySynced = %v", parentSynced, got)
+		}
+		m.CrashProcess()
+		if _, ok := m.Cached("/db/wal/000001.log"); !ok {
+			t.Fatal("a process crash removed a file in a made directory")
+		}
+		m.CrashPowerLoss(0)
+		_, ok := m.Cached("/db/wal/000001.log")
+		_, statErr := m.Stat("/db/wal")
+		if ok != parentSynced || (statErr == nil) != parentSynced {
+			t.Fatalf("parent synced %v: after a power loss the file survives %v, the directory stat %v",
+				parentSynced, ok, statErr)
+		}
+		if _, ok := m.Cached("/db/MANIFEST"); !ok {
+			t.Fatal("a file in an implicit directory did not survive")
+		}
+	}
+}
+
+// TestReadDirListsFilesAndDirectories: ReadDir lists a directory's files and
+// subdirectories, made or implicit, sorted; a missing one is fs.ErrNotExist.
+func TestReadDirListsFilesAndDirectories(t *testing.T) {
+	m := NewMemFS()
+	writeSynced(t, m, "/db/b.sst", []byte("bb"))
+	writeSynced(t, m, "/db/x/deep/f", []byte("f"))
+	if err := m.MkdirAll("/db/wal", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ents, err := m.ReadDir("/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, e := range ents {
+		name := e.Name()
+		if e.IsDir() {
+			name += "/"
+		}
+		got = append(got, name)
+	}
+	if want := []string{"b.sst", "wal/", "x/"}; !equalStrings(got, want) {
+		t.Fatalf("ReadDir(/db) = %v, want %v", got, want)
+	}
+	if ents, err := m.ReadDir("/db/wal"); err != nil || len(ents) != 0 {
+		t.Fatalf("an empty made directory: %v, %v", ents, err)
+	}
+	if _, err := m.ReadDir("/nowhere"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("ReadDir of a missing directory: %v", err)
+	}
+	if err := m.MkdirAll("/db/b.sst/sub", 0o755); err == nil {
+		t.Fatal("MkdirAll through a file succeeded")
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

@@ -24,6 +24,11 @@ const (
 	KindWriteBatch record.Kind = 0x01
 	// KindAppliedIndex carries durable Raft progress metadata.
 	KindAppliedIndex record.Kind = 0x02
+	// KindApplyBatch carries a state-machine application (S1): the mutations
+	// of a span of applied entries AND the applied index they bring the state
+	// machine to, in one record, so a crash keeps both or neither
+	// (docs/STORAGE_INTEGRATION.md §7.3).
+	KindApplyBatch record.Kind = 0x03
 )
 
 // OpKind distinguishes a write from a delete. The values match the internal-key
@@ -92,7 +97,11 @@ type AppliedIndex struct {
 const appliedIndexSize = 16
 
 // AppendTo encodes the batch onto dst and returns the extended slice.
-func (b Batch) AppendTo(dst []byte) []byte {
+func (b Batch) AppendTo(dst []byte) []byte { return b.appendOps(dst) }
+
+// appendOps encodes the operation count and the operations: a WriteBatch's
+// whole payload, and an ApplyBatch's after its header.
+func (b Batch) appendOps(dst []byte) []byte {
 	dst = binary.AppendUvarint(dst, uint64(len(b)))
 	for _, op := range b {
 		dst = append(dst, byte(op.Kind))
@@ -116,7 +125,7 @@ func (b Batch) AppendTo(dst []byte) []byte {
 func DecodeBatch(payload []byte) (Batch, error) {
 	p := payload
 
-	count, n := binary.Uvarint(p)
+	count, n := uvarint(p)
 	if n <= 0 {
 		return nil, fmt.Errorf("wal: batch: unreadable operation count: %w", ErrCorrupt)
 	}
@@ -133,16 +142,22 @@ func DecodeBatch(payload []byte) (Batch, error) {
 			count, len(p), ErrCorrupt)
 	}
 
+	return decodeOps(p, count, "batch")
+}
+
+// decodeOps decodes count operations, which must consume p exactly. what names
+// the record for the error.
+func decodeOps(p []byte, count uint64, what string) (Batch, error) {
 	batch := make(Batch, 0, count)
 	for i := uint64(0); i < count; i++ {
 		if len(p) < 1 {
-			return nil, fmt.Errorf("wal: batch: truncated at operation %d of %d: %w", i, count, ErrCorrupt)
+			return nil, fmt.Errorf("wal: %s: truncated at operation %d of %d: %w", what, i, count, ErrCorrupt)
 		}
 		kind := OpKind(p[0])
 		p = p[1:]
 
 		if kind != OpPut && kind != OpDelete {
-			return nil, fmt.Errorf("wal: batch: operation %d has unknown kind %#x: %w", i, uint8(kind), ErrCorrupt)
+			return nil, fmt.Errorf("wal: %s: operation %d has unknown kind %#x: %w", what, i, uint8(kind), ErrCorrupt)
 		}
 
 		key, rest, err := takeBytes(p, "key", i)
@@ -154,7 +169,7 @@ func DecodeBatch(payload []byte) (Batch, error) {
 			// An empty key is rejected by the Store contract, so one can never
 			// have been written. Seeing it means the payload is not what it
 			// claims to be.
-			return nil, fmt.Errorf("wal: batch: operation %d has an empty key: %w", i, ErrCorrupt)
+			return nil, fmt.Errorf("wal: %s: operation %d has an empty key: %w", what, i, ErrCorrupt)
 		}
 
 		op := Op{Kind: kind, Key: key}
@@ -170,15 +185,15 @@ func DecodeBatch(payload []byte) (Batch, error) {
 	}
 
 	if len(p) != 0 {
-		return nil, fmt.Errorf("wal: batch: %d unconsumed bytes after %d operations: %w",
-			len(p), count, ErrCorrupt)
+		return nil, fmt.Errorf("wal: %s: %d unconsumed bytes after %d operations: %w",
+			what, len(p), count, ErrCorrupt)
 	}
 	return batch, nil
 }
 
 // takeBytes reads a uvarint-prefixed byte string.
 func takeBytes(p []byte, what string, opIndex uint64) (value, rest []byte, err error) {
-	n, read := binary.Uvarint(p)
+	n, read := uvarint(p)
 	if read <= 0 {
 		return nil, nil, fmt.Errorf("wal: batch: operation %d has an unreadable %s length: %w",
 			opIndex, what, ErrCorrupt)
@@ -209,4 +224,91 @@ func DecodeAppliedIndex(payload []byte) (AppliedIndex, error) {
 		Index: binary.LittleEndian.Uint64(payload[0:8]),
 		Term:  binary.LittleEndian.Uint64(payload[8:16]),
 	}, nil
+}
+
+// ApplyBatch is a state-machine application (S1, docs/STORAGE_INTEGRATION.md
+// §7): the mutations a span of applied entries produced, and the applied index
+// they bring the state machine to. It is encoded as ONE record, so its checksum
+// covers both: either recovery sees every mutation together with the index, or
+// none of the mutations and the index as it was before. Ops may be empty — an
+// entry with no effect on the data (a Raft no-op, a configuration change) still
+// advances the index.
+type ApplyBatch struct {
+	Applied AppliedIndex
+	Ops     Batch
+}
+
+// applyBatchVersion is the payload version this package writes and reads.
+const applyBatchVersion = 1
+
+// applyHeaderSize is the fixed prefix: a version byte, the index and the term.
+const applyHeaderSize = 1 + appliedIndexSize
+
+// AppendTo encodes the apply batch onto dst and returns the extended slice:
+// version, index and term (little-endian), then the operations exactly as a
+// WriteBatch encodes them.
+func (a ApplyBatch) AppendTo(dst []byte) []byte {
+	dst = append(dst, applyBatchVersion)
+	dst = a.Applied.AppendTo(dst)
+	return a.Ops.appendOps(dst)
+}
+
+// DecodeApplyBatch decodes an ApplyBatch payload, strictly: an unknown version,
+// an index or term of zero (no applied entry has either), a count the bytes
+// cannot hold, a malformed operation or a trailing byte is corruption.
+func DecodeApplyBatch(payload []byte) (ApplyBatch, error) {
+	if len(payload) < applyHeaderSize {
+		return ApplyBatch{}, fmt.Errorf("wal: apply batch: payload is %d bytes, shorter than its %d-byte header: %w",
+			len(payload), applyHeaderSize, ErrCorrupt)
+	}
+	if v := payload[0]; v != applyBatchVersion {
+		return ApplyBatch{}, fmt.Errorf("wal: apply batch: unknown version %d: %w", v, ErrCorrupt)
+	}
+	applied, err := DecodeAppliedIndex(payload[1:applyHeaderSize])
+	if err != nil {
+		return ApplyBatch{}, err
+	}
+	if applied.Index == 0 || applied.Term == 0 {
+		return ApplyBatch{}, fmt.Errorf("wal: apply batch: applied index (%d, %d) names no entry: %w",
+			applied.Index, applied.Term, ErrCorrupt)
+	}
+	p := payload[applyHeaderSize:]
+	count, n := uvarint(p)
+	if n <= 0 {
+		return ApplyBatch{}, fmt.Errorf("wal: apply batch: unreadable operation count: %w", ErrCorrupt)
+	}
+	p = p[n:]
+	// As for a WriteBatch: each operation costs at least three bytes, so a
+	// count above the bytes left is impossible.
+	if count > uint64(len(p)) {
+		return ApplyBatch{}, fmt.Errorf("wal: apply batch: operation count %d exceeds the %d bytes remaining: %w",
+			count, len(p), ErrCorrupt)
+	}
+	ops, err := decodeOps(p, count, "apply batch")
+	if err != nil {
+		return ApplyBatch{}, err
+	}
+	return ApplyBatch{Applied: applied, Ops: ops}, nil
+}
+
+// Advances reports whether applying a moves the state machine forward from
+// prev, the applied index in effect before it: a higher index, in a term no
+// lower. It is the rule the writer enforces and replay re-checks.
+func (a ApplyBatch) Advances(prev AppliedIndex) bool {
+	return a.Applied.Index > prev.Index && a.Applied.Term >= prev.Term
+}
+
+// uvarint is binary.Uvarint restricted to the minimal (canonical) encoding: a
+// count or length written in more bytes than it needs (0 as 0x80 0x00) is
+// refused (n = 0), as the key-value codecs refuse it (kv.uvarint), so every
+// payload these decoders accept has exactly one meaning and is exactly what
+// this package would encode for it. Found by fuzzing apply batches (S1); the
+// encoder has only ever written the minimal form, so no log it wrote is
+// refused.
+func uvarint(p []byte) (uint64, int) {
+	v, n := binary.Uvarint(p)
+	if n > 0 && n != len(binary.AppendUvarint(nil, v)) {
+		return 0, 0
+	}
+	return v, n
 }

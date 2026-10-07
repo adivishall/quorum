@@ -1,9 +1,9 @@
 # STORAGE INTEGRATION — the LSM engine as the replicated state machine
 
-Status: **design and audit; nothing here is implemented.** This document is audited against the
-code at PR #10's head (`a8eb9e1`, 2026-10-07). It fixes who owns each invariant, so that no code
-moves before that is clear. `docs/ENGINEERING_ROADMAP.md` §0 states the project's thesis, and this
-is its first layer-2 deliverable.
+Status: **S1 is implemented (§7); S2–S6 are design.** The design was audited against the code at
+PR #10's head (`a8eb9e1`, 2026-10-07), and S1's audit against `main` after it. This document fixes
+who owns each invariant, so that no code moves before that is clear. `docs/ENGINEERING_ROADMAP.md`
+§0 states the project's thesis, and this is its layer-2 plan.
 
 The rule this document applies everywhere: **Raft decides order. The storage engine makes the
 result of applying that order durable. The engine never invents an order of its own.**
@@ -205,9 +205,9 @@ leaves `main` green.
 
 | # | Milestone | Touches | Exit criterion |
 |---|---|---|---|
-| **S1** | **Atomic apply batches in the engine** (§7) | `internal/storage` only | **R1** proven in isolation by a deterministic crash and power-loss matrix |
+| **S1** ✓ | **Atomic apply batches in the engine** (§7) | `internal/storage`, its WAL on `internal/vfs` | **R1**'s storage half proven in isolation by a deterministic crash and power-loss matrix — done, §7.9–§7.11 |
 | S2 | The engine behind the state-machine interface, with sessions under a reserved prefix; `dkvd -state-machine=memory\|lsm` | `internal/kv`, `cmd/dkvd` | every existing linearizability, dedup, snapshot, membership and chaos tier passes on both state machines; recovery still replays from the snapshot (engine state discarded at start) |
-| S3 | Recovery from the engine's applied index (exactly-once across restarts); log compaction gated by **R2** | `raftnode`, `kv` | the hosted crash matrix (§3.2, and `docs/ENGINEERING_ROADMAP.md` §3 item 4) and a replaced INV-CR4 |
+| S3 | Recovery from the engine's applied index (exactly-once across restarts); log compaction gated by **R2**; the engine's WAL truncated, with its applied index and last sequence made authoritative in the MANIFEST first (§7.1, §7.4) | `raftnode`, `kv`, `storage` | the hosted crash matrix (§3.2, and `docs/ENGINEERING_ROADMAP.md` §3 item 4) and a replaced INV-CR4 |
 | S4 | Snapshots as checkpoints, streamed, installed by ingest | `storage`, `snapshot`, `raftnode` | the snapshot crash matrix on the hosted engine |
 | S5 | The two-log decision: A, B and C measured | `storage`, `dkvlab` | a published comparison against the baseline, and the chosen option |
 | S6 | Performance: group commit, pipelining, batched apply | `raftnode`, `raft` | before-and-after measurements |
@@ -217,47 +217,374 @@ Chaos end to end, PreVote and CheckQuorum, and the delivery surface follow, in t
 
 ## 7. S1 — atomic apply batches in the engine
 
-The smallest step that establishes the central invariant. It stays inside the engine, so the
-replicated system is not touched.
+The smallest step that establishes the storage half of **R1**. It stays inside the engine:
+`dkvd`, `raftnode` and `kv` are untouched, and S1 does **not** make `dkvd`'s replicated state
+durable.
 
-**Builds:**
-1. `LSMStore.Apply(batch, applied)`: ordered puts and deletes plus an applied `(index, term)`,
-   written as **one** WAL record, a new record kind, decoded strictly. It is inserted into the
-   memtable only after the append succeeds. The applied index advances only forward; a batch
-   whose index does not exceed the current one is refused.
-2. **Recovery:** the engine returns the state and the applied index of the longest prefix of whole
-   apply records. A torn tail is discarded whole, as today. The data and the index are never
-   recovered apart.
-3. **The MANIFEST's `Applied`** is set at each flush to the applied index of the last batch the
-   flushed memtable holds, and read back at open. The WAL's value wins only when it is newer. This
-   makes the index survive the WAL truncation that S3 and S5 need.
-4. **The WAL on `internal/vfs`:** segment create, write, sync, rename and directory sync, so the
-   crash matrix can run on `fault.MemFS`. SSTables follow in S4. Until then the matrix covers WAL
-   and MANIFEST I/O and treats SSTable writes as atomic, and says so.
+### 7.1 Audit: the engine before S1
+
+The write path of `LSMStore.Put` or `Delete`:
+1. Validate the key and value.
+2. Under `writeMu`, append a one-operation `KindWriteBatch` record to the WAL: one `write(2)`,
+   then an fsync if the sync mode requires one.
+3. Only after the append succeeds, assign the next sequence number (`s.seq++`; `docs/LSM.md` §4
+   said "before the append", and the code has always done it after, so a failed append consumes
+   nothing).
+4. Insert into the memtable.
+5. If the memtable is full, flush.
+
+A flush:
+1. Freezes the memtable.
+2. Writes `NNNNNN.sst.tmp`, fsyncs it, renames it and fsyncs the directory.
+3. Syncs the WAL (audit D10).
+4. Appends one MANIFEST edit: the new table, `NextFileNum`, and `LastSequence = s.seq`.
+5. Swaps the version.
+
+Open:
+1. Recovers the MANIFEST.
+2. Opens and cross-checks the tables it names.
+3. Installs a fresh MANIFEST.
+4. Sweeps orphans.
+5. Replays every WAL segment. Each mutation gets `seq = 1, 2, …` in log order; one at or below
+   the highest flushed sequence is skipped as already in a table.
+
+The questions S1 has to answer, against that code:
+
+| # | Question | Answer before S1 |
+|---|---|---|
+| 1 | Where is sequence state held? | The last assigned sequence lives only in memory (`LSMStore.seq`). Each table's internal keys carry their sequences, and the MANIFEST records each table's range and a `LastSequence`. That `LastSequence` is written at every flush and open but **never read**. WAL records carry no sequence: replay re-derives it by counting mutations in log order. |
+| 2 | Where is the applied index held? | In memory (`LSMStore.applied`), and durably as `KindAppliedIndex` WAL records written by `SetAppliedIndex`: **a record of its own, separate from any data**. The MANIFEST has an `Applied` field that open reads before replay, but nothing ever sets it, so it is always zero and replay overrides it. |
+| 3 | Which metadata is durable? | MANIFEST: the live file set, each file's key and sequence range, `NextFileNum`, `LastSequence` (unread), `Applied` (unset). WAL: applied-index records, subject to the sync mode. SSTable footers. Never durable: the current sequence and the current applied index, which are always derived. |
+| 4 | What survives a process crash? | Every WAL record whose `write(2)` completed, in every sync mode (INV-W9); every table and MANIFEST edit already written. A record torn by the crash is the newest segment's tail, and open truncates it. |
+| 5 | What survives a modeled power loss? | Only fsynced bytes, and a file only once its directory entry is fsynced. **The WAL is not on `internal/vfs`, so none of this is tested** (`docs/WAL.md` §5). Reading the code found two gaps: (a) the WAL directory's own entry is never fsynced into its parent after it is created, so on the first open a power loss can lose every segment, synced or not; (b) open does not fsync the newest segment before a replay flush (`docs/WAL.md` §10). |
+| 6 | Which records can be partially written? | The record being appended, at the newest segment's tail. Older segments are fsynced at rotation, except in `SyncOff`. Separately, the legacy pair `Put` + `SetAppliedIndex` is **two** whole records, so a crash between them is a partial logical update that no checksum can see. |
+| 7 | What does recovery replay? | Every segment from the first: each mutation in log order, skipping those already in a table, and every applied-index record, the last one winning. A torn tail in the newest segment is truncated; anything else is refused. |
+| 8 | When can data become durable without metadata? | (i) Legacy: the `Put` record is durable and the `SetAppliedIndex` record is not yet written, or written but not synced. (ii) Gap (b): a replay flush at open makes tables and a MANIFEST edit durable while the WAL records they came from, and their applied index, are still only in the page cache. A power loss then leaves the MANIFEST ahead of the WAL, and open refuses the store. |
+| 9 | When can metadata become durable without data? | Legacy, in the other order: a `SetAppliedIndex` record durable before the `Put` it describes. Nothing else: no record carries an index for data it does not hold. |
+
+The audit corrects the plan in §6 in three places:
+- **No MANIFEST `Applied` in S1.** While the WAL is never truncated, it is the only authority
+  either fact needs. Adding the MANIFEST as a second authority for the applied index now would
+  create exactly the "two authorities for one number" that `SetAppliedIndex`'s comment warns
+  against. It moves to S3, together with WAL truncation, which is what first makes it necessary.
+- **No durable sequence in S1,** for the same reason: replay reproduces the numbering exactly as
+  long as nothing deletes a segment. §7.4 states the gap, and S3 must close it before truncating.
+- **Gaps (a) and (b) are fixed in S1.** Both are places where acknowledged or applied state
+  could be lost or outrun by its metadata under a power loss, and S1's matrix exists to find
+  exactly that.
+
+### 7.2 The contract
+
+```go
+// Mutation is one write of an apply batch.
+type Mutation struct {
+    Kind  MutationKind // MutationPut or MutationDelete
+    Key   []byte
+    Value []byte       // empty for MutationDelete
+}
+
+// Apply records mutations, and the applied index they bring the state
+// machine to, as ONE WAL record.
+func (s *LSMStore) Apply(ctx context.Context, muts []Mutation, applied AppliedIndex) error
+```
+
+**Guaranteed:**
+- **Crash atomicity (R1, storage half).** After any process crash or modeled power loss, recovery
+  observes a batch **whole**: every one of its mutations together with its applied index. Or it
+  observes **none** of it: no mutation, and the applied index as it was before. Recovery never
+  observes some mutations without the index, or the index without all its mutations.
+- **Prefix.** Recovery observes a prefix of the batches in the order they were applied: never a
+  later batch without an earlier one.
+- **Durability on return is the sync mode's,** exactly as for `Put` (`docs/WAL.md` §5):
+  - every mode survives a process crash;
+  - `sync` also survives a power loss;
+  - `batch` survives a power loss once a flush has covered it;
+  - `Sync()` forces that flush.
+- **Monotonic index.** `applied.Index` must exceed the current applied index, `applied.Term` must
+  be at least the current term, and both must be at least 1. Otherwise `ErrAppliedIndex` is
+  returned and nothing is written.
+- **Publication order.** The mutations become visible to `Get` before `AppliedIndex()` reports
+  the batch. A reader that sees index `i` sees every mutation of every batch up to `i`.
+- **A failed `Apply`** (an I/O error) leaves the in-memory state and `AppliedIndex()` unchanged.
+  Like any WAL failure it latches. The batch itself may or may not be recovered after a crash,
+  but never partly.
+- **Empty batches** (no mutations) are valid. They advance the index alone, as a Raft no-op or
+  configuration entry must.
+
+**Not guaranteed:**
+- **Isolation from concurrent readers.** A `Get` running while a batch is inserted into the
+  memtable may see some of its mutations and not others. Atomicity here is with respect to a
+  crash, not a transaction. The publication-order rule above is what a state machine can rely
+  on; S2 must decide reader visibility for the hosted engine.
+- **Read-modify-write.** There is no compare-and-swap or conditional mutation. The batch is
+  computed by the caller, deterministically, from the state it already read.
+- **That `SetAppliedIndex` and `Put` are atomic with anything.** They remain the standalone
+  API: two separate records. A hosted state machine must use `Apply` only.
+
+### 7.3 The WAL record
+
+A new record kind in the existing framing (`internal/record`). The framing gives one CRC-32C over
+length, kind and payload, and the existing torn-tail and mid-log rules. No second persistence
+format is introduced.
+
+```
+kind 0x03  KindApplyBatch, payload version 1:
+  offset  size  field
+  0       1     version            = 1
+  1       8     applied index      little-endian uint64, >= 1
+  9       8     applied term       little-endian uint64, >= 1
+  17      var   operation count    uvarint, may be 0
+  ...           operations         exactly a WriteBatch's: kind byte (0 delete, 1 put),
+                                   uvarint key length, key, and for a put a uvarint value
+                                   length and the value
+```
+
+- **Size:** the whole payload must fit `record.MaxRecordSize` (64 MiB). A larger batch is refused
+  with `ErrInvalidBatch` before anything is written, and latches nothing.
+- **Decoding is strict.** Each of these is `ErrCorrupt`:
+  - an unknown version;
+  - an index or term of 0;
+  - a count larger than the bytes left;
+  - an unknown operation kind;
+  - an empty key;
+  - a length running past the payload;
+  - trailing bytes.
+- **Framing rules are the existing ones:**
+  - a torn record at the newest segment's tail is truncated;
+  - a bad record with bytes after it, or anywhere in an older segment, is refused;
+  - an unknown kind is refused.
+
+  So a binary from before S1 refuses a WAL holding apply records, and never skips them.
+- **One more replay rule.** An apply record whose index does not exceed the applied index in
+  effect before it, or whose term is lower, is refused as `ErrCorrupt`. The writer never produces
+  one, so its presence means the log is not one this engine wrote.
+
+### 7.4 Sequence numbers
+
+- An apply batch of `n` mutations takes sequences `s+1 … s+n`, in batch order, where `s` is the
+  last sequence before it. The applied index takes **none**, and an empty batch takes none.
+- Sequences are assigned only after the record is appended, so a refused or failed `Apply`
+  consumes none.
+- Replay counts every mutation of every `KindWriteBatch` and `KindApplyBatch` record in log
+  order, so it reproduces the live numbering exactly. It also records, for the last apply
+  record, the sequence of its last mutation (`AppliedSequence()`).
+- **The gap, stated:** the current sequence is still derived, not stored. That is sound only
+  because no WAL segment is ever deleted. The MANIFEST's `LastSequence` stays unread in S1. S3,
+  which truncates the WAL, must make it authoritative first, or replay would number the
+  surviving records from 1.
+
+### 7.5 Recovery
+
+Replay reconstructs, from the same WAL history:
+- the key-value state;
+- the last sequence;
+- the applied index, together with the sequence it covers.
+
+An apply record is applied as a unit: its mutations, then the index. Two changes close gaps (a)
+and (b):
+- **(a)** when `wal.Create` makes the WAL directory, it fsyncs the parent;
+- **(b)** `wal.Recover` fsyncs the newest segment before replaying it, unless the sync mode is
+  `off`, so everything recovery hands to the engine is durable before a replay flush can record
+  it. After open, recovered implies durable, which is the fact R2 will need.
+
+### 7.6 The `vfs` seam
+
+`wal.Options.FS` (nil meaning the OS) carries every WAL file operation:
+- segment create, append, read, truncate and fsync;
+- the directory listing;
+- `MkdirAll`;
+- directory fsync.
+
+`vfs.FS` gains `ReadDir` and `MkdirAll`, and `fault.MemFS` gains a minimal directory model:
+- a directory made with `MkdirAll` is durable only once its parent is fsynced;
+- a power loss removes an undurable directory, and every file under it;
+- directories never made explicitly behave as before, so existing users are unaffected.
+
+On Darwin a `*os.File` is still flushed with `F_FULLFSYNC`. Nothing else in the engine moves.
+SSTables and the MANIFEST's reads stay on `os` until S4.
+
+### 7.7 The crash matrix
+
+`TestApplyCrashMatrix` scripts a sequence of steps, then crashes at every WAL I/O operation the
+script performs. The steps include:
+- apply batches of puts, deletes and both;
+- an empty batch;
+- explicit syncs;
+- a flush, whose MANIFEST edit is the metadata it publishes;
+- more batches after it.
+
+The script runs in the `sync` and `batch` modes. The `batch` mode runs with its timer disabled,
+so every fsync is one the script caused and the run is deterministic.
+
+The crash operations it enumerates:
+- every segment create and parent fsync;
+- every append, torn halfway as well as whole;
+- every fsync.
+
+The fsync before the flush's MANIFEST edit is the "before metadata publication" cell. The first
+append after it is the "after publication" cell. One extra set of cells fails the MANIFEST
+append itself, before and partway through it.
+
+Each cell is run three ways:
+- **process crash:** every byte written survives;
+- **power loss:** only fsynced bytes and fsynced directory entries survive;
+- **power loss with a torn tail:** a prefix of the unsynced bytes survives.
+
+Every cell asserts:
+1. the store opens;
+2. the recovered applied index, sequence and full key-value state equal the reference model after
+   exactly `m` batches, for one `m`: R1, the prefix and the sequences together;
+3. `m` lies within the cell's bounds. The lower bound is every batch whose record was written
+   (process crash) or covered by an fsync (power loss); the upper bound is every batch attempted;
+4. the recovered WAL is fully synced, and a second power loss right after open changes nothing;
+5. the store then accepts the next batch, and recovers it.
+
+The SSTables and the MANIFEST stay on the real filesystem, so their side of a cell is a process
+crash. That is sound for R1 because:
+- a table becomes part of the database only through its MANIFEST edit;
+- the WAL is fsynced before that edit (D10, and the matrix checks it);
+- a table that never reached its edit is an orphan, deleted at open.
+
+What it does **not** test is the SSTable and MANIFEST code's own ordering under a power loss:
+the MANIFEST has its own matrix (`docs/MANIFEST.md` §10), and SSTables move onto `vfs` in S4.
+
+### 7.8 Tests, mutants, fuzzing, benchmark
+
+- **Regression tests:**
+  - one batch; many mutations; many batches; put and delete of the same key in one batch;
+  - an empty batch;
+  - index monotonicity, refused live and refused at replay;
+  - malformed, duplicate and impossible apply records;
+  - torn tails;
+  - sequence reconstruction;
+  - publication order;
+  - a failed `Apply` changing nothing;
+  - legacy `Put` and `SetAppliedIndex` interleaved with `Apply` never moving the index a batch
+    set, while the legacy pair is shown to split under a crash.
+- **Mutants 310–328, one per R1 failure mode, each with its killer named in `scripts/mutation.sh`:**
+  - data and index written as two records;
+  - the index written without the data;
+  - the index published before the append;
+  - the index restored late, or not at all, at replay;
+  - an empty batch's index skipped;
+  - the monotonicity check removed or reversed, live or at replay;
+  - the index counted as a sequence;
+  - replay numbering apply mutations differently;
+  - gaps (a) and (b) reopened.
+- **Fuzzing:** `FuzzApplyBatchRoundTrip` and `FuzzDecodeApplyBatchIsTotal` in `internal/storage/wal`.
+- **Benchmark:** `dkvbench -suite apply`. Before is today's only way to record an apply: `Put` and
+  `SetAppliedIndex`, two records per entry. After is `Apply`, with one entry per batch and with
+  many. It reports bytes and records per entry, fsyncs, append and sync latency, and recovery
+  time with the recovered index and sequence.
+
+### 7.9 What was built, and what building it found
+
+**Built:**
+- `vfs.FS` gains `ReadDir` and `MkdirAll`, and `fault.MemFS` a directory model.
+- The WAL runs on `vfs`, with the `ApplyBatch` record (kind `0x03`) and gaps (a) and (b) closed.
+- `LSMStore.Apply`, `AppliedSequence`, and replay of apply records as units.
+- `WALStore` refuses a log of apply batches.
 
 **Tests:**
-- A deterministic crash and power-loss matrix over every I/O operation of a scripted sequence of
-  apply batches, flushes and reopens: write, torn write, fsync, rename, directory fsync. At each
-  cell the recovered `(state, applied)` must equal the reference model after exactly `applied`
-  batches, and `applied` must be at least the last batch whose sync returned.
-- Fuzzing the new record decoder.
-- The existing conformance suite, unchanged.
+- 21 regression tests (7 in the WAL, 12 in the store, 2 for `MemFS`) and the crash matrix;
+- two fuzz targets;
+- `dkvbench -suite apply`;
+- 19 mutants (310–328), every one killed by the test named for it.
 
-**Mutants:**
-- data and index written as two records;
-- memtable insertion before the append succeeds;
-- MANIFEST `Applied` taken from the wrong memtable;
-- the applied index allowed to go backwards;
-- a torn record half-applied.
+One of those kills depends on timing: mutant 313, publication order, is killed by a concurrent
+reader. It was measured at 20 kills in 20 runs, and 10 in 10 under the race detector.
 
-**Measures:** `dkvbench` before and after, comparing one batch per cycle with N single-operation
-writes: records, bytes and fsyncs per entry.
+**What building it found:**
+1. **Gaps (a) and (b)** (§7.1), from reading the code. Both are fixed, and each fix is guarded by
+   a mutant (322 and 323) that its test and the matrix kill.
+2. **A count or length written in more bytes than it needs was accepted** by the WAL's decoders.
+   `0` written as `0x80 0x00` gives one batch two encodings. `FuzzDecodeApplyBatchIsTotal` found it
+   within seconds. The `WriteBatch` decoder had always done the same. Both now refuse it, as the
+   key-value codecs already did (mutant 328).
+3. **`docs/LSM.md` §4 said the sequence number moves before the append.** The code has always
+   moved it after, so a failed append consumes nothing. The document was wrong, and is corrected.
 
-**Out of scope:**
-- any change to `dkvd`, `raftnode` or `kv`;
-- WAL truncation;
-- checkpoints and ingest;
-- SSTables on `vfs`.
+The matrix itself passed its first complete run. Every mutant in 310–328 shows it, or the
+regression test named beside it, failing when the rule it checks is broken.
 
-**Risk:** contained. The engine is still standalone, and its standalone API and recovery are
-unchanged for callers that never use `Apply`.
+### 7.10 Measurements
+
+`dkvbench -suite apply -runs 3` was run on a clean tree at `30b84cd` on an Apple M4, macOS and
+APFS; raw results are in `bench/s1-apply.json`. The workload is one 100-byte put per applied
+entry: 32,000 entries in `off` and `batch` mode, and 1,600 in `sync` mode. The table gives
+medians of three runs. The baseline ("legacy") is the only way to record an application before
+S1: a `Put`, then `SetAppliedIndex`, which is two records and not atomic.
+
+| Mode | Arm | Entries/s | Call p50 / p99 (µs) | WAL records per entry | WAL bytes per entry | fsyncs | Recovery (ms) |
+|---|---|---|---|---|---|---|---|
+| `off` | legacy | 270,389 | 3.2 / 6.5 | 2 | 150.0 | 0 | 28.0 |
+| `off` | `Apply`, 1 entry | 391,219 | 1.9 / 5.2 | 1 | 142.0 | 0 | 26.7 |
+| `off` | `Apply`, 16 entries | 1,641,717 | 6.0 / 45.2 | 0.0625 | 116.7 | 0 | 24.5 |
+| `batch` | legacy | 224,279 | 3.2 / 7.3 | 2 | 150.0 | 5 | 26.9 |
+| `batch` | `Apply`, 1 entry | 353,320 | 1.9 / 4.8 | 1 | 142.0 | 4 | 23.5 |
+| `batch` | `Apply`, 16 entries | 1,027,161 | 6.1 / 45.8 | 0.0625 | 116.7 | 3 | 22.8 |
+| `sync` | legacy | 130 | 7,958 / 11,435 | 2 | 150.0 | 3,200 | 18.9 |
+| `sync` | `Apply`, 1 entry | 261 | 3,941 / 6,134 | 1 | 142.0 | 1,600 | 20.1 |
+| `sync` | `Apply`, 16 entries | 4,370 | 3,912 / 6,350 | 0.0625 | 116.7 | 100 | 19.9 |
+
+Every reopen recovered exactly what was written:
+- index and sequence `(32,000, 32,000)`, or `(2,000, 32,000)` for 16-entry batches;
+- `(1,600, 1,600)` in `sync` mode, or `(100, 1,600)` for 16-entry batches.
+
+What the numbers say, and no more:
+- **Atomicity costs nothing here; it saves.** The legacy pair writes two records and, in `sync`
+  mode, two fsyncs per entry. One apply record writes one, and 8 fewer bytes per entry. On this
+  machine an fsync (`F_FULLFSYNC`) is about 3.9 ms, and it dominates `sync` mode.
+- **Batching entries into one record** is the caller's choice: one record per Raft cycle, as S2
+  will do. It divides records and fsyncs by the batch size: 16 entries per fsync gives 4,370
+  entries/s against 261. This is the amortization the cluster measurements asked for
+  (`docs/CLUSTER_BENCHMARKS.md` §6.1). It is measured here on the engine alone; the engine has
+  not been optimized.
+- **Recovery time is not separated by the arm at these sizes.** Replaying 32,000 entries takes
+  about 23–28 ms, and the fixed cost of an open (installing a MANIFEST, its fsyncs) is most of
+  `sync` mode's 19–20 ms. Recovery growing with the WAL is S3's question, which truncation
+  answers.
+
+### 7.11 What S1 proves, and what it does not
+
+**S1 proves, for the standalone engine, in the software model (`fault.MemFS`):**
+- **R1, the storage half (INV-W11).** An application's mutations and its applied index are
+  recovered together or not at all, as a prefix of the order applied. This holds at every WAL
+  operation, under a process crash and under a power loss with or without a torn tail, in `sync`
+  and `batch` mode, across a flush and segment rotations.
+- **The index, the data and the sequence agree** (INV-L11). The recovered applied index, the
+  sequence it covers, and the sequence agree with the reference model in every matrix cell.
+- **Durability as each sync mode promises it.** No acknowledged-durable batch is lost, and after
+  open everything recovered is durable (INV-W13).
+- **The index only advances** (INV-W12). Apply batches are published in order (INV-L10), and
+  every accepted payload is canonical (INV-W14).
+
+**S1 does not prove:**
+- **That `dkvd` has durable replicated state.** It does not use the engine at all: the
+  replicated state machine is still the in-memory `kv.Store`, recovered by replaying the Raft
+  log.
+- **R2, or exactly-once across restarts of a replica.** Both need the engine behind the state
+  machine (S2) and recovery from its applied index (S3).
+- **Power loss on a real device.** The model assumes an honest fsync and loses un-synced data
+  only as a prefix.
+- **The power-loss ordering of the SSTable and MANIFEST code.** Their side of every cell is a
+  process crash. §7.7 argues why that is sound for R1. The MANIFEST has its own matrix, and
+  SSTables move onto `vfs` in S4.
+- **Crashes during recovery itself.** The matrix crashes the script, then a power loss right
+  after open, never inside an open. The WAL's own tests cover a torn tail's repair and
+  recovery's idempotence.
+- **Isolation of a batch from concurrent readers,** or anything about compaction running under
+  a crash: the matrix keeps compaction off.
+- **Anything after WAL truncation.** The current sequence and applied index are still derived
+  from the whole log, and S3 must make both authoritative in the MANIFEST before deleting a
+  segment.
+
+**Next dependency: S2.** S2 puts the engine behind the state-machine interface:
+- the session table goes under a reserved key prefix;
+- one apply batch is written per Ready cycle;
+- the reader-visibility rule §7.2 leaves open is decided;
+- recovery still starts from the snapshot.
+
+Every existing linearizability, dedup, snapshot, membership and chaos tier must pass on both
+state machines.
+
