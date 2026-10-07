@@ -485,3 +485,47 @@ func TestATornApplyBatchIsDroppedWhole(t *testing.T) {
 		t.Fatalf("a damaged batch mid-log: %v, want ErrCorrupt", err)
 	}
 }
+
+// TestAnEmptyBatchIsRecoveredAsTheIndex: an apply batch with no mutations — a
+// Raft no-op or configuration entry — advances the index alone, and when it is
+// the last one, recovery restores exactly that index and the sequence before it.
+func TestAnEmptyBatchIsRecoveredAsTheIndex(t *testing.T) {
+	dir := t.TempDir()
+	s := openLSM(t, dir, lsmOpts(storage.DefaultMemTableSize))
+	steps := []applyStep{{[]storage.Mutation{mput("a", "1"), mput("b", "2")}, ai(3, 1)}, {nil, ai(4, 2)}}
+	for _, st := range steps {
+		mustApply(t, s, st)
+	}
+	want := models(steps)[2]
+	if d := diff(s, want, []string{"a", "b"}); d != "" {
+		t.Fatalf("live: %s", d)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = openLSM(t, dir, lsmOpts(storage.DefaultMemTableSize))
+	defer s.Close()
+	if d := diff(s, want, []string{"a", "b"}); d != "" {
+		t.Fatalf("recovered: %s", d)
+	}
+}
+
+// TestWALStoreRefusesApplyBatches: WALStore never writes an apply record, so a
+// log holding one is not its own; it refuses it rather than replaying around
+// the batch and losing its mutations.
+func TestWALStoreRefusesApplyBatches(t *testing.T) {
+	dir := t.TempDir()
+	w, err := wal.Create(filepath.Join(dir, "wal"), wal.Options{SyncMode: wal.SyncOff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AppendApply(wal.ApplyBatch{Applied: wal.AppliedIndex{Index: 1, Term: 1}, Ops: wal.Batch{{Kind: wal.OpPut, Key: []byte("k"), Value: []byte("v")}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.OpenWALStore(dir, storage.DefaultOptions()); !errors.Is(err, storage.ErrCorrupt) {
+		t.Fatalf("WALStore opened a log of apply batches: %v", err)
+	}
+}
