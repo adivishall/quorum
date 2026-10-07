@@ -363,6 +363,12 @@ func (c *snapCluster) start(id NodeID, hook Hook) {
 	default:
 		peers = c.genesis
 	}
+	// The node's goroutines log through this closure while the test goroutine
+	// goes on adding nodes to c.logs; a map read and a map write race even on
+	// different keys (CI, main at 5f8ca4b). So the builder is resolved here,
+	// on the test goroutine, and the node never touches the map. c.mu still
+	// orders the writes against log()'s reads of the builder.
+	lg := c.logs[id]
 	node, err := Start(c.ctx, Config{
 		ID: id, Peers: peers, Join: c.joiners[id], Transport: c.trs[id], LogPath: filepath.Join(c.dir, string(id)+".log"),
 		StateMachine: sm, TickInterval: 15 * time.Millisecond, DisableSync: true, Hook: hook,
@@ -370,7 +376,7 @@ func (c *snapCluster) start(id NodeID, hook Hook) {
 		Logf: func(f string, a ...any) {
 			c.mu.Lock()
 			defer c.mu.Unlock()
-			fmt.Fprintf(c.logs[id], f+"\n", a...)
+			fmt.Fprintf(lg, f+"\n", a...)
 		},
 	})
 	if err != nil {
