@@ -139,3 +139,56 @@ func TestAdminDrivesMembershipThroughTheLog(t *testing.T) {
 		}
 	}
 }
+
+// TestAdminStatusNamesItsNodeAndTheLeadersFollowers: status says which node
+// answered; on a group's leader it reports each other member's match index —
+// once the group is quiet, every follower's reaches the leader's last index
+// (the lag an operator reads is their difference) — and on a follower it
+// reports none.
+func TestAdminStatusNamesItsNodeAndTheLeadersFollowers(t *testing.T) {
+	c := newHostCluster(t, "a", "b", "c")
+	for _, id := range c.ids {
+		c.startHost(id, false)
+	}
+	c.create(1, "a", "b", "c")
+	admin := map[NodeID]string{}
+	for _, id := range c.ids {
+		admin[id] = c.serveAdmin(id)
+	}
+	c.write(1, "k", "a", "b", "c")
+	ld := c.leader(1, "a", "b", "c")
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		st := call(t, admin[ld], AdminRequest{Op: "status"})
+		if st.Node != string(ld) || len(st.Groups) != 1 {
+			t.Fatalf("the leader's status: %+v", st)
+		}
+		gs := st.Groups[0]
+		caughtUp := len(gs.FollowerMatch) == 2
+		for _, id := range c.ids {
+			if id == ld {
+				if _, ok := gs.FollowerMatch[string(id)]; ok {
+					t.Fatalf("the leader lists itself among its followers: %v", gs.FollowerMatch)
+				}
+				continue
+			}
+			caughtUp = caughtUp && gs.FollowerMatch[string(id)] == gs.LastIndex
+		}
+		if gs.Role == "Leader" && caughtUp {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the leader's followers never matched its last index: %+v", gs)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for _, id := range c.ids {
+		if id == ld {
+			continue
+		}
+		st := call(t, admin[id], AdminRequest{Op: "status"})
+		if st.Node != string(id) || len(st.Groups) != 1 || st.Groups[0].FollowerMatch != nil {
+			t.Fatalf("follower %s's status: %+v", id, st)
+		}
+	}
+}

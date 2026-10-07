@@ -382,31 +382,77 @@ func TestIdentityFileRules(t *testing.T) {
 	}
 }
 
-// TestIdentityFileCorruptionIsRefused: every truncation and every bit flip of
-// an identity file, and a file of a future version, refuse to start.
-func TestIdentityFileCorruptionIsRefused(t *testing.T) {
-	good, err := EncodeIdentity(Identity{Group: 9, Genesis: replication.Configuration{Voters: []replication.Member{{ID: "n0", Addr: "h:0"}}}})
-	if err != nil {
-		t.Fatal(err)
+// TestIdentityFileNamesItsNode (audit H1): a group's identity file records the
+// node whose state it is, and a node configured as another refuses it — the
+// genesis cannot tell them apart (it is the same on every member), and running
+// on another node's term, vote and log breaks Raft's safety. A version-1 file,
+// written before the node was recorded, is still read.
+func TestIdentityFileNamesItsNode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "raft.log")
+	boot := replication.VotersOf([]NodeID{"n0", "n1", "n2"})
+	start := func(id NodeID, cfg Config) error {
+		t.Helper()
+		cfg.ID, cfg.LogPath, cfg.Rand = id, path, newRand()
+		rc, err := Recover(cfg)
+		if err == nil {
+			rc.Log.Close()
+		}
+		return err
 	}
-	if _, err := DecodeIdentity(good); err != nil {
-		t.Fatal(err)
+	if err := start("n0", Config{Bootstrap: &boot}); err != nil {
+		t.Fatalf("first start: %v", err)
 	}
-	for n := 0; n < len(good); n++ {
-		if _, err := DecodeIdentity(good[:n]); !errors.Is(err, ErrIdentity) {
-			t.Fatalf("truncated to %d of %d: %v", n, len(good), err)
+	if id, found, err := LoadIdentity(nil, path); err != nil || !found || id.Node != "n0" {
+		t.Fatalf("recorded identity: %+v %v %v; want node n0", id, found, err)
+	}
+	for _, other := range []NodeID{"n1", "n2", "n9"} {
+		if err := start(other, Config{}); !errors.Is(err, ErrIdentity) {
+			t.Fatalf("%s on n0's state: %v, want ErrIdentity", other, err)
 		}
 	}
-	for i := range good {
-		for bit := 0; bit < 8; bit++ {
-			bad := append([]byte(nil), good...)
-			bad[i] ^= 1 << bit
-			if _, err := DecodeIdentity(bad); !errors.Is(err, ErrIdentity) {
-				t.Fatalf("bit %d of byte %d: %v", bit, i, err)
+	if err := start("n0", Config{}); err != nil {
+		t.Fatalf("n0 restarting on its own state: %v", err)
+	}
+	// A version-1 file names no node: read as before.
+	if err := writeIdentity(nil, path, Identity{Genesis: boot}); err != nil {
+		t.Fatal(err)
+	}
+	if err := start("n1", Config{}); err != nil {
+		t.Fatalf("a version-1 identity file: %v", err)
+	}
+}
+
+// TestIdentityFileCorruptionIsRefused: every truncation and every bit flip of
+// an identity file — version 1 and version 2 — and a file of a future version,
+// refuse to start.
+func TestIdentityFileCorruptionIsRefused(t *testing.T) {
+	gen := replication.Configuration{Voters: []replication.Member{{ID: "n0", Addr: "h:0"}}}
+	for _, node := range []NodeID{"", "n0"} {
+		good, err := EncodeIdentity(Identity{Group: 9, Genesis: gen, Node: node})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := DecodeIdentity(good); err != nil || got.Node != node {
+			t.Fatalf("round trip (node %q): %+v %v", node, got, err)
+		}
+		for n := 0; n < len(good); n++ {
+			if _, err := DecodeIdentity(good[:n]); !errors.Is(err, ErrIdentity) {
+				t.Fatalf("node %q, truncated to %d of %d: %v", node, n, len(good), err)
+			}
+		}
+		for i := range good {
+			for bit := 0; bit < 8; bit++ {
+				bad := append([]byte(nil), good...)
+				bad[i] ^= 1 << bit
+				if _, err := DecodeIdentity(bad); !errors.Is(err, ErrIdentity) {
+					t.Fatalf("node %q, bit %d of byte %d: %v", node, bit, i, err)
+				}
 			}
 		}
 	}
-	future, _ := record.Encode(nil, identityKind, append([]byte(identityMagic), 2, 9, 0))
+	future, _ := record.Encode(nil, identityKind, append([]byte(identityMagic), 3, 9, 0))
+	good, _ := EncodeIdentity(Identity{Group: 9, Genesis: gen, Node: "n0"})
 	trailing := append(append([]byte(nil), good...), 0)
 	for name, b := range map[string][]byte{"future version": future, "trailing byte": trailing} {
 		if _, err := DecodeIdentity(b); !errors.Is(err, ErrIdentity) {
@@ -436,6 +482,8 @@ func TestIdentityFileCorruptionIsRefused(t *testing.T) {
 func FuzzDecodeIdentity(f *testing.F) {
 	good, _ := EncodeIdentity(Identity{Group: 3, Genesis: replication.VotersOf([]NodeID{"a", "b"})})
 	f.Add(good)
+	v2, _ := EncodeIdentity(Identity{Group: 3, Genesis: replication.VotersOf([]NodeID{"a", "b"}), Node: "a"})
+	f.Add(v2)
 	f.Add([]byte{})
 	f.Fuzz(func(t *testing.T, b []byte) {
 		id, err := DecodeIdentity(b)

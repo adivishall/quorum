@@ -11,6 +11,7 @@ import (
 	"github.com/adivishall/quorum/internal/metrics"
 	"github.com/adivishall/quorum/internal/multiraft"
 	"github.com/adivishall/quorum/internal/raft"
+	"github.com/adivishall/quorum/internal/replication"
 )
 
 // Phase 16 (docs/OBSERVABILITY.md): the client API's metrics against what the
@@ -232,5 +233,37 @@ func TestDecisionCountsSurviveARestore(t *testing.T) {
 	}
 	if v, _ := scrapeKV(t, r).Get("dkv_kv_apply_decisions_total", "group", "7", "decision", "executed"); v != 4 {
 		t.Fatalf("executed decisions counted %v across a restore, want 4", v)
+	}
+}
+
+// TestClientsCannotCreateMetricSeries (audit M7): the group a request names is
+// the client's choice. Requests naming a thousand groups this node does not
+// host are counted under group="other" — one series per op and status — not
+// one series per group id, which let any client grow the node's metrics
+// without bound.
+func TestClientsCannotCreateMetricSeries(t *testing.T) {
+	r := metrics.NewRegistry()
+	front := kv.NewFront("n1", nil)
+	front.SetMetrics(kv.NewMetrics(r))
+	ctx := context.Background()
+	for g := 1; g <= 1000; g++ {
+		resp, _ := front.Do(ctx, kv.Request{Op: kv.ReqRegister, Group: replication.GroupID(g)})
+		if resp.Status != kv.StatusNotLeader {
+			t.Fatalf("REGISTER naming unhosted group %d: %+v", g, resp)
+		}
+	}
+	series, other := 0, 0.0
+	for _, s := range scrapeKV(t, r) {
+		if s.Name != "dkv_kv_requests_total" {
+			continue
+		}
+		series++
+		if s.Labels["group"] != "other" {
+			t.Fatalf("a series labelled with an unhosted group: %+v", s)
+		}
+		other += s.Value
+	}
+	if series != 1 || other != 1000 {
+		t.Fatalf("%d series counting %v requests, want 1 counting 1000", series, other)
 	}
 }

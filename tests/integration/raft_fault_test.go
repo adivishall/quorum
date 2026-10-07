@@ -49,6 +49,7 @@ type rcluster struct {
 	procs   map[string]*dkvNode     // the current process of each node (nil = not running)
 	history []*dkvNode              // every process ever started, for election-safety checks
 	every   []string                // dkvd flags for EVERY start of every node (e.g. session limits)
+	cluster string                  // the cluster id its nodes' data directories record
 }
 
 func newRCluster(t *testing.T, n int) *rcluster {
@@ -70,7 +71,7 @@ func newRClusterEvery(t *testing.T, n int, every []string, extra ...string) *rcl
 	t.Helper()
 	c := &rcluster{
 		t: t, bin: buildDkvd(t), addrs: map[string]string{}, kvAddrs: map[string]string{}, dirs: map[string]string{},
-		proxies: map[[2]string]*tcpProxy{}, procs: map[string]*dkvNode{}, every: every,
+		proxies: map[[2]string]*tcpProxy{}, procs: map[string]*dkvNode{}, every: every, cluster: newClusterID(),
 	}
 	root := t.TempDir()
 	for i := 1; i <= n; i++ {
@@ -500,7 +501,7 @@ func (c *rcluster) outputs() string {
 		}
 	}
 	for k, p := range c.proxies {
-		fmt.Fprintf(&b, "--- proxy %s->%s (listen %s target %s) ---\n%s\n", k[0], k[1], p.Addr(), p.target, p.debugLog())
+		fmt.Fprintf(&b, "--- proxy %s->%s (listen %s target %s) ---\n%s\n", k[0], k[1], p.Addr(), p.Target(), p.Log())
 	}
 	return b.String()
 }

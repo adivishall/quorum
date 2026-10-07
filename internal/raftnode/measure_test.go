@@ -70,9 +70,16 @@ func buildLog(t testing.TB, dir string, entries int, every, retain uint64) (stri
 		t.Fatal(err)
 	}
 	defer n.Close()
-	for n.Role() != raft.Leader {
-		time.Sleep(time.Millisecond)
+	waitFor := func(what string, cond func() bool) {
+		deadline := time.Now().Add(30 * time.Second)
+		for !cond() {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: not within 30s", what)
+			}
+			time.Sleep(time.Millisecond)
+		}
 	}
+	waitFor("the single node leads", func() bool { return n.Role() == raft.Leader })
 	for i := 0; i < entries; i++ {
 		cmd := kv.Command{Op: kv.OpPut, Key: []byte(fmt.Sprintf("key%05d", i%measureKeys)), Value: value(i)}
 		if err := n.Propose(context.Background(), cmd.Encode()); err != nil {
@@ -80,9 +87,7 @@ func buildLog(t testing.TB, dir string, entries int, every, retain uint64) (stri
 		}
 	}
 	last := n.Status().LastIndex
-	for n.Status().Applied < last {
-		time.Sleep(time.Millisecond)
-	}
+	waitFor("every proposal applied", func() bool { return n.Status().Applied >= last })
 	return path, last
 }
 

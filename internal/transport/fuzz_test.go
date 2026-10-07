@@ -41,12 +41,15 @@ func frameBytesRaw(kind MsgKind, payload []byte) []byte {
 func FuzzHandshakeDecode(f *testing.F) {
 	f.Add([]byte("DKV1"))
 	var seed bytes.Buffer
-	_ = writeHandshake(&seed, "seed-node")
+	_ = writeHandshake(&seed, hello{id: "seed-node", cluster: "c", digest: []byte{1}})
 	f.Add(seed.Bytes())
 	f.Fuzz(func(t *testing.T, data []byte) {
-		id, err := readHandshake(bytes.NewReader(data))
-		if err == nil && (id == "" || len(id) > MaxNodeIDLen) {
-			t.Fatalf("accepted an invalid node id %q (len %d)", id, len(id))
+		h, err := readHandshake(bytes.NewReader(data))
+		if err == nil && (h.id == "" || len(h.id) > MaxNodeIDLen || len(h.cluster) > MaxClusterIDLen || len(h.digest) > MaxDigestLen) {
+			t.Fatalf("accepted an invalid hello %+v", h)
+		}
+		if _, h, err := readReply(bytes.NewReader(data)); err == nil && h.id == "" {
+			t.Fatalf("accepted a reply with no node id")
 		}
 	})
 }

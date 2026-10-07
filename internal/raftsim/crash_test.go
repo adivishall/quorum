@@ -206,7 +206,10 @@ func TestVoterCrashAroundPersistingItsVote(t *testing.T) {
 		s.crashAt("n2", "after-save", 1)
 		s.campaign("n1")
 		term := s.State("n1").Term
-		s.deliverFrom("n1")
+		// Only n2 hears n1: n3 stays a term behind, so that its own campaign
+		// below is in n1's term — the same term n2 voted in.
+		s.dropAll(func(m raft.Message) bool { return m.From == "n1" && m.To == "n3" })
+		s.deliverLink("n1", "n2")
 		s.requireDown("n2", "the crash point after the vote's Save did not fire")
 		if s.inFlight(func(m raft.Message) bool { return m.From == "n2" && m.Type == raft.MsgVoteResponse }) != 0 {
 			t.Fatal("the vote reply left before the crash point after its Save")
@@ -216,18 +219,23 @@ func TestVoterCrashAroundPersistingItsVote(t *testing.T) {
 			t.Fatalf("n2 recovered term %d vote %q, want the durable vote for n1 in term %d", st.Term, st.Vote, term)
 		}
 		// A competing candidate in the same term must be refused by the restarted
-		// voter: deliver n3's RequestVote for the same term directly.
+		// voter. (This check used to tick n3 past several election timeouts after
+		// n3 had already heard n1, so n3 always campaigned a term later and the
+		// check skipped itself on every run.)
 		s.dropAll(func(raft.Message) bool { return true })
-		s.tick("n3", 4*raft.DefaultElectionTicks)
+		s.campaign("n3") // one campaign: from the term before n1's into n1's
 		if s.State("n3").Term != term {
-			t.Skipf("n3 campaigned in term %d, not %d; the competing-vote check needs the same term", s.State("n3").Term, term)
+			t.Fatalf("premise: n3 campaigned in term %d, not n1's term %d", s.State("n3").Term, term)
 		}
-		s.deliverFrom("n3")
+		s.deliverLink("n3", "n2")
 		granted := s.inFlight(func(m raft.Message) bool {
 			return m.From == "n2" && m.To == "n3" && m.Type == raft.MsgVoteResponse && m.VoteGranted
 		})
-		if granted != 0 {
-			t.Fatal("the restarted voter granted its term's vote a second time, to a different candidate")
+		refused := s.inFlight(func(m raft.Message) bool {
+			return m.From == "n2" && m.To == "n3" && m.Type == raft.MsgVoteResponse && !m.VoteGranted && m.Term == term
+		})
+		if granted != 0 || refused != 1 {
+			t.Fatalf("the restarted voter answered n3's same-term request with %d grants and %d refusals; want one refusal: its vote for n1 is durable", granted, refused)
 		}
 		s.Stabilize(400)
 	})

@@ -19,6 +19,9 @@ type transportMetrics struct {
 	writeFailed          *metrics.Counter
 	inbound, outbound    *metrics.Counter
 	dialFailed           *metrics.Counter
+	acceptFailed         *metrics.Counter
+	handshakeRefused     *metrics.Counter // inbound connections refused for want of a handshake slot
+	handshakeRejected    *metrics.Counter // handshakes refused by either side: wrong cluster, settings, peer, direction
 }
 
 // kindLabel is a kind's name in snake case (AppendEntries → append_entries).
@@ -52,11 +55,14 @@ func newTransportMetrics(r *metrics.Registry, t *TCPTransport) *transportMetrics
 			m.sentBytes[k], m.recvBytes[k] = bytes.With(l), bytesIn.With(l)
 		}
 	}
-	fails := r.CounterVec("dkv_transport_send_failures_total", "Sends that did not write a frame: not_connected (no live connection to the peer), closed (the transport is shut down), write (the write failed or its deadline passed; the peer may have received part of it).", "reason")
+	fails := r.CounterVec("dkv_transport_send_failures_total", "Sends that did not write a frame: not_connected (no live connection to the peer), closed (the transport is shut down), write (the frame was over the size limit, or the write failed or its deadline passed — the peer may have received part of it, and the connection was closed).", "reason")
 	m.notConnected, m.closed, m.writeFailed = fails.With("not_connected"), fails.With("closed"), fails.With("write")
 	conns := r.CounterVec("dkv_transport_connections_total", "Connections established with a peer (handshake done, registered), by direction.", "dir")
 	m.inbound, m.outbound = conns.With("inbound"), conns.With("outbound")
-	m.dialFailed = r.Counter("dkv_transport_dial_failures_total", "Outbound connection attempts that failed to connect or to send the handshake.")
+	m.dialFailed = r.Counter("dkv_transport_dial_failures_total", "Outbound connection attempts that failed to connect or to complete the handshake.")
+	m.acceptFailed = r.Counter("dkv_transport_accept_failures_total", "Errors accepting an inbound connection (e.g. descriptors exhausted); the accept loop retries after a pause.")
+	hs := r.CounterVec("dkv_transport_handshakes_refused_total", "Connections refused during the handshake: busy (too many inbound handshakes in flight), rejected (another cluster, other replica settings, an unknown peer, the wrong dial direction, or another node than the one dialed).", "reason")
+	m.handshakeRefused, m.handshakeRejected = hs.With("busy"), hs.With("rejected")
 	r.CollectGauge("dkv_transport_peers", "Peers this node knows (accepts and, with the smaller id, dials) and peers it has a live connection to.", []string{"state"}, func(emit func(float64, ...string)) {
 		t.mu.Lock()
 		known, connected := len(t.peers), len(t.conns)

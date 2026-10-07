@@ -52,12 +52,15 @@ type Profile struct {
 	// one that applies to its configuration (a spare added as a learner, a
 	// learner promoted or removed, a voter removed).
 	Genesis, Member int
+	// Audit H4: every node's AppendEntries budgets (Config).
+	MaxEntriesPerMsg, MaxSizePerMsg int
 }
 
 // Config is the cluster configuration a run of the profile uses.
 func (p Profile) Config(seed int64) Config {
 	return Config{Nodes: p.Nodes, Seed: seed, KVLimits: p.KVLimits,
-		SnapshotEvery: p.SnapshotEvery, SnapshotRetain: p.SnapshotRetain, ChunkSize: p.ChunkSize, Genesis: p.Genesis}
+		SnapshotEvery: p.SnapshotEvery, SnapshotRetain: p.SnapshotRetain, ChunkSize: p.ChunkSize, Genesis: p.Genesis,
+		MaxEntriesPerMsg: p.MaxEntriesPerMsg, MaxSizePerMsg: p.MaxSizePerMsg}
 }
 
 // Profiles are the built-in chaos mixes. Every one exercises the continuous

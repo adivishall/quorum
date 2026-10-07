@@ -171,6 +171,26 @@ func (c *Cluster) checkSend(n *node, m raft.Message) {
 			return
 		}
 	}
+	// Audit H4: an AppendEntries keeps to the budgets — at most
+	// MaxEntriesPerMsg entries, and their data at most MaxSizePerMsg unless a
+	// single entry alone exceeds it.
+	if m.Type == raft.MsgAppendRequest && len(m.Entries) > 0 && (c.cfg.MaxEntriesPerMsg > 0 || c.cfg.MaxSizePerMsg > 0) {
+		size := 0
+		for _, e := range m.Entries {
+			size += len(e.Data)
+		}
+		switch {
+		case c.cfg.MaxEntriesPerMsg > 0 && len(m.Entries) > c.cfg.MaxEntriesPerMsg:
+			c.violate("H4", "%s sent %s: %d entries, the budget is %d", n.id, describe(m), len(m.Entries), c.cfg.MaxEntriesPerMsg)
+			return
+		case c.cfg.MaxSizePerMsg > 0 && size > c.cfg.MaxSizePerMsg && len(m.Entries) > 1:
+			c.violate("H4", "%s sent %s: %d bytes of entries, the budget is %d", n.id, describe(m), size, c.cfg.MaxSizePerMsg)
+			return
+		}
+		if c.cfg.MaxEntriesPerMsg > 0 && len(m.Entries) == c.cfg.MaxEntriesPerMsg {
+			c.stats.FullBatches++
+		}
+	}
 	// INV-MB5: only a voter of its own configuration campaigns, and only the
 	// voters whose votes count are asked. (Any node may GRANT a vote: it may be
 	// a voter of a configuration it has not received, and whether the vote

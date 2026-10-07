@@ -119,6 +119,27 @@ func (w *Waiters) Installed(index uint64) {
 	}
 }
 
+// Cancel forgets the waiter at index whose channel is ch: its client stopped
+// waiting (audit M3), so nobody would read its Outcome. Without it the waiter
+// stayed until its index was applied — for an entry an isolated leader
+// appended, possibly never, if the log that replaced it never grew that far.
+// An unknown waiter (already completed) is ignored.
+func (w *Waiters) Cancel(index uint64, ch <-chan Outcome) {
+	ws := w.byIndex[index]
+	for i, wt := range ws {
+		if wt.ch == ch {
+			ws = append(ws[:i:i], ws[i+1:]...)
+			w.n--
+			break
+		}
+	}
+	if len(ws) == 0 {
+		delete(w.byIndex, index)
+	} else {
+		w.byIndex[index] = ws
+	}
+}
+
 // Len is the number of waiters registered and not yet completed.
 func (w *Waiters) Len() int { return w.n }
 
@@ -174,6 +195,9 @@ func (r *Reads) DropStale(term uint64, leader bool) {
 		}
 	}
 }
+
+// Cancel forgets an unconfirmed read whose client stopped waiting (audit M3).
+func (r *Reads) Cancel(id uint64) { delete(r.byID, id) }
 
 // FailAll fails every unconfirmed read with err.
 func (r *Reads) FailAll(err error) {

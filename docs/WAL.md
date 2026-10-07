@@ -151,6 +151,29 @@ A failed background flush **latches**: every subsequent append fails with that e
 Continuing to accept writes after the log can no longer honour its durability promise would
 mean acknowledging writes that may not survive, which is the worst possible response.
 
+So does a failed **append** (audit D10): its write may have left a partial record — a torn tail
+recovery repairs — as long as nothing is written after it; a later record would make it damage
+mid-segment, which recovery refuses (`TestATornAppendLatches`). And `Close` after a failed flush
+returns that failure **without flushing again**: a second fsync can succeed once the kernel has
+dropped the pages the first failed to write, and reporting that as durability is the fsyncgate
+error (`TestCloseAfterAFailedFlushReportsItAndDoesNotFlushAgain`; mutants 261–262, 265). After a
+failed **write**, the records acknowledged before it are still owed their flush: the batch syncer
+goes on flushing, `Sync` flushes, and `Close` flushes, each then reporting the latched failure
+(`TestAFailedWriteDoesNotStopTheBatchFlush`, `TestSyncAfterAFailedWriteFlushes`,
+`TestCloseAfterAFailedWriteStillFlushes`; mutants 264, 292–293). A record larger than the framing
+holds is refused before anything is written and latches nothing (`ErrRecordTooLarge`,
+`TestAnOversizedRecordLatchesNothing`, mutant 291); the LSM store refuses options whose largest put
+would not fit one (`TestAPutAlwaysFitsAWALRecord`).
+
+The LSM store syncs the WAL before a flush records its table in the manifest — except in `SyncOff`,
+which never fsyncs (`TestSyncOffNeverFsyncsTheWAL`) — so the manifest never runs ahead of the
+durable log (`TestAFlushMakesTheWALDurableBeforeItsEdit`, mutant 260). The exception is a
+flush during replay at open: its records come from segments an earlier process wrote, and open
+does not sync them. If that process was killed with records still in the page cache, and the
+machine then loses power after the replay flush but before the kernel writes those pages back, the
+manifest is ahead of the log and the next open refuses it (`ErrCorrupt`). This is a limitation (§10).
+(`TestAReplayThatFlushesOpens`, mutant 263, covers a replay flush itself.)
+
 ### The cost, measured
 
 Apple M4, macOS 26.5.2, Go 1.27.1, APFS on internal SSD. 100-byte values, single-operation
@@ -314,3 +337,4 @@ data to have reached the physical device, which no userspace test on a laptop ca
 | Mis-classification possible if a length field is corrupted within range | inherent to this framing; see §8 |
 | `sync` mode serialises writers behind the flush | Phase 5 may add group commit, if measured to matter |
 | Power-loss durability untested in every mode | not testable here |
+| Open does not sync the recovered segments before a replay flush records a table (§5) | open |

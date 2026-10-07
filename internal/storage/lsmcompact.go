@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -196,8 +197,15 @@ func (s *LSMStore) Compact() (bool, error) {
 	if s.closed {
 		return false, opErr("compact", nil, ErrClosed)
 	}
+	// Latched as the background compactor is: after a failure no compaction
+	// runs again in this process. An explicit one used to merge again after a
+	// failed manifest edit, and keep each output on disk (audit M11).
+	if err := s.CompactionError(); err != nil {
+		return false, classify("compact", nil, fmt.Errorf("lsm: compaction stopped by an earlier failure: %w", err))
+	}
 	ran, err := s.compactOnce()
 	if err != nil {
+		s.setCompactErr(err)
 		return false, classify("compact", nil, err)
 	}
 	return ran, nil
@@ -263,12 +271,16 @@ func (s *LSMStore) compactOnce() (bool, error) {
 		return false, err
 	}
 	if err := s.publishCompaction(job, num, meta, produced); err != nil {
-		if produced {
+		if produced && !errors.Is(err, manifest.ErrFailed) {
 			// The output was renamed into place but never referenced. Removing it
 			// here is tidiness, not correctness: it is already an orphan and the
 			// next startup would sweep it.
 			_ = os.Remove(s.sstPath(num))
 		}
+		// After a failed manifest append the edit naming the output may be on
+		// disk — written, its fsync failed — and the next open would then
+		// refuse a store whose live file was deleted (audit M11). The output
+		// stays; if the edit did not survive, the next startup sweeps it.
 		return false, err
 	}
 
@@ -483,6 +495,13 @@ func (s *LSMStore) runCompactor() {
 			if s.closed {
 				s.closeMu.RUnlock()
 				return
+			}
+			if s.CompactionError() != nil {
+				// Latched: no compaction runs again in this process. Retrying
+				// after a failure appended edits after an ambiguous one and
+				// burned file numbers, every flush (audit M11).
+				s.closeMu.RUnlock()
+				break
 			}
 			ran, err := s.compactOnce()
 			s.closeMu.RUnlock()

@@ -32,6 +32,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -41,6 +42,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,6 +54,7 @@ import (
 	"github.com/adivishall/quorum/internal/kv"
 	"github.com/adivishall/quorum/internal/metrics"
 	"github.com/adivishall/quorum/internal/multiraft"
+	"github.com/adivishall/quorum/internal/nodedir"
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftnode"
 	"github.com/adivishall/quorum/internal/replication"
@@ -77,7 +80,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		peersArg  = fs.String("peers", "", "comma-separated peers as id=host:port")
 		probeIvl  = fs.Duration("probe-interval", 100*time.Millisecond, "how often to probe each peer")
 		raftMode  = fs.Bool("raft", false, "run a single Raft group over the transport (Phase 9) instead of the probe demo")
-		dataDir   = fs.String("data-dir", "", "directory for the durable Raft log (raft mode; a temp dir if empty)")
+		dataDir   = fs.String("data-dir", "", "raft/cluster mode (required): the node's data directory — its Raft logs, snapshots and identity. Locked while the process runs; it belongs to one node of one cluster (docs/MULTI_RAFT.md §5)")
+		initDir   = fs.Bool("init", false, "raft/cluster mode: initialize a new, empty -data-dir for this node (first start only; needs -cluster-id). A directory with no node is otherwise refused: a node whose state was lost must be replaced, not restarted empty")
+		clusterID = fs.String("cluster-id", "", "raft/cluster mode: the cluster this node belongs to (letters, digits, '.', '_', '-'), recorded at -init; later starts may omit it or must repeat it")
 		tickIvl   = fs.Duration("tick-interval", 50*time.Millisecond, "raft logical tick duration")
 		crashAt   = fs.String("crash-at", "", "TEST SEAM (raft mode): kill this process with SIGKILL at a crash point, e.g. after-save:2 (the 2nd time it is reached), fsync:3 (before the 3rd fsync of any of the node's files — its Raft log and snapshot files), rename:1, syncdir:2, after-snapshot-publish:1 or before-reply:1 (before the 1st client response is written); see docs/CRASH_RECOVERY.md and docs/SNAPSHOTS.md")
 		crashArm  = fs.Bool("crash-armed-by-signal", false, "TEST SEAM: count -crash-at occurrences only after this process receives SIGUSR1 (it logs event=crash_armed), so a test can crash at the Nth occurrence after a point of its choosing; driver and reply points only")
@@ -93,11 +98,14 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		nodesArg  = fs.String("nodes", "", "cluster mode: comma-separated node ids of the routing (the genesis cluster); default this node and its -peers. Identical on every node, including one that joins later")
 		joinArg   = fs.String("join", "", "raft/cluster mode: comma-separated group ids this node hosts as a JOINER — it starts with no configuration and its group's leader adds it (admin add-learner); -raft takes only 0")
 		metricsAt = fs.String("metrics-listen", "", "serve Prometheus metrics over HTTP (GET /metrics, docs/OBSERVABILITY.md) on this host:port — separate from the client and admin ports")
-		adminAt   = fs.String("admin-listen", "", "raft/cluster mode: serve the admin protocol (docs/MULTI_RAFT.md §7: status, add-learner, promote, remove-voter, remove-learner, create-group, stop-group, snapshot) on this host:port — separate from the client port")
+		adminAt   = fs.String("admin-listen", "", "raft/cluster mode: serve the admin protocol (docs/MULTI_RAFT.md §7: status, add-learner, promote, remove-voter, remove-learner, create-group, stop-group, snapshot) on this host:port — separate from the client port. A loopback address only, unless -admin-allow-remote")
+		adminAny  = fs.Bool("admin-allow-remote", false, "allow -admin-listen on an address other than loopback. The admin port is unauthenticated plaintext: anyone who can reach it can remove voters and stop groups (docs/LIMITATIONS.md)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	explicit := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
 	crash, err := parseCrashAt(*crashAt)
 	if err != nil {
 		fmt.Fprintf(stderr, "dkvd: %v\n", err)
@@ -120,7 +128,75 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "dkvd: -probe-interval must be positive, got %s\n", *probeIvl)
 		return 2
 	}
+	// Likewise the Raft tick: a negative one would panic every group's actor,
+	// and zero would disable the transport's idle timeout (120 ticks) while
+	// the driver silently used its default (audit M5).
+	if *tickIvl <= 0 {
+		fmt.Fprintf(stderr, "dkvd: -tick-interval must be positive, got %s\n", *tickIvl)
+		return 2
+	}
 
+	if *raftMode && *cluster {
+		fmt.Fprintln(stderr, "dkvd: -raft and -cluster are exclusive")
+		return 2
+	}
+	if (*clientAt != "" || *adminAt != "" || *joinArg != "" || *initDir || *clusterID != "") && !*raftMode && !*cluster {
+		fmt.Fprintln(stderr, "dkvd: -client-listen, -admin-listen, -join, -init and -cluster-id require -raft or -cluster")
+		return 2
+	}
+	// The admin port can remove voters and stop groups, with no
+	// authentication: it listens on loopback unless the operator says
+	// otherwise (audit H6).
+	if *adminAt != "" && !*adminAny && !isLoopback(*adminAt) {
+		fmt.Fprintf(stderr, "dkvd: -admin-listen %s is not a loopback address; the admin port is unauthenticated — pass -admin-allow-remote to expose it anyway\n", *adminAt)
+		return 2
+	}
+	// A node's durable state is the whole of its Raft safety: it is never a
+	// temporary directory that a restart would forget (audit H1).
+	if (*raftMode || *cluster) && *dataDir == "" {
+		fmt.Fprintln(stderr, "dkvd: -raft and -cluster require -data-dir")
+		return 2
+	}
+	// The routing flags define -cluster mode's groups; anywhere else they were
+	// silently ignored, so a node meant for a sharded cluster could run as
+	// something else unnoticed (audit H5/D5).
+	if !*cluster {
+		for _, name := range []string{"shards", "rf", "nodes"} {
+			if explicit[name] {
+				fmt.Fprintf(stderr, "dkvd: -%s applies to -cluster mode only\n", name)
+				return 2
+			}
+		}
+	}
+	join, err := parseGroups(*joinArg)
+	if err != nil || (*raftMode && (len(join) > 1 || len(join) == 1 && join[0] != 0)) {
+		fmt.Fprintf(stderr, "dkvd: bad -join %q (with -raft only group 0): %v\n", *joinArg, err)
+		return 2
+	}
+	var assign *multiraft.Assignment
+	var nodes []routing.NodeID
+	if *cluster {
+		nodes = []routing.NodeID{routing.NodeID(*id)}
+		for p := range peers {
+			nodes = append(nodes, routing.NodeID(p))
+		}
+		if *nodesArg != "" {
+			nodes = nil
+			for _, n := range strings.Split(*nodesArg, ",") {
+				nodes = append(nodes, routing.NodeID(strings.TrimSpace(n)))
+			}
+		}
+		assign, err = multiraft.NewAssignment(routing.Config{ShardCount: *shards, ReplicationFactor: *rf, Nodes: nodes})
+		if err != nil {
+			fmt.Fprintf(stderr, "dkvd: the cluster's routing: %v\n", err)
+			return 2
+		}
+	}
+	limits := kv.Limits{MaxSessions: *sessMax, MaxUnacked: *sessUnk}
+	if limits.MaxSessions < 1 || limits.MaxUnacked < 1 {
+		fmt.Fprintf(stderr, "dkvd: -session-max and -session-max-unacked must be at least 1, got %d and %d\n", limits.MaxSessions, limits.MaxUnacked)
+		return 2
+	}
 	// readIdle: a connection that has delivered no frame for this long is treated
 	// as dead and torn down, so the dialer reconnects. Without it a connection
 	// that is established but silently delivers nothing — a peer that vanished
@@ -147,63 +223,48 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 		defer stopMetrics()
 	}
-	tr, err := transport.NewTCPTransport(transport.Config{
+	tcfg := transport.Config{
 		NodeID:          transport.NodeID(*id),
 		ListenAddr:      *listen,
 		Peers:           peers,
 		Logf:            lg.logf,
 		ReadIdleTimeout: readIdle,
 		Metrics:         reg,
-	})
+	}
+	var settings string
+	var nd *nodedir.Dir
+	if *raftMode || *cluster {
+		// The data directory is opened before the transport listens: its
+		// identity names the cluster, and its pinned replica settings are the
+		// ones in force, so the transport admits only nodes that share both
+		// (audit H2, H5; docs/TRANSPORT.md §3).
+		settings = replicaSettings(*cluster, limits, *shards, *rf, nodes)
+		if *initDir && assign != nil && len(join) == 0 && len(assign.GenesisGroups(multiraft.NodeID(*id))) == 0 {
+			// Decided by the flags alone: refused before the directory
+			// records anything, so a corrected retry is not refused for
+			// settings no group was ever created under.
+			fmt.Fprintf(stderr, "dkvd: node %s would host no group: it is not in the routing's -nodes and joins none (-join)\n", *id)
+			return 2
+		}
+		nd, err = openDataDir(*dataDir, *id, *clusterID, *initDir, settings, lg)
+		if err != nil {
+			fmt.Fprintf(stderr, "dkvd: -data-dir: %v\n", err)
+			return 2
+		}
+		defer nd.Close()
+		tcfg.ClusterID, tcfg.SettingsDigest = nd.ID.Cluster, settingsDigest(nd.ID.Settings)
+	}
+	tr, err := transport.NewTCPTransport(tcfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "dkvd: %v\n", err)
 		return 2
 	}
+	defer func() { _ = tr.Close() }() // on every return; Close is idempotent
 	lg.logf("event=ready node=%s addr=%s peers=%d", *id, tr.LocalAddr(), len(peers))
 
-	if *raftMode && *cluster {
-		fmt.Fprintln(stderr, "dkvd: -raft and -cluster are exclusive")
-		_ = tr.Close()
-		return 2
-	}
-	if (*clientAt != "" || *adminAt != "" || *joinArg != "") && !*raftMode && !*cluster {
-		fmt.Fprintln(stderr, "dkvd: -client-listen, -admin-listen and -join require -raft or -cluster")
-		_ = tr.Close()
-		return 2
-	}
-	join, err := parseGroups(*joinArg)
-	if err != nil || (*raftMode && (len(join) > 1 || len(join) == 1 && join[0] != 0)) {
-		fmt.Fprintf(stderr, "dkvd: bad -join %q (with -raft only group 0): %v\n", *joinArg, err)
-		_ = tr.Close()
-		return 2
-	}
-	var assign *multiraft.Assignment
-	if *cluster {
-		nodes := []routing.NodeID{routing.NodeID(*id)}
-		for p := range peers {
-			nodes = append(nodes, routing.NodeID(p))
-		}
-		if *nodesArg != "" {
-			nodes = nil
-			for _, n := range strings.Split(*nodesArg, ",") {
-				nodes = append(nodes, routing.NodeID(strings.TrimSpace(n)))
-			}
-		}
-		assign, err = multiraft.NewAssignment(routing.Config{ShardCount: *shards, ReplicationFactor: *rf, Nodes: nodes})
-		if err != nil {
-			fmt.Fprintf(stderr, "dkvd: the cluster's routing: %v\n", err)
-			_ = tr.Close()
-			return 2
-		}
-	}
-	limits := kv.Limits{MaxSessions: *sessMax, MaxUnacked: *sessUnk}
-	if limits.MaxSessions < 1 || limits.MaxUnacked < 1 {
-		fmt.Fprintf(stderr, "dkvd: -session-max and -session-max-unacked must be at least 1, got %d and %d\n", limits.MaxSessions, limits.MaxUnacked)
-		_ = tr.Close()
-		return 2
-	}
 	if *raftMode || *cluster {
-		r := raftRun{id: *id, listen: *listen, peers: peers, tr: tr, dataDir: *dataDir, tick: *tickIvl, lg: lg, stderr: stderr, clientAddr: *clientAt, crash: crash,
+		r := raftRun{id: *id, listen: *listen, peers: peers, tr: tr, dataDir: *dataDir, nd: nd, init: *initDir, clusterID: *clusterID,
+			settings: settings, tick: *tickIvl, lg: lg, stderr: stderr, clientAddr: *clientAt, crash: crash,
 			limits: limits, redirectOnly: !*forward, snapshotEvery: *snapEv, snapshotRetain: *snapKeep,
 			assign: assign, join: join, adminAddr: *adminAt, metrics: reg}
 		if crash != nil {
@@ -345,11 +406,18 @@ type raftRun struct {
 	peers   map[transport.NodeID]string
 	tr      transport.Transport
 	dataDir string
-	tick    time.Duration
-	lg      *logger
-	stderr  io.Writer
-	fs      vfs.FS
-	hook    raftnode.Hook // -crash-at driver point; nil in normal operation
+	// nd: the data directory, opened and locked by the caller; nil opens it
+	// here from init, clusterID and settings (-init, -cluster-id and
+	// replicaSettings, which the data directory pins).
+	nd        *nodedir.Dir
+	init      bool
+	clusterID string
+	settings  string
+	tick      time.Duration
+	lg        *logger
+	stderr    io.Writer
+	fs        vfs.FS
+	hook      raftnode.Hook // -crash-at driver point; nil in normal operation
 	// clientAddr, if set, serves the key-value protocol (internal/kv) on that
 	// address, for every group the node hosts (kv.Front).
 	clientAddr   string
@@ -391,15 +459,22 @@ func runRaft(ctx context.Context, r raftRun) int {
 	id, lg := r.id, r.lg
 	dataDir := r.dataDir
 	if dataDir == "" {
-		d, err := os.MkdirTemp("", "dkvd-raft-")
+		fmt.Fprintln(r.stderr, "dkvd: no data directory")
+		return 2
+	}
+	// The data directory is this process's (locked) and this node's (its
+	// identity), and a directory with no node is initialized only on request
+	// (-init): a node whose state was lost must not restart empty under its
+	// old id (audit H1, internal/nodedir).
+	nd := r.nd
+	if nd == nil {
+		var err error
+		nd, err = openDataDir(dataDir, id, r.clusterID, r.init, r.settings, lg)
 		if err != nil {
-			fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
+			fmt.Fprintf(r.stderr, "dkvd: -data-dir: %v\n", err)
 			return 2
 		}
-		dataDir = d
-	} else if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
-		return 2
+		defer nd.Close()
 	}
 	limits := r.limits
 	if limits == (kv.Limits{}) {
@@ -438,11 +513,6 @@ func runRaft(ctx context.Context, r raftRun) int {
 	if r.assign == nil {
 		hc.LogPathFor = func(multiraft.GroupID) string { return filepath.Join(dataDir, "raft-"+id+".log") }
 	}
-	host, err := multiraft.Start(ctx, hc)
-	if err != nil {
-		fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
-		return 2
-	}
 	// The genesis groups, then the joined ones. A group already running (found
 	// on disk) is left as it is; a group that cannot start is fatal in -raft
 	// mode and reported in -cluster mode.
@@ -476,7 +546,6 @@ func runRaft(ctx context.Context, r raftRun) int {
 			conf, err := r.assign.Genesis(g, addrs)
 			if err != nil {
 				fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
-				_ = host.Close()
 				return 2
 			}
 			creations = append(creations, creation{g, &conf})
@@ -485,17 +554,71 @@ func runRaft(ctx context.Context, r raftRun) int {
 	for _, g := range r.join {
 		creations = append(creations, creation{g, nil})
 	}
+	// Initialization records every genesis and -join group's identity, then
+	// the initialization itself, and only then starts any group: no group ever
+	// runs in a directory whose initialization did not finish. A group that
+	// ran there — voted, acknowledged — and then lost its state was created
+	// again empty by the next start, which still counted as initializing
+	// (audit H1). A failure here leaves the initialization to resume; nothing
+	// has run.
+	if nd.Initializing() {
+		if len(creations) == 0 {
+			fmt.Fprintf(r.stderr, "dkvd: node %s would host no group: it is not in the routing's -nodes and joins none (-join)\n", id)
+			return 2
+		}
+		for _, c := range creations {
+			if err := multiraft.Prepare(hc, c.g, c.boot); err != nil {
+				fmt.Fprintf(r.stderr, "dkvd: initializing group %d in %s: %v (no group has started; the next start resumes the initialization)\n", c.g, dataDir, err)
+				return 2
+			}
+		}
+		if err := nd.FinishInit(); err != nil {
+			fmt.Fprintf(r.stderr, "dkvd: recording the initialization of %s: %v\n", dataDir, err)
+			return 2
+		}
+		lg.logf("event=data_dir_initialized node=%s dir=%s cluster=%s", id, dataDir, nd.ID.Cluster)
+	}
+	host, err := multiraft.Start(ctx, hc)
+	if err != nil {
+		fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
+		return 2
+	}
+	// Genesis and -join state is created only by initialization (above). In an
+	// initialized directory such a group with no state was lost, and is
+	// reported rather than created empty: its node voted and acknowledged as a
+	// member, and an empty replica under its id would do so again without that
+	// state. A group new to an initialized node is created through the admin
+	// port (create-group). A group that failed to recover is reported by the
+	// host already. In -raft mode group 0 is always opened through Create
+	// (which checks the configured genesis against the recorded one), so its
+	// identity file must exist.
 	for _, c := range creations {
 		if host.Group(c.g) != nil {
 			continue
 		}
-		if _, err := host.Create(c.g, c.boot); err != nil {
-			if r.assign == nil {
-				fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
+		if _, failed := host.Failed()[c.g]; failed && r.assign != nil {
+			continue
+		}
+		if r.assign == nil {
+			if _, found, err := raftnode.LoadIdentity(r.fs, hc.LogPathFor(c.g)); err != nil || !found {
+				fmt.Fprintf(r.stderr, "dkvd: group %d has no state in the initialized data directory %s (%v): "+
+					"its state was lost; replace this node through a membership change\n", c.g, dataDir, err)
 				_ = host.Close()
 				return 2
 			}
-			lg.logf("event=group_failed node=%s group=%d err=%v", id, c.g, err)
+		} else {
+			what := "genesis group"
+			if c.boot == nil {
+				what = "-join group"
+			}
+			lg.logf("event=group_failed node=%s group=%d err=%q", id, c.g,
+				what+" with no state in an initialized data directory: its state was lost; replace this replica through a membership change")
+			continue
+		}
+		if _, err := host.Create(c.g, c.boot); err != nil {
+			fmt.Fprintf(r.stderr, "dkvd: %v\n", err)
+			_ = host.Close()
+			return 2
 		}
 	}
 	if r.assign == nil && host.Group(0) == nil {
@@ -794,8 +917,62 @@ func (c *crashConn) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// parsePeers parses "id=host:port,id=host:port" into a map. It rejects empty
-// entries, a missing '=', an empty id, and a duplicate id — never silently.
+// isLoopback reports whether a listen address binds loopback only: localhost
+// or a loopback IP. An empty host binds every interface.
+func isLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// openDataDir opens and locks the node's data directory (internal/nodedir).
+func openDataDir(dir, id, cluster string, init bool, settings string, lg *logger) (*nodedir.Dir, error) {
+	nd, err := nodedir.Open(dir, nodedir.Options{Node: id, Cluster: cluster, Init: init, Settings: settings})
+	if err != nil {
+		return nil, err
+	}
+	lg.logf("event=data_dir node=%s dir=%s cluster=%s state=%s", id, dir, nd.ID.Cluster, nd.State)
+	return nd, nil
+}
+
+// settingsDigest is what the transport handshake compares (docs/TRANSPORT.md
+// §3): the SHA-256 of the pinned replica settings, so nodes whose replicas
+// would decide entries differently never connect.
+func settingsDigest(settings string) []byte {
+	d := sha256.Sum256([]byte(settings))
+	return d[:]
+}
+
+// replicaSettings renders, canonically, the settings every replica of this
+// node's groups must share because they are part of the replicated state
+// machine's definition (audit H5): the session table's limits decide entries
+// at apply (SESSION_LIMIT, SESSION_EXPIRED), and in -cluster mode the routing
+// decides every group's genesis members and every key's group. The data
+// directory pins them (internal/nodedir): a node cannot change them by
+// restarting. Peer addresses are not among them: they may legitimately differ
+// from node to node.
+func replicaSettings(cluster bool, limits kv.Limits, shards, rf int, nodes []routing.NodeID) string {
+	var b strings.Builder
+	if cluster {
+		ids := make([]string, 0, len(nodes))
+		for _, n := range nodes {
+			ids = append(ids, string(n))
+		}
+		sort.Strings(ids)
+		fmt.Fprintf(&b, "mode=cluster shards=%d rf=%d nodes=%s ", shards, rf, strings.Join(ids, ","))
+	} else {
+		b.WriteString("mode=raft ")
+	}
+	fmt.Fprintf(&b, "session-max=%d session-max-unacked=%d", limits.MaxSessions, limits.MaxUnacked)
+	return b.String()
+}
+
 // parseGroups parses -join's comma-separated group ids.
 func parseGroups(s string) ([]multiraft.GroupID, error) {
 	if s == "" {
@@ -818,6 +995,8 @@ func parseGroups(s string) ([]multiraft.GroupID, error) {
 	return out, nil
 }
 
+// parsePeers parses "id=host:port,id=host:port" into a map. It rejects empty
+// entries, a missing '=', an empty id, and a duplicate id — never silently.
 func parsePeers(s string) (map[transport.NodeID]string, error) {
 	peers := make(map[transport.NodeID]string)
 	s = strings.TrimSpace(s)
@@ -860,14 +1039,73 @@ func (l *logger) logf(format string, args ...any) {
 // serveMetrics serves reg at GET /metrics on addr (Phase 16,
 // docs/OBSERVABILITY.md) and returns the function that stops it. The listener is
 // bound before it returns, so a bad address is a startup error.
+// newMetricsServer bounds what a metrics connection may cost (audit M1): a
+// scraper's request must arrive, and its answer be taken, within bounds, and
+// an idle keep-alive connection is closed instead of held for ever.
+func newMetricsServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+}
+
+// maxMetricsConns bounds the metrics port's connections (audit M1): one
+// beyond is closed as soon as it is accepted, as on the client and admin
+// ports. A scraper needs one or two; without a cap, a flood held a descriptor
+// and a goroutine per connection, for as long as the idle timeout.
+const maxMetricsConns = 64
+
+// cappedListener closes a connection accepted beyond its capacity at once.
+type cappedListener struct {
+	net.Listener
+	slots chan struct{}
+}
+
+func capListener(ln net.Listener, n int) net.Listener {
+	return &cappedListener{Listener: ln, slots: make(chan struct{}, n)}
+}
+
+func (l *cappedListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		select {
+		case l.slots <- struct{}{}:
+			return &slotConn{Conn: c, release: func() { <-l.slots }}, nil
+		default:
+			_ = c.Close()
+		}
+	}
+}
+
+// slotConn returns its slot when it is first closed.
+type slotConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *slotConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
+}
+
 func serveMetrics(addr string, reg *metrics.Registry, id string, lg *logger) (func(), error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
+	ln = capListener(ln, maxMetricsConns)
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", metrics.Handler(reg))
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	srv := newMetricsServer(mux)
 	go func() { _ = srv.Serve(ln) }()
 	lg.logf("event=metrics_ready node=%s addr=%s", id, ln.Addr())
 	return func() { _ = srv.Close() }, nil

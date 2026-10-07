@@ -50,9 +50,20 @@ The host owns only what is per process:
   starts a group for the first time as a genesis member or a joiner; `Stop` stops one, keeping its
   files; `Open` starts a stopped one again from its own identity file; a group whose node reports its
   removal (`docs/MEMBERSHIP.md` §7) is **retired** — stopped, files kept (`event=group_retired`,
-  `TestRemovedLeaderRetiresItsGroup`). Nothing is ever deleted automatically. A group directory is
+  logged and counted once, when the stop is certain: `TestRemovedLeaderRetiresItsGroup`,
+  `TestARetirementIsLoggedOnce`). Nothing is ever deleted automatically. A group directory is
   created durably: each new directory's parent is fsynced, so a group can never vanish from a
-  node that held its state;
+  node that held its state. **Starts and stops of one group never overlap** (audit H3): a start
+  reserves the group before it touches its files and holds it until the group is registered and
+  announced (`OnGroup`); a stop moves it out of the registry into the reservation and holds it until
+  its node is closed. Meanwhile any other `Create`, `Open` or `Stop` of that group — an admin
+  operation, or a retirement — is refused with `ErrGroupBusy` (the admin answers it as an error, to
+  retry), so a group never has two drivers on its log, and the front's attach and detach of a group
+  strictly alternate. `Close` waits for transitions in flight. A first start that fails before
+  recording anything removes the empty group directory it made
+  (`TestAStartingGroupCannotBeStartedOrStoppedAgain`, `TestAStoppingGroupCannotBeStartedUntilItsNodeIsClosed`,
+  `TestConcurrentLifecycleOperations` under `-race`, `TestAFailedFirstStartLeavesNoDirectory`;
+  mutants 189–191);
 - **the demultiplexer** (§4);
 - **the transport's peer set** — the members with addresses of every hosted group's current
   configuration, plus the static peers (`-peers`), kept in step as configurations change
@@ -85,11 +96,14 @@ group id over 32 bits; duplicated frames; one group's frame never moving another
 ## 5. Persistence layout
 
 ```
-<data-dir>/
+<data-dir>/                      mode 0700
+  LOCK                           flock'd by the process using the directory (internal/nodedir)
+  node.identity                  the node identity: node id, cluster id, replica settings,
+                                 initialized (written at -init)
   groups/
     <gid>/
       raft.log                   the group's durable Raft log (entries, HardStates, boundaries)
-      raft.log.group             the group identity: group id + genesis configuration (written once)
+      raft.log.group             the group identity: group id + genesis configuration + node id (written once)
       raft.log.snap              its one published snapshot (format v2: group id + configuration)
       raft.log.tmp, raft.log.group.tmp, raft.log.snap.tmp, raft.log.snap.recv
                                  temporaries (a log rewrite, an identity, a snapshot being
@@ -102,6 +116,59 @@ recover, snapshot, compact and fail independently (`TestGroupsSnapshotAndCompact
 `dkvd -raft` — the Phase 9–14 single-group deployment — is the host with one group, 0, whose log
 keeps its Phase 9–14 path (`<data-dir>/raft-<id>.log`) and its first-start I/O, so every earlier
 real-process test runs unchanged.
+
+**A data directory is one node's, and is initialized only on request** (audit H1,
+`internal/nodedir`). Raft's safety rests on each node's durable term, vote and log; a node that
+runs without them — on a temporary directory, on another node's directory, beside a second process
+on the same one, or on an empty directory under the id of a member whose state was lost — can vote
+twice in a term or lose a committed entry. So `dkvd -raft|-cluster`:
+
+- requires `-data-dir` (there is no temporary default) and takes an exclusive `flock` on
+  `<data-dir>/LOCK` for its lifetime — the kernel releases it when the process dies, SIGKILL
+  included;
+- reads `<data-dir>/node.identity`, written once, and refuses a directory recorded for another node
+  id or another cluster id;
+- initializes a directory that holds no node **only with `-init`** (and a `-cluster-id`), and
+  refuses one otherwise: an empty directory and a wiped one look the same, and only the operator
+  knows which it is. A node whose state was lost is replaced through a membership change, never
+  restarted empty under its old id. `-init` on an initialized directory is refused too, so it cannot
+  live in a unit file;
+- creates genesis and `-join` groups only while initializing, and **runs none of them until the
+  initialization is recorded**: `node.identity` is written first, marked unfinished; then every
+  such group's identity is recorded without starting it (`multiraft.Prepare`); then the directory
+  is marked initialized; only then does any group start. A group that cannot be recorded exits 2
+  with nothing started, and the next start resumes without `-init`. So no group ever runs in a
+  directory whose initialization did not finish — before, a `-cluster` start ran the groups it
+  could create as voting members while another failed, and every later start, still
+  initializing, created a lost one again empty (`TestAnUnfinishedInitRunsNoGroup`, mutant 280). A
+  node that would host no group is refused from its flags, before the directory records anything
+  (`TestAnInitRefusedByItsFlagsRecordsNothing`). In an initialized directory a genesis or `-join` group with no state is reported
+  (`event=group_failed`, or exit 2 in `-raft` mode), never created empty
+  (`TestALostJoinGroupIsReportedNotRecreated`, mutant 266). A group new to an initialized node is
+  created through the admin port (`create-group`, §7), which cannot tell a new group from one whose
+  state was lost: the operator must;
+- adopts a directory written before node identities (Raft state, no `node.identity`) once a
+  `-cluster-id` is given, unless it holds another node's `raft-<id>.log` (matched by its whole
+  name: an id may contain `.log`). It cannot tell another node's `groups/`: their version-1 group
+  identity files name no node, so adopting the wrong directory is the operator's error to avoid;
+- pins the node's **replica settings** in `node.identity` (audit H5): the settings every replica
+  must share — the session limits, and in `-cluster` mode the routing (`-shards`, `-rf`, the
+  sorted `-nodes`) — recorded at initialization; a start whose flags give others exits 2 naming
+  both, even one resuming an unfinished initialization once it recorded a group (the group
+  follows them); one that recorded none takes the new settings and cluster id
+  (`TestAnUnfinishedInitWithNoGroupStateTakesNewFlags`). Peer addresses are not among them. `-shards/-rf/-nodes` outside `-cluster` mode are
+  refused;
+- opens the directory **before** the transport listens, and the transport handshake carries the
+  recorded cluster id and a SHA-256 digest of the pinned settings: a node of another cluster, or
+  one whose settings differ, is never connected to, both ways (`docs/TRANSPORT.md` §3,
+  `TestRealImpostorsNeverJoinTheGroup`).
+
+Each group's identity file (version 2) also records its node, and `raftnode` refuses a group's
+state recorded for another node; a version-1 file, written before, is still read. Evidence:
+`internal/nodedir` (every rule, the codec, the lock), `TestIdentityFileNamesItsNode`,
+`TestDataDirectoryRules` (dkvd's own raft-mode code) and `TestRealWipedNodeIsRefused` (a member's
+directory wiped and restarted with its ordinary flags is refused, and a second process on a running
+node's directory too).
 
 ## 6. Client routing
 
@@ -135,7 +202,7 @@ request and per answer, acting on this node's groups only:
 
 | Op | Arguments | Effect |
 |---|---|---|
-| `status` | | every hosted group's role, term, leader, commit, applied, boundary, snapshot, configuration, pending change; the groups that failed to recover |
+| `status` | | the answering node's id (`node`); every hosted group's role, term, leader, commit, applied, last index, boundary, snapshot, configuration and its index, pending change, voter, removed, the writes and reads accepted and not yet answered (`pending_writes`, `pending_reads`), and — on the group's leader — every other member's match index (`follower_match`, from which its lag follows); the groups that failed to recover |
 | `add-learner` | group, id, addr | add a non-voting member (only the group's leader accepts; others name it) |
 | `promote` | group, id | a learner becomes a voter, by joint consensus |
 | `remove-voter` | group, id | by joint consensus |
@@ -146,7 +213,24 @@ request and per answer, acting on this node's groups only:
 | `snapshot` | group | snapshot the group's state machine now |
 
 A membership operation completes only when the group's log says so (`docs/MEMBERSHIP.md` §7). The
-protocol never decides membership (`TestAdminDrivesMembershipThroughTheLog`).
+protocol never decides membership (`TestAdminDrivesMembershipThroughTheLog`). `dkvctl` is its
+operator client — status, leaders, configurations, lag, health and readiness — and
+`docs/OPERATIONS.md` defines the health verdicts it derives from `status`
+(`TestAdminStatusNamesItsNodeAndTheLeadersFollowers` pins the node id and the leader's follower
+match).
+
+**The port is unauthenticated plaintext**, and anyone who reaches it can remove voters and stop
+groups. So `dkvd` refuses an `-admin-listen` address other than loopback unless
+`-admin-allow-remote` is given (audit H6, `TestAdminListensOnLoopbackUnlessAllowed`); expose it
+only on a network you trust. No token is offered: on plaintext it would only seem to protect.
+What a connection may cost is bounded (audit M1): at most 16 at once (one beyond is closed at
+once), 30 s to send each request line, 10 s to take each answer, a request's `timeout_ms` clamped
+to 60 s, and an `Accept` error retried rather than ending the loop. The client's `op` and `id` are
+logged quoted, so a newline cannot forge an event line; and a member id or address holding
+whitespace or a control character is refused, since a member enters the replicated configuration
+and every node logs it in its own event lines (`TestAdminCapsItsConnections`,
+`TestAdminDropsAnIdleConnection`, `TestAdminTimeoutIsClamped`, `TestAdminSurvivesAcceptErrors`,
+`TestAdminLogLinesCannotBeForged`, `TestAMemberIDCannotForgeLogLines`).
 
 ## 8. Evidence
 

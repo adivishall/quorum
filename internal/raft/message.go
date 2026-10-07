@@ -15,10 +15,15 @@ const (
 	// declared count cannot size an unbounded allocation. Far beyond any single
 	// AppendEntries this implementation sends.
 	MaxEntriesPerMessage = 1 << 16
-	// MaxEntryDataLen bounds one entry's opaque command bytes (the 1 MiB value
-	// limit, docs/DESIGN.md §1).
-	MaxEntryDataLen = 1 << 20
+	// MaxEntryDataLen bounds one entry's opaque bytes: the system's one entry-size
+	// limit, replication.MaxEntryDataLen. Propose refuses a larger proposal, Step
+	// refuses an AppendEntries carrying a larger entry, and the codec refuses to
+	// decode one.
+	MaxEntryDataLen = replication.MaxEntryDataLen
 )
+
+// A configuration entry is the leader's own; it must always fit an entry.
+const _ = uint64(MaxEntryDataLen - replication.MaxEncodedConfiguration)
 
 // Marshal encodes a message payload deterministically. It encodes the type and
 // the type-specific fields; From/To are NOT encoded — the receiver attributes a

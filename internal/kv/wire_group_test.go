@@ -53,7 +53,7 @@ func TestRetiredRequestKindsAreRefused(t *testing.T) {
 	for _, kind := range []record.Kind{1, 3} {
 		d := &fixedDoer{}
 		a, b := net.Pipe()
-		go serveConn(context.Background(), b, d, nil)
+		go serveConn(context.Background(), b, d, nil, ServeConfig{})
 		frame, _ := record.Encode(nil, kind, []byte{byte(ReqGet), 0, 0, 0, 0, 1, 'k'})
 		go a.Write(frame)
 		_ = a.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -68,7 +68,7 @@ func TestRetiredRequestKindsAreRefused(t *testing.T) {
 	d := &fixedDoer{}
 	a, b := net.Pipe()
 	defer a.Close()
-	go serveConn(context.Background(), b, d, nil)
+	go serveConn(context.Background(), b, d, nil, ServeConfig{})
 	if err := writeFrame(a, kindRequest, encodeRequest(Request{Op: ReqGet, Group: 7, Key: []byte("k")})); err != nil {
 		t.Fatal(err)
 	}

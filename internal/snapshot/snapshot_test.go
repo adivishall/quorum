@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -359,4 +360,41 @@ func Example() {
 	m, data, err := Decode(file)
 	fmt.Println(m.Index, m.Term, string(data), err)
 	// Output: 100 3 state <nil>
+}
+
+// TestDecodeAllocatesNoMoreThanItsInput (audit M1): a header declaring the
+// largest state, MaxData, in a file of a few hundred bytes — what a peer's
+// chunks can deliver — is refused without allocating what it declares; the
+// state's buffer is sized by the bytes that exist.
+func TestDecodeAllocatesNoMoreThanItsInput(t *testing.T) {
+	m := meta(9, 2)
+	h := []byte(magic)
+	h = binary.AppendUvarint(h, Version)
+	h = binary.AppendUvarint(h, uint64(m.Group))
+	conf := replication.EncodeConfiguration(m.Conf)
+	h = binary.AppendUvarint(h, uint64(len(conf)))
+	h = append(h, conf...)
+	h = binary.AppendUvarint(h, m.Index)
+	h = binary.AppendUvarint(h, m.Term)
+	h = binary.AppendUvarint(h, MaxData)
+	h = append(h, make([]byte, 32)...)
+	file, err := record.Encode(nil, kindHeader, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := binary.AppendUvarint(nil, m.Index)
+	f = binary.AppendUvarint(f, m.Term)
+	if file, err = record.Encode(file, kindFooter, f); err != nil {
+		t.Fatal(err)
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	if _, _, err := Decode(file); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("a %d-byte file declaring %d state bytes: %v, want ErrCorrupt", len(file), uint64(MaxData), err)
+	}
+	runtime.ReadMemStats(&after)
+	if got := after.TotalAlloc - before.TotalAlloc; got > 1<<20 {
+		t.Fatalf("decoding a %d-byte file allocated %d bytes: the header's declared length sized the buffer", len(file), got)
+	}
 }

@@ -208,12 +208,12 @@ func TestRetryAtEveryCrashPointOfAWrite(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
 				c := startClusterWith(t, ctx, 3, false, kv.Limits{})
-				l := c.waitLeader(0, 10*time.Second)
+				c.waitLeader(0, 10*time.Second)
 				s := register(t, c, kv.SessionOptions{AttemptTimeout: 2 * time.Second, MaxAttempts: 20, Backoff: 20 * time.Millisecond})
 				if o := s.Put(ctx, []byte("k"), []byte("old"), nil); o.Err != nil {
 					t.Fatal(o.Err)
 				}
-				l = c.waitLeader(0, 10*time.Second)
+				l := c.waitLeader(0, 10*time.Second)
 				t1 := c.node(l).Status().Term
 				idx := c.quiesce(l) + 1
 				c.premise(c.ledThroughout(l, t1), "%s was deposed during setup", l)
@@ -794,5 +794,49 @@ func waitFired(fired *sync.WaitGroup, d time.Duration) bool {
 		return true
 	case <-time.After(d):
 		return false
+	}
+}
+
+// TestForwardsBeyondTheBoundAreRefusedUnavailable (audit M1): a leader serves
+// at most MaxForwardsServed forwards at once, each holding a goroutine for up
+// to the request's timeout; beyond them a forward is answered UNAVAILABLE at
+// once — definite, nothing executed — and relayed to the client as such, not
+// left to the forwarder's deadline (UNKNOWN). Before, every inbound forward
+// started a goroutine, without bound.
+func TestForwardsBeyondTheBoundAreRefusedUnavailable(t *testing.T) {
+	withPremise(t, func() { forwardsBeyondTheBound(t) })
+}
+
+func forwardsBeyondTheBound(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := startClusterWith(t, ctx, 3, false, kv.Limits{})
+	l := c.waitLeader(0, 10*time.Second)
+	t1 := c.node(l).Status().Term
+	f := c.ids[0]
+	if f == l {
+		f = c.ids[1]
+	}
+	c.quiesce(l)
+	release := c.server(l).HoldForwardSlots(kv.MaxForwardsServed)
+	start := time.Now()
+	resp, _ := c.server(f).Do(ctx, kv.Request{Op: kv.ReqPut, Key: []byte("k"), Value: []byte("v"), Timeout: 5 * time.Second})
+	took := time.Since(start)
+	c.premise(c.ledThroughout(l, t1), "%s did not lead throughout: the request may not have been forwarded to it", l)
+	if resp.Status != kv.StatusUnavailable || resp.Via != string(f) || resp.Node != string(l) {
+		release()
+		t.Fatalf("a forward to a leader with every slot taken: %+v, want UNAVAILABLE from %s via %s", resp, l, f)
+	}
+	if took > 2*time.Second {
+		release()
+		t.Fatalf("the refusal took %s: the forward waited instead of being refused", took)
+	}
+	release()
+	if _, ok := get(t, c, "k"); ok {
+		t.Fatal("the refused forward executed")
+	}
+	resp, _ = c.server(f).Do(ctx, kv.Request{Op: kv.ReqPut, Key: []byte("k"), Value: []byte("v"), Timeout: 5 * time.Second})
+	if resp.Status != kv.StatusOK || resp.Via != string(f) {
+		t.Fatalf("a forward once slots are free: %+v, want OK via %s", resp, f)
 	}
 }

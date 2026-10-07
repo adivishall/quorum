@@ -15,16 +15,6 @@ import (
 // algorithmic correctness proof lives in the deterministic simulation
 // (internal/raft); these prove the wiring is real, not mocked.
 
-func buildDkvd(t *testing.T) string {
-	t.Helper()
-	bin := filepath.Join(t.TempDir(), "dkvd")
-	build := exec.Command("go", "build", "-o", bin, "github.com/adivishall/quorum/cmd/dkvd")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("go build dkvd: %v\n%s", err, out)
-	}
-	return bin
-}
-
 // anyNodeHas polls every node's output for substr until the deadline.
 func anyNodeHas(nodes []*dkvNode, substr string, d time.Duration) *dkvNode {
 	deadline := time.Now().Add(d)
@@ -51,6 +41,7 @@ func TestThreeNodeRaftElectsLeaderOverTCP(t *testing.T) {
 		addrs[id] = freeTCPAddr(t)
 	}
 	dir := t.TempDir()
+	cluster := newClusterID()
 
 	var nodes []*dkvNode
 	for _, id := range ids {
@@ -61,13 +52,13 @@ func TestThreeNodeRaftElectsLeaderOverTCP(t *testing.T) {
 			}
 		}
 		buf := &safeBuf{}
-		cmd := exec.Command(bin,
+		cmd := exec.Command(bin, append([]string{
 			"-id", id, "-listen", addrs[id], "-peers", strings.Join(peers, ","),
 			"-raft", "-data-dir", filepath.Join(dir, id), "-tick-interval", "25ms",
-		)
+		}, initFlags(filepath.Join(dir, id), cluster)...)...)
 		cmd.Stdout = buf
 		cmd.Stderr = buf
-		if err := cmd.Start(); err != nil {
+		if err := startProc(t, cmd); err != nil {
 			t.Fatalf("start %s: %v", id, err)
 		}
 		nodes = append(nodes, &dkvNode{id: id, addr: addrs[id], cmd: cmd, out: buf})
@@ -117,10 +108,10 @@ func TestRaftLogSurvivesSIGKILL(t *testing.T) {
 
 	launch := func() *dkvNode {
 		buf := &safeBuf{}
-		cmd := exec.Command(bin, "-id", "n0", "-listen", addr, "-raft", "-data-dir", dir, "-tick-interval", "25ms")
+		cmd := exec.Command(bin, append([]string{"-id", "n0", "-listen", addr, "-raft", "-data-dir", dir, "-tick-interval", "25ms"}, initFlags(dir, "itest")...)...)
 		cmd.Stdout = buf
 		cmd.Stderr = buf
-		if err := cmd.Start(); err != nil {
+		if err := startProc(t, cmd); err != nil {
 			t.Fatalf("start: %v", err)
 		}
 		return &dkvNode{id: "n0", addr: addr, cmd: cmd, out: buf}

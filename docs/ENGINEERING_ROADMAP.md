@@ -48,7 +48,9 @@ probe showed it; where it is called *from the code*, it was read and traced but 
 - **Empty directories:** `internal/api`, `internal/cluster`, `internal/config`, `pkg/client`,
   `docker`, `dashboard` and `tests/chaos` hold no tracked files. The first five exist in
   ARCHITECTURE's layer map.
-- **No operator tool** beyond raw JSON lines to the admin port; no health or readiness endpoint.
+- **Operator tool: built** (the chaos-and-operability milestone). `dkvctl` reads the admin protocol
+  — status, leaders, configurations, lag, health and readiness, snapshots — with exit codes for
+  probes (`docs/OPERATIONS.md`). There is deliberately no HTTP health endpoint.
 
 ### 1.4 Verified defects
 
@@ -56,16 +58,16 @@ Ranked by what a single input can do.
 
 | # | Defect | Evidence | How verified | Severity |
 |---|---|---|---|---|
-| D1 | **A PUT near the 1 MiB value limit breaks the group.** The client protocol accepts a 4 KiB key and a 1 MiB value; the Raft decoders accept an entry of at most 1 MiB (`raft.MaxEntryDataLen`, `raftlog.MaxEntryDataLen`); nothing checks at `raft.Propose` or `raftlog.Save`. The leader persists the entry; every follower drops the AppendEntries carrying it; an election replaces the leader; the write is `LOST`; and the old leader can never restart (`raftlog: corrupt log: length 1048582 out of range`). | `kv/api.go` validation; `raft/message.go:20`; `raftlog/raftlog.go:654` | **Reproduced** (in-process three-node group, a 1 MiB value) | Critical: one valid request permanently disables a node; three in turn, a group |
-| D2 | **AppendEntries has no byte or count budget, and every broadcast resends the unacknowledged tail.** `sendAppend` sends `[nextIndex, last]`; `nextIndex` moves only on a response. The receiver refuses a frame over 16 MiB (`transport.MaxFrameSize`), which the sender does not check, so a backlog above it can never be sent; past 65,536 entries the decoder refuses the message (`MaxEntriesPerMessage`). | `raft/raft.go` `sendAppend`; `transport/wire.go:147` | Resend **measured** (bytes per entry ×10.9 from 1 to 16 clients, `docs/CLUSTER_BENCHMARKS.md` §6.3); the 16 MiB stall **from the code** | High: liveness of a lagging follower; bandwidth grows with the square of the writes in flight |
-| D3 | **Concurrent `create-group`/`start-group` admin calls can start two drivers on one log.** `Host.start` checks `groups[g]` under the lock, releases it, starts the node, and re-takes it to store the result. | `multiraft/host.go` `start` | From the code | High (durability), operator-triggered |
-| D4 | **`dkvd -data-dir` defaults to a fresh temporary directory on every start**, so a restarted node forgets its term, vote and log, which Raft forbids. Nothing locks a data directory, so two processes can open one log. | `cmd/dkvd/main.go:80, 394`; no flock anywhere | From the code | High (safety), configuration-triggered |
-| D5 | **Replicated configuration is not validated across nodes.** Session limits must be identical on every replica (they decide `SESSION_LIMIT`/`EXPIRED` at apply), but nothing checks. Mismatched nodes decide differently before a snapshot, and refuse each other's snapshots after one. `-shards/-rf/-nodes` are unchecked, and silently ignored under `-raft`; `-id` need not be in `-nodes`. | `cmd/dkvd/main.go:85-86, 181-192`; `kv/snapshot.go:142` | From the code | High (replica divergence), configuration-triggered |
-| D6 | **A deterministic Apply error is logged and retried every cycle, forever,** instead of failing stop. | `raftnode/node.go` processReady; `crashpoint.go` ApplyCommitted | From the code | Medium |
-| D7 | **Accept loops (transport, client, admin) exit permanently on any error, EMFILE included, without logging. Client and admin connections have no deadlines and no cap.** | `transport.go:272`, `kv/wire.go:312, 326`, `multiraft/admin.go:131` | From the code | Medium |
-| D8 | **`-tick-interval` is unvalidated.** 0 disables the idle-connection timeout while the driver silently uses 50 ms; a negative value panics the actor, and with it every group (there is no `recover`). | `cmd/dkvd/main.go:81, 137`; `raftnode/node.go` | From the code | Medium |
-| D9 | **The transport's handshake version stayed 1 when Phase 15 added the group envelope,** so a pre-envelope peer passes the handshake and its frames are dropped as malformed. | `transport/handshake.go:16` | From the code (`git log -S`) | Low (no mixed deployments exist) |
-| D10 | **Storage engine (standalone):** the WAL and MANIFEST writers do not latch a failed write, so the next append follows a partial record and recovery then refuses the store; a flush does not sync the WAL first, so a power loss in `batch` mode can leave tables ahead of the durable WAL, which open refuses. | `wal/wal.go:277`, `manifest.go:694`, `lsmstore.go:833` | From the code | Medium (engine only; blocks hosting it) |
+| D1 | **Fixed** (one entry-size limit enforced at every boundary; `docs/RAFT.md` §16, `TestRealEntryLimit`, mutants 173–179). **A PUT near the 1 MiB value limit breaks the group.** The client protocol accepts a 4 KiB key and a 1 MiB value; the Raft decoders accept an entry of at most 1 MiB (`raft.MaxEntryDataLen`, `raftlog.MaxEntryDataLen`); nothing checks at `raft.Propose` or `raftlog.Save`. The leader persists the entry; every follower drops the AppendEntries carrying it; an election replaces the leader; the write is `LOST`; and the old leader can never restart (`raftlog: corrupt log: length 1048582 out of range`). | `kv/api.go` validation; `raft/message.go:20`; `raftlog/raftlog.go:654` | **Reproduced** (in-process three-node group, a 1 MiB value) | Critical: one valid request permanently disables a node; three in turn, a group |
+| D2 | **Mostly fixed** (per-message budgets, a cut backlog streams, reads share entry-less rounds; the transport refuses an oversized frame; `docs/RAFT.md` §18, mutants 243–251). Still open: with no optimistic pipelining, an unacknowledged batch is resent by each broadcast — bounded by the budget. **AppendEntries has no byte or count budget, and every broadcast resends the unacknowledged tail.** `sendAppend` sends `[nextIndex, last]`; `nextIndex` moves only on a response. The receiver refuses a frame over 16 MiB (`transport.MaxFrameSize`), which the sender does not check, so a backlog above it can never be sent; past 65,536 entries the decoder refuses the message (`MaxEntriesPerMessage`). | `raft/raft.go` `sendAppend`; `transport/wire.go:147` | Resend **measured** (bytes per entry ×10.9 from 1 to 16 clients, `docs/CLUSTER_BENCHMARKS.md` §6.3); the 16 MiB stall **from the code** | High: liveness of a lagging follower; bandwidth grows with the square of the writes in flight |
+| D3 | **Fixed** (per-group lifecycle reservations; `docs/MULTI_RAFT.md` §3, mutants 189–191). **Concurrent `create-group`/`start-group` admin calls can start two drivers on one log.** `Host.start` checks `groups[g]` under the lock, releases it, starts the node, and re-takes it to store the result. | `multiraft/host.go` `start` | From the code | High (durability), operator-triggered |
+| D4 | **Fixed** (`-data-dir` required and locked; node and cluster identity recorded; a directory with no node initialized only with `-init`; `docs/MULTI_RAFT.md` §5). **`dkvd -data-dir` defaults to a fresh temporary directory on every start**, so a restarted node forgets its term, vote and log, which Raft forbids. Nothing locks a data directory, so two processes can open one log. | `cmd/dkvd/main.go:80, 394`; no flock anywhere | From the code | High (safety), configuration-triggered |
+| D5 | **Fixed** (each data directory pins its replica settings — the session limits, and in `-cluster` mode the routing — and refuses a start with others; the transport handshake carries their digest and nodes whose settings differ never connect; `-shards/-rf/-nodes` are refused outside `-cluster` mode; `docs/MULTI_RAFT.md` §5, `docs/TRANSPORT.md` §3, `TestRealImpostorsNeverJoinTheGroup`). **Replicated configuration is not validated across nodes.** Session limits must be identical on every replica (they decide `SESSION_LIMIT`/`EXPIRED` at apply), but nothing checks. Mismatched nodes decide differently before a snapshot, and refuse each other's snapshots after one. `-shards/-rf/-nodes` are unchecked, and silently ignored under `-raft`; `-id` need not be in `-nodes`. | `cmd/dkvd/main.go:85-86, 181-192`; `kv/snapshot.go:142` | From the code | High (replica divergence), configuration-triggered |
+| D6 | **Fixed** (the node fail-stops on an apply error; `docs/RAFT.md` §17). **A deterministic Apply error is logged and retried every cycle, forever,** instead of failing stop. | `raftnode/node.go` processReady; `crashpoint.go` ApplyCommitted | From the code | Medium |
+| D7 | **Fixed** (every accept loop logs and retries an error; the transport bounds pending handshakes, the client and admin ports their connections and deadlines; `docs/TRANSPORT.md` §8, `docs/API.md` §1, `docs/MULTI_RAFT.md` §7). **Accept loops (transport, client, admin) exit permanently on any error, EMFILE included, without logging. Client and admin connections have no deadlines and no cap.** | `transport.go:272`, `kv/wire.go:312, 326`, `multiraft/admin.go:131` | From the code | Medium |
+| D8 | **Fixed** (a non-positive `-tick-interval` is a startup error in `dkvd`; a negative tick is refused by `raftnode` and `multiraft`, where zero means the default). **`-tick-interval` is unvalidated.** 0 disables the idle-connection timeout while the driver silently uses 50 ms; a negative value panics the actor, and with it every group (there is no `recover`). | `cmd/dkvd/main.go:81, 137`; `raftnode/node.go` | From the code | Medium |
+| D9 | **Fixed** (handshake version 2: answered, with the cluster id and settings digest; `docs/TRANSPORT.md` §3, mutants 197–213). **The transport's handshake version stayed 1 when Phase 15 added the group envelope,** so a pre-envelope peer passes the handshake and its frames are dropped as malformed. | `transport/handshake.go:16` | From the code (`git log -S`) | Low (no mixed deployments exist) |
+| D10 | **Fixed** (the WAL and MANIFEST writers latch a failed write; a flush syncs the WAL before its manifest edit; `docs/WAL.md`, `docs/MANIFEST.md` §5, mutants 256–265; open does not yet sync recovered WAL segments before a replay flush, `docs/WAL.md` §10). **Storage engine (standalone):** the WAL and MANIFEST writers do not latch a failed write, so the next append follows a partial record and recovery then refuses the store; a flush does not sync the WAL first, so a power loss in `batch` mode can leave tables ahead of the durable WAL, which open refuses. | `wal/wal.go:277`, `manifest.go:694`, `lsmstore.go:833` | From the code | Medium (engine only; blocks hosting it) |
 
 ### 1.5 What is verified, argued, measured — and what is not
 
@@ -88,14 +90,16 @@ Ranked by what a single input can do.
   - rolling restart, membership change and snapshot costs under load;
   - persistence and replication traffic per write.
 - **Not measured:**
-  - partitions under load;
+  - the performance cost of partitions under load (the chaos runs check them for safety and
+    convergence, not for latency);
   - values larger than 100 bytes (D1 blocks values near the limit), and key skew;
   - more than 16 groups or 16 clients under load;
   - multi-host deployments;
   - restart time as the state grows.
 - **Not operationally visible:**
   - no storage-engine metrics (no engine on the path);
-  - no health or readiness endpoint;
+  - health and readiness only through `dkvctl` over the admin protocol, not as an HTTP route
+    (by choice, `docs/OPERATIONS.md`);
   - the transport logs a disconnect but not its reason (a frame too large, a bad checksum);
   - no aggregation; `/metrics` is per node.
 
@@ -112,9 +116,9 @@ code adds four more that the earlier list missed.
 | Ordered iterator | **Missing as an API.** The parts exist: a memtable iterator with Seek, an SSTable iterator, and a k-way merger that drops tombstones. | `compaction.go`, `memtable.go:325` |
 | Consistent checkpoint | **Partial.** Versions are reference-counted and files immutable, but a version and its sequence cannot be captured together, and `Snapshot()` iterates the live memtable. | `lsmversion.go`, `lsmstore.go:1248` |
 | Bulk ingest | **Missing.** There is no API, no "replace everything", and recovery would refuse an ingested file's sequences. | `lsmstore.go:641-648` |
-| — *new:* failure latching | **Missing** for the WAL and MANIFEST writers (D10). | — |
-| — *new:* a sync before flush | **Missing** (D10). | — |
-| — *new:* crash and power-loss testing | **Partial.** Real SIGKILL tests exist for flush and compaction; the engine does not use `internal/vfs`, so it has no injected crash-point matrix and no power-loss model, unlike the Raft node. | `tests/integration/lsm_crash_test.go` |
+| — *new:* failure latching | **Done** for the WAL and MANIFEST writers and the compactor (D10, audit M11); a failed manifest step never deletes what it may have made live. | `wal.go`, `manifest.go`, `lsmcompact.go` |
+| — *new:* a sync before flush | **Done** (D10). | `lsmstore.go` `flushLocked` |
+| — *new:* crash and power-loss testing | **Partial.** Real SIGKILL tests exist for flush and compaction, and the MANIFEST's writes now go through `internal/vfs` with a deterministic fault matrix (every write, torn write, fsync, rename and directory fsync of `Install` and `Append`). The rest of the engine — WAL segments, SSTables — still bypasses `vfs`: no power-loss model, no injected crash-point matrix for them. Also still open from audit M11: options are not checked against the format's limits, SSTable numbers are a lifetime budget, and open repairs before it can refuse. | `tests/integration/lsm_crash_test.go`, `manifest/faults_test.go` |
 
 **Why the applied index must be atomic with the data and the sessions:** replaying an entry the
 engine already holds is not idempotent for this state machine. A replayed REGISTER overwrites its
@@ -166,6 +170,15 @@ Phase 19 row, and LIMITATIONS' status, metrics and measurement statements.
   - harness logic is duplicated: four ways to launch `dkvd`, four leader waits, three percentile
     definitions.
 
+  Status (the hardening branch): `dkvd` under the integration tests is race-built, and a race
+  report in its output fails the test (a SIGKILLed process never exits with the detector's
+  status, so its output is the evidence); every job has a timeout; the mutation runner confirms
+  real-process kills on the clean tree, attributes kills to a failing test, refuses a build
+  failure, and covers the storage engine. The lab (`internal/lab`) starts its processes through
+  the launcher it is given (`ClusterConfig.Start`), so under the integration tests they are
+  race-scanned and die with their test, as every other `dkvd` there does
+  (`TestALabProcessDiesWithItsTest`). Still open: macOS in CI.
+
 ### 1.9 Out of scope, deliberately
 
 Shard rebalancing and moving data between groups, cross-group transactions, TLS, authentication,
@@ -204,6 +217,10 @@ break safety or make replicas diverge. The engine integration adds a durable app
 log and more configuration on top of exactly these paths, so they must hold first.
 
 ### 1. Input and replication bounds (D1, D2) — next
+
+- **Status:** D1 done — the entry budget is enforced at the front, at `raft.Propose`, in the
+  in-memory log, at `Step` and at `raftlog.Save` (`docs/RAFT.md` §16). D2 is mostly fixed (row
+  D2 above).
 
 - **Problem:** a request within the documented limits can disable a node; a replication message
   has no size bound.
@@ -310,15 +327,25 @@ log and more configuration on top of exactly these paths, so they must hold firs
 - **Benchmark:** `docs/CLUSTER_BENCHMARKS.md` §3 and §6.3 before and after, with variance.
 - **Risk:** medium; the crash matrices and fault schedules must stay green.
 
-### 7. Chaos under load, and the rest of Phase 19
+### 7. Chaos under load, and the rest of Phase 19 — mostly done
 
-- Simulator campaigns that combine clients, snapshots, membership, partitions and persistence
-  faults.
-- A real-process runner that replays a recorded fault schedule against `dkvd` under `dkvload`,
-  recording client history, metrics, faults and node events, and checking linearizability.
-- Partitions in `dkvlab`.
-- The open measurements: value sizes, key skew, more groups and clients, more runs.
-- The rolling-restart unknown outcomes explained, with an attempt-level trace.
+- **Done** (the chaos-and-operability milestone):
+  - **Partitions in the lab.** `internal/netproxy` is on every link; the lab can cut, isolate, heal
+    and pause.
+  - **A real-process chaos runner** (`docs/CHAOS.md`). Seeded schedules of kill, stop, crash at a
+    driver point, pause, isolate, cut, snapshot and add-member, one impairment at a time, replayable
+    exactly. It runs under a recorded workload whose history is checked, with every unknown outcome
+    kept. It records events, status samples, convergence and artifacts.
+  - **Measurement matrices.** `dkvlab` sweeps nodes, groups, clients, value size, read share and
+    attempt budget, and its summaries are never success-only.
+  - **The rolling-restart unknown outcomes explained** (`docs/CLUSTER_BENCHMARKS.md` §11). An
+    attempt budget runs out before the election the leader's stop forces, two attempts spent
+    instantly on stale connections. 30 attempts leave none unknown.
+- **Remaining:**
+  - simulator campaigns that combine every family with clients;
+  - black-hole and one-way partitions on real processes (kernel filtering);
+  - the open measurements published: value sizes, key skew, more groups and clients, more runs;
+  - the chaos campaign in CI.
 
 ### 8. PreVote, then CheckQuorum
 
@@ -338,15 +365,17 @@ log and more configuration on top of exactly these paths, so they must hold firs
   "as built" and "planned"; invariants for Phase 16 and #2.
 - **Timing:** best done after task 1, so the size rules are written once.
 
-### 10. Operator and client surface
+### 10. Operator and client surface — operator half done
 
-- **Problem:** there is no operator tool beyond raw JSON lines, and the `dkv` CLI is not a network
-  client.
-- **Architecture impact:**
-  - `dkvctl` over the admin protocol: status, leader, terms, indexes, lag, membership, snapshot,
-    health;
-  - health and readiness beside `/metrics`;
-  - `dkv` as a networked session client over the existing binary protocol.
+- **Done:** `dkvctl` over the admin protocol, which now also reports the node id, each leader's
+  follower match and the pending requests. Health and readiness are derived by `internal/health`
+  (`docs/OPERATIONS.md`) and served through `dkvctl`'s exit codes, not an HTTP route.
+- **Remaining:**
+  - `dkv` as a networked session client over the existing binary protocol;
+  - in the client library, measured by §11 of `docs/CLUSTER_BENCHMARKS.md`:
+    - redial a connection the peer has closed before sending on it, instead of spending an attempt
+      unknown;
+    - a retry budget sized in time, so it covers an election.
 - **HTTP:** an HTTP gateway only if a consumer needs one; the binary protocol already carries
   identity, retries and routing.
 

@@ -38,8 +38,21 @@ var (
 	reRaftStarted = regexp.MustCompile(`event=raft_started node=(\S+) peers=\d+ term=(\d+) lastIndex=(\d+)`)
 )
 
-// startWith is rcluster.start with extra dkvd flags (e.g. -crash-at).
+// startWith is rcluster.start with extra dkvd flags (e.g. -crash-at). A node's
+// first start initializes its data directory (initFlags).
 func (c *rcluster) startWith(id string, extra ...string) {
+	c.t.Helper()
+	c.launch(id, append(initFlags(c.dirs[id], c.cluster), extra...))
+}
+
+// startPlain starts a node with its ordinary flags only — never -init: what an
+// operator's restart passes, whatever its data directory holds.
+func (c *rcluster) startPlain(id string) {
+	c.t.Helper()
+	c.launch(id, nil)
+}
+
+func (c *rcluster) launch(id string, extra []string) {
 	c.t.Helper()
 	var peers []string
 	for _, other := range c.ids {
@@ -56,7 +69,7 @@ func (c *rcluster) startWith(id string, extra ...string) {
 		"-raft", "-data-dir", c.dirs[id], "-tick-interval", "25ms", "-client-listen", c.kvAddrs[id]}, append(append([]string(nil), c.every...), extra...)...)
 	cmd := exec.Command(c.bin, args...)
 	cmd.Stdout, cmd.Stderr = buf, buf
-	if err := cmd.Start(); err != nil {
+	if err := startProc(c.t, cmd); err != nil {
 		c.t.Fatalf("start %s: %v", id, err)
 	}
 	p := &dkvNode{id: id, addr: c.addrs[id], cmd: cmd, out: buf}
@@ -268,9 +281,9 @@ func TestRealCrashAtEveryEarlyPointIsRecoverable(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "n0")
 			logPath := filepath.Join(dir, "raft-n0.log")
 			buf := &safeBuf{}
-			cmd := exec.Command(bin, "-id", "n0", "-listen", addr, "-raft", "-data-dir", dir, "-tick-interval", "25ms", "-crash-at", spec)
+			cmd := exec.Command(bin, append([]string{"-id", "n0", "-listen", addr, "-raft", "-data-dir", dir, "-tick-interval", "25ms", "-crash-at", spec}, initFlags(dir, "itest")...)...)
 			cmd.Stdout, cmd.Stderr = buf, buf
-			if err := cmd.Start(); err != nil {
+			if err := startProc(t, cmd); err != nil {
 				t.Fatal(err)
 			}
 			done := make(chan error, 1)

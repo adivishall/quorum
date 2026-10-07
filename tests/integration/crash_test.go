@@ -40,7 +40,9 @@ func TestMain(m *testing.M) {
 	if os.Getenv(envDir) != "" {
 		runChild() // never returns
 	}
-	os.Exit(m.Run())
+	code := m.Run()
+	removeBuild()
+	os.Exit(code)
 }
 
 // keyFor and valueFor define the child's write pattern, shared with the parent
@@ -189,7 +191,7 @@ func startChildEnv(t *testing.T, dir, mode string, sync wal.SyncMode, count int,
 	}
 	cmd.Stderr = os.Stderr
 
-	if err := cmd.Start(); err != nil {
+	if err := startProc(t, cmd); err != nil {
 		t.Fatalf("starting child: %v", err)
 	}
 	c := &child{cmd: cmd, t: t}

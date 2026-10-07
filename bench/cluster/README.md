@@ -15,6 +15,8 @@ Each file is one `dkvlab` invocation, written with `-out`. It records:
 | `leader-kill-500ms.json` | the same with `-attempt-timeout 500ms` | `b251527` |
 | `concurrency-c{1,4,16}.json` | `bin/dkvlab -scenario steady -nodes 3 -runs 3 -duration 10s -warmup 2s -read 50 -clients C` | `86c8518` |
 | `rolling-restart.json`, `membership.json` | `bin/dkvlab -scenario rolling-restart -nodes 3 -runs 3 -rate 50` (and `membership`) | `f1b6e8f` |
+| `rolling-restart-attempts.json` | `bin/dkvlab -scenario rolling-restart -nodes 3 -runs 3 -rate 50 -read 50 -trace -max-attempts 8,30` — the unknown outcomes' attempt traces (`docs/CLUSTER_BENCHMARKS.md` §11) | `3b5654a` |
+| `chaos-seeds-1-10.json` | `bin/dkvlab -scenario chaos -seed 1 -runs 10` — ten chaos runs, every fault kind (`docs/CHAOS.md` §7); the per-run status samples are dropped to keep the file small, everything else is as written | `00a136b` |
 
 The `dkvd` source is identical at the four commits; they differ only in `internal/lab`. Any configuration not named here is the default: 16 clients, 20 s window, 3 s warmup, 50% reads, 10,000 keys, 100-byte values, seed 1, tick 50 ms.
 
@@ -50,3 +52,6 @@ The table lists every run of both files, sorted by that prediction. The measured
 | leader-kill-2s | 7 | n3 | n2 | 560 | 3561 | 439 | 465 | +26 |
 | leader-kill-500ms | 6 | n3 | n2 | 560 | 3561 | 439 | 455 | +16 |
 | leader-kill-500ms | 1 | n3 | n2 | 558 | 3559 | 441 | 463 | +22 |
+
+**`chaos-seeds-1-10.json` predates `22673c0`**, which stopped counting a group's first leader as a leader change. In it, the first `leader` event of each run is that first sighting: a run's leader changes are its `leader` events minus one.
+

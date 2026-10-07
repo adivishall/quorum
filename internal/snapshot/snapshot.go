@@ -161,7 +161,10 @@ func Decode(b []byte) (Meta, []byte, error) {
 	if err != nil {
 		return Meta{}, nil, err
 	}
-	data := make([]byte, 0, dataLen)
+	// The state is at most the file's own length: a header that declares
+	// more — up to MaxData — must not size the allocation before the bytes
+	// it claims are seen (audit M1; a snapshot arrives in chunks from a peer).
+	data := make([]byte, 0, min(dataLen, uint64(len(b))))
 	for {
 		kind, p, err := next()
 		if err != nil {

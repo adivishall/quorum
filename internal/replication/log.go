@@ -1,5 +1,16 @@
 package replication
 
+// MaxEntryDataLen is the largest Entry.Data, in bytes, anywhere in the system:
+// the one authoritative entry-size limit. Every layer an entry passes through
+// enforces this same constant — the key-value front validates the ENCODED
+// command against it, raft.Propose refuses a larger proposal, the log refuses
+// to hold one, the AppendEntries codec and the core refuse to accept one,
+// raftlog.Save refuses to persist one and raftlog replay refuses to read one.
+// So no code path creates, persists, transmits or accepts an entry that some
+// other path would refuse to read back (docs/RAFT.md §16). It is 1 MiB, the
+// size every on-disk and on-wire decoder has always bounded an entry by.
+const MaxEntryDataLen = 1 << 20
+
 // Entry is one opaque log entry. Data is arbitrary bytes the replication layer
 // never interprets — in the finished system it is an encoded state-machine
 // command, but Phase 8 treats it as opaque (docs/REPLICATION.md §3.1).
@@ -55,6 +66,10 @@ type Log interface {
 	// reaching at or below the boundary is ErrCompacted; any other invalid range
 	// is ErrOutOfRange, never clamped.
 	Slice(lo, hi uint64) ([]Entry, error)
+	// SliceBounded is Slice of the longest prefix of [lo,hi) whose entries'
+	// data total at most maxBytes — but never empty when lo < hi: the first
+	// entry is returned whatever its size. Nothing past the prefix is copied.
+	SliceBounded(lo, hi uint64, maxBytes int) ([]Entry, error)
 
 	// Append extends the log at the end only. Entries must be contiguous starting
 	// at LastIndex()+1 with non-decreasing terms; a gap, a duplicate index, or a
@@ -180,6 +195,27 @@ func (l *MemoryLog) Slice(lo, hi uint64) ([]Entry, error) {
 	return out, nil
 }
 
+// SliceBounded is Slice of the longest prefix of [lo,hi) whose data total at
+// most maxBytes, and at least the first entry (see the Log interface).
+func (l *MemoryLog) SliceBounded(lo, hi uint64, maxBytes int) ([]Entry, error) {
+	if lo <= l.base && l.base > 0 {
+		return nil, ErrCompacted
+	}
+	if lo < 1 || hi < lo || hi > l.LastIndex()+1 {
+		return nil, ErrOutOfRange
+	}
+	var out []Entry
+	size := 0
+	for i := lo; i < hi; i++ {
+		e := l.entries[i-l.base-1]
+		if size += len(e.Data); size > maxBytes && len(out) > 0 {
+			break
+		}
+		out = append(out, copyEntry(e))
+	}
+	return out, nil
+}
+
 // Append extends the log at the end. See the Log interface for the contract.
 func (l *MemoryLog) Append(entries ...Entry) error {
 	if len(entries) == 0 {
@@ -225,6 +261,9 @@ func (l *MemoryLog) appendFrom(f uint64, entries []Entry) error {
 		}
 		if e.Term < prevTerm {
 			return ErrTermRegression
+		}
+		if len(e.Data) > MaxEntryDataLen {
+			return ErrEntryTooLarge
 		}
 		prevTerm = e.Term
 	}

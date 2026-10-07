@@ -18,6 +18,12 @@
 // Everything random — operation type, key, value — is drawn from a generator
 // seeded by Config.Seed, so a run's workload is reproducible from its recorded
 // configuration. Timing is real and is not.
+//
+// A run can also leave evidence, not only statistics: with Config.History
+// every operation — its identity, every attempt and its outcome, unknown ones
+// included — is recorded for the linearizability checker (internal/lincheck),
+// and with Config.Trace every operation that did not end in a definite answer
+// keeps an attempt-by-attempt trace in the result.
 package load
 
 import (
@@ -33,6 +39,7 @@ import (
 	"time"
 
 	"github.com/adivishall/quorum/internal/kv"
+	"github.com/adivishall/quorum/internal/lincheck"
 	"github.com/adivishall/quorum/internal/replication"
 )
 
@@ -78,7 +85,24 @@ type Config struct {
 
 	// Bucket is the timeline's resolution.
 	Bucket time.Duration `json:"bucket"`
+
+	// History, if set, records every operation the run issues — warmup
+	// included, so the history is complete — for internal/lincheck: client,
+	// kind, key and value; the session identity of an identified request,
+	// (group << 48 | session id, request id), since session ids are local to
+	// a group; every attempt, with the node it went to and its answer; and the
+	// outcome, an unknown one as Incomplete. A PUT's value then begins with
+	// "c<client>.<seq>" so every write is distinguishable (padded to
+	// ValueSize; longer if ValueSize is shorter than that prefix).
+	History *lincheck.Recorder `json:"-"`
+	// Trace keeps, for every operation that ended refused or unknown, the
+	// trace of its attempts: where each went, how long it took, what it got.
+	// At most MaxTraces are kept; TracesDropped counts the rest.
+	Trace bool `json:"trace,omitempty"`
 }
+
+// MaxTraces bounds the operation traces one run keeps.
+const MaxTraces = 5000
 
 func (c *Config) defaults() error {
 	if len(c.Endpoints) == 0 {
@@ -207,6 +231,7 @@ func Value(size int) []byte {
 // client is one simulated client: its own connections, its own sessions.
 type client struct {
 	id      int
+	name    string
 	cfg     *Config
 	doers   []kv.Doer
 	closers []func() error
@@ -217,7 +242,7 @@ type client struct {
 }
 
 func newClient(id int, cfg *Config, rec *recorder) *client {
-	c := &client{id: id, cfg: cfg, rec: rec, value: Value(cfg.ValueSize), next: id % len(cfg.Endpoints)}
+	c := &client{id: id, name: fmt.Sprintf("c%d", id), cfg: cfg, rec: rec, value: Value(cfg.ValueSize), next: id % len(cfg.Endpoints)}
 	for _, e := range cfg.Endpoints {
 		cl := kv.NewClient(e.Name, e.Addr)
 		c.doers = append(c.doers, cl)
@@ -240,6 +265,9 @@ func (c *client) do(ctx context.Context, t task) string {
 	if c.cfg.Anonymous {
 		return c.doAnonymous(ctx, t)
 	}
+	if c.cfg.History != nil || c.cfg.Trace {
+		return c.doRecorded(ctx, t)
+	}
 	var out kv.Outcome
 	switch t.op {
 	case Get:
@@ -249,6 +277,11 @@ func (c *client) do(ctx context.Context, t task) string {
 	case Delete:
 		out = c.sharded.Delete(ctx, t.key, nil)
 	}
+	return classify(out)
+}
+
+// classify is the class a client must treat an outcome as.
+func classify(out kv.Outcome) string {
 	switch {
 	case !out.Known:
 		return ClassUnknown
@@ -259,6 +292,127 @@ func (c *client) do(ctx context.Context, t task) string {
 	default:
 		return ClassRefused
 	}
+}
+
+// putValue is the value a PUT writes: the shared fixed value, or — when the
+// run records a history — one that names its writer and its sequence, so
+// every write is distinguishable to the checker.
+func (c *client) putValue(t task) []byte {
+	if c.cfg.History == nil {
+		return c.value
+	}
+	v := []byte(fmt.Sprintf("%s.%d.", c.name, t.seq))
+	if len(v) < len(c.value) {
+		v = append(v, c.value[len(v):]...)
+	}
+	return v
+}
+
+// doRecorded runs one identified operation exactly as Sharded does — reserve
+// a request id in the key's group's session, send it under that identity,
+// release it — while recording it into the history and keeping its trace.
+func (c *client) doRecorded(ctx context.Context, t task) string {
+	began := time.Now()
+	g := c.cfg.Route(t.key)
+	s, err := c.sharded.Session(ctx, g)
+	if err != nil {
+		// No session: nothing was sent, so the history has no operation; the
+		// failure is counted (refused) and traced.
+		if c.cfg.Trace {
+			c.rec.trace(OpTrace{Client: c.id, Op: t.op.String(), Key: string(t.key), Group: uint32(g), Class: ClassRefused,
+				Start: began.Sub(c.rec.start), Duration: time.Since(began), Err: err.Error()})
+		}
+		return ClassRefused
+	}
+	rid := s.Reserve()
+	defer s.Release(rid)
+	var value []byte
+	kind, req := lincheck.Get, kv.ReqGet
+	switch t.op {
+	case Put:
+		kind, req, value = lincheck.Put, kv.ReqPut, c.putValue(t)
+	case Delete:
+		kind, req = lincheck.Delete, kv.ReqDelete
+	}
+	h := c.cfg.History
+	hid := 0
+	if h != nil {
+		hid = h.BeginRequest(c.name, kind, string(t.key), value, uint64(g)<<48|s.ID(), rid)
+	}
+	var attempts []AttemptTrace
+	hook := func(node string) func(kv.Response, error) {
+		ai := 0
+		if h != nil {
+			ai = h.Attempt(hid, node)
+		}
+		at := time.Now()
+		return func(resp kv.Response, err error) {
+			if h != nil {
+				h.AttemptDone(hid, ai, err == nil, fmt.Sprintf("%v %s", resp.Status, resp.Message), resp.Term)
+			}
+			if c.cfg.Trace {
+				a := AttemptTrace{Node: node, Start: at.Sub(c.rec.start), Duration: time.Since(at), Leader: resp.Leader, Term: resp.Term}
+				if err != nil {
+					a.Err = err.Error()
+				} else {
+					a.Status = resp.Status.String()
+				}
+				attempts = append(attempts, a)
+			}
+		}
+	}
+	out := s.Send(ctx, rid, req, t.key, value, hook)
+	class := classify(out)
+	if h != nil {
+		switch class {
+		case ClassOK:
+			h.End(hid, lincheck.OK, out.Response.Value, out.Response.Node, out.Response.Term, out.Response.Index)
+		case ClassNotFound:
+			h.End(hid, lincheck.NotFound, nil, out.Response.Node, out.Response.Term, out.Response.Index)
+		case ClassUnknown:
+			h.End(hid, lincheck.Incomplete, nil, "", 0, 0)
+		default:
+			h.End(hid, lincheck.Rejected, nil, out.Response.Node, out.Response.Term, 0)
+		}
+	}
+	if c.cfg.Trace && (class == ClassUnknown || class == ClassRefused) {
+		ot := OpTrace{Client: c.id, Op: t.op.String(), Key: string(t.key), Group: uint32(g), Session: s.ID(), Request: rid,
+			Class: class, Start: began.Sub(c.rec.start), Duration: time.Since(began), Attempts: attempts}
+		if out.Err != nil {
+			ot.Err = out.Err.Error()
+		}
+		c.rec.trace(ot)
+	}
+	return class
+}
+
+// OpTrace is one operation that did not end in a definite answer: where each
+// of its attempts went and what it got. Offsets are from the run's start.
+type OpTrace struct {
+	Client   int            `json:"client"`
+	Op       string         `json:"op"`
+	Key      string         `json:"key"`
+	Group    uint32         `json:"group"`
+	Session  uint64         `json:"session,omitempty"`
+	Request  uint64         `json:"request,omitempty"`
+	Class    string         `json:"class"`
+	Start    time.Duration  `json:"start"`
+	Duration time.Duration  `json:"duration"`
+	Err      string         `json:"err,omitempty"`
+	Attempts []AttemptTrace `json:"attempts"`
+}
+
+// AttemptTrace is one attempt of a traced operation: its node, when it was
+// sent and how long it took, and either the response's status (with the
+// leader it named and its term) or the transport error.
+type AttemptTrace struct {
+	Node     string        `json:"node"`
+	Start    time.Duration `json:"start"`
+	Duration time.Duration `json:"duration"`
+	Status   string        `json:"status,omitempty"`
+	Leader   string        `json:"leader,omitempty"`
+	Term     uint64        `json:"term,omitempty"`
+	Err      string        `json:"err,omitempty"`
 }
 
 func (c *client) doAnonymous(ctx context.Context, t task) string {
@@ -426,12 +580,28 @@ type recorder struct {
 	inWindow, late atomic.Int64
 	perCli         []*clientRecord
 	buckets        []bucket
+
+	traceMu       sync.Mutex
+	traces        []OpTrace
+	tracesDropped int64
+}
+
+// trace keeps an operation's trace, up to MaxTraces.
+func (r *recorder) trace(t OpTrace) {
+	r.traceMu.Lock()
+	defer r.traceMu.Unlock()
+	if len(r.traces) >= MaxTraces {
+		r.tracesDropped++
+		return
+	}
+	r.traces = append(r.traces, t)
 }
 
 type bucket struct{ ok, failed atomic.Int64 }
 
 type clientRecord struct {
-	lat     [3][]int64 // by op, nanoseconds, measured window only
+	lat     [3][]int64 // by op, nanoseconds, measured window only: successes
+	latAll  [3][]int64 // by op: every outcome, to its definite answer or give-up
 	classes map[string]int64
 	byOp    [3]map[string]int64
 }
@@ -470,8 +640,10 @@ func (r *recorder) record(id int, t task, class string, done time.Time, measureF
 	c := r.perCli[id]
 	c.classes[class]++
 	c.byOp[t.op][class]++
+	d := int64(done.Sub(t.intended))
+	c.latAll[t.op] = append(c.latAll[t.op], d)
 	if class == ClassOK || class == ClassNotFound {
-		c.lat[t.op] = append(c.lat[t.op], int64(done.Sub(t.intended)))
+		c.lat[t.op] = append(c.lat[t.op], d)
 	}
 }
 
@@ -512,10 +684,17 @@ func Summarize(samples []int64) Latency {
 		P50: us(rank(50)), P90: us(rank(90)), P95: us(rank(95)), P99: us(rank(99)), P999: us(rank(99.9)), Max: us(samples[len(samples)-1])}
 }
 
-// OpResult is one operation type's outcome counts and latency.
+// OpResult is one operation type's outcome counts and latency. Latency is of
+// the successes (ok, not_found) only; AllOutcomes of every operation due in
+// the window, each measured to its definite answer or to the client giving up
+// — the refused and unknown ones are usually the slowest, having waited out
+// their retries — and Excluded counts those Latency leaves out (audit:
+// success-only percentiles alone understate a failure scenario's tail).
 type OpResult struct {
-	Classes map[string]int64 `json:"classes"`
-	Latency Latency          `json:"latency"`
+	Classes     map[string]int64 `json:"classes"`
+	Latency     Latency          `json:"latency"`
+	AllOutcomes Latency          `json:"latency_all_outcomes"`
+	Excluded    int64            `json:"excluded_from_latency"`
 }
 
 // Point is one timeline bucket: operations that completed in it.
@@ -533,7 +712,11 @@ type Result struct {
 	Issued  int64               `json:"issued"`
 	Classes map[string]int64    `json:"classes"`
 	Ops     map[string]OpResult `json:"ops"`
-	All     Latency             `json:"all"`
+	All     Latency             `json:"all"` // successes, every operation type
+	// AllOutcomes is every operation due in the window, whatever its outcome,
+	// and Excluded the count All leaves out (OpResult).
+	AllOutcomes Latency `json:"all_outcomes"`
+	Excluded    int64   `json:"excluded_from_latency"`
 	// OKPerSec is the achieved throughput: successes that completed inside
 	// the measured window, per second of it. Classes and the latencies count
 	// the operations DUE in the window, whenever they completed.
@@ -550,26 +733,35 @@ type Result struct {
 	// GeneratorCPU is the CPU time this process (the generator) used during
 	// the run: a generator near a full core per client is measuring itself.
 	GeneratorCPU time.Duration `json:"generator_cpu"`
+	// Traces (Config.Trace) are the operations — warmup included — that
+	// ended refused or unknown, attempt by attempt, in completion order.
+	Traces        []OpTrace `json:"traces,omitempty"`
+	TracesDropped int64     `json:"traces_dropped,omitempty"`
 }
 
 func (r *recorder) result(cfg *Config, start, finished time.Time, cpu time.Duration) *Result {
 	res := &Result{Config: *cfg, Start: start, Elapsed: finished.Sub(start), Issued: r.issued.Load(),
 		Classes: map[string]int64{}, Ops: map[string]OpResult{}, GeneratorCPU: cpu}
-	var all []int64
+	var all, allOutcomes []int64
 	for op := Get; op <= Delete; op++ {
-		var lat []int64
+		var lat, latAll []int64
 		classes := map[string]int64{}
 		for _, c := range r.perCli {
 			lat = append(lat, c.lat[op]...)
+			latAll = append(latAll, c.latAll[op]...)
 			for k, v := range c.byOp[op] {
 				classes[k] += v
 			}
 		}
 		all = append(all, lat...)
+		allOutcomes = append(allOutcomes, latAll...)
 		if len(classes) > 0 {
-			res.Ops[op.String()] = OpResult{Classes: classes, Latency: Summarize(lat)}
+			excluded := int64(len(latAll) - len(lat))
+			res.Ops[op.String()] = OpResult{Classes: classes, Latency: Summarize(lat), AllOutcomes: Summarize(latAll), Excluded: excluded}
+			res.Excluded += excluded
 		}
 	}
+	res.AllOutcomes = Summarize(allOutcomes)
 	for _, c := range r.perCli {
 		for k, v := range c.classes {
 			res.Classes[k] += v
@@ -588,6 +780,9 @@ func (r *recorder) result(cfg *Config, start, finished time.Time, cpu time.Durat
 			OK: r.buckets[i].ok.Load(), Failed: r.buckets[i].failed.Load()})
 	}
 	res.LongestOutage = LongestOutage(res.Timeline, cfg.Bucket, cfg.Warmup, cfg.Warmup+cfg.Duration)
+	r.traceMu.Lock()
+	res.Traces, res.TracesDropped = r.traces, r.tracesDropped
+	r.traceMu.Unlock()
 	return res
 }
 
@@ -629,12 +824,23 @@ func PrintSummary(w io.Writer, r *Result) {
 		fmt.Fprintf(w, "WARNING: %d operations due in the window completed after it: the offered rate exceeded what the cluster sustained, and latencies include the backlog\n", r.Late)
 	}
 	fmt.Fprintf(w, "%-7s %9s %9s %9s %9s %9s %9s %9s\n", "op", "count", "p50 µs", "p90", "p95", "p99", "p99.9", "max")
+	row := func(name string, l Latency) {
+		fmt.Fprintf(w, "%-7s %9d %9.0f %9.0f %9.0f %9.0f %9.0f %9.0f\n", name, l.Count, l.P50, l.P90, l.P95, l.P99, l.P999, l.Max)
+	}
 	for _, op := range []string{"get", "put", "delete"} {
-		o, ok := r.Ops[op]
-		if !ok {
-			continue
+		if o, ok := r.Ops[op]; ok {
+			row(op, o.Latency)
 		}
-		l := o.Latency
-		fmt.Fprintf(w, "%-7s %9d %9.0f %9.0f %9.0f %9.0f %9.0f %9.0f\n", op, l.Count, l.P50, l.P90, l.P95, l.P99, l.P999, l.Max)
+	}
+	if r.Excluded == 0 {
+		return
+	}
+	// The rows above are successes only; the refused and unknown operations
+	// they leave out are usually the slowest. Every outcome:
+	fmt.Fprintf(w, "%d operations were refused or unknown and are excluded above; every outcome, to its answer or give-up:\n", r.Excluded)
+	for _, op := range []string{"get", "put", "delete"} {
+		if o, ok := r.Ops[op]; ok && o.Excluded > 0 {
+			row(op+"*", o.AllOutcomes)
+		}
 	}
 }

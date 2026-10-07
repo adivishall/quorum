@@ -625,3 +625,51 @@ func FuzzDecodeBoundary(f *testing.F) {
 		}
 	})
 }
+
+// TestInstallIsDurableWhenItReturns: an Install that returned has fsynced its
+// boundary — a power loss right after it keeps the snapshot's boundary, so the
+// node never reports a snapshot installed that a power loss could take back.
+func TestInstallIsDurableWhenItReturns(t *testing.T) {
+	mem := fault.NewMemFS()
+	l, _, err := Open(memPath, Options{Sync: true, FS: mem})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustSave(t, l, &HardState{Term: 3, Vote: "n3", Commit: 2}, ents(1, 3, 1)...)
+	if err := l.Install(9, 3); err != nil {
+		t.Fatal(err)
+	}
+	mem.CrashPowerLoss(0)
+	l2, rec, err := Open(memPath, Options{Sync: true, FS: mem})
+	if err != nil {
+		t.Fatalf("reopen after a power loss: %v", err)
+	}
+	defer l2.Close()
+	if rec.Boundary != (Boundary{9, 3}) {
+		t.Fatalf("after a power loss the boundary is %+v: the returned Install was not durable", rec.Boundary)
+	}
+}
+
+// TestAFailedLogRefusesInstallAndCompact (INV-F1): once the log has failed,
+// Install and Compact — like Save — return the failure and touch nothing; a
+// log that cannot vouch for its file must not rewrite or extend it.
+func TestAFailedLogRefusesInstallAndCompact(t *testing.T) {
+	mem := fault.NewMemFS()
+	inj := fault.NewInjectFS(mem)
+	l, _ := openMem(t, inj)
+	mustSave(t, l, &HardState{Term: 3, Vote: "n3", Commit: 4}, ents(1, 5, 1)...)
+	inj.Arm(fault.Injection{Op: fault.OpSync, Nth: 1})
+	if err := l.Save(&HardState{Term: 3, Vote: "n3", Commit: 5}, nil); !errors.Is(err, ErrFailed) {
+		t.Fatalf("the failing Save: %v, want ErrFailed", err)
+	}
+	ops := len(inj.Ops())
+	if err := l.Install(9, 3); !errors.Is(err, ErrFailed) {
+		t.Fatalf("Install on a failed log: %v, want ErrFailed", err)
+	}
+	if err := l.Compact(3, 1); !errors.Is(err, ErrFailed) {
+		t.Fatalf("Compact on a failed log: %v, want ErrFailed", err)
+	}
+	if done := inj.Ops()[ops:]; len(done) != 0 {
+		t.Fatalf("the failed log still performed %v", done)
+	}
+}

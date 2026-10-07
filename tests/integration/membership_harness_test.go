@@ -43,6 +43,7 @@ type mcluster struct {
 	procs   map[string]*dkvNode
 	every   []string
 	assign  *multiraft.Assignment
+	cluster string // the cluster id its nodes' data directories record
 }
 
 // newMCluster starts genesis nodes (n1..nG) hosting shards groups, with
@@ -51,7 +52,7 @@ func newMCluster(t *testing.T, genesis, spares, shards int, every ...string) *mc
 	t.Helper()
 	c := &mcluster{t: t, bin: buildDkvd(t), shards: shards, rf: min(3, genesis),
 		addrs: map[string]string{}, kvAddrs: map[string]string{}, admAddr: map[string]string{}, dirs: map[string]string{},
-		proxies: map[[2]string]*tcpProxy{}, procs: map[string]*dkvNode{}, every: every}
+		proxies: map[[2]string]*tcpProxy{}, procs: map[string]*dkvNode{}, every: every, cluster: newClusterID()}
 	root := t.TempDir()
 	var rnodes []routing.NodeID
 	for i := 1; i <= genesis+spares; i++ {
@@ -100,11 +101,11 @@ func (c *mcluster) start(id string, extra ...string) {
 	args := []string{"-id", id, "-listen", c.addrs[id], "-peers", strings.Join(peers, ","),
 		"-cluster", "-shards", fmt.Sprint(c.shards), "-rf", fmt.Sprint(c.rf), "-nodes", strings.Join(c.genesis, ","),
 		"-data-dir", c.dirs[id], "-tick-interval", "25ms", "-client-listen", c.kvAddrs[id], "-admin-listen", c.admAddr[id]}
-	args = append(append(args, c.every...), extra...)
+	args = append(append(append(args, initFlags(c.dirs[id], c.cluster)...), c.every...), extra...)
 	buf := &safeBuf{}
 	cmd := exec.Command(c.bin, args...)
 	cmd.Stdout, cmd.Stderr = buf, buf
-	if err := cmd.Start(); err != nil {
+	if err := startProc(c.t, cmd); err != nil {
 		c.t.Fatalf("start %s: %v", id, err)
 	}
 	c.procs[id] = &dkvNode{id: id, addr: c.addrs[id], cmd: cmd, out: buf}

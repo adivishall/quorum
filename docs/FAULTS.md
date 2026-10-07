@@ -243,7 +243,7 @@ known committed before a fault is still at the head of every log afterwards.
 Scenarios: `TestRealLeaderCrashAndReelection`, `TestRealFollowerCrashAndCatchUp`,
 `TestRealFrozenLeaderStepsDown`, `TestRealIsolatedLeaderRejoinsAfterPartition`,
 `TestRealConnectionFlapping`, `TestRealRestartWhileIsolated`, `TestRealRepeatedCrashRestart`,
-plus `TestProxyForwardsCutsAndHeals` pinning the proxy. `dkvd` proposes no client commands, so the
+plus `TestProxyForwardsCutsAndHeals` (`internal/netproxy`, the proxy the lab partitions with too) pinning the proxy. `dkvd` proposes no client commands, so the
 committed entries in these runs are election no-ops, each carrying its term — enough structure to
 check matching and survival across crashes, not a workload.
 

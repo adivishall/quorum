@@ -1,15 +1,22 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/adivishall/quorum/internal/fault"
+	"github.com/adivishall/quorum/internal/metrics"
 	"github.com/adivishall/quorum/internal/transport"
 )
 
@@ -190,7 +197,7 @@ func TestRaftModeExitsNonZeroWhenTheLogFails(t *testing.T) {
 	done := make(chan int, 1)
 	go func() {
 		done <- runRaft(context.Background(), raftRun{
-			id: "solo", tr: tr, dataDir: t.TempDir(), tick: 5 * time.Millisecond,
+			id: "solo", tr: tr, dataDir: t.TempDir(), init: true, clusterID: "test", tick: 5 * time.Millisecond,
 			lg: &logger{w: out}, stderr: io.Discard, fs: inj,
 		})
 	}()
@@ -222,7 +229,7 @@ func TestRaftModeCleanShutdownExitsZero(t *testing.T) {
 	out := &syncBuffer{}
 	done := make(chan int, 1)
 	go func() {
-		done <- runRaft(ctx, raftRun{id: "solo", tr: tr, dataDir: t.TempDir(), tick: 5 * time.Millisecond, lg: &logger{w: out}, stderr: io.Discard})
+		done <- runRaft(ctx, raftRun{id: "solo", tr: tr, dataDir: t.TempDir(), init: true, clusterID: "test", tick: 5 * time.Millisecond, lg: &logger{w: out}, stderr: io.Discard})
 	}()
 	waitFor(t, out, "event=raft_commit node=solo index=1", 5*time.Second)
 	cancel()
@@ -264,5 +271,114 @@ func TestParseCrashAt(t *testing.T) {
 		if _, err := parseCrashAt(bad); err == nil {
 			t.Errorf("%s accepted", bad)
 		}
+	}
+}
+
+// TestAdminListensOnLoopbackUnlessAllowed (audit H6): the admin port can
+// remove voters and stop groups, unauthenticated; dkvd refuses to expose it
+// beyond loopback unless -admin-allow-remote says so — before anything is
+// opened or listened on.
+func TestAdminListensOnLoopbackUnlessAllowed(t *testing.T) {
+	for addr, want := range map[string]bool{
+		"127.0.0.1:7000": true, "[::1]:7000": true, "localhost:7000": true, "127.1.2.3:0": true,
+		"0.0.0.0:7000": false, ":7000": false, "[::]:7000": false, "10.0.0.5:7000": false, "example.com:1": false, "nonsense": false,
+	} {
+		if got := isLoopback(addr); got != want {
+			t.Errorf("isLoopback(%q) = %v, want %v", addr, got, want)
+		}
+	}
+	dir := filepath.Join(t.TempDir(), "never-created")
+	base := []string{"-id", "a", "-listen", "127.0.0.1:0", "-raft", "-data-dir", dir, "-admin-listen", "0.0.0.0:0"}
+	var out, errb bytes.Buffer
+	if code := run(context.Background(), base, &out, &errb); code != 2 || !strings.Contains(errb.String(), "not a loopback address") {
+		t.Fatalf("admin on every interface: exit %d, stderr %q; want 2 naming the loopback rule", code, errb.String())
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("the refused start touched its data directory: %v", err)
+	}
+	errb.Reset()
+	// Allowed, the start goes on — and here stops at the data directory, which
+	// does not exist (no -init): the admin rule passed.
+	if code := run(context.Background(), append(base, "-admin-allow-remote"), &out, &errb); code != 2 || strings.Contains(errb.String(), "loopback") {
+		t.Fatalf("admin on every interface, allowed: exit %d, stderr %q; want it past the loopback rule", code, errb.String())
+	}
+}
+
+// TestMetricsServerBoundsItsConnections (audit M1): the metrics port times out
+// slow requests, slow readers and idle keep-alive connections, and caps a
+// request's headers — none of it was bounded but the header read.
+func TestMetricsServerBoundsItsConnections(t *testing.T) {
+	s := newMetricsServer(nil)
+	if s.ReadHeaderTimeout <= 0 || s.ReadTimeout <= 0 || s.WriteTimeout <= 0 || s.IdleTimeout <= 0 || s.MaxHeaderBytes <= 0 {
+		t.Fatalf("an unbounded metrics server: %+v", s)
+	}
+}
+
+// TestMetricsPortCapsItsConnections (audit M1): the metrics port serves at
+// most maxMetricsConns connections at once — one beyond is closed as soon as
+// it is accepted — and a closed connection frees its slot. It held any
+// number: 3000 connections a flood opened stayed open, each a descriptor and
+// a goroutine, for as long as the idle timeout.
+func TestMetricsPortCapsItsConnections(t *testing.T) {
+	out := &syncBuffer{}
+	stop, err := serveMetrics("127.0.0.1:0", metrics.NewRegistry(), "m", &logger{w: out})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	_, addr, ok := strings.Cut(out.String(), "event=metrics_ready node=m addr=")
+	if !ok {
+		t.Fatalf("no metrics_ready event: %q", out.String())
+	}
+	addr = strings.TrimSpace(addr)
+	scrape := func(c net.Conn) error {
+		fmt.Fprintf(c, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		return err
+	}
+	var held []net.Conn
+	defer func() {
+		for _, c := range held {
+			_ = c.Close()
+		}
+	}()
+	for i := 0; i < maxMetricsConns; i++ {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, c)
+		if err := scrape(c); err != nil {
+			t.Fatalf("scrape on connection %d of %d: %v", i+1, maxMetricsConns, err)
+		}
+	}
+	extra, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer extra.Close()
+	if err := scrape(extra); err == nil {
+		t.Fatalf("connection %d was served beyond the cap of %d", maxMetricsConns+1, maxMetricsConns)
+	}
+	_ = held[0].Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = scrape(c)
+		_ = c.Close()
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a closed connection's slot was never freed: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

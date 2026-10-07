@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/storage"
 )
 
@@ -41,10 +42,18 @@ func (o Op) String() string {
 	return fmt.Sprintf("op(%d)", o)
 }
 
-// Limits, the Phase 1 contract (docs/DESIGN.md §1).
+// Limits, the Phase 1 contract (docs/DESIGN.md §1). MaxKeyLen and MaxValueLen
+// bound the raw key and value; MaxCommandLen bounds the ENCODED command, which
+// is the Raft entry that carries it, and is the limit that decides (docs/API.md
+// §3): a command's encoding adds an op byte, the uvarint lengths and, for an
+// identified write, its identity, so a value near MaxValueLen fits only if the
+// key and identity leave room. MaxCommandLen is the system's one entry-size
+// limit, raft.MaxEntryDataLen — a command that passes Validate is one every
+// layer below accepts, persists and reads back.
 const (
-	MaxKeyLen   = storage.DefaultMaxKeySize
-	MaxValueLen = storage.DefaultMaxValueSize
+	MaxKeyLen     = storage.DefaultMaxKeySize
+	MaxValueLen   = storage.DefaultMaxValueSize
+	MaxCommandLen = raft.MaxEntryDataLen
 )
 
 // ErrMalformedCommand means bytes in a log entry are not a Command. The Store
@@ -98,6 +107,22 @@ func (c Command) Encode() []byte {
 	return b
 }
 
+// EncodedLen is len(c.Encode()), computed without encoding: what the front
+// checks against MaxCommandLen before a command is proposed.
+func (c Command) EncodedLen() int {
+	if c.Op == OpRegister {
+		return 1
+	}
+	n := 1 + uvarintLen(uint64(len(c.Key))) + len(c.Key)
+	if c.ClientID != 0 {
+		n += uvarintLen(c.ClientID) + uvarintLen(c.RequestID) + uvarintLen(c.AckedBelow)
+	}
+	if c.Op == OpPut {
+		n += uvarintLen(uint64(len(c.Value))) + len(c.Value)
+	}
+	return n
+}
+
 // Fingerprint identifies the command's EFFECT — operation, key and value, never
 // its identity or watermark — so the same request re-sent with a newer
 // AckedBelow is still recognised as the same command. It is SHA-256 of the
@@ -107,10 +132,10 @@ func (c Command) Fingerprint() [32]byte {
 }
 
 // Validate reports whether the command satisfies the protocol's rules: a
-// non-empty key within MaxKeyLen, a value within MaxValueLen, and for an
-// identified command RequestID ≥ 1 and 1 ≤ AckedBelow ≤ RequestID. Decode
-// accepts exactly the commands Validate accepts, so a command a server has
-// validated always applies.
+// non-empty key within MaxKeyLen, a value within MaxValueLen, for an
+// identified command RequestID ≥ 1 and 1 ≤ AckedBelow ≤ RequestID, and an
+// encoding within MaxCommandLen. Decode accepts exactly the commands Validate
+// accepts, so a command a server has validated always applies.
 func (c Command) Validate() error {
 	switch c.Op {
 	case OpRegister:
@@ -132,10 +157,11 @@ func (c Command) Validate() error {
 		if c.RequestID != 0 || c.AckedBelow != 0 {
 			return fmt.Errorf("%w: an anonymous command carries no request id", ErrMalformedCommand)
 		}
-		return nil
-	}
-	if c.RequestID == 0 || c.AckedBelow == 0 || c.AckedBelow > c.RequestID {
+	} else if c.RequestID == 0 || c.AckedBelow == 0 || c.AckedBelow > c.RequestID {
 		return fmt.Errorf("%w: identified command needs requestID >= 1 and 1 <= ackedBelow <= requestID (got %d, %d)", ErrMalformedCommand, c.RequestID, c.AckedBelow)
+	}
+	if n := c.EncodedLen(); n > MaxCommandLen {
+		return fmt.Errorf("%w: encoded command of %d bytes exceeds %d", ErrMalformedCommand, n, MaxCommandLen)
 	}
 	return nil
 }

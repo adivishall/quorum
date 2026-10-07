@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -450,6 +451,84 @@ func TestRemovedLeaderRetiresItsGroup(t *testing.T) {
 	c.applied(1, []string{"one-0", "one-1"}, rest...)
 	c.write(2, "two-0", c.ids...)
 	c.applied(2, []string{"two-0"}, c.ids...)
+}
+
+// TestARetirementIsLoggedOnce: a removed group is retired once, and logged
+// and counted once — also when it is started again and its start is still
+// announcing it (a slow attach) when the next tick retires it. The stop is
+// refused while the start holds the group (ErrGroupBusy), and the retirement
+// was logged and counted before each attempt: 31 times for one retirement.
+func TestARetirementIsLoggedOnce(t *testing.T) {
+	c := newHostCluster(t, "a", "b", "c")
+	var slow atomic.Bool
+	for _, id := range c.ids {
+		id := id
+		h, err := Start(c.ctx, Config{
+			ID: id, DataDir: c.dirs[id], Transport: c.trs[id], StaticPeers: c.static(id),
+			NewStateMachine: func(GroupID) raftnode.StateMachine { return &recSM{} },
+			TickInterval:    10 * time.Millisecond, DisableSync: true,
+			OnGroup: func(g GroupID, node *raftnode.Node, _ raftnode.StateMachine) {
+				if node != nil && slow.Load() {
+					time.Sleep(300 * time.Millisecond) // a slow attach (front registry, metrics)
+				}
+			},
+			Logf: func(f string, a ...any) {
+				c.mu.Lock()
+				defer c.mu.Unlock()
+				fmt.Fprintf(c.logs[id], f+"\n", a...)
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.hosts[id] = h
+	}
+	c.create(1, "a", "b", "c")
+	c.write(1, "one-0", c.ids...)
+	ld := c.leader(1, c.ids...)
+	// The leader removes itself (a removed follower is not told: the existing
+	// TestRemovedLeaderRetiresItsGroup removes the leader for that reason).
+	victim := ld
+	if _, _, err := c.hosts[ld].Group(1).Node.ChangeMembership(context.Background(),
+		raft.ConfChange{Type: raft.RemoveVoter, Member: raft.Member{ID: victim}}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for c.hosts[victim].Group(1) != nil {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s did not retire group 1", victim)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	before := strings.Count(c.log(victim), "event=group_retired")
+	slow.Store(true)
+	// The operator starts it again (admin start-group): it is retired again,
+	// once. The group leaves the host's table before its retirement's stop
+	// has finished, and Open answers ErrGroupBusy until it has — transient,
+	// and retried, as an operator would.
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		_, err := c.hosts[victim].Open(1)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ErrGroupBusy) || time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	for c.hosts[victim].Group(1) != nil {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s did not retire group 1 again", victim)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	after := strings.Count(c.log(victim), "event=group_retired")
+	if before != 1 || after-before != 1 {
+		t.Fatalf("group_retired logged %d times for the first retirement and %d for the second, want once each", before, after-before)
+	}
 }
 
 // chanTransport is a transport whose inbound frames the test injects.

@@ -165,10 +165,16 @@ func (r Request) validate() error {
 		if r.RequestID != 0 || r.AckedBelow != 0 {
 			return fmt.Errorf("%w: an anonymous request carries no request id or watermark", ErrInvalid)
 		}
-		return nil
-	}
-	if r.RequestID == 0 || r.AckedBelow == 0 || r.AckedBelow > r.RequestID {
+	} else if r.RequestID == 0 || r.AckedBelow == 0 || r.AckedBelow > r.RequestID {
 		return fmt.Errorf("%w: an identified request needs request id >= 1 and 1 <= acked-below <= request id (got %d, %d)", ErrInvalid, r.RequestID, r.AckedBelow)
+	}
+	// The limit that decides is the size of the Raft entry the write becomes,
+	// not the raw key and value: the encoding adds lengths and the identity
+	// (docs/API.md §3). A GET never enters the log.
+	if r.Op != ReqGet {
+		if n := r.command().EncodedLen(); n > MaxCommandLen {
+			return fmt.Errorf("%w: the request encodes to a %d-byte log entry, the limit is %d (key %d bytes, value %d bytes)", ErrInvalid, n, MaxCommandLen, len(r.Key), len(r.Value))
+		}
 	}
 	return nil
 }

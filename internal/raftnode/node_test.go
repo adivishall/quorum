@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/adivishall/quorum/internal/raft"
+	"github.com/adivishall/quorum/internal/replication"
 	"github.com/adivishall/quorum/internal/testport"
 	"github.com/adivishall/quorum/internal/transport"
 )
@@ -74,6 +75,19 @@ func startCluster(t *testing.T, ctx context.Context, n int) *harness {
 // and closes the underlying TCP transports.
 func startClusterWith(t *testing.T, ctx context.Context, n int, wrap func(transport.Transport) transport.Transport) *harness {
 	t.Helper()
+	return startClusterTick(t, ctx, n, wrap, 15*time.Millisecond)
+}
+
+// startClusterTick is startClusterWith with every node's tick interval.
+func startClusterTick(t *testing.T, ctx context.Context, n int, wrap func(transport.Transport) transport.Transport, tick time.Duration) *harness {
+	t.Helper()
+	return startClusterHooked(t, ctx, n, wrap, tick, nil)
+}
+
+// startClusterHooked is startClusterTick with each node's driver hook (nil:
+// none) made by hook from its id.
+func startClusterHooked(t *testing.T, ctx context.Context, n int, wrap func(transport.Transport) transport.Transport, tick time.Duration, hook func(NodeID) Hook) *harness {
+	t.Helper()
 	var ids []NodeID
 	addrs := map[NodeID]string{}
 	for i := 0; i < n; i++ {
@@ -98,10 +112,14 @@ func startClusterWith(t *testing.T, ctx context.Context, n int, wrap func(transp
 		h.trs[id] = tr
 		sm := &recSM{}
 		h.sms[id] = sm
+		var hk Hook
+		if hook != nil {
+			hk = hook(id)
+		}
 		node, err := Start(ctx, Config{
 			ID: id, Peers: ids, Transport: wrap(tr),
 			LogPath:      filepath.Join(h.dir, string(id)+".log"),
-			StateMachine: sm, TickInterval: 15 * time.Millisecond, DisableSync: true,
+			StateMachine: sm, TickInterval: tick, DisableSync: true, Hook: hk,
 		})
 		if err != nil {
 			t.Fatalf("node %s: %v", id, err)
@@ -275,5 +293,48 @@ func TestGracefulRecovery(t *testing.T) {
 	}
 	if n2.CommitIndex() < commitBefore {
 		t.Fatalf("recovered commit %d < %d (INV-R8: commit moved backward)", n2.CommitIndex(), commitBefore)
+	}
+}
+
+// TestStartRefusesANegativeTick (audit M5): a negative tick interval is a
+// configuration error from Start, before anything is recovered or any
+// goroutine runs — never a time.NewTicker panic inside the actor, which would
+// take down every group of the process.
+func TestStartRefusesANegativeTick(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "n0.log")
+	// A complete config, so a Start that let the tick through would reach the
+	// actor's ticker — the panic the rule prevents — not fail elsewhere.
+	tr, err := transport.NewTCPTransport(transport.Config{NodeID: "n0", ListenAddr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	n, err := Start(context.Background(), Config{ID: "n0", Peers: []NodeID{"n0"}, Transport: tr, LogPath: path, StateMachine: &recSM{}, TickInterval: -time.Millisecond})
+	if err == nil {
+		_ = n.Close()
+		t.Fatal("Start accepted a negative tick interval")
+	}
+	if _, found, _ := LoadIdentity(nil, path); found {
+		t.Fatal("a refused Start recorded durable state")
+	}
+}
+
+// TestGroupsDrawDifferentElectionSeeds (audit F13): the default election seed
+// of a node's groups mixes in the group, so groups on one node do not draw one
+// timeout sequence and campaign in lockstep; group 0 keeps the node's seed.
+func TestGroupsDrawDifferentElectionSeeds(t *testing.T) {
+	if seedFor("n1", 0) != seedFromID("n1") {
+		t.Fatal("group 0's seed changed: the single-group deployment's timing would change")
+	}
+	seen := map[int64]bool{}
+	for g := 0; g < 256; g++ {
+		s := seedFor("n1", replication.GroupID(g))
+		if s <= 0 {
+			t.Fatalf("group %d: seed %d is not positive", g, s)
+		}
+		if seen[s] {
+			t.Fatalf("group %d shares a seed with another group of the node", g)
+		}
+		seen[s] = true
 	}
 }

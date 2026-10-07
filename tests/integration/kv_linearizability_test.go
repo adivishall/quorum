@@ -226,7 +226,7 @@ func (r *linRun) check() lincheck.Result {
 // output — to a directory that outlives the test and fails with its path.
 func (r *linRun) fail(format string, args ...any) {
 	r.t.Helper()
-	dir, err := os.MkdirTemp("", "dkv-lin-"+strings.ReplaceAll(r.t.Name(), "/", "_")+"-")
+	dir, err := artifactDir("dkv-lin-", r.t.Name())
 	msg := fmt.Sprintf(format, args...)
 	if err == nil {
 		r.mu.Lock()
@@ -884,6 +884,19 @@ func crashWindow(t *testing.T, tc crashCase) {
 	r.premise(!refusedAsNotLeader(op), "the armed node %s had been deposed before the write arrived: %s", l, op)
 	point, nth := c.waitKilledAtPoint(l, 30*time.Second)
 	r.event("%s died at %s#%d", l, point, nth)
+
+	// What the system did: the victim's durable log.
+	held, err := raftlog.Inspect(filepath.Join(c.dirs[l], "raft-"+l+".log"))
+	if err != nil {
+		r.fail("inspect %s: %v", l, err)
+	}
+	// Every row below assumes the write's life in the term it was armed in.
+	// The crash point belongs to this write only if no election intervened
+	// between arming and the crash, so that is established first: a leader
+	// deposed with the write in flight may rightly answer it LOST before it
+	// dies (TestRealDeposedLeaderAnswersLostThenDies), and that answer says
+	// nothing about the window this row tests.
+	r.premise(held.HardState.Term == tm, "%s's term moved from %d to %d between arming and the crash (the writer heard: %s): the point may belong to another operation", l, tm, held.HardState.Term, op)
 	if want := strings.SplitN(tc.spec, ":", 2)[0]; point != want {
 		r.fail("died at %s, want %s", point, want)
 	}
@@ -893,15 +906,6 @@ func crashWindow(t *testing.T, tc crashCase) {
 	case op.Outcome != lincheck.Incomplete:
 		r.fail("the writer must hear nothing from a leader that died at %s: %s", tc.spec, op)
 	}
-
-	// What the system did: the victim's durable log.
-	held, err := raftlog.Inspect(filepath.Join(c.dirs[l], "raft-"+l+".log"))
-	if err != nil {
-		r.fail("inspect %s: %v", l, err)
-	}
-	// The crash point belongs to this write only if no election
-	// intervened between arming and the crash.
-	r.premise(held.HardState.Term == tm, "%s's term moved from %d to %d between arming and the crash: the point may belong to another operation", l, tm, held.HardState.Term)
 	idx := entryHolding(held, "k", "new")
 	switch {
 	case tc.inLog && idx == 0:
@@ -1066,6 +1070,98 @@ func TestRealWriteToPartitionedLeaderNeverTakesEffect(t *testing.T) {
 		if idx := entryHolding(c.liveLog(l), "k", "new"); idx != 0 {
 			r.fail("the old leader's uncommitted entry survived the new leader's log at index %d", idx)
 		}
+		r.check()
+		c.finish()
+	})
+}
+
+// TestRealDeposedLeaderAnswersLostThenDies is the lifecycle CI met by chance in
+// TestRealWriteCrashWindows/after-reply:1, made deterministic:
+//
+//	writer --PUT(new)--> leader L: appended at index i, term t   (L is cut off)
+//	the others elect L2 (term t2 > t); L2's no-op commits at index i
+//	heal: L learns t2, replaces its entry at i with L2's, applies it
+//	      --> the writer hears LOST --> L SIGKILLs itself (after-reply:1)
+//	restart L; a read returns old; the history is linearizable
+//
+// LOST is a definite answer: a different entry is committed at the write's
+// index, so the write can never commit. The writer records a Rejected
+// operation, which the checker requires to have had no effect, and the later
+// read must return the old value. That the process dies the moment the answer
+// leaves it changes nothing: the answer was already true when it was given,
+// and the durable log the SIGKILL leaves behind shows why — the new term and
+// L2's entry at index i, never the write.
+func TestRealDeposedLeaderAnswersLostThenDies(t *testing.T) {
+	withPremise(t, func() {
+		c := newRClusterArgs(t, 3, "-crash-at", "after-reply:1", "-crash-armed-by-signal")
+		c.waitLeader(c.ids, 0, 20*time.Second)
+		c.waitClientReady(20 * time.Second)
+		r := newLinRun(t, c)
+		ctx := context.Background()
+		setup := r.client("setup", 10*time.Second, 4)
+		r.require(setup.Put(ctx, "k", []byte("old")), lincheck.OK, "")
+		l, tm := c.waitStable(c.ids, 0, 30*time.Second)
+		c.waitCommit(c.ids, c.commitOf(l), 20*time.Second)
+
+		c.armCrash(l)
+		c.isolate(l)
+		r.event("armed after-reply:1 on leader %s (term %d), and isolated it", l, tm)
+		w := r.client("writer", 30*time.Second, 1) // one attempt: no retry, no redirect
+		w.Prefer(l)
+		done := make(chan lincheck.Op, 1)
+		go func() { done <- w.Put(ctx, "k", []byte("new")) }()
+		// The isolated leader appends the write; it cannot replicate it.
+		var idx uint64
+		for deadline := time.Now().Add(20 * time.Second); idx == 0; {
+			select {
+			case op := <-done:
+				r.premise(!refusedAsNotLeader(op), "%s had been deposed before the write arrived: %s", l, op)
+				r.fail("the isolated leader answered before it was healed: %s", op)
+			default:
+			}
+			if time.Now().After(deadline) {
+				r.fail("the isolated leader %s never appended the write", l)
+			}
+			idx = entryHolding(c.liveLog(l), "k", "new")
+			time.Sleep(20 * time.Millisecond)
+		}
+		r.event("%s appended the write at index %d", l, idx)
+		l2, t2 := c.waitLeader(others(c.ids, l), tm, 20*time.Second)
+		c.waitCommit(others(c.ids, l), idx, 20*time.Second)
+		r.event("%s leads term %d and has committed index %d", l2, t2, idx)
+
+		r.event("heal")
+		c.healAll()
+		var op lincheck.Op
+		select {
+		case op = <-done:
+		case <-time.After(30 * time.Second):
+			r.fail("the writer heard nothing after the heal")
+		}
+		point, nth := c.waitKilledAtPoint(l, 30*time.Second)
+		r.event("%s died at %s#%d", l, point, nth)
+		if op.Outcome != lincheck.Rejected || len(op.Attempts) != 1 || op.Attempts[0].Result != "lost" {
+			r.fail("a deposed leader whose entry was replaced must answer LOST: %s", op)
+		}
+		if point != "after-reply" {
+			r.fail("died at %s, want after-reply: the LOST answer was its first response", point)
+		}
+		held, err := raftlog.Inspect(filepath.Join(c.dirs[l], "raft-"+l+".log"))
+		if err != nil {
+			r.fail("inspect %s: %v", l, err)
+		}
+		if held.HardState.Term < t2 || entryHolding(held, "k", "new") != 0 {
+			r.fail("%s answered LOST, but its durable log (term %d, the write at index %d) does not show the new leader's entry replacing the write",
+				l, held.HardState.Term, entryHolding(held, "k", "new"))
+		}
+		r.event("%s's disk: term %d, index %d holds the new leader's entry", l, held.HardState.Term, idx)
+
+		c.start(l)
+		waitForLine(t, c.procs[l], "event=client_ready", 20*time.Second)
+		r.event("restarted %s", l)
+		c.waitStable(c.ids, 0, 30*time.Second)
+		rd := r.client("reader", 10*time.Second, 6)
+		r.require(rd.Get(ctx, "k"), lincheck.OK, "old")
 		r.check()
 		c.finish()
 	})

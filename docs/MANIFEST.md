@@ -133,6 +133,28 @@ The asymmetry is deliberate: a file becomes live at exactly one instant (the fsy
 before that instant it does not exist as far as the database is concerned, no matter how complete it
 is on disk.
 
+**A FAILED step 5 is not a crash** (audit M11). When the append's write or fsync fails, the record
+may be absent, partial, or complete and durable — the process cannot know which — so:
+
+- the Writer **latches** (`manifest.ErrFailed`): it refuses every later edit, since an edit appended
+  after a partial record would turn a repairable torn tail into damage mid-file, which recovery
+  refuses;
+- the output is **not deleted** — the edit naming it may be durable, and the next open would then
+  refuse a store whose live file is missing; if the edit did not survive, the next startup sweeps
+  the output as an orphan;
+- the store stops publishing: the compactor runs no more compactions (`docs/COMPACTION.md` §7), and a
+  flush, which needs the manifest, latches its failure too.
+
+The same holds for `Install` on every open: a failure of `CURRENT`'s rename or of the directory
+fsync after it may leave `CURRENT` naming the new manifest, so `Install` keeps both manifests —
+it used to delete the new one, leaving `CURRENT` naming a file that did not exist. Only a failure
+before the rename removes the unreferenced new manifest. `TestInstallUnderEveryFault` and
+`TestAppendUnderEveryFault` fail a write, a torn write, an fsync, a rename and a directory fsync at
+each of their first three occurrences and require the directory to recover to the state before the
+operation or after it; `TestAnAmbiguousCompactionEditKeepsItsOutput` does the same through the
+engine (mutants 256–258). The manifest writes through `manifest.FS` (the OS; a fault injector in
+tests).
+
 ## 6. Startup
 
 ```
@@ -140,8 +162,8 @@ is on disk.
        -> live file set, each file's sequence range and level, nextFileNum, lastSequence
 2. open every referenced file; cross-check it against the MANIFEST
 3. check the file set is coherent: sequence ranges disjoint and ascending, no empty tables
-4. sweep orphans: *.sst.tmp, *.sst the MANIFEST does not name, superseded MANIFESTs, CURRENT.tmp
-5. install a fresh MANIFEST holding a full snapshot; point CURRENT at it; delete the old ones
+4. install a fresh MANIFEST holding a full snapshot; point CURRENT at it; delete the old ones
+5. sweep orphans: *.sst.tmp, *.sst the MANIFEST does not name, CURRENT.tmp
 6. replay the WAL from sequence 1, skipping every mutation at or below the highest flushed sequence
 ```
 
@@ -157,11 +179,15 @@ than as a missing key (INV-L7). `Options.VerifySSTablesOnOpen` restores the Phas
 operators who would rather pay at startup, and `TestCorruptSSTableRefusesToOpen` pins both halves
 so neither can drift silently.
 
-**Step 4 is after step 1 for a reason.** Deleting a file because it is absent from a file set we are
-not yet sure of would be the one way this could lose data. Orphan sweeping is safe only once the
-MANIFEST has been recovered successfully.
+**Step 5 is after step 4 for a reason.** Deleting a file because it is absent from a file set we are
+not yet sure of would be the one way this could lose data. Recovering the MANIFEST is not enough:
+what step 1 read may include an edit that was written but never fsynced — a compaction whose
+manifest fsync failed — and only the fresh manifest of step 4 makes that state durable. Sweeping
+first deleted the compaction's inputs; when step 4 then failed, a power loss left the old manifest
+naming them, and the store never opened again (`TestOpenSweepsOnlyAgainstADurableManifest`). A
+failed step 4 also closes the manifest it opened (`TestAFailedOpenClosesItsManifest`).
 
-**Step 5 is what bounds a manifest's length.** Without it a manifest would accumulate every edit
+**Step 4 is what bounds a manifest's length.** Without it a manifest would accumulate every edit
 for the life of the database and recovery time would track total history rather than current state.
 Installing a fresh one on every open means recovery replays one snapshot plus one session's edits.
 A crash partway through leaves the previous `CURRENT` and manifest untouched and the new manifest
