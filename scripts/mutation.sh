@@ -2613,6 +2613,15 @@ mutant "status-reports-follower-match" internal/multiraft/admin.go \
   '			if false {' \
   ./internal/multiraft '^TestAdminStatusNamesItsNodeAndTheLeadersFollowers$'
 
+# 309. A leader deposed with a write in flight answers UNKNOWN, not LOST: a
+#      definite no-effect answer, which the client may retry safely, is lost.
+mutant "deposed-leader-answers-lost" internal/kv/server.go \
+  '	case errors.Is(err, ErrLost):
+		resp.Status = StatusLost' \
+  '	case errors.Is(err, ErrLost):
+		resp.Status = StatusUnknown' \
+  ./tests/integration '^TestRealDeposedLeaderAnswersLostThenDies$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then
