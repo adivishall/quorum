@@ -450,6 +450,19 @@ premise of each row is **proved from the victim's durable log** after the kill, 
 In every row the history (setup put, the crashed put, the later read) is also checked. The
 simulator repeats the driver points deterministically (`TestKVCrashAtEveryPointOfAWrite`).
 
+Every row assumes the write lived its whole life in the term it was armed in, so the test proves
+that first, from the victim's durable term, and only then asserts what the client heard. A leader
+deposed with the write in flight may rightly answer it **LOST** before it dies: another leader's
+entry committed at the write's index, so the write can never commit. CI met this once, in
+`after-reply:1`, while the test still asserted the answer before the premise, and called a correct
+answer a failure. `TestRealDeposedLeaderAnswersLostThenDies` makes that lifecycle deterministic:
+1. The armed leader is isolated, and appends the write at index *i*.
+2. The others elect a leader whose no-op commits at *i*.
+3. Healed, the old leader replaces its entry, applies the new one, answers LOST, and dies at
+   `after-reply:1`.
+4. Its durable log shows the new term and the new entry at *i*; a later read returns `old`, and the
+   history, with LOST recorded as a Rejected operation, is linearizable.
+
 ---
 
 ## 8. Deterministic simulator tier (`internal/raftsim`, `kv.go`)
@@ -766,6 +779,7 @@ committed logs against the session model (`dedupEvidence`):
 | Test | What it establishes |
 |---|---|
 | `TestRealSessionWorkloadsUnderFaults` (leader killed mid-write, leader partition, rolling restart starting with the leader mid-write) | six session clients, 15% concurrent duplicates: linearizable; writes retried after unanswered attempts (the leader dies at its after-applied-to seam, so some client's write is unanswered by construction — its durable term proves it still led); duplicate entries in the log answered from their originals |
+| `TestRealDeposedLeaderAnswersLostThenDies` | a leader deposed with a write in flight answers LOST, then dies at `after-reply:1`: the answer is definite, the write never takes effect (mutant 309) |
 | `TestRealSessionRetryAcrossCrashWindows` (8 points: before-save … after-reply) | the hardest case at every window; the victim's disk decides which case; a read between the crash and B lets the checker alone see a second execution |
 | `TestRealForwarderDiesBeforeRelaying` | a follower SIGKILLed before relaying the leader's answer; the retry is a duplicate |
 | `TestRealConcurrentDuplicatesThroughEveryNode` | one request sent at once to all three nodes — 20 PUT, 5 GET, 5 DELETE rounds: each write executes once, every other copy its duplicate at the same index; every GET copy really reads (reads are never deduplicated) |
