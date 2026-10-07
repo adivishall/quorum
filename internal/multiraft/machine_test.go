@@ -1,6 +1,9 @@
 package multiraft
 
 import (
+	"errors"
+	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -62,5 +65,25 @@ func TestStopAndCloseCloseTheMachine(t *testing.T) {
 	}
 	if n := made[0].closed.Load(); n != 1 {
 		t.Fatalf("Close closed the stopped group's old machine again (%d)", n)
+	}
+}
+
+// TestAFailedMachineLeavesNoDirectory: a first start whose state machine
+// cannot be made — the engine would not open — fails the group and leaves no
+// directory behind, as a start that fails in Raft does, so the group is not
+// reported as failed at every later start.
+func TestAFailedMachineLeavesNoDirectory(t *testing.T) {
+	c := newHostCluster(t, "n1")
+	h := lifecycleHost(t, c, "n1", func(GroupID) (raftnode.StateMachine, error) {
+		return nil, errors.New("the engine would not open")
+	}, nil)
+	if _, err := h.Create(7, c.genesis("n1")); err == nil || !strings.Contains(err.Error(), "its state machine") {
+		t.Fatalf("Create with a machine that cannot be made: %v", err)
+	}
+	if _, err := os.Stat(GroupDir(c.dirs["n1"], 7)); !os.IsNotExist(err) {
+		t.Fatalf("the failed start left its directory: %v", err)
+	}
+	if _, err := h.Open(7); err == nil {
+		t.Fatal("Open of a group that was never started succeeded")
 	}
 }

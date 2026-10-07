@@ -437,9 +437,12 @@ mutant "applied-recorded-only-after-apply" internal/raftnode/crashpoint.go \
 			if e.Type != replication.EntryNormal {
 				cmd = nil
 			}
-			if rsm != nil {
+			switch {
+			case csm != nil:
+				result, err = csm.ApplyEntry(e.Index, e.Term, cmd)
+			case rsm != nil:
 				result, err = rsm.ApplyResult(e.Index, cmd)
-			} else {
+			default:
 				err = sm.Apply(e.Index, cmd)
 			}
 			if err != nil {
@@ -462,9 +465,12 @@ mutant "applied-recorded-only-after-apply" internal/raftnode/crashpoint.go \
 			if e.Type != replication.EntryNormal {
 				cmd = nil
 			}
-			if rsm != nil {
+			switch {
+			case csm != nil:
+				result, err = csm.ApplyEntry(e.Index, e.Term, cmd)
+			case rsm != nil:
 				result, err = rsm.ApplyResult(e.Index, cmd)
-			} else {
+			default:
 				err = sm.Apply(e.Index, cmd)
 			}
 			if err != nil {
@@ -556,7 +562,7 @@ mutant "server-get-goes-through-readindex" internal/kv/server.go \
 #     committed state vanishes from the client-visible view.
 #     (Phase 15: every group's server is attached to the front with its store.)
 mutant "dkvd-serves-the-replicated-state-machine" cmd/dkvd/main.go \
-  'front.Attach(g, node, sm.(*kv.Store))' \
+  'front.Attach(g, node, sm.(kv.Machine))' \
   'front.Attach(g, node, kv.NewStore())' \
   ./tests/integration 'TestRealSequentialBaselineMatchesTheModel'
 
@@ -696,9 +702,8 @@ mutant "conflicting-reuse-is-detected-by-fingerprint" internal/kv/store.go \
 
 # 63. A conflicting reuse is refused but TAKES EFFECT.
 mutant "a-refused-conflict-has-no-effect" internal/kv/store.go \
-  '		return Result{Decision: Conflict}' \
-  '		s.write(c)
-		return Result{Decision: Conflict}' \
+  '		return Result{Decision: Conflict}, ef' \
+  '		return Result{Decision: Executed, Index: index}, ef' \
   ./internal/kv 'TestStoreAgreesWithTheSessionModel|TestConflictingReuseAndIdentityScope'
 
 # 64. The fingerprint omits the value: PUT(k, x) and PUT(k, y) under one id are
@@ -712,11 +717,11 @@ mutant "the-fingerprint-covers-the-whole-command" internal/kv/command.go \
 #     again, their results forgotten with the eviction.
 mutant "an-evicted-session-is-never-revived" internal/kv/store.go \
   '	if ss == nil {
-		return Result{Decision: Expired}
+		return Result{Decision: Expired}, effect{}
 	}' \
   '	if ss == nil {
 		ss = &session{ackedBelow: 1, results: map[uint64]execution{}}
-		s.sessions[c.ClientID] = ss
+		t.sessions[c.ClientID] = ss
 	}' \
   "./internal/kv ./internal/raftsim" 'TestStoreAgreesWithTheSessionModel|TestEvictedSessionIsRefusedNotReexecuted|TestKVSeededHistoriesAreLinearizable/kv-sessions-evict'
 
@@ -735,14 +740,14 @@ mutant "a-request-below-the-watermark-is-stale" internal/kv/store.go \
 
 # 68. The unacknowledged-result bound is not enforced (unbounded memory).
 mutant "a-session-holds-at-most-maxunacked-results" internal/kv/store.go \
-  '	if len(ss.results) >= s.limits.MaxUnacked {' \
-  '	if false && len(ss.results) >= s.limits.MaxUnacked {' \
+  '	if len(ss.results) >= t.limits.MaxUnacked {' \
+  '	if false && len(ss.results) >= t.limits.MaxUnacked {' \
   ./internal/kv 'TestStoreAgreesWithTheSessionModel|TestSessionLimitRefusesRatherThanForgets'
 
 # 69. LRU evicts the MOST recently used session — the one just registered.
 mutant "eviction-takes-the-least-recently-used" internal/kv/store.go \
-  '				if lru == 0 || ss.last < s.sessions[lru].last {' \
-  '				if lru == 0 || ss.last > s.sessions[lru].last {' \
+  '				if lru == 0 || ss.last < t.sessions[lru].last {' \
+  '				if lru == 0 || ss.last > t.sessions[lru].last {' \
   "./internal/kv ./internal/raftsim" 'TestStoreAgreesWithTheSessionModel|TestEvictedSessionIsRefusedNotReexecuted|TestKVSeededHistoriesAreLinearizable/kv-sessions-evict'
 
 # 70. A forwarded request is forwarded again (forwarding can loop).
@@ -793,8 +798,8 @@ mutant "the-watermark-waits-for-requests-in-flight" internal/kv/session.go \
 # 76. dkvd ignores -session-max / -session-max-unacked.
 #     (Phase 15: the host builds every group's state machine.)
 mutant "dkvd-applies-the-configured-session-limits" cmd/dkvd/main.go \
-  '			store := kv.NewStoreWithLimits(limits)' \
-  '			store := kv.NewStore()' \
+  '				m = kv.NewStoreWithLimits(limits)' \
+  '				m = kv.NewStore()' \
   ./tests/integration 'TestRealSessionContractSurvivesFullClusterRestart'
 
 # 87. Request validation drops the watermark bound: a request with AckedBelow
@@ -936,11 +941,11 @@ mutant "a-retry-after-a-dead-connection-keeps-its-request-id (real processes)" i
 # 86. An evicted session revived, on real processes, through a full restart.
 mutant "an-evicted-session-is-never-revived (real processes)" internal/kv/store.go \
   '	if ss == nil {
-		return Result{Decision: Expired}
+		return Result{Decision: Expired}, effect{}
 	}' \
   '	if ss == nil {
 		ss = &session{ackedBelow: 1, results: map[uint64]execution{}}
-		s.sessions[c.ClientID] = ss
+		t.sessions[c.ClientID] = ss
 	}' \
   ./tests/integration 'TestRealSessionContractSurvivesFullClusterRestart'
 
@@ -1073,7 +1078,7 @@ mutant "replay-keeps-a-matching-suffix" internal/raftlog/raftlog.go \
 # 109. A restart forgets its snapshot: the state machine is validated against
 #      it but not restored, while the applied index says it was.
 mutant "restart-restores-the-published-snapshot" internal/raftnode/node.go \
-  '		if err := ssm.RestoreSnapshot(meta.Index, data); err != nil {' \
+  '		if err := ssm.RestoreSnapshot(meta.Index, meta.Term, data); err != nil {' \
   '		if err := ssm.ValidateSnapshot(meta.Index, data); err != nil {' \
   "./internal/raftnode ./internal/raftsim" 'TestRecoverFromSnapshotAndSuffix|TestSimRestartFromSnapshotAfterPowerLoss'
 
@@ -1524,10 +1529,10 @@ mutant "the-front-counts-every-answer" internal/kv/front.go \
 # 162. The state machine's decisions are not observed (the metric would have
 #      to fall back on kv.Store.Stats, which a restore resets).
 mutant "every-apply-decision-is-observed" internal/kv/store.go \
-  '	if s.observe != nil {
-		s.observe(r.Decision)
+  '	if t.observe != nil {
+		t.observe(d)
 	}' \
-  '	_ = s.observe' \
+  '	_ = t.observe' \
   ./internal/kv 'TestKVMetricsMatchTheResponses|TestDecisionCountsSurviveARestore'
 
 # 163. The core's cumulative role transitions are added whole at every
@@ -1746,8 +1751,10 @@ mutant "lifecycle-stop-holds-the-group" internal/multiraft/host.go \
 # 191. A failed first start leaves its empty directory, reported as a failed
 #      group at every later start.
 mutant "failed-start-leaves-no-directory" internal/multiraft/host.go \
-  '			_ = os.Remove(GroupDir(h.cfg.DataDir, g))' \
-  '			_ = GroupDir(h.cfg.DataDir, g)' \
+  '			// stays.
+			_ = os.Remove(GroupDir(h.cfg.DataDir, g))' \
+  '			// stays.
+			_ = GroupDir(h.cfg.DataDir, g)' \
   ./internal/multiraft '^TestAFailedFirstStartLeavesNoDirectory$'
 
 # --- Replica settings (audit H5): what the replicated state machine's definition
@@ -2313,11 +2320,11 @@ mutant "snapshot-offer-ends-the-cut" internal/raft/raft.go \
 # 270. An apply failure publishes the Status covering the entries applied
 # before it, whose writes complete.
 mutant "apply-failure-publishes-status" internal/raftnode/node.go \
-  '		// first, as a cycle that succeeds does.
+  '		}
 		n.snapshotStatus()
-' \
-  '		// first, as a cycle that succeeds does.
-' \
+		return err // ErrApply, or a crash point fired' \
+  '		}
+		return err // ErrApply, or a crash point fired' \
   ./internal/raftnode '^TestApplyFailureStopsTheNode$'
 
 # 271. A proposal sends a peer with a cut batch in flight a heartbeat, not
@@ -2893,6 +2900,18 @@ mutant "session-records-load-at-open" internal/kv/lsm.go \
   '		id, ok := parseSessionKey([]byte(k))
 		if !ok || true {' \
   ./internal/kv '^TestLSMMachineMatchesTheStoreOnAScript$'
+
+# 343. S2: a group whose state machine cannot be made leaves its directory behind,
+#      to be reported as a failed group at every later start.
+mutant "failed-machine-leaves-no-directory" internal/multiraft/host.go \
+  '	if err != nil {
+		if created {
+			_ = os.Remove(GroupDir(h.cfg.DataDir, g))
+		}
+		return nil, fmt.Errorf("multiraft: group %d: its state machine: %w", g, err)' \
+  '	if err != nil {
+		return nil, fmt.Errorf("multiraft: group %d: its state machine: %w", g, err)' \
+  ./internal/multiraft '^TestAFailedMachineLeavesNoDirectory$'
 
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"

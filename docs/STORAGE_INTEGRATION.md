@@ -805,7 +805,11 @@ The existing snapshot tests run against the LSM machine through the same interfa
    of the cycle's waiters: a client is told nothing definite for a state the engine did not
    record (`TestLSMEngineFailureFailsStopsTheNode`, mutant 337). The write is committed in Raft
    and comes back from the log at the node's restart, once.
-4. **Nothing in the engine changed.** S1's `Apply` carried the composition as designed.
+4. **Nothing in the engine changed.** S1's `Apply` carried the composition as designed. S2's gate
+   did surface a race in one of the engine's own tests, untouched since Phase 5:
+   `TestFlushEveryWriteReallyFlushes` counted tables with the background compactor on, and under a
+   full parallel run the compactor merged four of them first. The test now keeps the compactor off,
+   as an assertion about file counts must; the assertion is unchanged.
 
 ### 8.10 Tests and fault coverage
 
