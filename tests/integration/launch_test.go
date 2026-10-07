@@ -215,3 +215,8 @@ func TestArtifactNamesAreUploadable(t *testing.T) {
 		t.Fatalf("artifact directory %q", base)
 	}
 }
+
+// stateMachineKind is the dkvd -state-machine every real-process test starts
+// its nodes with: QUORUM_STATE_MACHINE, so the whole suite runs against the
+// in-memory store (unset) and the LSM machine ("lsm") alike (S2).
+func stateMachineKind() string { return os.Getenv("QUORUM_STATE_MACHINE") }
