@@ -135,11 +135,11 @@ Phase 9 has to inherit the same semantics for replicas to agree.
 | Question | Answer |
 |---|---|
 | Initial value | `0`, meaning *no mutation has been assigned*. The first mutation gets `1`. |
-| Increment point | Once per mutation, under `writeMu`, immediately before the WAL append. |
-| What counts as a mutation | One `Put` or one `Delete`. A delete of an absent key counts: it writes a tombstone like any other. |
-| What does not | Reads. Rejected operations (bad key, oversized value, cancelled context, closed store) — they fail before the counter moves. `SetAppliedIndex`, which is metadata, not data. |
-| Batches | Each operation in a batch gets its own number, assigned in batch order. Phase 3 only ever writes single-operation batches; the rule is stated because the format allows more. |
-| Persistence | **Not stored.** It is re-derived by replay. |
+| Increment point | Once per mutation, under `writeMu`, immediately **after** the WAL append succeeds, so a failed append consumes nothing. (This table said "before" until S1's audit read the code; the code has always done it after.) |
+| What counts as a mutation | One `Put` or one `Delete`, or one mutation of an apply batch. A delete of an absent key counts: it writes a tombstone like any other. |
+| What does not | Reads. Rejected operations (bad key, oversized value, cancelled context, closed store, an apply batch whose index does not advance) — they fail before the counter moves. `SetAppliedIndex`, and an apply batch's applied index, which are metadata, not data. An empty apply batch consumes none. |
+| Batches | Each operation in a batch gets its own number, assigned in batch order. `Put` and `Delete` write single-operation batches; since S1 `Apply` writes one record of any number of mutations, numbered `s+1 … s+n`, and `AppliedSequence()` reports the number of the last one, the data its index covers (`docs/STORAGE_INTEGRATION.md` §7.4). |
+| Persistence | **Not stored.** It is re-derived by replay — sound only because no WAL segment is ever deleted. The MANIFEST's `LastSequence` is written at each flush and open and still never read; S3 must make it authoritative before it truncates the WAL. |
 | Recovery | Replay walks the WAL in order and assigns `1, 2, 3, …` to the mutations it finds — which is the identical assignment the original writes received, because both walk the same records in the same order. |
 | Exhaustion | A store that reaches `2^56-1` refuses further mutations rather than wrapping. |
 
