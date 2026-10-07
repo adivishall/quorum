@@ -2787,6 +2787,13 @@ mutant "memfs-power-loss-takes-undurable-directories" internal/fault/memfs.go \
   '		if true {' \
   ./internal/fault '^TestAMadeDirectoryIsDurableOnlyOnceItsParentIsSynced$'
 
+# 328. S1: the WAL decoders accept a count or length written in more bytes than
+#      it needs — one batch, two encodings (found by fuzzing apply batches).
+mutant "wal-varints-are-canonical" internal/storage/wal/batch.go \
+  '	if n > 0 && n != len(binary.AppendUvarint(nil, v)) {' \
+  '	if false {' \
+  ./internal/storage/wal '^(TestDecodeBatchRefusesOverlongVarints|TestDecodeApplyBatchRefusesMalformedPayloads)$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then
