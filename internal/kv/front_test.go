@@ -76,13 +76,13 @@ func startMulti(t testing.TB, shards int, metered bool) *multiCluster {
 		}
 		h, err := multiraft.Start(context.Background(), multiraft.Config{
 			ID: id, DataDir: t.TempDir(), Transport: trs[id], StaticPeers: static,
-			NewStateMachine: func(g replication.GroupID) raftnode.StateMachine {
+			NewStateMachine: func(g replication.GroupID) (raftnode.StateMachine, error) {
 				s := kv.NewStore()
 				km.Observe(s, g)
 				c.mu.Lock()
 				c.stores[id][g] = s
 				c.mu.Unlock()
-				return s
+				return s, nil
 			},
 			OnGroup: func(g replication.GroupID, node *raftnode.Node, sm raftnode.StateMachine) {
 				if node == nil {

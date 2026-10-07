@@ -59,6 +59,7 @@ import (
 	"github.com/adivishall/quorum/internal/raftnode"
 	"github.com/adivishall/quorum/internal/replication"
 	"github.com/adivishall/quorum/internal/routing"
+	"github.com/adivishall/quorum/internal/storage"
 	"github.com/adivishall/quorum/internal/transport"
 	"github.com/adivishall/quorum/internal/vfs"
 )
@@ -90,6 +91,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		sessMax   = fs.Int("session-max", kv.DefaultLimits.MaxSessions, "raft mode: the most client sessions the state machine keeps; the least recently used is evicted beyond it (docs/DEDUP.md). Part of the replicated state machine: every node of a group MUST use the same value")
 		sessUnk   = fs.Int("session-max-unacked", kv.DefaultLimits.MaxUnacked, "raft mode: the most unacknowledged results one session may hold (docs/DEDUP.md). Every node of a group MUST use the same value")
 		forward   = fs.Bool("client-forwarding", true, "raft mode: a node that is not the leader forwards a client request one hop to the leader; false is redirect-only (NOT_LEADER with a leader hint)")
+		smKind    = fs.String("state-machine", "memory", "raft mode: where each group's replicated state machine keeps its state: memory (rebuilt from the snapshot and the log at every start), or lsm (the storage engine under the group's directory, S2, docs/STORAGE_INTEGRATION.md §8). A data directory that holds an engine must be started as lsm")
 		snapEv    = fs.Uint64("snapshot-every", 10000, "raft mode: snapshot the state machine every N applied entries and compact the Raft log behind the snapshot (docs/SNAPSHOTS.md); 0 never snapshots (the log then grows without bound). Each node decides on its own; values may differ")
 		snapKeep  = fs.Uint64("snapshot-retain", 1000, "raft mode: entries kept in the Raft log below each new snapshot, so a follower slightly behind catches up by entries rather than a snapshot transfer")
 		cluster   = fs.Bool("cluster", false, "run one Raft group per shard of the routing (Phase 15, docs/MULTI_RAFT.md): this node hosts the groups whose genesis replica group names it, under -data-dir/groups/, plus every group found there and every -join group; clients are routed key -> shard -> group")
@@ -193,6 +195,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	limits := kv.Limits{MaxSessions: *sessMax, MaxUnacked: *sessUnk}
+	if *smKind != "memory" && *smKind != "lsm" {
+		fmt.Fprintf(stderr, "dkvd: -state-machine must be memory or lsm, got %q\n", *smKind)
+		return 2
+	}
 	if limits.MaxSessions < 1 || limits.MaxUnacked < 1 {
 		fmt.Fprintf(stderr, "dkvd: -session-max and -session-max-unacked must be at least 1, got %d and %d\n", limits.MaxSessions, limits.MaxUnacked)
 		return 2
@@ -265,7 +271,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if *raftMode || *cluster {
 		r := raftRun{id: *id, listen: *listen, peers: peers, tr: tr, dataDir: *dataDir, nd: nd, init: *initDir, clusterID: *clusterID,
 			settings: settings, tick: *tickIvl, lg: lg, stderr: stderr, clientAddr: *clientAt, crash: crash,
-			limits: limits, redirectOnly: !*forward, snapshotEvery: *snapEv, snapshotRetain: *snapKeep,
+			limits: limits, redirectOnly: !*forward, snapshotEvery: *snapEv, snapshotRetain: *snapKeep, stateMachine: *smKind,
 			assign: assign, join: join, adminAddr: *adminAt, metrics: reg}
 		if crash != nil {
 			r.hook, r.fs = crash.install(ctx, lg, *id, *crashArm)
@@ -426,6 +432,7 @@ type raftRun struct {
 	redirectOnly bool        // -client-forwarding=false
 	// Phase 14: -snapshot-every and -snapshot-retain.
 	snapshotEvery, snapshotRetain uint64
+	stateMachine                  string // "memory" or "lsm"
 	// Phase 15: -cluster mode's assignment (nil: -raft, one group 0 of this
 	// node and its peers); -join's groups; -admin-listen.
 	assign    *multiraft.Assignment
@@ -494,10 +501,30 @@ func runRaft(ctx context.Context, r raftRun) int {
 	}
 	hc := multiraft.Config{
 		ID: raftnode.NodeID(id), DataDir: dataDir, Transport: r.tr, StaticPeers: static,
-		NewStateMachine: func(g multiraft.GroupID) raftnode.StateMachine {
-			store := kv.NewStoreWithLimits(limits)
-			km.Observe(store, g)
-			return store
+		NewStateMachine: func(g multiraft.GroupID) (raftnode.StateMachine, error) {
+			dir := filepath.Join(dataDir, "lsm")
+			if r.assign != nil {
+				dir = filepath.Join(multiraft.GroupDir(dataDir, g), "lsm")
+			}
+			var m kv.Machine
+			switch r.stateMachine {
+			case "lsm":
+				lm, err := kv.OpenLSMMachine(dir, limits, storage.DefaultOptions())
+				if err != nil {
+					return nil, err
+				}
+				m = lm
+			default:
+				if _, err := os.Stat(dir); err == nil {
+					// The engine's state would be ignored and go stale while
+					// the memory machine rebuilds from the log: refuse, so the
+					// operator chooses on purpose.
+					return nil, fmt.Errorf("%s holds an LSM state machine; start this node with -state-machine lsm", dir)
+				}
+				m = kv.NewStoreWithLimits(limits)
+			}
+			km.Observe(m, g)
+			return m, nil
 		},
 		OnGroup: func(g multiraft.GroupID, node *raftnode.Node, sm raftnode.StateMachine) {
 			if node == nil {

@@ -159,7 +159,10 @@ func (s *Server) execute(ctx context.Context, req Request) Response {
 		if err != nil {
 			return s.failed(resp, err)
 		}
-		v, ok := s.store.Get(req.Key)
+		v, ok, err := s.store.Lookup(req.Key)
+		if err != nil {
+			return s.failed(resp, err)
+		}
 		if !ok {
 			resp.Status = StatusNotFound
 			return resp

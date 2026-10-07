@@ -3,6 +3,10 @@ package kv_test
 import (
 	"context"
 	"fmt"
+	"github.com/adivishall/quorum/internal/storage"
+	"github.com/adivishall/quorum/internal/storage/wal"
+	"io"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -163,10 +167,7 @@ func (c *cluster) startNode(id raftnode.NodeID) {
 	if c.net != nil {
 		wrapped = c.net.Wrap(tr)
 	}
-	store := kv.NewStore()
-	if c.limits != (kv.Limits{}) {
-		store = kv.NewStoreWithLimits(c.limits)
-	}
+	store := c.newMachine(id)
 	node, err := raftnode.Start(c.ctx, raftnode.Config{
 		ID: id, Peers: c.ids, Transport: wrapped,
 		LogPath:      filepath.Join(c.dir, string(id)+".log"),
@@ -189,11 +190,45 @@ func (c *cluster) startNode(id raftnode.NodeID) {
 	c.eps[id].mu.Unlock()
 }
 
+// newMachine makes id's state machine: the in-memory store, or — with
+// QUORUM_STATE_MACHINE=lsm, so every test of this package runs against both
+// (S2) — the LSM machine on an engine under the cluster's directory, which a
+// restart of the node reopens on its own durable state.
+func (c *cluster) newMachine(id raftnode.NodeID) kv.Machine {
+	c.t.Helper()
+	limits := c.limits
+	if limits == (kv.Limits{}) {
+		limits = kv.DefaultLimits
+	}
+	if os.Getenv("QUORUM_STATE_MACHINE") != "lsm" {
+		return kv.NewStoreWithLimits(limits)
+	}
+	opts := storage.DefaultOptions()
+	opts.WAL.SyncMode = wal.SyncOff // as the nodes' logs: DisableSync
+	m, err := kv.OpenLSMMachine(filepath.Join(c.dir, string(id)+"-lsm"), limits, opts)
+	if err != nil {
+		c.t.Fatalf("machine %s: %v", id, err)
+	}
+	return m
+}
+
+// closeMachine closes a node's machine once its node has stopped (the LSM
+// machine holds its engine; the store holds nothing).
+func closeMachine(srv *kv.Server) {
+	if srv == nil {
+		return
+	}
+	if cl, ok := srv.Store().(io.Closer); ok {
+		_ = cl.Close()
+	}
+}
+
 // crash stops a node abruptly from the clients' point of view (its actor exits;
 // the transport closes) — the in-process stand-in for a kill. Its durable log
 // stays; restart brings it back on that log.
 func (c *cluster) crash(id raftnode.NodeID) {
 	c.eps[id].mu.Lock()
+	srv := c.eps[id].srv
 	c.eps[id].srv = nil
 	c.eps[id].mu.Unlock()
 	c.mu.Lock()
@@ -203,6 +238,7 @@ func (c *cluster) crash(id raftnode.NodeID) {
 	c.mu.Unlock()
 	_ = n.Close()
 	_ = tr.Close()
+	closeMachine(srv)
 }
 
 func (c *cluster) stop() {
@@ -213,6 +249,11 @@ func (c *cluster) stop() {
 	}
 	for _, tr := range c.trs {
 		_ = tr.Close()
+	}
+	for _, e := range c.eps {
+		e.mu.Lock()
+		closeMachine(e.srv)
+		e.mu.Unlock()
 	}
 }
 

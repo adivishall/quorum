@@ -22,7 +22,7 @@ func TestGroupsSnapshotAndCompactIndependently(t *testing.T) {
 	start := func(id NodeID) {
 		h, err := Start(c.ctx, Config{
 			ID: id, DataDir: c.dirs[id], Transport: c.trs[id], StaticPeers: c.static(id),
-			NewStateMachine: func(GroupID) raftnode.StateMachine { return kv.NewStore() },
+			NewStateMachine: func(GroupID) (raftnode.StateMachine, error) { return kv.NewStore(), nil },
 			TickInterval:    10 * time.Millisecond, DisableSync: true,
 		})
 		if err != nil {

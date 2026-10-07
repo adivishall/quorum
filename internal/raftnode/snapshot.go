@@ -255,7 +255,16 @@ func (d *Durable) Snapshot(core *raft.Raft, at Hook) error {
 	if err != nil {
 		return fmt.Errorf("%w: encoding the state: %w", ErrSnapshot, err)
 	}
-	if idx != core.AppliedIndex() {
+	switch {
+	case idx > core.AppliedIndex():
+		// A machine whose durable state recovered more than the core has
+		// replayed yet (S2, docs/STORAGE_INTEGRATION.md §8.6): the core is
+		// catching up through entries the machine already holds and skips.
+		// A snapshot at the machine's index would compact a log the core
+		// still reads; none is taken until they agree, which the catch-up
+		// makes true within a few cycles.
+		return nil
+	case idx < core.AppliedIndex():
 		return fmt.Errorf("%w: the state machine is at %d, the core applied %d", ErrSnapshot, idx, core.AppliedIndex())
 	}
 	if idx <= s.meta.Index {

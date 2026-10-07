@@ -9,14 +9,17 @@ import "github.com/adivishall/quorum/internal/raftnode"
 // Machine — the front, the server, raftnode, multiraft — knows which it has.
 type Machine interface {
 	raftnode.StateMachine
-	// Get returns a copy of the value under key and whether the key is present.
-	Get(key []byte) ([]byte, bool)
+	// Lookup returns a copy of the value under key and whether the key is
+	// present. An engine that cannot read reports it: a failure is never
+	// presented as absence (INV-L7).
+	Lookup(key []byte) (value []byte, ok bool, err error)
 	// Applied returns the highest log index applied.
 	Applied() uint64
 	// Sessions returns a copy of the session table.
 	Sessions() map[uint64]SessionState
-	// Snapshot returns a copy of every present key (tests compare replicas with it).
-	Snapshot() map[string][]byte
+	// Contents returns a copy of every present key (tests compare replicas
+	// with it); it may read the engine's whole state.
+	Contents() (map[string][]byte, error)
 	// Stats returns the decision counters.
 	Stats() ApplyStats
 	// setObserve installs the decision counters (Metrics.Observe).
