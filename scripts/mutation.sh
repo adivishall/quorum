@@ -2794,6 +2794,106 @@ mutant "wal-varints-are-canonical" internal/storage/wal/batch.go \
   '	if false {' \
   ./internal/storage/wal '^(TestDecodeBatchRefusesOverlongVarints|TestDecodeApplyBatchRefusesMalformedPayloads)$'
 
+# 329. S2: the cycle's batch leaves out the session records a decision changed — a
+#      restart forgets the sessions, and a retry executes again.
+mutant "lsm-batch-carries-session-records" internal/kv/lsm.go \
+  '		muts = append(muts, storage.Mutation{Kind: storage.MutationPut, Key: sessionKey(id), Value: encodeSession(ss)})' \
+  '		_ = ss' \
+  ./internal/kv '^TestLSMMachineMatchesTheStoreOnAScript$'
+
+# 330. S2: the applied index advances without the cycle's writes.
+mutant "lsm-batch-carries-user-writes" internal/kv/lsm.go \
+  '	if err := m.db.Apply(context.Background(), muts, m.last); err != nil {' \
+  '	if err := m.db.Apply(context.Background(), nil, m.last); err != nil {' \
+  ./internal/kv '^TestLSMMachineMatchesTheStoreOnAScript$'
+
+# 331. S2: an entry the engine already holds is applied again at replay — a REGISTER
+#      resets its session, a request becomes a duplicate of itself.
+mutant "lsm-skips-what-its-engine-holds" internal/kv/lsm.go \
+  '	if index <= m.engine.Index {' \
+  '	if false {' \
+  ./internal/kv '^TestLSMMachineSkipsWhatItsEngineHolds$'
+
+# 332. S2: a staged write is invisible until the cycle is recorded — a read released
+#      by its barrier mid-cycle misses the entry it waited for.
+mutant "lsm-staged-writes-visible" internal/kv/lsm.go \
+  '	if ov, ok := m.overlay[string(key)]; ok {' \
+  '	if ov, ok := m.overlay[string(key)]; ok && false {' \
+  ./internal/kv '^TestLSMMachineStagedWritesAreVisibleBeforeTheyAreRecorded$'
+
+# 333. S2: a snapshot below the engine's state replaces it with the older state.
+mutant "lsm-restore-below-engine-is-noop" internal/kv/lsm.go \
+  '	if m.engine.Index >= index {' \
+  '	if false {' \
+  ./internal/kv '^TestLSMMachineARestoreBelowItsEngineChangesNothing$'
+
+# 334. S2: a restore leaves the session table out of the engine.
+mutant "lsm-restore-carries-session-records" internal/kv/lsm.go \
+  '		muts = append(muts, storage.Mutation{Kind: storage.MutationPut, Key: sessionKey(id), Value: encodeSession(st.sessions[id])})' \
+  '		_ = id' \
+  ./internal/kv '^TestLSMMachineRestoresASnapshot$'
+
+# 335. S2: the machine's record of what its engine holds does not follow the cycle —
+#      its snapshot names a stale index.
+mutant "lsm-engine-index-follows-the-cycle" internal/kv/lsm.go \
+  '	m.engine = m.last
+	m.resetCycle()' \
+  '	m.resetCycle()' \
+  ./internal/kv '^TestLSMMachineRestoresASnapshot$'
+
+# 336. S2: a session a decision touched is not rewritten.
+mutant "lsm-touched-session-recorded" internal/kv/lsm.go \
+  '		m.touched[ef.touched] = true' \
+  '		_ = ef.touched' \
+  ./internal/kv '^TestLSMMachineMatchesTheStoreOnAScript$'
+
+# 337. S2: a failed cycle completes its waiters — a client is acknowledged for a
+#      state the engine did not record.
+mutant "cycle-failure-completes-no-waiter" internal/raftnode/node.go \
+  '			n.completed = n.completed[:0]
+		}
+		n.snapshotStatus()' \
+  '			_ = n.completed
+		}
+		n.snapshotStatus()' \
+  ./internal/kv '^TestLSMEngineFailureFailsStopsTheNode$'
+
+# 338. S2: the cycle is never recorded — nothing a durable machine staged reaches its
+#      engine.
+mutant "cycle-is-recorded" internal/raftnode/crashpoint.go \
+  '		if err := csm.EndCycle(); err != nil {' \
+  '		if err := error(nil); err != nil {' \
+  ./internal/kv '^TestLSMEngineFailureFailsStopsTheNode$'
+
+# 339. S2: a stopped group's machine is never closed — its engine stays open.
+mutant "host-closes-the-machine" internal/multiraft/host.go \
+  '	if cerr := closeMachine(hg.g.SM); cerr != nil && err == nil {' \
+  '	if cerr := error(nil); cerr != nil && err == nil {' \
+  ./internal/multiraft '^TestStopAndCloseCloseTheMachine$'
+
+# 340. S2: a directory that holds an engine starts as memory — the engine goes stale
+#      behind the memory machine's rebuild.
+mutant "dkvd-refuses-memory-over-an-engine" cmd/dkvd/main.go \
+  '					return nil, fmt.Errorf("%s holds an LSM state machine; start this node with -state-machine lsm", dir)' \
+  '					_ = dir' \
+  ./tests/integration '^TestRealStateMachineKindIsAnOperatorsChoice$'
+
+# 341. S2: a user key is stored under the session tag — a user key can be a session
+#      record.
+mutant "user-keys-are-tagged" internal/kv/namespace.go \
+  '	return append(append(make([]byte, 0, 1+len(key)), tagUser), key...)' \
+  '	return append(append(make([]byte, 0, 1+len(key)), tagSession), key...)' \
+  ./internal/kv '^TestUserKeysNeverCollideWithSessionRecords$'
+
+# 342. S2: the session records are not loaded at open — a restart forgets every
+#      session.
+mutant "session-records-load-at-open" internal/kv/lsm.go \
+  '		id, ok := parseSessionKey([]byte(k))
+		if !ok {' \
+  '		id, ok := parseSessionKey([]byte(k))
+		if !ok || true {' \
+  ./internal/kv '^TestLSMMachineMatchesTheStoreOnAScript$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then

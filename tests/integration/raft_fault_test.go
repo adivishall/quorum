@@ -70,7 +70,9 @@ func newRClusterArgs(t *testing.T, n int, extra ...string) *rcluster {
 func newRClusterEvery(t *testing.T, n int, every []string, extra ...string) *rcluster {
 	t.Helper()
 	if kind := stateMachineKind(); kind != "" {
-		every = append(append([]string(nil), every...), "-state-machine", kind)
+		// The suite-wide default goes first: a test's own every, and a
+		// launch's extra, name the kind they mean and win (the last flag does).
+		every = append([]string{"-state-machine", kind}, every...)
 	}
 	c := &rcluster{
 		t: t, bin: buildDkvd(t), addrs: map[string]string{}, kvAddrs: map[string]string{}, dirs: map[string]string{},

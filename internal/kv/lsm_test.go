@@ -529,3 +529,65 @@ func TestLSMMachineRefusesAForeignSessionRecord(t *testing.T) {
 		t.Fatalf("the engine directory: %v", err)
 	}
 }
+
+// TestLSMMachineStagedWritesAreVisibleBeforeTheyAreRecorded: a read released
+// by its barrier in the middle of a cycle must see the entry it waited for,
+// so a staged put is read before EndCycle records it, a staged delete hides
+// what the engine still holds, and Contents agrees with Lookup throughout.
+func TestLSMMachineStagedWritesAreVisibleBeforeTheyAreRecorded(t *testing.T) {
+	p := newPair(t, Limits{MaxSessions: 4, MaxUnacked: 4}, nil)
+	p.cycle(anonPut("a", "1"), anonPut("b", "2"))
+	for i, cmd := range [][]byte{anonPut("a", "staged"), anonDel("b"), anonPut("c", "new")} {
+		if _, err := p.lsm.ApplyEntry(p.next+uint64(i), 1, cmd); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if v, ok, err := p.lsm.Lookup([]byte("a")); err != nil || !ok || string(v) != "staged" {
+		t.Fatalf("a staged put reads %q, %v, %v before EndCycle", v, ok, err)
+	}
+	if _, ok, err := p.lsm.Lookup([]byte("b")); err != nil || ok {
+		t.Fatalf("a staged delete still reads the engine's value (%v, %v)", ok, err)
+	}
+	if v, ok, _ := p.lsm.Lookup([]byte("c")); !ok || string(v) != "new" {
+		t.Fatalf("a staged new key reads %q, %v", v, ok)
+	}
+	if c, err := p.lsm.Contents(); err != nil || string(c["a"]) != "staged" || c["b"] != nil || string(c["c"]) != "new" {
+		t.Fatalf("Contents mid-cycle: %v, %v", c, err)
+	}
+	if e := p.lsm.EngineApplied(); e.Index != 2 {
+		t.Fatalf("the engine moved to %+v before EndCycle", e)
+	}
+	if err := p.lsm.EndCycle(); err != nil {
+		t.Fatal(err)
+	}
+	p.next += 3
+	for _, cmd := range [][]byte{anonPut("a", "staged"), anonDel("b"), anonPut("c", "new")} {
+		p.log = append(p.log, entry{index: uint64(len(p.log) + 1), term: 1, cmd: cmd})
+		_, _ = p.mem.ApplyResult(uint64(len(p.log)), cmd)
+	}
+	p.same("after the cycle was recorded")
+	p.reopen()
+}
+
+// TestLSMMachineARestoreBelowItsEngineChangesNothing: a published snapshot
+// older than the engine's state — the engine recovered more than the last
+// snapshot covers — must not replace the newer state with the older one.
+func TestLSMMachineARestoreBelowItsEngineChangesNothing(t *testing.T) {
+	p := newPair(t, Limits{MaxSessions: 4, MaxUnacked: 4}, nil)
+	p.cycle(register(), idPut(1, 1, 1, "a", "1"))
+	idx, data, err := p.mem.EncodeSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.cycle(idPut(1, 2, 1, "a", "2"), anonPut("b", "3"))
+	for _, when := range []string{"live", "reopened"} {
+		if err := p.lsm.RestoreSnapshot(idx, 1, data); err != nil {
+			t.Fatal(err)
+		}
+		p.same("after a restore below the engine, " + when)
+		if e := p.lsm.EngineApplied(); e.Index != 4 {
+			t.Fatalf("%s: the engine regressed to %+v", when, e)
+		}
+		p.reopen()
+	}
+}

@@ -688,11 +688,12 @@ type CycleStateMachine interface {
 }
 ```
 
-`ApplyEntry` decides the command against the in-memory session mirror, stages its mutations, and
-returns the decision — the decision is final: it depends only on the command and the state the
-earlier entries left, including earlier entries of the same cycle. `EndCycle` calls
-`LSMStore.Apply(staged, {index, term of the last entry})`, then publishes the staged session
-changes to the mirror. `ApplyCommitted` calls it once after the loop when it applied at least one
+`ApplyEntry` decides the command against the in-memory session mirror — which it updates at once,
+because a later entry of the same cycle may depend on the decision — stages the command's write
+and notes the sessions the decision changed, and returns the decision. `EndCycle` calls
+`LSMStore.Apply(staged writes + the noted sessions' records + the evicted sessions' deletions,
+{index, term of the last entry})`. The mirror is ahead of the engine between the two; a failed
+`EndCycle` leaves it so, and the node fail-stops, so the mirror never outlives the engine's state. `ApplyCommitted` calls it once after the loop when it applied at least one
 entry, and reports its error as `ErrApply`. The in-memory `kv.Store` and the simulator's machines
 do not implement it and are unchanged.
 

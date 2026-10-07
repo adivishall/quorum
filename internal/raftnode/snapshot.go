@@ -257,12 +257,14 @@ func (d *Durable) Snapshot(core *raft.Raft, at Hook) error {
 	}
 	switch {
 	case idx > core.AppliedIndex():
-		// A machine whose durable state recovered more than the core has
-		// replayed yet (S2, docs/STORAGE_INTEGRATION.md §8.6): the core is
-		// catching up through entries the machine already holds and skips.
-		// A snapshot at the machine's index would compact a log the core
-		// still reads; none is taken until they agree, which the catch-up
-		// makes true within a few cycles.
+		// A machine whose durable state holds more than the core has applied
+		// (S2, docs/STORAGE_INTEGRATION.md §8.6): after a restart the core
+		// catches up through entries the machine already holds and skips. In
+		// practice the first cycle applies the whole committed backlog, and
+		// the engine never holds past the durable commit (INV-CR3), so by the
+		// time a trigger fires they agree; this guard keeps a snapshot from
+		// ever being taken at an index the core has not reached, which would
+		// compact a log the core still reads. None is taken until they agree.
 		return nil
 	case idx < core.AppliedIndex():
 		return fmt.Errorf("%w: the state machine is at %d, the core applied %d", ErrSnapshot, idx, core.AppliedIndex())
