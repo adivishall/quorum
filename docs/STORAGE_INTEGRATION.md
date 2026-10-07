@@ -588,3 +588,180 @@ What the numbers say, and no more:
 Every existing linearizability, dedup, snapshot, membership and chaos tier must pass on both
 state machines.
 
+## 8. S2 — the engine behind the replicated state machine
+
+Status: **design, audited against the code at `5f8ca4b` before any change.** S2 composes S1's
+engine with the real system and proves the composition keeps every externally observable
+semantic. It does not start S3: no WAL truncation, no MANIFEST applied index, no engine-backed
+snapshot format, no optimization.
+
+### 8.1 The path today, traced
+
+One client mutation, from the code:
+1. `kv.Front` decodes the request; `Server.handle` → `execute` → `Node.Write(ctx, cmd.Encode())`.
+2. The actor: `core.Propose`; the entry is the log's tail at (index, term); `waiters.Add(index, term)`.
+3. `processReady`: `DrainReadyAt` saves the Ready (fsync), sends it, advances. Followers persist
+   and acknowledge; the commit index moves; the next Ready persists it (INV-CR3).
+4. `ApplyCommitted`: for each committed, unapplied entry, `Store.ApplyResult(index, cmd)` decides
+   it against the in-memory map and session table, then `core.AppliedTo(index)`; the actor collects
+   `(index, term, result)`.
+5. The cycle ends: `snapshotStatus`, then `completeApplied` fires every waiter. `Write` returns the
+   decision; `execute` turns it into the response. The reply exists only after this point.
+
+What the pieces assume:
+- `raftnode` knows a `replication.StateMachine` (`Apply(index, cmd) error`), optionally a
+  `ResultStateMachine` (`ApplyResult`) and a `SnapshotStateMachine` (`EncodeSnapshot`,
+  `ValidateSnapshot`, `RestoreSnapshot(index, data)`). It never passes an entry's **term** to the
+  state machine, and it has no notion of a cycle boundary: entries are applied one at a time.
+- `multiraft.Host` makes a group's machine through `Config.NewStateMachine(g)` and hands it to
+  `OnGroup`. It **never closes it**: stop and retire call `Node.Close` only.
+- `kv.Front.Attach`, `kv.NewServer`, `Server.Store()` and `kv.Metrics.Observe` take the concrete
+  `*kv.Store`; `dkvd` asserts `sm.(*kv.Store)`. Tests reach the store through `Server.Store()` for
+  `Get`, `Snapshot` and `Stats`.
+- `Recover` restores the published snapshot into the machine **unconditionally**, sets the applied
+  index to the snapshot's, and the actor then re-applies every committed entry above it: replay is
+  at-least-once per incarnation (INV-CR4), which is correct only because the machine starts from the
+  snapshot, or from nothing.
+- The simulator (`internal/raftsim`) drives `kv.Store` through the same `ApplyCommitted`.
+
+### 8.2 The composition contract
+
+| Question | Answer |
+|---|---|
+| What is one apply cycle? | One `ApplyCommitted` call: the entries `core.NextApply()` returns in one `processReady`, applied in index order. |
+| Which mutations belong to one cycle? | Every effect of every entry in that cycle: the user puts and deletes the executed commands produced, and every session-table change any command caused (a session registered, evicted, marked used, its watermark raised, a result recorded). |
+| When may the reply become visible? | Only after the cycle's batch has been recorded by `LSMStore.Apply` (the WAL record is written; fsynced as the engine's sync mode says). `completeApplied` runs after the batch, as it already runs after the applications. A cycle whose batch fails completes **no** waiter. |
+| Where is session state? | In the engine, under the session tag (§8.3), as one record per session; and mirrored in memory, loaded from the engine at open, because decisions read it on every identified command. The engine's copy is the durable one. |
+| What is persisted atomically with a user mutation? | The session-record rewrite the same command caused, every other mutation of the cycle, and the applied index of the cycle's last entry: one `Apply`, one WAL record. |
+| A duplicate request? | No user mutation. The session record is still rewritten: a duplicate marks the session used at this index and may raise its watermark, exactly as `kv.Store.decide` does today. The result is `Duplicate` with the original index. |
+| A Raft no-op or configuration entry? | Zero mutations; the batch still advances the applied index. S1 allows an empty batch for exactly this. |
+| A committed operation whose reply is lost? | Unchanged: the client retries under the same request id; the session record, recovered with the data it was written with (R1), answers `Duplicate`. |
+| The Raft log index and the engine's applied index? | The engine's applied index is the log index of the last entry whose effects the engine holds, with that entry's term. It never exceeds the core's commit index (INV-CR3 makes the commit durable before apply). |
+| Who owns session semantics? | `internal/kv`. One decision function, shared by both machines, decides every command from the command and the session table; the engine never interprets a command. |
+| Who owns storage atomicity? | The engine: `Apply` is the only write path the LSM machine uses. Never `Put` then `SetAppliedIndex`. |
+| `Apply` returns an error? | The cycle fails as a state-machine failure (`ErrApply`): the node fail-stops, as it does today for a deterministic apply error (D6). Its waiters, including this cycle's, fail with the error, and every client of them sees UNKNOWN. The engine's own latch refuses further writes. |
+| May the machine continue after an apply failure? | No. The in-memory mirror has advanced past what the engine holds; the only consistent state is the engine's, read back by a restart. |
+
+No second authoritative copy of the applied index: the engine's is the durable one. The core's is
+this incarnation's bookkeeping, and the published snapshot's index is the fallback used only when
+the engine is behind it (§8.6).
+
+### 8.3 The reserved keyspace
+
+Every key the LSM machine writes to the engine carries a one-byte tag:
+
+| Tag | Key | Value |
+|---|---|---|
+| `0x01` | the user key, as the client sent it | the value |
+| `0x02` | the session id, 8 bytes big-endian | the session record |
+
+A user key cannot collide with a session record because every user key is stored under `0x01`,
+whatever its bytes. No user key is forbidden: INV-A5 ("any byte sequence is a valid key") is
+untouched, and the engine is opened with `MaxKeySize` one byte above `kv.MaxKeyLen`. The tags are
+the engine-side namespace; nothing above the machine sees them.
+
+The session record is exactly the session table's entry for one session, the same fields the
+snapshot format carries:
+
+```
+version    u8      = 1
+last       u64     the log index of the session's last command
+ackedBelow u64
+n          uvarint
+n × { requestID u64 | index u64 | fingerprint 32 bytes }   requestIDs strictly ascending
+```
+
+Decoding is strict: an unknown version, a watermark of 0, a count the bytes cannot hold, a
+non-ascending request id, a result below the watermark, or a trailing byte is
+`ErrSessionRecord`, and the machine refuses to open on it — a malformed record means the engine's
+content is not what this machine wrote, and guessing would make replicas diverge.
+
+### 8.4 One batch per cycle
+
+`raftnode` gains one optional interface, and `ApplyCommitted` uses it when the machine has it:
+
+```go
+type CycleStateMachine interface {
+    StateMachine
+    ApplyEntry(index, term uint64, command []byte) (any, error) // decide and stage
+    EndCycle() error                                            // record the cycle's effects as one unit
+}
+```
+
+`ApplyEntry` decides the command against the in-memory session mirror, stages its mutations, and
+returns the decision — the decision is final: it depends only on the command and the state the
+earlier entries left, including earlier entries of the same cycle. `EndCycle` calls
+`LSMStore.Apply(staged, {index, term of the last entry})`, then publishes the staged session
+changes to the mirror. `ApplyCommitted` calls it once after the loop when it applied at least one
+entry, and reports its error as `ErrApply`. The in-memory `kv.Store` and the simulator's machines
+do not implement it and are unchanged.
+
+A cycle's mutations exceed one WAL record only if a cycle applies tens of MiB of entries (a
+follower catching up). `EndCycle` then splits at entry boundaries, each piece recorded at its last
+entry's index — each piece is a true state — and the reply rule holds because `completeApplied`
+runs after `EndCycle` returns.
+
+The entry's term reaches the machine through `ApplyEntry`, and `RestoreSnapshot` gains the
+snapshot's term: `RestoreSnapshot(index, term, data)`. That is the one change to an existing
+interface, and the smallest that lets the engine record a true term for a restored state. The
+in-memory store ignores it.
+
+### 8.5 The machine abstraction
+
+`kv.Machine` is what the front, the server, the metrics and the tests need of a state machine:
+`Get`, `Applied`, `Sessions`, `Snapshot`, `Stats`, and the observe hooks. `*kv.Store` implements it
+unchanged; `*kv.LSMMachine` implements it over an `LSMStore`. `Front.Attach`, `NewServer`,
+`Server.Store()` and `Metrics.Observe` take a `Machine`. `dkvd -state-machine memory|lsm` chooses
+the constructor in `NewStateMachine`; nothing in `raftnode`, `multiraft` or `kv`'s server branches
+on the kind. `multiraft.Host` closes a machine that implements `io.Closer` after it closes the
+group's node.
+
+A data directory that holds an engine refuses to start as `memory` (exit 2, the reason named).
+Starting an existing `memory` directory as `lsm` is allowed: the engine is empty, its applied index
+0, and it is built from the published snapshot and the log like any new replica.
+
+### 8.6 Restart and replay
+
+At open the LSM machine loads its session mirror from the engine's session records and reads the
+engine's applied index `e`. Then, in `Recover`:
+- a published snapshot at index `i` is validated as today; if `e >= i`, the machine's state is at
+  least as new and `RestoreSnapshot` changes nothing; if `e < i`, the engine is replaced by the
+  snapshot's state (§8.7);
+- the core's applied index is set to `i` as today, and the actor re-applies the log above it.
+  `ApplyEntry` **skips** an entry whose index is at or below the engine's applied index: its effects
+  are already in the engine, and re-applying them would reset a session or turn a request into a
+  duplicate of itself (§3.2). It returns no result; no waiter of this incarnation exists for it.
+
+So after any crash the machine is exactly the engine's state at `e` plus the committed entries
+above `e`, applied once each. This is what R1 was built for. It is still **not** R2 and not
+exactly-once across every compaction scenario: the Raft log is compacted on the snapshot schedule,
+not on the engine's durable index, so an engine behind the last snapshot is restored from the
+snapshot rather than replayed. That is correct — the snapshot is a true state above `e` — and it is
+why S2 needs no R2 yet.
+
+### 8.7 The snapshot boundary
+
+`EncodeSnapshot` produces today's format from the engine: every user key (via the engine's
+whole-state iteration, sorted), the session mirror, and the applied index. It reads every table,
+as the in-memory store already holds every key; S4 replaces this with a checkpoint.
+
+`RestoreSnapshot(index, term, data)` validates the state as today, then replaces the engine: close
+it, remove its directory, open it fresh, and record the whole state — user keys, session records
+— in **one** `Apply` at `(index, term)`. The replacement is atomic under R1: either the batch is
+recovered whole, or the engine is empty with applied index 0, below the published snapshot, and the
+next open restores it again. A snapshot whose state does not fit one WAL record (64 MiB) is refused
+by `ValidateSnapshot`, so the core never installs it; today's bound is 512 MiB, and this is an S2
+limitation lifted by S4's ingest.
+
+The existing snapshot tests run against the LSM machine through the same interface; nothing in
+`raftnode`'s snapshot machinery changes beyond the term parameter.
+
+### 8.8 What is deliberately deferred
+
+- WAL truncation, the MANIFEST as the authority for the applied index and sequence (S3).
+- R2: compaction gated by the engine's durable index (S3).
+- Snapshots as checkpoints; ingest; the 512 MiB bound back (S4).
+- The two-log measurement (S5) and every optimization (S6).
+- Reader isolation across a batch: a `Get` during a batch's publication may see part of it; single-key
+  reads over an index-ordered publication stay linearizable (§7.2).
+
