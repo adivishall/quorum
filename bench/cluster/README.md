@@ -17,6 +17,8 @@ Each file is one `dkvlab` invocation, written with `-out`. It records:
 | `rolling-restart.json`, `membership.json` | `bin/dkvlab -scenario rolling-restart -nodes 3 -runs 3 -rate 50` (and `membership`) | `f1b6e8f` |
 | `rolling-restart-attempts.json` | `bin/dkvlab -scenario rolling-restart -nodes 3 -runs 3 -rate 50 -read 50 -trace -max-attempts 8,30` — the unknown outcomes' attempt traces (`docs/CLUSTER_BENCHMARKS.md` §11) | `3b5654a` |
 | `chaos-seeds-1-10.json` | `bin/dkvlab -scenario chaos -seed 1 -runs 10` — ten chaos runs, every fault kind (`docs/CHAOS.md` §7); the per-run status samples are dropped to keep the file small, everything else is as written | `00a136b` |
+| `steady-memory.json`, `steady-lsm.json` | `bin/dkvlab -scenario steady -nodes 3 -clients 4 -read 50 -runs 3`, without and with `-state-machine lsm` — the cost of running each group's state machine in the storage engine (`docs/STORAGE_INTEGRATION.md` §8.13) | `7597923` |
+| `chaos-lsm-seeds-1-3.json` | `bin/dkvlab -scenario chaos -seed 1 -runs 3 -state-machine lsm` — three chaos runs on the LSM state machine, every node's log naming it (`docs/STORAGE_INTEGRATION.md` §8.11); status samples dropped as above | `7597923` |
 
 The `dkvd` source is identical at the four commits; they differ only in `internal/lab`. Any configuration not named here is the default: 16 clients, 20 s window, 3 s warmup, 50% reads, 10,000 keys, 100-byte values, seed 1, tick 50 ms.
 

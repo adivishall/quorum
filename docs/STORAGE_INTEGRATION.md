@@ -1,6 +1,6 @@
 # STORAGE INTEGRATION — the LSM engine as the replicated state machine
 
-Status: **S1 is implemented (§7); S2–S6 are design.** The design was audited against the code at
+Status: **S1 and S2 are implemented (§7, §8); S3–S6 are design.** The design was audited against the code at
 PR #10's head (`a8eb9e1`, 2026-10-07), and S1's audit against `main` after it. This document fixes
 who owns each invariant, so that no code moves before that is clear. `docs/ENGINEERING_ROADMAP.md`
 §0 states the project's thesis, and this is its layer-2 plan.
@@ -206,7 +206,7 @@ leaves `main` green.
 | # | Milestone | Touches | Exit criterion |
 |---|---|---|---|
 | **S1** ✓ | **Atomic apply batches in the engine** (§7) | `internal/storage`, its WAL on `internal/vfs` | **R1**'s storage half proven in isolation by a deterministic crash and power-loss matrix — done, §7.9–§7.11 |
-| S2 | The engine behind the state-machine interface, with sessions under a reserved prefix; `dkvd -state-machine=memory\|lsm` | `internal/kv`, `cmd/dkvd` | every existing linearizability, dedup, snapshot, membership and chaos tier passes on both state machines; recovery still replays from the snapshot (engine state discarded at start) |
+| **S2** ✓ | **The engine behind the state-machine interface** (§8), sessions under a reserved tag; `dkvd -state-machine memory\|lsm` | `internal/kv`, `raftnode` (a cycle hook, the term on restore), `multiraft`, `cmd/dkvd` | every existing linearizability, dedup, snapshot, membership and chaos tier passes on both machines; the engine's applied index is the durable authority at restart — done, §8.9–§8.12 |
 | S3 | Recovery from the engine's applied index (exactly-once across restarts); log compaction gated by **R2**; the engine's WAL truncated, with its applied index and last sequence made authoritative in the MANIFEST first (§7.1, §7.4) | `raftnode`, `kv`, `storage` | the hosted crash matrix (§3.2, and `docs/ENGINEERING_ROADMAP.md` §3 item 4) and a replaced INV-CR4 |
 | S4 | Snapshots as checkpoints, streamed, installed by ingest | `storage`, `snapshot`, `raftnode` | the snapshot crash matrix on the hosted engine |
 | S5 | The two-log decision: A, B and C measured | `storage`, `dkvlab` | a published comparison against the baseline, and the chosen option |
@@ -590,10 +590,11 @@ state machines.
 
 ## 8. S2 — the engine behind the replicated state machine
 
-Status: **design, audited against the code at `5f8ca4b` before any change.** S2 composes S1's
-engine with the real system and proves the composition keeps every externally observable
-semantic. It does not start S3: no WAL truncation, no MANIFEST applied index, no engine-backed
-snapshot format, no optimization.
+Status: **implemented.** The design (§8.1–§8.8) was audited against the code at `5f8ca4b` before
+any change; §8.9–§8.12 record what was built, what it is tested against, and what it proves. S2
+composes S1's engine with the real system and proves the composition keeps every externally
+observable semantic. It does not start S3: no WAL truncation, no MANIFEST applied index, no
+engine-backed snapshot format, no optimization.
 
 ### 8.1 The path today, traced
 
@@ -766,3 +767,167 @@ The existing snapshot tests run against the LSM machine through the same interfa
 - Reader isolation across a batch: a `Get` during a batch's publication may see part of it; single-key
   reads over an index-ordered publication stay linearizable (§7.2).
 
+### 8.9 What was built, and what building it found
+
+**Built:**
+- `kv.Machine`: what the front, the server, the metrics and the tests need of a state machine.
+  `*kv.Store` and `*kv.LSMMachine` implement it; nothing above a machine knows which it has.
+  `Lookup` and `Contents` carry an error, so an engine that cannot read never answers "absent".
+- `kv.sessionTable`: the session table and its decision function, one type both machines hold.
+- `kv.LSMMachine` (`internal/kv/lsm.go`): `ApplyEntry` decides and stages, `EndCycle` records one
+  apply batch per cycle; the reserved keyspace and the session record (`namespace.go`); the skip
+  rule, the restore rules and the 64 MiB restore bound; `Close`.
+- `raftnode.CycleStateMachine`, used by `ApplyCommitted`; a failed cycle completes no waiter;
+  `RestoreSnapshot` carries the term; `Durable.Snapshot` never snapshots past the core.
+- `multiraft.Config.NewStateMachine` can fail, and the host closes a machine that is an
+  `io.Closer` after its node — on `Stop`, on `Close`, and when a start fails.
+- `dkvd -state-machine memory|lsm`; a directory holding an engine refuses to start as memory;
+  `dkvlab -state-machine`; `QUORUM_STATE_MACHINE=lsm` runs the kv package's and the integration
+  suite's every test on the LSM machine.
+
+**What building it found:**
+1. **Decision counters are not replicated state**, and two tests used them as if they were. The
+   snapshot format omits them; the in-memory store has them after a restart only because it
+   replays the log. `TestRetryAtEveryCrashPointOfAWrite` proved "executed exactly once anywhere"
+   by every replica's counters, and said restarted replicas "rebuilt theirs by replaying the log".
+   A durable machine recovers its state and skips those entries, so its counters cover what it
+   applied since. The test now takes the count from the replicas that never restarted and
+   requires the restarted one to hold the same contents and session table — stronger than a
+   counter. The differential harness compares counters only within one incarnation.
+2. **A read released by its barrier mid-cycle** would have read the engine before the cycle's
+   batch was written: the core's applied index moves per entry, inside the cycle, and a read
+   whose index it has passed is released at once. So a cycle's staged writes are visible to
+   `Lookup` before they are recorded, under the staging mutex (§8.4, `TestLSMMachineStagedWrites
+   AreVisibleBeforeTheyAreRecorded`, mutant 332). Publication is in index order, so a single-key
+   read sees a prefix-closed state.
+3. **The engine's batch can fail inside a cycle** after the core has applied the entries and the
+   mirror has advanced. The node fail-stops, as for any apply failure, and — new — completes none
+   of the cycle's waiters: a client is told nothing definite for a state the engine did not
+   record (`TestLSMEngineFailureFailsStopsTheNode`, mutant 337). The write is committed in Raft
+   and comes back from the log at the node's restart, once.
+4. **Nothing in the engine changed.** S1's `Apply` carried the composition as designed.
+
+### 8.10 Tests and fault coverage
+
+| Test | What it establishes |
+|---|---|
+| `TestLSMMachineMatchesTheStoreOnAScript`, `…OnSeededScripts` | The executable reference: the same entries through both machines leave the same contents, every key's `Lookup`, the session table, the applied index and (within an incarnation) the counters, after every cycle and across reopens. The script reaches every decision; the seeded scripts mix retries, conflicts, watermarks, anonymous writes, no-ops, evictions and reopens. Each cycle's batch is also sized from the outside: one sequence per executed write, per session changed and per session evicted. |
+| `TestLSMMachineSkipsWhatItsEngineHolds` | Replaying the recovered prefix changes nothing; the next entry is applied; a retry is a duplicate of the original. |
+| `TestLSMMachineRecoversAPrefixAfterAPowerLoss` | R1 through the machine: after a process crash every recorded cycle is back; after a modeled power loss exactly the fsynced prefix is, contents, sessions and index together; a second restart reads the same; the log replays the rest once. |
+| `TestLSMMachineAFailedCyclePublishesNothingDurable` | A failed batch records nothing, latches, and a reopen shows the state before it. |
+| `TestLSMMachineRestoresASnapshot`, `…ARestoreBelowItsEngineChangesNothing` | Restore replaces the engine as one batch at (index, term); a restore whose batch failed leaves an empty engine the next restore replaces; at or below the engine's index nothing changes; the machine's own snapshot is the store's, byte for byte; a state too large for one batch is refused before the core could install it. |
+| `TestLSMMachineStagedWritesAreVisibleBeforeTheyAreRecorded` | §8.9 (2). |
+| `TestLSMMachineRefusesAForeignSessionRecord`, the `namespace_test` tests | A record the machine did not write refuses the open; user keys never collide with records; the record codec is canonical and strict. |
+| `TestLSMEngineFailureFailsStopsTheNode` | §8.9 (3), in a real three-node group with the engine's WAL under fault injection. |
+| `TestStopAndCloseCloseTheMachine` | The host closes a machine once, after its node. |
+| `TestRealStateMachineKindIsAnOperatorsChoice` | Real processes: memory → lsm bootstraps from the snapshot and the log and catches up into the engine; lsm → memory is refused before Raft starts; back on lsm the node recovers and rejoins. |
+| The kv package under `QUORUM_STATE_MACHINE=lsm` | Every in-process test — linearizability, sessions and deduplication, retries at every crash point, snapshots, entry limits, forwarding — on the LSM machine, under the race detector. |
+| The integration suite under `QUORUM_STATE_MACHINE=lsm` | Every real-process test — crash windows, session retries across crashes, snapshots, membership, chaos, dkvctl — on the LSM machine. |
+| Mutants 329–342 | One per way the composition can break (§8.9 and `scripts/mutation.sh`), each killed by the test named for it. |
+
+Fault coverage: the engine's WAL write fails inside a cycle (in-process group); a process crash and
+a modeled power loss under the machine (`fault.MemFS`); every crash point of the driver with a
+session retrying (`TestRetryAtEveryCrashPointOfAWrite` on the LSM machine); and, on real
+processes, every integration fault the suite already injects.
+
+### 8.11 Real-cluster evidence
+
+Real `dkvd` processes on loopback TCP, started by the lab with `-state-machine lsm`, under the
+seeded chaos campaign (`docs/CHAOS.md`): clients write, read and delete through the session client
+— identified requests, retried under the same identity — while the schedule kills, stops, crashes
+at a driver point, pauses, isolates and cuts nodes, takes snapshots and adds a member; every
+client-visible operation is checked for linearizability afterwards, and the group must converge.
+
+`dkvlab -scenario chaos -seed 1 -runs 3 -state-machine lsm` at `7597923` (Apple M4, macOS; raw
+results in `bench/cluster/chaos-lsm-seeds-1-3.json`, status samples stripped):
+
+| Seed | Faults injected | Leader changes | Operations (kept Incomplete) | Linearizable | Converged |
+|---|---|---|---|---|---|
+| 1 | 7: add-member, stop, snapshot, stop, crash, crash, pause | 3 | 1804 (0) | yes | yes |
+| 2 | 7: crash, crash, isolate, kill, cut, add-member, isolate | 4 | 1645 (4) | yes | yes |
+| 3 | 6: stop, cut, add-member, crash, crash, stop | 1 | 2179 (4) | yes | yes |
+
+What identifies the machine: the run's configuration records `state_machine: lsm`, and every
+node's log carries `event=state_machine node=… group=0 kind=lsm dir=…/lsm` when its group's
+machine is made — once per process, so a node that was crashed and restarted logs it twice. The
+same campaign on the in-memory machine is `bench/cluster/chaos-seeds-1-10.json`.
+
+What the runs show on the production path, on the engine:
+- leader election and leader replacement (the leader killed, crashed at `after-save`, isolated);
+- writes and reads served through forwarding and redirection;
+- follower replication, a follower stopped and restarted, a node brought back by a snapshot;
+- a member added (`add-member`: learner, caught up, promoted);
+- client retries answered by deduplication: unknown outcomes stay Incomplete, and the histories
+  are linearizable with every identified request applied once;
+- applied indexes coherent: convergence requires every member to have applied the leader's commit
+  index, and a restarted node's engine resumes from its own applied index.
+
+The whole real-process suite on the engine (`make integration-lsm`) passed locally at `7597923`:
+89 tests in 402 s under the race detector, every `dkvd` race-built, no process left behind. CI runs
+it on every change (`integration-lsm`).
+
+### 8.12 What S2 proves, and what it does not
+
+**S2 proves:**
+- **The composition keeps the contract.** Every existing linearizability, deduplication, retry,
+  snapshot, membership and chaos test passes against the LSM machine unchanged, except the one
+  test that measured replicated state by counters (§8.9).
+- **One apply batch per cycle holds everything the cycle changed** — the user writes, the
+  session records, the applied index and term — and nothing else (the batch is sized from the
+  outside in every differential cycle). **R1 holds through the machine:** after a process crash
+  or a modeled power loss the machine recovers a prefix of cycles, contents, sessions and index
+  together.
+- **A durable machine restarts correctly inside Raft:** the entries its engine holds are skipped,
+  the rest replayed once, a snapshot below its state leaves it alone, a snapshot above it replaces
+  it atomically; a retry after any of that is a duplicate of the original execution.
+- **A reply never precedes the batch**, and a failed batch never acknowledges: the node fail-stops
+  and its clients learn nothing definite.
+- **The two machines decide identically**, from one decision function, on scripted and seeded
+  histories.
+
+**S2 does not prove:**
+- **R2.** The Raft log is still compacted on the snapshot schedule, not on the engine's durable
+  index. An engine behind the last snapshot is restored from the snapshot — correct, but a
+  restore of the whole state, not a replay. Compaction gated by the engine's durable index is S3.
+- **Exactly-once replay durability across every log-compaction scenario.** What is proven is
+  exactly-once across the restarts the tests perform: a restart with the entries still in the
+  log, and a restart from a snapshot above the engine.
+- **Durability of the engine's own state on a real device.** Power loss is the software model;
+  the Raft log, fsynced, is what makes a committed write durable (§3.3).
+- **Anything about the WAL growing**, the sequence or the applied index after truncation, or the
+  MANIFEST as an authority: S3.
+- **Snapshots larger than one WAL record** (64 MiB) on the LSM machine, and snapshots as
+  checkpoints rather than a whole-state batch: S4.
+- **Reader isolation across a batch,** and the cost of composition beyond what §8.13 measures.
+- **The engine's SSTable and MANIFEST code under a power loss** inside the machine: the machine's
+  crash tests put the WAL on the model, as S1 did.
+
+### 8.13 The cost of composition
+
+`dkvlab -scenario steady -nodes 3 -clients 4 -read 50 -runs 3`, with and without
+`-state-machine lsm`, at `7597923` (Apple M4, macOS, one disk; medians of three 20 s runs; raw
+results in `bench/cluster/steady-memory.json` and `bench/cluster/steady-lsm.json`):
+
+| | memory | lsm |
+|---|---|---|
+| ok/s (median) | 124.5 | 101.6 |
+| operations per 20 s run | 2,489 | 2,031 |
+| success rate | 100% | 100% |
+| GET p50 / p95 / p99 (ms) | 22.2 / 44.1 / 55.0 | 26.9 / 53.5 / 68.2 |
+| PUT p50 / p95 / p99 (ms) | 40.2 / 64.9 / 74.9 | 46.2 / 79.0 / 94.4 |
+| every-outcome p99 (ms) | 72.0 | 88.0 |
+| unknown / refused outcomes | 0 / 0 | 0 / 0 |
+| node CPU per second, max RSS | 0.060, 20.2 MiB | 0.060, 20.4 MiB |
+| Raft-log persists per node per run | 6,820 | 6,617 |
+
+A second run of the same configuration, on the same machine with uncommitted changes in the
+tree, measured 121.7 against 109.0 ok/s: the composition costs **ten to twenty percent** of
+throughput here, with run-to-run variance of that order, and ten to twenty-five percent on the
+tail latencies.
+
+Nothing was optimized, and no concurrency was added to flatter the numbers. The load is
+fsync-bound (`docs/CLUSTER_BENCHMARKS.md` §6.1: one Raft-log fsync per write, two at the leader),
+and the engine's WAL runs in its default batch mode, so the engine adds a write per cycle and no
+fsync per write. The cost that shows is the engine's write path per entry — the record, the
+memtable, the session record rewrite — on the actor goroutine. The replicated apply path is what
+S6 measures and optimizes; the figures here are the before.
