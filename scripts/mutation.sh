@@ -2751,7 +2751,7 @@ mutant "replay-numbers-apply-batches-as-apply-did" internal/storage/lsmstore.go 
 #      the directory and every synced segment in it.
 mutant "wal-directory-is-durable" internal/storage/wal/wal.go \
   '		if err := fsys.SyncDir(filepath.Dir(filepath.Clean(dir))); err != nil {' \
-  '		if err := error(nil); err != nil {' \
+  '		if _, err := filepath.Dir(filepath.Clean(dir)), error(nil); err != nil {' \
   "./internal/storage ./internal/storage/wal" '^(TestANewWALDirectoryIsDurable|TestApplyCrashMatrix)$'
 
 # 323. S1 gap (b): recovery does not fsync the newest segment — what it replays, and
