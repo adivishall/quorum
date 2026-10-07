@@ -57,7 +57,7 @@ func NewFront(id string, route func(key []byte) replication.GroupID) *Front {
 
 // Attach serves group g through node (a member of g) and its store; it
 // replaces any earlier Server of g. It returns the group's Server.
-func (f *Front) Attach(g replication.GroupID, node *raftnode.Node, store *Store) *Server {
+func (f *Front) Attach(g replication.GroupID, node *raftnode.Node, store Machine) *Server {
 	srv := NewServer(f.id, node, store)
 	f.mu.Lock()
 	srv.SetForwarding(!f.noForward)

@@ -35,6 +35,13 @@ type Store struct {
 	observeEvicted func()
 }
 
+// setObserve installs the decision counters (Machine).
+func (s *Store) setObserve(observe func(Decision), evicted func()) {
+	s.mu.Lock()
+	s.observe, s.observeEvicted = observe, evicted
+	s.mu.Unlock()
+}
+
 // Limits bound the session table (docs/CLIENT_SEMANTICS.md §8). They are part
 // of the state machine's definition: every replica of a group MUST use the same
 // limits, or their decisions — and so their states — would diverge.

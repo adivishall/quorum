@@ -504,7 +504,7 @@ func runRaft(ctx context.Context, r raftRun) int {
 				front.Detach(g)
 				return
 			}
-			front.Attach(g, node, sm.(*kv.Store))
+			front.Attach(g, node, sm.(kv.Machine))
 		},
 		TickInterval: r.tick, FS: r.fs, Hook: r.hook, // durable by default (DisableSync left false)
 		SnapshotEvery: r.snapshotEvery, SnapshotRetain: r.snapshotRetain,

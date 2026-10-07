@@ -88,8 +88,9 @@ func appendBytes(b, p []byte) []byte {
 // ordering, the limits it was built under (they must be this store's: they
 // change decisions), and every relation the session table's construction
 // guarantees — and the store is unchanged if any fails. The decision counters
-// restart at zero.
-func (s *Store) RestoreSnapshot(index uint64, data []byte) error {
+// restart at zero. The snapshot's term is not part of the state: the in-memory
+// store ignores it, and the LSM machine records it beside the index (S2).
+func (s *Store) RestoreSnapshot(index, _ uint64, data []byte) error {
 	st, err := s.checkSnapshot(index, data)
 	if err != nil {
 		return err

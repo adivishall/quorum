@@ -89,7 +89,7 @@ func startMulti(t testing.TB, shards int, metered bool) *multiCluster {
 					front.Detach(g)
 					return
 				}
-				front.Attach(g, node, sm.(*kv.Store))
+				front.Attach(g, node, sm.(kv.Machine))
 			},
 			TickInterval: 15 * time.Millisecond, DisableSync: true, Metrics: c.regs[id],
 		})

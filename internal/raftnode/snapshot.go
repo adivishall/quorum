@@ -36,8 +36,10 @@ type SnapshotStateMachine interface {
 	EncodeSnapshot() (index uint64, data []byte, err error)
 	// ValidateSnapshot reports whether RestoreSnapshot would accept the state.
 	ValidateSnapshot(index uint64, data []byte) error
-	// RestoreSnapshot replaces the whole state, or changes nothing on error.
-	RestoreSnapshot(index uint64, data []byte) error
+	// RestoreSnapshot replaces the whole state with the snapshot's, taken at
+	// (index, term), or changes nothing on error. The in-memory store has no
+	// use for the term; a durable engine records it beside the index (S2).
+	RestoreSnapshot(index, term uint64, data []byte) error
 }
 
 // LogStore is the durable Raft log as the driver uses it: *raftlog.Log, or the
@@ -204,7 +206,7 @@ func (d *Durable) InstallSnapshot(meta raft.SnapshotMeta, hs *raftlog.HardState,
 	if err := at.hit(AfterInstallBoundary, meta.Index); err != nil {
 		return err
 	}
-	if err := s.SM.RestoreSnapshot(meta.Index, st.Data); err != nil {
+	if err := s.SM.RestoreSnapshot(meta.Index, meta.Term, st.Data); err != nil {
 		return fmt.Errorf("%w: restoring a validated snapshot: %w", ErrSnapshot, err)
 	}
 	s.staged = nil

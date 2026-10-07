@@ -222,7 +222,7 @@ func TestDecisionCountsSurviveARestore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RestoreSnapshot(idx, data); err != nil {
+	if err := s.RestoreSnapshot(idx, 0, data); err != nil {
 		t.Fatal(err)
 	}
 	if s.Stats().Executed != 0 {

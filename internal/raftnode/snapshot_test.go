@@ -84,7 +84,7 @@ func (s *snapSM) ValidateSnapshot(index uint64, data []byte) error {
 	return err
 }
 
-func (s *snapSM) RestoreSnapshot(index uint64, data []byte) error {
+func (s *snapSM) RestoreSnapshot(index, _ uint64, data []byte) error {
 	cmds, err := decodeSnapSM(index, data)
 	if err != nil {
 		return err
