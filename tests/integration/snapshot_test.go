@@ -139,7 +139,7 @@ func (c *rcluster) durableStore(id string, through uint64) *kv.Store {
 		if m.Index > through {
 			c.t.Fatalf("%s's snapshot at %d is past %d", id, m.Index, through)
 		}
-		if err := store.RestoreSnapshot(m.Index, data); err != nil {
+		if err := store.RestoreSnapshot(m.Index, m.Term, data); err != nil {
 			c.t.Fatalf("%s's snapshot does not restore: %v", id, err)
 		}
 		at = m.Index
@@ -261,7 +261,7 @@ func TestRealLeaderCreatesSnapshot(t *testing.T) {
 	}
 	_, data, _ := c.published(l)
 	st := kv.NewStore()
-	if err := st.RestoreSnapshot(m.Index, data); err != nil {
+	if err := st.RestoreSnapshot(m.Index, m.Term, data); err != nil {
 		t.Fatal(err)
 	}
 	if v, ok := st.Get([]byte("a000")); !ok || string(v) != "v-a-0" {

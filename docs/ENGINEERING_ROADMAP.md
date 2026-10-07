@@ -23,7 +23,7 @@ work is organized into four layers, and **a lower layer takes priority over a hi
 | Layer | What it holds | State (after PR #10) |
 |---|---|---|
 | **1. Correctness foundation** | Raft, its durable log and crash recovery; linearizability; sessions and deduplication; snapshots; membership; Multi-Raft. Verified by the simulator, the crash matrices, the linearizability checker, real-process fault and chaos tests, mutation testing and fuzzing. | **Built and verified** (§1.5) |
-| **2. Durable storage integration** | The LSM engine as the replicated state machine: atomic apply with a durable applied index, exactly-once recovery, snapshots as engine checkpoints, the two-log decision | **S1 done:** the engine records an application's mutations and applied index as one recovery unit, proven by a crash and power-loss matrix (`docs/STORAGE_INTEGRATION.md` §7). `dkvd` still replicates an in-memory `kv.Store`; S2 puts the engine behind it. |
+| **2. Durable storage integration** | The LSM engine as the replicated state machine: atomic apply with a durable applied index, exactly-once recovery, snapshots as engine checkpoints, the two-log decision | **S1 and S2 done:** the engine records an application's mutations and applied index as one recovery unit (§7), and `dkvd -state-machine lsm` runs each group's state machine on it, one apply batch per Raft cycle, recovering from the engine's applied index; every existing correctness tier passes on both machines (`docs/STORAGE_INTEGRATION.md` §8). R2, WAL truncation and engine-backed snapshots are S3 and S4. |
 | **3. Distributed performance** | Group commit, replication pipelining, batched apply, each measured before and after | **Baseline measured** (`docs/CLUSTER_BENCHMARKS.md`); nothing optimized |
 | **4. Operational and demo surface** | `dkvctl`, health and readiness, the chaos and load labs; then a network client, Docker Compose, a dashboard, the demo and the write-ups | Operator tool and labs **built**; the rest waits for layers 2 and 3 |
 
@@ -302,7 +302,7 @@ log and more configuration on top of exactly these paths, so they must hold firs
   the start path; mutants.
 - **Docs:** MULTI_RAFT, DEDUP, LIMITATIONS, a configuration reference.
 
-### 3. Storage-engine prerequisites (§1.6) — S1 done; S2 next
+### 3. Storage-engine prerequisites (§1.6) — S1 and S2 done; S3 next
 
 S1 (`docs/STORAGE_INTEGRATION.md` §7) is done:
 - atomic apply batches with their applied index, inside the engine;

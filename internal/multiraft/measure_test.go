@@ -53,7 +53,7 @@ func TestMeasureGroupsPerNode(t *testing.T) {
 			c := newHostCluster(t, ids...)
 			for _, id := range ids {
 				h, err := Start(c.ctx, Config{ID: id, DataDir: c.dirs[id], Transport: c.trs[id], StaticPeers: c.static(id),
-					NewStateMachine: func(GroupID) raftnode.StateMachine { return kv.NewStore() }, DisableSync: true})
+					NewStateMachine: func(GroupID) (raftnode.StateMachine, error) { return kv.NewStore(), nil }, DisableSync: true})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -98,7 +98,7 @@ func TestMeasureMembershipChanges(t *testing.T) {
 	c := newHostCluster(t, "a", "b", "c", "d")
 	for _, id := range c.ids {
 		h, err := Start(c.ctx, Config{ID: id, DataDir: c.dirs[id], Transport: c.trs[id], StaticPeers: c.static(id),
-			NewStateMachine: func(GroupID) raftnode.StateMachine { return kv.NewStore() }, TickInterval: 20 * time.Millisecond})
+			NewStateMachine: func(GroupID) (raftnode.StateMachine, error) { return kv.NewStore(), nil }, TickInterval: 20 * time.Millisecond})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -150,7 +150,7 @@ func TestMeasureCatchUp(t *testing.T) {
 		c := newHostCluster(t, "a", "b", "c", "d")
 		for _, id := range c.ids {
 			h, err := Start(c.ctx, Config{ID: id, DataDir: c.dirs[id], Transport: c.trs[id], StaticPeers: c.static(id),
-				NewStateMachine: func(GroupID) raftnode.StateMachine { return kv.NewStore() }, DisableSync: true,
+				NewStateMachine: func(GroupID) (raftnode.StateMachine, error) { return kv.NewStore(), nil }, DisableSync: true,
 				TickInterval: 20 * time.Millisecond, SnapshotEvery: every})
 			if err != nil {
 				t.Fatal(err)

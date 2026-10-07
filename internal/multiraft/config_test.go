@@ -56,7 +56,7 @@ func TestHostRefusesANegativeTick(t *testing.T) {
 	}
 	defer tr.Close()
 	h, err := Start(context.Background(), Config{ID: "a", DataDir: t.TempDir(), Transport: tr, TickInterval: -time.Millisecond,
-		NewStateMachine: func(GroupID) raftnode.StateMachine { return &recSM{} }})
+		NewStateMachine: func(GroupID) (raftnode.StateMachine, error) { return &recSM{}, nil }})
 	if err == nil {
 		_ = h.Close()
 		t.Fatal("the host accepted a negative tick interval")

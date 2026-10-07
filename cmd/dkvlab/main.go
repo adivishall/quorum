@@ -72,6 +72,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		data      = fs.String("data", "", "where the nodes' data directories go (default: a temporary directory)")
 		del       = fs.Int("delete", 0, "load: percentage of DELETEs")
 		spares    = fs.Int("spares", 0, "extra nodes a scenario may add (chaos: 1, for add-member)")
+		smKind    = fs.String("state-machine", "", "dkvd -state-machine for every node: memory (the default) or lsm (S2)")
 		chaosF    = chaosFlags(fs)
 	)
 	if err := fs.Parse(args); err != nil {
@@ -105,7 +106,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	mk := func(n, g, c, r, v, a int) lab.Experiment {
 		return lab.Experiment{
-			Cluster: lab.ClusterConfig{Bin: bin, Mode: *mode, Nodes: n, Spares: *spares, Shards: g, RF: *rf, Tick: *tick, SnapshotEvery: *snapEv},
+			Cluster: lab.ClusterConfig{Bin: bin, Mode: *mode, Nodes: n, Spares: *spares, StateMachine: *smKind, Shards: g, RF: *rf, Tick: *tick, SnapshotEvery: *snapEv},
 			Load: load.Config{Clients: c, Duration: *duration, Warmup: *warmup, Rate: *rate, ReadPct: r, DeletePct: *del,
 				Keys: *keys, KeyDist: *dist, ValueSize: v, Seed: *seed, AttemptTimeout: *attempt, MaxAttempts: a, Trace: *trace},
 		}

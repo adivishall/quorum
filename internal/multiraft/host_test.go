@@ -100,7 +100,7 @@ func (c *hostCluster) startHost(id NodeID, static bool) *Host {
 	}
 	h, err := Start(c.ctx, Config{
 		ID: id, DataDir: c.dirs[id], Transport: c.trs[id], StaticPeers: peers,
-		NewStateMachine: func(GroupID) raftnode.StateMachine { return &recSM{} },
+		NewStateMachine: func(GroupID) (raftnode.StateMachine, error) { return &recSM{}, nil },
 		TickInterval:    10 * time.Millisecond, DisableSync: true,
 		Logf: func(f string, a ...any) {
 			c.mu.Lock()
@@ -465,7 +465,7 @@ func TestARetirementIsLoggedOnce(t *testing.T) {
 		id := id
 		h, err := Start(c.ctx, Config{
 			ID: id, DataDir: c.dirs[id], Transport: c.trs[id], StaticPeers: c.static(id),
-			NewStateMachine: func(GroupID) raftnode.StateMachine { return &recSM{} },
+			NewStateMachine: func(GroupID) (raftnode.StateMachine, error) { return &recSM{}, nil },
 			TickInterval:    10 * time.Millisecond, DisableSync: true,
 			OnGroup: func(g GroupID, node *raftnode.Node, _ raftnode.StateMachine) {
 				if node != nil && slow.Load() {
@@ -553,7 +553,7 @@ func TestFramesReachExactlyTheirGroup(t *testing.T) {
 	tr := &chanTransport{id: "a", ch: make(chan transport.Envelope, 16)}
 	h, err := Start(context.Background(), Config{
 		ID: "a", DataDir: t.TempDir(), Transport: tr, InboxSize: 4,
-		NewStateMachine: func(GroupID) raftnode.StateMachine { return &recSM{} },
+		NewStateMachine: func(GroupID) (raftnode.StateMachine, error) { return &recSM{}, nil },
 		TickInterval:    time.Hour, DisableSync: true,
 	})
 	if err != nil {

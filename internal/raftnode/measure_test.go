@@ -244,7 +244,7 @@ func BenchmarkSnapshotRestore(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				if err := kv.NewStore().RestoreSnapshot(m.Index, data); err != nil {
+				if err := kv.NewStore().RestoreSnapshot(m.Index, m.Term, data); err != nil {
 					b.Fatal(err)
 				}
 			}

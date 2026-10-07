@@ -192,6 +192,18 @@ type ResultStateMachine interface {
 	ApplyResult(index uint64, command []byte) (any, error)
 }
 
+// CycleStateMachine is a state machine that records the effects of one apply
+// cycle as one unit (S2, docs/STORAGE_INTEGRATION.md §8.4). ApplyEntry decides
+// each entry and stages its effects, with the entry's term, which a durable
+// engine records beside the index; EndCycle, called once after the cycle's
+// last entry, makes every staged effect durable together with the applied
+// index, or fails the cycle. ApplyCommitted prefers it to ResultStateMachine.
+type CycleStateMachine interface {
+	StateMachine
+	ApplyEntry(index, term uint64, command []byte) (any, error)
+	EndCycle() error
+}
+
 // ApplyCommitted feeds the committed-but-unapplied entries to sm in index order,
 // recording each through AppliedTo only after its Apply returned nil (so an apply
 // failure never advances appliedIndex — INV-R7's driver half). A nil sm applies
@@ -207,6 +219,8 @@ type ResultStateMachine interface {
 // never the application's, and the entry still occupies its index.
 func ApplyCommitted(core *raft.Raft, sm StateMachine, at Hook, applied func(raft.Entry, any)) error {
 	rsm, _ := sm.(ResultStateMachine)
+	csm, _ := sm.(CycleStateMachine)
+	var n, last uint64
 	for _, e := range core.NextApply() {
 		if err := at.hit(BeforeApply, e.Index); err != nil {
 			return err
@@ -218,9 +232,12 @@ func ApplyCommitted(core *raft.Raft, sm StateMachine, at Hook, applied func(raft
 			if e.Type != replication.EntryNormal {
 				cmd = nil
 			}
-			if rsm != nil {
+			switch {
+			case csm != nil:
+				result, err = csm.ApplyEntry(e.Index, e.Term, cmd)
+			case rsm != nil:
 				result, err = rsm.ApplyResult(e.Index, cmd)
-			} else {
+			default:
 				err = sm.Apply(e.Index, cmd)
 			}
 			if err != nil {
@@ -238,6 +255,15 @@ func ApplyCommitted(core *raft.Raft, sm StateMachine, at Hook, applied func(raft
 		}
 		if applied != nil {
 			applied(e, result)
+		}
+		n, last = n+1, e.Index
+	}
+	// The cycle's effects become durable as one unit, after its last entry
+	// and before any of its waiters completes (the caller completes them once
+	// ApplyCommitted returns). A failure here is a state-machine failure.
+	if csm != nil && n > 0 {
+		if err := csm.EndCycle(); err != nil {
+			return fmt.Errorf("%w: recording the cycle through index %d: %w", ErrApply, last, err)
 		}
 	}
 	return nil

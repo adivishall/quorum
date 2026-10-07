@@ -43,7 +43,7 @@ const DefaultRequestTimeout = 10 * time.Second
 type Server struct {
 	id    string
 	node  *raftnode.Node
-	store *Store
+	store Machine
 
 	mu        sync.Mutex
 	nextFwd   uint64 // forward ids; random start per incarnation (see NewServer)
@@ -95,7 +95,7 @@ func (s *Server) SetForwarding(on bool) {
 
 // NewServer wires a node and its state machine, and installs the node's
 // application-message handler for forwarding.
-func NewServer(id string, node *raftnode.Node, store *Store) *Server {
+func NewServer(id string, node *raftnode.Node, store Machine) *Server {
 	var seed [8]byte
 	_, _ = rand.Read(seed[:])
 	s := &Server{id: id, node: node, store: store, pending: map[uint64]chan Response{},
@@ -113,7 +113,7 @@ func NewServer(id string, node *raftnode.Node, store *Store) *Server {
 func (s *Server) Name() string { return s.id }
 
 // Store returns the node's state machine.
-func (s *Server) Store() *Store { return s.store }
+func (s *Server) Store() Machine { return s.store }
 
 // Node returns the node.
 func (s *Server) Node() *raftnode.Node { return s.node }
@@ -159,7 +159,10 @@ func (s *Server) execute(ctx context.Context, req Request) Response {
 		if err != nil {
 			return s.failed(resp, err)
 		}
-		v, ok := s.store.Get(req.Key)
+		v, ok, err := s.store.Lookup(req.Key)
+		if err != nil {
+			return s.failed(resp, err)
+		}
 		if !ok {
 			resp.Status = StatusNotFound
 			return resp

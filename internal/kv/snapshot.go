@@ -37,28 +37,40 @@ var ErrSnapshotState = errors.New("kv: invalid snapshot state")
 func (s *Store) EncodeSnapshot() (index uint64, data []byte, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.applied, encodeState(s.applied, s.sessions.limits, s.m, s.sessions.sessions), nil
+}
+
+// encodeState renders a state — the map, the session table, the applied index
+// and the limits — in the snapshot format. Both machines encode through it.
+func encodeState(applied uint64, l Limits, m map[string][]byte, sessions map[uint64]*session) []byte {
 	b := binary.AppendUvarint(nil, SnapshotVersion)
-	b = binary.AppendUvarint(b, s.applied)
-	b = binary.AppendUvarint(b, uint64(s.limits.MaxSessions))
-	b = binary.AppendUvarint(b, uint64(s.limits.MaxUnacked))
-	keys := make([]string, 0, len(s.m))
-	for k := range s.m {
+	b = binary.AppendUvarint(b, applied)
+	b = binary.AppendUvarint(b, uint64(l.MaxSessions))
+	b = binary.AppendUvarint(b, uint64(l.MaxUnacked))
+	keys := make([]string, 0, len(m))
+	for k := range m {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	b = binary.AppendUvarint(b, uint64(len(keys)))
 	for _, k := range keys {
 		b = appendBytes(b, []byte(k))
-		b = appendBytes(b, s.m[k])
+		b = appendBytes(b, m[k])
 	}
-	ids := make([]uint64, 0, len(s.sessions))
-	for id := range s.sessions {
+	return appendSessions(b, sessions)
+}
+
+// appendSessions encodes the session table as the snapshot format carries it:
+// ids strictly ascending, each session's record fields, request ids ascending.
+func appendSessions(b []byte, sessions map[uint64]*session) []byte {
+	ids := make([]uint64, 0, len(sessions))
+	for id := range sessions {
 		ids = append(ids, id)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	b = binary.AppendUvarint(b, uint64(len(ids)))
 	for _, id := range ids {
-		ss := s.sessions[id]
+		ss := sessions[id]
 		b = binary.AppendUvarint(b, id)
 		b = binary.AppendUvarint(b, ss.last)
 		b = binary.AppendUvarint(b, ss.ackedBelow)
@@ -75,7 +87,7 @@ func (s *Store) EncodeSnapshot() (index uint64, data []byte, err error) {
 			b = append(b, e.fp[:]...)
 		}
 	}
-	return s.applied, b, nil
+	return b
 }
 
 func appendBytes(b, p []byte) []byte {
@@ -88,15 +100,16 @@ func appendBytes(b, p []byte) []byte {
 // ordering, the limits it was built under (they must be this store's: they
 // change decisions), and every relation the session table's construction
 // guarantees — and the store is unchanged if any fails. The decision counters
-// restart at zero.
-func (s *Store) RestoreSnapshot(index uint64, data []byte) error {
+// restart at zero. The snapshot's term is not part of the state: the in-memory
+// store ignores it, and the LSM machine records it beside the index (S2).
+func (s *Store) RestoreSnapshot(index, _ uint64, data []byte) error {
 	st, err := s.checkSnapshot(index, data)
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.m, s.sessions, s.applied, s.stats = st.m, st.sessions, st.applied, ApplyStats{}
+	s.m, s.sessions.sessions, s.applied, s.sessions.stats = st.m, st.sessions, st.applied, ApplyStats{}
 	return nil
 }
 
@@ -111,7 +124,7 @@ func (s *Store) ValidateSnapshot(index uint64, data []byte) error {
 }
 
 func (s *Store) checkSnapshot(index uint64, data []byte) (*state, error) {
-	st, err := decodeState(data, s.limits)
+	st, err := decodeState(data, s.sessions.limits)
 	if err != nil {
 		return nil, err
 	}

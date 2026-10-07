@@ -55,6 +55,9 @@ type ClusterConfig struct {
 	SnapshotEvery uint64        `json:"snapshot_every"`
 	PortBase      int           `json:"-"`
 	Extra         []string      `json:"extra,omitempty"`
+	// StateMachine is dkvd -state-machine for every node: "" (dkvd's default,
+	// memory) or "lsm" (S2, docs/STORAGE_INTEGRATION.md §8).
+	StateMachine string `json:"state_machine,omitempty"`
 	// Links routes every link between genesis nodes through a proxy
 	// (internal/netproxy) on the dialing side, so the run can partition the
 	// cluster (Cut, Isolate, Heal, HealAll). Off by default: the proxy adds a
@@ -308,6 +311,9 @@ func (c *Cluster) launch(n *Node) error {
 	// -init with the cluster's id, once; a restart passes neither.
 	if _, err := os.Stat(filepath.Join(n.Dir, nodedir.IdentityFile)); errors.Is(err, fs.ErrNotExist) {
 		args = append(args, "-init", "-cluster-id", "lab")
+	}
+	if c.cfg.StateMachine != "" {
+		args = append(args, "-state-machine", c.cfg.StateMachine)
 	}
 	args = append(args, c.cfg.Extra...)
 	cmd := exec.Command(c.cfg.Bin, args...)

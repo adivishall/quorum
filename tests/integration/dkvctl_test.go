@@ -62,7 +62,7 @@ func TestDkvctlOnARealCluster(t *testing.T) {
 	bin := buildDkvd(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	c, err := lab.Start(ctx, lab.ClusterConfig{Bin: bin, Mode: "raft", Nodes: 3, Tick: 25 * time.Millisecond, DataRoot: t.TempDir(),
+	c, err := lab.Start(ctx, lab.ClusterConfig{Bin: bin, Mode: "raft", StateMachine: stateMachineKind(), Nodes: 3, Tick: 25 * time.Millisecond, DataRoot: t.TempDir(),
 		PortBase: 25000, Start: labStart(t), Links: true})
 	if err != nil {
 		t.Fatal(err)

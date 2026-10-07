@@ -280,7 +280,11 @@ func TestLinearizableAcrossLeaderCrashAndRestart(t *testing.T) {
 	waitFor(t, "the restarted node catching up", 10*time.Second, func() bool {
 		return srvR.Node().Status().Applied >= srvL.Node().Status().Commit
 	})
-	a, b := srvL.Store().Snapshot(), srvR.Store().Snapshot()
+	a, aerr := srvL.Store().Contents()
+	b, berr := srvR.Store().Contents()
+	if aerr != nil || berr != nil {
+		t.Fatal(aerr, berr)
+	}
 	if len(a) != len(b) {
 		t.Fatalf("stores differ in size: %d vs %d", len(a), len(b))
 	}
@@ -472,7 +476,7 @@ func followerLocalRead(t *testing.T) {
 	rec.End(id, lincheck.OK, nil, string(l), m.Term, m.Index)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if v, ok := srvF.Store().Get([]byte("k")); ok && string(v) == "old" {
+		if v, ok, err := srvF.Store().Lookup([]byte("k")); err == nil && ok && string(v) == "old" {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -505,8 +509,8 @@ func followerLocalRead(t *testing.T) {
 	// A local read on the isolated follower — bypassing ReadIndex — after the
 	// write completed.
 	id = rec.Begin("c2", lincheck.Get, "k", nil)
-	v, ok := srvF.Store().Get([]byte("k"))
-	if !ok {
+	v, ok, err := srvF.Store().Lookup([]byte("k"))
+	if err != nil || !ok {
 		t.Fatal("follower lost the key")
 	}
 	rec.End(id, lincheck.OK, v, follower.Name(), 0, 0)
