@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/adivishall/quorum/internal/storage"
 	"github.com/adivishall/quorum/internal/storage/wal"
+	"github.com/adivishall/quorum/internal/vfs"
 	"io"
 	"os"
 	"path/filepath"
@@ -101,6 +102,10 @@ type cluster struct {
 	// limits are the session-table limits every node's store uses (zero:
 	// kv.DefaultLimits); they must be the same on every node.
 	limits kv.Limits
+	// lsm forces the LSM machine on every node whatever the environment, and
+	// engineFS puts a node's engine WAL on a filesystem of the test's (S2).
+	lsm      bool
+	engineFS map[raftnode.NodeID]vfs.FS
 	// tick is every node's Raft tick (zero: 15 ms).
 	tick time.Duration
 	// hook, if set, is consulted at every driver crash point of every node: it
@@ -200,11 +205,14 @@ func (c *cluster) newMachine(id raftnode.NodeID) kv.Machine {
 	if limits == (kv.Limits{}) {
 		limits = kv.DefaultLimits
 	}
-	if os.Getenv("QUORUM_STATE_MACHINE") != "lsm" {
+	if os.Getenv("QUORUM_STATE_MACHINE") != "lsm" && !c.lsm {
 		return kv.NewStoreWithLimits(limits)
 	}
 	opts := storage.DefaultOptions()
 	opts.WAL.SyncMode = wal.SyncOff // as the nodes' logs: DisableSync
+	if fsys := c.engineFS[id]; fsys != nil {
+		opts.WAL.FS = fsys // a test's fault injector under one node's engine
+	}
 	m, err := kv.OpenLSMMachine(filepath.Join(c.dir, string(id)+"-lsm"), limits, opts)
 	if err != nil {
 		c.t.Fatalf("machine %s: %v", id, err)

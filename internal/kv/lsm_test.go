@@ -87,9 +87,17 @@ func (p *pair) open() {
 	p.lsm = m
 }
 
-// cycle applies entries as one cycle to both machines and compares them.
+// cycle applies entries as one cycle to both machines and compares them. It
+// also checks the batch's size from the outside: the engine numbers every
+// mutation, so the cycle's batch must have taken exactly one sequence per
+// executed write, per session whose table entry changed (registered, marked
+// used, its watermark raised, a result recorded) and per session evicted —
+// no mutation twice, none left out, none the cycle did not cause.
 func (p *pair) cycle(cmds ...[]byte) {
 	p.t.Helper()
+	before := p.mem.Sessions()
+	seqBefore := p.lsm.db.Sequence()
+	writes := 0
 	for _, cmd := range cmds {
 		e := entry{index: p.next, term: p.term, cmd: cmd}
 		p.next++
@@ -102,9 +110,28 @@ func (p *pair) cycle(cmds ...[]byte) {
 		if gerr != nil || !reflect.DeepEqual(want, got) {
 			p.t.Fatalf("entry %d: the store decided %v, the machine %v (%v)", e.index, want, got, gerr)
 		}
+		if r, ok := want.(Result); ok && r.Decision == Executed {
+			writes++
+		}
 	}
 	if err := p.lsm.EndCycle(); err != nil {
 		p.t.Fatalf("EndCycle after entry %d: %v", p.next-1, err)
+	}
+	after := p.mem.Sessions()
+	changed, removed := 0, 0
+	for id, st := range after {
+		if old, ok := before[id]; !ok || !reflect.DeepEqual(old, st) {
+			changed++
+		}
+	}
+	for id := range before {
+		if _, ok := after[id]; !ok {
+			removed++
+		}
+	}
+	if got, want := p.lsm.db.Sequence()-seqBefore, uint64(writes+changed+removed); got != want {
+		p.t.Fatalf("the cycle through %d took %d sequence numbers: %d writes, %d sessions changed, %d evicted want %d",
+			p.next-1, got, writes, changed, removed, want)
 	}
 	p.same("after the cycle through " + fmt.Sprint(p.next-1))
 }
@@ -337,6 +364,12 @@ func TestLSMMachineRecoversAPrefixAfterAPowerLoss(t *testing.T) {
 			}
 			if got := int(p.lsm.Applied()); got != want {
 				t.Fatalf("recovered through index %d, want %d", got, want)
+			}
+			// A second restart right after the recovery reads the same state.
+			_ = p.lsm.Close()
+			p.open()
+			if got := int(p.lsm.Applied()); got != want {
+				t.Fatalf("the second restart recovered through index %d, want %d", got, want)
 			}
 			sameMachines(t, "after the "+crash+" crash", p.modelAfter(want), p.lsm, false)
 			// The lost entries come back from the log; the kept ones are skipped.

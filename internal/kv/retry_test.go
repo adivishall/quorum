@@ -270,17 +270,28 @@ func TestRetryAtEveryCrashPointOfAWrite(t *testing.T) {
 				if v, _ := get(t, c, "k"); v != "new" {
 					t.Fatalf("k = %q", v)
 				}
-				// Exactly one execution anywhere: every replica — restarted ones
-				// rebuilt theirs by replaying the log — executed exactly two
-				// writes, the setup "old" and the one logical request "new";
-				// every other entry carrying the request was a duplicate.
+				// Exactly one execution anywhere. A replica that never restarted
+				// counted every execution: exactly two writes, the setup "old"
+				// and the one logical request "new"; every other entry carrying
+				// the request was a duplicate. The restarted replica holds the
+				// same state as such a replica — contents and session table —
+				// whether it rebuilt it by replaying the log (the in-memory
+				// store) or recovered it from its engine and skipped the entries
+				// the engine held (the LSM machine, whose counters then cover
+				// only what it applied since its restart).
 				commit := c.node(c.waitLeader(0, 10*time.Second)).Status().Commit
+				var witness kv.Machine
 				for _, id := range c.ids {
 					c.waitApplied(id, commit)
+					if id == l {
+						continue
+					}
 					if st := c.server(id).Store().Stats(); st.Executed != 2 {
 						t.Fatalf("%s executed %d writes (%+v): the request took effect more than once, or never", id, st.Executed, st)
 					}
+					witness = c.server(id).Store()
 				}
+				sameState(t, "the restarted "+string(l), witness, c.server(l).Store())
 				t.Logf("crash at %s: %d attempts; duplicate=%v, executed at index %d", tc.point, out.Attempts, out.Response.Duplicate, out.Response.Index)
 			})
 		})
