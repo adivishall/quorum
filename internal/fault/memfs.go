@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/adivishall/quorum/internal/vfs"
@@ -42,13 +44,23 @@ var ErrCrashed = errors.New("fault: file handle belongs to a crashed process")
 // as a torn prefix — never as holes, reordered sectors, or bit rot. Real
 // power-loss durability remains untested (docs/FAULTS.md, docs/FAILURE_MODEL.md).
 //
+// Directories (S1, docs/STORAGE_INTEGRATION.md §7.6) are modeled only when made
+// explicitly with MkdirAll. Such a directory is bound in its parent like a file:
+// a process crash keeps it, but it survives a power loss only once its parent has
+// been SyncDir'd — and a power loss that removes it removes every file and
+// directory under it. A directory never made with MkdirAll — every one a durable
+// log used before S1 — exists implicitly and is always durable, exactly as
+// before.
+//
 // MemFS is safe for concurrent use and uses no clock or randomness, so a run
 // against it is exactly reproducible.
 type MemFS struct {
-	mu    sync.Mutex
-	files map[string]*memNode // the cached directory: what every lookup sees now
-	names map[string]*memNode // the durable directory: bindings as of each dir's last SyncDir
-	epoch uint64              // bumped by every crash; handles from an older epoch are dead
+	mu       sync.Mutex
+	files    map[string]*memNode // the cached directory: what every lookup sees now
+	names    map[string]*memNode // the durable directory: bindings as of each dir's last SyncDir
+	dirs     map[string]bool     // directories made with MkdirAll: the cached view
+	dirNames map[string]bool     // those of them bound durably (their parent SyncDir'd since)
+	epoch    uint64              // bumped by every crash; handles from an older epoch are dead
 }
 
 // memNode is one file. The durable view is data[:syncedLen] while the file has
@@ -79,7 +91,8 @@ func (n *memNode) detach() {
 
 // NewMemFS returns an empty filesystem.
 func NewMemFS() *MemFS {
-	return &MemFS{files: map[string]*memNode{}, names: map[string]*memNode{}}
+	return &MemFS{files: map[string]*memNode{}, names: map[string]*memNode{},
+		dirs: map[string]bool{}, dirNames: map[string]bool{}}
 }
 
 var _ vfs.FS = (*MemFS)(nil)
@@ -122,9 +135,111 @@ func (m *MemFS) Stat(name string) (fs.FileInfo, error) {
 	defer m.mu.Unlock()
 	n, ok := m.files[name]
 	if !ok {
+		if m.dirExists(name) {
+			return memInfo{name: filepath.Base(name), dir: true}, nil
+		}
 		return nil, &fs.PathError{Op: "stat", Path: name, Err: fs.ErrNotExist}
 	}
 	return memInfo{name: filepath.Base(name), size: int64(len(n.data))}, nil
+}
+
+// dirExists reports whether dir is a directory: made with MkdirAll, or holding a
+// file or a directory (an implicit one). Called with m.mu held.
+func (m *MemFS) dirExists(dir string) bool {
+	if m.dirs[dir] {
+		return true
+	}
+	prefix := dir + string(filepath.Separator)
+	if dir == string(filepath.Separator) {
+		prefix = dir
+	}
+	for name := range m.files {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	for d := range m.dirs {
+		if strings.HasPrefix(d, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// MkdirAll makes dir, and every missing parent, an explicit directory: bound in
+// its parent at once (a process crash keeps it) and durably only once the
+// parent is SyncDir'd. A directory that already exists, explicitly or because
+// something lies under it, is left as it is.
+func (m *MemFS) MkdirAll(dir string, perm fs.FileMode) error {
+	dir = filepath.Clean(dir)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var missing []string
+	for d := dir; ; d = filepath.Dir(d) {
+		if _, isFile := m.files[d]; isFile {
+			return &fs.PathError{Op: "mkdir", Path: d, Err: syscall.ENOTDIR}
+		}
+		if m.dirExists(d) {
+			break
+		}
+		missing = append(missing, d)
+		if parent := filepath.Dir(d); parent == d {
+			break
+		}
+	}
+	for _, d := range missing {
+		m.dirs[d] = true
+	}
+	return nil
+}
+
+// ReadDir lists dir's files and directories, sorted by name.
+func (m *MemFS) ReadDir(dir string) ([]fs.DirEntry, error) {
+	dir = filepath.Clean(dir)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.dirExists(dir) {
+		return nil, &fs.PathError{Op: "readdir", Path: dir, Err: fs.ErrNotExist}
+	}
+	entries := map[string]memInfo{}
+	// below records the entry of dir that path lies in or is, if any.
+	below := func(path string, size int64, isDir bool) {
+		for p := path; filepath.Dir(p) != p; p = filepath.Dir(p) {
+			if filepath.Dir(p) == dir {
+				if p == path {
+					entries[filepath.Base(p)] = memInfo{name: filepath.Base(p), size: size, dir: isDir}
+				} else {
+					entries[filepath.Base(p)] = memInfo{name: filepath.Base(p), dir: true}
+				}
+				return
+			}
+		}
+	}
+	for name, n := range m.files {
+		below(name, int64(len(n.data)), false)
+	}
+	for d := range m.dirs {
+		below(d, 0, true)
+	}
+	out := make([]fs.DirEntry, 0, len(entries))
+	for _, info := range entries {
+		out = append(out, fs.FileInfoToDirEntry(info))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name() < out[j].Name() })
+	return out, nil
+}
+
+// undurable reports whether name lies under an explicit directory that a power
+// loss would remove. Called with m.mu held.
+func (m *MemFS) undurable(name string) bool {
+	for d := filepath.Dir(name); ; d = filepath.Dir(d) {
+		if m.dirs[d] && !m.dirNames[d] {
+			return true
+		}
+		if filepath.Dir(d) == d {
+			return false
+		}
+	}
 }
 
 // SyncDir makes dir's current bindings durable: every creation, rename and
@@ -143,6 +258,11 @@ func (m *MemFS) SyncDir(dir string) error {
 	for name, n := range m.files {
 		if filepath.Dir(name) == dir {
 			m.names[name] = n
+		}
+	}
+	for d := range m.dirs {
+		if filepath.Dir(d) == dir {
+			m.dirNames[d] = true
 		}
 	}
 	return nil
@@ -201,7 +321,9 @@ func (m *MemFS) CrashPowerLoss(tornTail int) {
 	m.epoch++
 	names := make([]string, 0, len(m.names))
 	for name := range m.names {
-		names = append(names, name)
+		if !m.undurable(name) {
+			names = append(names, name)
+		}
 	}
 	sort.Strings(names)
 	files := make(map[string]*memNode, len(names))
@@ -222,6 +344,17 @@ func (m *MemFS) CrashPowerLoss(tornTail int) {
 	m.names = make(map[string]*memNode, len(files))
 	for name, n := range files {
 		m.names[name] = n
+	}
+	dirs := map[string]bool{}
+	for d := range m.dirNames {
+		if !m.undurable(d) {
+			dirs[d] = true
+		}
+	}
+	m.dirs = dirs
+	m.dirNames = make(map[string]bool, len(dirs))
+	for d := range dirs {
+		m.dirNames[d] = true
 	}
 }
 
@@ -292,9 +425,17 @@ func (m *MemFS) DurableCopy() *MemFS {
 	defer m.mu.Unlock()
 	out := NewMemFS()
 	for name, n := range m.names {
+		if m.undurable(name) {
+			continue
+		}
 		d := append([]byte(nil), n.durable()...)
 		c := &memNode{data: d, syncedLen: len(d)}
 		out.files[name], out.names[name] = c, c
+	}
+	for d := range m.dirNames {
+		if !m.undurable(d) {
+			out.dirs[d], out.dirNames[d] = true, true
+		}
 	}
 	return out
 }
@@ -308,7 +449,7 @@ func (m *MemFS) FullySynced(name string) bool {
 	defer m.mu.Unlock()
 	name = filepath.Clean(name)
 	n, ok := m.files[name]
-	return ok && m.names[name] == n && !n.isDetached && n.syncedLen == len(n.data)
+	return ok && m.names[name] == n && !n.isDetached && n.syncedLen == len(n.data) && !m.undurable(name)
 }
 
 // memFile is an open handle.
@@ -469,11 +610,17 @@ func (f *memFile) Close() error {
 type memInfo struct {
 	name string
 	size int64
+	dir  bool
 }
 
-func (i memInfo) Name() string       { return i.name }
-func (i memInfo) Size() int64        { return i.size }
-func (i memInfo) Mode() fs.FileMode  { return 0o644 }
+func (i memInfo) Name() string { return i.name }
+func (i memInfo) Size() int64  { return i.size }
+func (i memInfo) Mode() fs.FileMode {
+	if i.dir {
+		return fs.ModeDir | 0o755
+	}
+	return 0o644
+}
 func (i memInfo) ModTime() time.Time { return time.Time{} }
-func (i memInfo) IsDir() bool        { return false }
+func (i memInfo) IsDir() bool        { return i.dir }
 func (i memInfo) Sys() any           { return nil }

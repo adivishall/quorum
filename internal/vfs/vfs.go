@@ -1,8 +1,9 @@
 // Package vfs is the filesystem seam of Quorum's durable Raft log (Phase 10,
-// docs/FAULTS.md, ADR-017).
+// docs/FAULTS.md, ADR-017) and, since S1, of the storage engine's write-ahead
+// log (docs/STORAGE_INTEGRATION.md §7.6).
 //
-// internal/raftlog reads and writes its log through the two small interfaces
-// here instead of calling package os directly. Production code uses OS, which is
+// internal/raftlog and internal/storage/wal read and write their logs through the
+// two small interfaces here instead of calling package os directly. Production code uses OS, which is
 // a zero-cost pass-through to the real filesystem and is what a nil FS means
 // everywhere. Tests substitute internal/fault's implementations at exactly this
 // boundary: a crash-consistent in-memory filesystem (to model what a process
@@ -54,6 +55,13 @@ type FS interface {
 	// Remove deletes name. The deletion survives a power loss only once SyncDir
 	// has been called on the directory.
 	Remove(name string) error
+	// ReadDir lists the directory dir, sorted by name, as os.ReadDir does; a
+	// missing directory yields an error satisfying errors.Is(err, fs.ErrNotExist).
+	ReadDir(dir string) ([]fs.DirEntry, error)
+	// MkdirAll creates dir and any missing parents, as os.MkdirAll does. Like a
+	// file's creation, a new directory survives a power loss only once SyncDir
+	// has been called on its parent.
+	MkdirAll(dir string, perm fs.FileMode) error
 }
 
 // OS is the real filesystem, and the production default: every method is a
@@ -92,6 +100,12 @@ func (OS) Rename(oldname, newname string) error { return os.Rename(oldname, newn
 
 // Remove calls os.Remove.
 func (OS) Remove(name string) error { return os.Remove(name) }
+
+// ReadDir calls os.ReadDir.
+func (OS) ReadDir(dir string) ([]fs.DirEntry, error) { return os.ReadDir(dir) }
+
+// MkdirAll calls os.MkdirAll.
+func (OS) MkdirAll(dir string, perm fs.FileMode) error { return os.MkdirAll(dir, perm) }
 
 // Or returns fsys, or OS when fsys is nil — so a zero-valued option means the
 // real filesystem.
