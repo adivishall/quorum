@@ -100,10 +100,9 @@ func (h *harness) suiteApply() error {
 			float64(last.records)/e, float64(last.walBytes)/e, last.syncs, recMs[len(recMs)/2],
 			last.recApplied.Index, last.recSequence)
 	}
-	fmt.Fprintf(h.out, "  note: entries/s counts applied entries (a call carries 1 or 16). fsyncs is the run's total.\n")
-	fmt.Fprintf(h.out, "        Call latency is per call: one\n")
-	fmt.Fprintf(h.out, "        Put+SetAppliedIndex pair, or one Apply. Recovery is the median reopen; the recovered\n")
-	fmt.Fprintf(h.out, "        index and sequence are checked against what was written.\n")
+	fmt.Fprintf(h.out, "  note: entries/s counts applied entries (a call carries 1 or 16); fsyncs is the run's total.\n")
+	fmt.Fprintf(h.out, "        Call latency is per call: one Put+SetAppliedIndex pair, or one Apply. Recovery is the\n")
+	fmt.Fprintf(h.out, "        median reopen; the recovered index and sequence are checked against what was written.\n")
 	return nil
 }
 
