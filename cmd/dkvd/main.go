@@ -524,6 +524,9 @@ func runRaft(ctx context.Context, r raftRun) int {
 				m = kv.NewStoreWithLimits(limits)
 			}
 			km.Observe(m, g)
+			// Which machine holds this group's state is a fact an operator,
+			// and the evidence of a run, must be able to read.
+			lg.logf("event=state_machine node=%s group=%d kind=%s dir=%s", id, g, r.stateMachine, dir)
 			return m, nil
 		},
 		OnGroup: func(g multiraft.GroupID, node *raftnode.Node, sm raftnode.StateMachine) {

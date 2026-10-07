@@ -25,9 +25,18 @@ test:
 race:
 	$(GO) test -race -count=1 -timeout 30m $(UNIT)
 
+## race-lsm — the key-value package's tests with the state machine in the
+## storage engine (S2, docs/STORAGE_INTEGRATION.md §8)
+race-lsm:
+	QUORUM_STATE_MACHINE=lsm $(GO) test -race -count=1 -timeout 30m ./internal/kv/...
+
 ## integration — multi-process tests, including real SIGKILL crash recovery
 integration:
 	$(GO) test -race -count=1 -v -timeout 40m ./tests/integration/
+
+## integration-lsm — the same, every dkvd on the LSM state machine (S2)
+integration-lsm:
+	QUORUM_STATE_MACHINE=lsm $(GO) test -race -count=1 -v -timeout 40m ./tests/integration/
 
 ## mutation — mutation testing (Phase 9 Raft rules, Phase 10 failure handling and
 ## fault-model fidelity, Phase 11 crash-recovery rules, Phase 12 client-visible

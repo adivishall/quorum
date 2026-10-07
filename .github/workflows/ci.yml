@@ -53,6 +53,13 @@ jobs:
       - name: unit tests (race detector)
         run: make race 2>&1 | tee unit.log
 
+      # The key-value package's every test again, with the group's state
+      # machine in the storage engine instead of memory (S2,
+      # docs/STORAGE_INTEGRATION.md §8): the composition must keep every
+      # externally observable semantic the in-memory machine has.
+      - name: key-value tests on the LSM state machine (race detector)
+        run: make race-lsm 2>&1 | tee -a unit.log
+
       # Correctness checks only (SA*): the style checks would churn code that
       # is not wrong. Pinned versions, run with the module's toolchain.
       - name: staticcheck (correctness checks)
@@ -109,6 +116,36 @@ jobs:
           name: integration-evidence
           path: |
             integration.log
+            artifacts/
+          if-no-files-found: ignore
+
+  # The same real-process suite with every dkvd on the LSM state machine (S2,
+  # docs/STORAGE_INTEGRATION.md §8): the engine behind the replicated state
+  # machine must pass every crash, retry, snapshot, membership and chaos test
+  # the in-memory one passes.
+  integration-lsm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
+
+      - name: integration tests on the LSM state machine (real processes, race detector)
+        env:
+          QUORUM_ARTIFACTS: ${{ github.workspace }}/artifacts
+        run: make integration-lsm 2>&1 | tee integration-lsm.log
+
+      - name: upload evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-lsm-evidence
+          path: |
+            integration-lsm.log
             artifacts/
           if-no-files-found: ignore
 

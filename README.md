@@ -13,7 +13,7 @@ replicated state machine without weakening the guarantees already proven.
 | Layer | State |
 |---|---|
 | 1. Correctness foundation: Raft, crash recovery, linearizability, sessions, snapshots, membership, Multi-Raft | built, and verified by simulation, crash matrices, recorded histories, real-process chaos, mutation and fuzzing |
-| 2. Durable storage integration: the LSM engine as the replicated state machine | **S1 of six done:** the engine records an application's mutations and applied index as one recovery unit, proven by a crash and power-loss matrix. `dkvd` still replicates an in-memory `kv.Store`. Design and status: [`docs/STORAGE_INTEGRATION.md`](docs/STORAGE_INTEGRATION.md) |
+| 2. Durable storage integration: the LSM engine as the replicated state machine | **S1 and S2 of six done:** `dkvd -state-machine lsm` runs each group's state machine on the engine, one apply batch per Raft cycle, recovering from the engine's applied index; every correctness tier passes on both machines. Memory is still the default; R2 and engine-backed snapshots are next. Design and status: [`docs/STORAGE_INTEGRATION.md`](docs/STORAGE_INTEGRATION.md) |
 | 3. Distributed performance | baseline measured ([`docs/CLUSTER_BENCHMARKS.md`](docs/CLUSTER_BENCHMARKS.md)); nothing optimized yet |
 | 4. Operational and demo surface | `dkvctl`, health and readiness, chaos and load labs; the rest waits for layers 2 and 3 |
 
@@ -258,11 +258,14 @@ and — as carefully — what it does not: [docs/RAFT.md](docs/RAFT.md). Run a r
 `dkvd -raft`, or, since Phase 15, one group per shard with `dkvd -cluster` (identical `-shards`,
 `-rf` and `-nodes` on every node) and change a group's members through its JSON-line admin port.
 A node's first start initializes its data directory (`-init -cluster-id NAME`); every later start
-omits `-init` (`docs/MULTI_RAFT.md` §5):
+omits `-init` (`docs/MULTI_RAFT.md` §5). Each group's state machine lives in memory by default,
+rebuilt from the snapshot and the log at every start; `-state-machine lsm` puts it in the storage
+engine under the group's directory, one apply batch per Raft cycle, recovered from the engine's
+applied index at a restart (`docs/STORAGE_INTEGRATION.md` §8):
 
 ```bash
 dkvd -id n1 -listen 127.0.0.1:7001 -peers n2=127.0.0.1:7002,n3=127.0.0.1:7003 -data-dir d1 \
-     -init -cluster-id demo \
+     -init -cluster-id demo -state-machine lsm \
      -cluster -shards 4 -rf 3 -client-listen 127.0.0.1:8001 -admin-listen 127.0.0.1:9001 \
      -metrics-listen 127.0.0.1:9101
 echo '{"op":"add-learner","group":0,"id":"n4","addr":"127.0.0.1:7004"}' | nc 127.0.0.1 9001
