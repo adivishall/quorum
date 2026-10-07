@@ -4,11 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/adivishall/quorum/internal/record"
+	"github.com/adivishall/quorum/internal/vfs"
 )
 
 // SyncMode selects when the WAL flushes to stable storage. The three modes and
@@ -95,6 +98,13 @@ type Options struct {
 	// bytes accumulate.
 	SyncInterval time.Duration
 	SyncBytes    int64
+
+	// FS is the filesystem every WAL file operation goes through: segment
+	// creation, appends, reads, truncation, fsyncs, the directory listing and
+	// directory fsyncs (S1, docs/STORAGE_INTEGRATION.md §7.6). Nil is the real
+	// one. Tests substitute internal/fault's crash-consistent MemFS, so the WAL
+	// takes part in the process-crash and power-loss model.
+	FS vfs.FS
 }
 
 // DefaultOptions returns the documented defaults: batch sync, 16 MiB segments.
@@ -154,8 +164,9 @@ type WAL struct {
 	dir  string
 	opts Options
 
+	fs       vfs.FS
 	mu       sync.Mutex
-	f        *os.File
+	f        vfs.File
 	w        *record.Writer
 	seg      uint64 // active segment number
 	segBytes int64  // bytes written to the active segment
@@ -186,8 +197,26 @@ type WAL struct {
 // file itself; a test fails a flush, or tears a write, at an exact point.
 var (
 	syncFile   = fullSync
-	segmentOut = func(f *os.File) io.Writer { return f }
+	segmentOut = func(f vfs.File) io.Writer { return f }
 )
+
+// fullSync flushes a segment as far as the platform allows: a real file with
+// the platform's strongest flush (F_FULLFSYNC on Darwin), any other vfs.File —
+// a test's in-memory one — with its own Sync.
+func fullSync(f vfs.File) error {
+	if osf, ok := f.(*os.File); ok {
+		return fullSyncOS(osf)
+	}
+	return f.Sync()
+}
+
+// supportsFullSync reports whether fullSync gives its strongest flush on f.
+func supportsFullSync(f vfs.File) bool {
+	if osf, ok := f.(*os.File); ok {
+		return supportsFullSyncOS(osf)
+	}
+	return true
+}
 
 // Create opens the WAL in dir for appending, creating dir if necessary.
 //
@@ -197,17 +226,28 @@ var (
 // clean record boundary.
 func Create(dir string, opts Options) (*WAL, error) {
 	opts.applyDefaults()
+	fsys := vfs.Or(opts.FS)
 
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	_, statErr := fsys.Stat(dir)
+	if err := fsys.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("wal: creating %s: %w", dir, err)
 	}
+	if errors.Is(statErr, fs.ErrNotExist) && opts.SyncMode != SyncOff {
+		// A new directory is not durable until its parent is flushed, any more
+		// than a new segment is until this one is (S1, gap (a)): without it a
+		// power loss can take the directory, and every segment in it, synced
+		// or not.
+		if err := fsys.SyncDir(filepath.Dir(filepath.Clean(dir))); err != nil {
+			return nil, fmt.Errorf("wal: syncing the parent of %s: %w", dir, err)
+		}
+	}
 
-	nums, _, err := listSegments(dir)
+	nums, _, err := listSegments(fsys, dir)
 	if err != nil {
 		return nil, err
 	}
 
-	w := &WAL{dir: dir, opts: opts}
+	w := &WAL{dir: dir, opts: opts, fs: fsys}
 
 	seg := firstSegment
 	if len(nums) > 0 {
@@ -227,7 +267,7 @@ func Create(dir string, opts Options) (*WAL, error) {
 func (w *WAL) openSegment(seg uint64, isNew bool) error {
 	path := segmentPath(w.dir, seg)
 
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := w.fs.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return fmt.Errorf("wal: opening segment %s: %w", path, err)
 	}
@@ -241,7 +281,7 @@ func (w *WAL) openSegment(seg uint64, isNew bool) error {
 		// A newly created file is not durable until its parent directory is
 		// flushed, or a crash can leave the segment's records in the page
 		// cache with no directory entry pointing at them.
-		if err := syncDir(w.dir); err != nil {
+		if err := w.fs.SyncDir(w.dir); err != nil {
 			_ = f.Close()
 			return fmt.Errorf("wal: syncing directory %s: %w", w.dir, err)
 		}
@@ -264,6 +304,19 @@ func (w *WAL) AppendBatch(b Batch) error {
 		return fmt.Errorf("wal: refusing to append an empty batch")
 	}
 	return w.append(KindWriteBatch, b.AppendTo(nil))
+}
+
+// AppendApply appends a state-machine application — its mutations and its
+// applied index — as ONE record (S1, docs/STORAGE_INTEGRATION.md §7.3). An empty
+// Ops is valid: the index alone advances. Whether the index advances is the
+// caller's rule to enforce (the store does, and replay re-checks it); this
+// refuses only an index or term of zero, which no applied entry has.
+func (w *WAL) AppendApply(a ApplyBatch) error {
+	if a.Applied.Index == 0 || a.Applied.Term == 0 {
+		return fmt.Errorf("wal: refusing an apply batch at (%d, %d): no applied entry has a zero index or term",
+			a.Applied.Index, a.Applied.Term)
+	}
+	return w.append(KindApplyBatch, a.AppendTo(nil))
 }
 
 // AppendAppliedIndex appends durable applied-index metadata. See AppliedIndex

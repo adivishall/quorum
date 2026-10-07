@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 
 	"github.com/adivishall/quorum/internal/record"
+	"github.com/adivishall/quorum/internal/vfs"
 )
 
 // Handler receives records during replay, in the exact order they were
@@ -15,6 +17,9 @@ import (
 type Handler struct {
 	Batch   func(Batch) error
 	Applied func(AppliedIndex) error
+	// Apply receives each apply batch (S1): its mutations and its applied
+	// index, as the one unit they were written as.
+	Apply func(ApplyBatch) error
 }
 
 // Recovery describes what Recover found. It is returned even when recovery
@@ -25,9 +30,15 @@ type Recovery struct {
 	BytesScanned    int64
 	RecordsApplied  int64
 	BatchesApplied  int64
+	ApplyBatches    int64 // apply records replayed (S1)
 	OpsApplied      int64
-	AppliedIndex    AppliedIndex
+	AppliedIndex    AppliedIndex // the last applied index replayed, from either record kind
 	SawAppliedIndex bool
+
+	// SyncedNewest reports that the newest segment was fsynced before it was
+	// replayed (S1, gap (b)), so everything recovery handed to the handler is
+	// durable.
+	SyncedNewest bool
 
 	// IgnoredEntries counts directory entries that are not segment files.
 	IgnoredEntries int
@@ -61,10 +72,27 @@ type Recovery struct {
 // Recover is called before Create. It leaves the directory in a state where the
 // newest segment ends on a clean record boundary, so that appending to it
 // cannot produce a record that starts after garbage.
+//
+// Recover uses the real filesystem and the default (batch) sync mode; see
+// RecoverWith.
 func Recover(dir string, h Handler) (Recovery, error) {
-	var rec Recovery
+	return RecoverWith(dir, DefaultOptions(), h)
+}
 
-	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+// RecoverWith is Recover on opts.FS, under opts.SyncMode.
+//
+// Since S1 it fsyncs the newest segment before replaying it, unless the sync
+// mode is off (docs/STORAGE_INTEGRATION.md §7.5, gap (b)). A process killed with
+// records still in the page cache leaves them readable but not durable; replay
+// hands them to the engine, which may then make a table — and a MANIFEST edit —
+// out of them before the kernel writes them back. Syncing first means
+// everything replayed is durable: after open, recovered implies durable. Older
+// segments were fsynced when they were rotated out.
+func RecoverWith(dir string, opts Options, h Handler) (Recovery, error) {
+	var rec Recovery
+	fsys := vfs.Or(opts.FS)
+
+	if _, err := fsys.Stat(dir); errors.Is(err, fs.ErrNotExist) {
 		// A directory that does not exist is an empty log, not an error: this
 		// is what a brand-new database looks like.
 		return rec, nil
@@ -72,7 +100,7 @@ func Recover(dir string, h Handler) (Recovery, error) {
 		return rec, fmt.Errorf("wal: stat %s: %w", dir, err)
 	}
 
-	nums, ignored, err := listSegments(dir)
+	nums, ignored, err := listSegments(fsys, dir)
 	if err != nil {
 		return rec, err
 	}
@@ -80,7 +108,13 @@ func Recover(dir string, h Handler) (Recovery, error) {
 
 	for i, seg := range nums {
 		isFinal := i == len(nums)-1
-		if err := replaySegment(dir, seg, isFinal, h, &rec); err != nil {
+		if isFinal && opts.SyncMode != SyncOff {
+			if err := syncSegment(fsys, segmentPath(dir, seg)); err != nil {
+				return rec, err
+			}
+			rec.SyncedNewest = true
+		}
+		if err := replaySegment(fsys, dir, seg, isFinal, h, &rec); err != nil {
 			return rec, err
 		}
 		rec.SegmentsScanned++
@@ -88,10 +122,24 @@ func Recover(dir string, h Handler) (Recovery, error) {
 	return rec, nil
 }
 
-func replaySegment(dir string, seg uint64, isFinal bool, h Handler, rec *Recovery) error {
+// syncSegment fsyncs a segment as it stands, torn tail and all: syncing bytes
+// that are about to be truncated is harmless, and the truncation is synced too.
+func syncSegment(fsys vfs.FS, path string) error {
+	f, err := fsys.OpenFile(path, os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("wal: opening %s to sync it before replay: %w", path, err)
+	}
+	if err := syncFile(f); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("wal: syncing %s before replay: %w", path, err)
+	}
+	return f.Close()
+}
+
+func replaySegment(fsys vfs.FS, dir string, seg uint64, isFinal bool, h Handler, rec *Recovery) error {
 	path := segmentPath(dir, seg)
 
-	f, err := os.Open(path)
+	f, err := fsys.OpenFile(path, os.O_RDONLY, 0)
 	if err != nil {
 		return fmt.Errorf("wal: opening segment %s: %w", path, err)
 	}
@@ -174,7 +222,7 @@ readLoop:
 	}
 
 	if truncTo >= 0 {
-		if err := truncateSegment(path, truncTo); err != nil {
+		if err := truncateSegment(fsys, path, truncTo); err != nil {
 			return err
 		}
 		rec.Truncated = true
@@ -203,6 +251,28 @@ func dispatch(kind record.Kind, payload []byte, h Handler, rec *Recovery, path s
 		}
 		return nil
 
+	case KindApplyBatch:
+		ab, err := DecodeApplyBatch(payload)
+		if err != nil {
+			return fmt.Errorf("wal: %s offset %d: %w", path, off, err)
+		}
+		// The writer refuses an index that does not advance; one in the log
+		// was not written by it.
+		if !ab.Advances(rec.AppliedIndex) {
+			return fmt.Errorf("wal: %s offset %d: apply batch at (%d, %d) does not advance past (%d, %d): %w",
+				path, off, ab.Applied.Index, ab.Applied.Term, rec.AppliedIndex.Index, rec.AppliedIndex.Term, ErrCorrupt)
+		}
+		rec.ApplyBatches++
+		rec.OpsApplied += int64(len(ab.Ops))
+		if h.Apply != nil {
+			if err := h.Apply(ab); err != nil {
+				return fmt.Errorf("wal: applying apply batch from %s offset %d: %w", path, off, err)
+			}
+		}
+		rec.AppliedIndex = ab.Applied
+		rec.SawAppliedIndex = true
+		return nil
+
 	case KindAppliedIndex:
 		applied, err := DecodeAppliedIndex(payload)
 		if err != nil {
@@ -229,8 +299,8 @@ func dispatch(kind record.Kind, payload []byte, h Handler, rec *Recovery, path s
 
 // truncateSegment cuts a segment back to a known-good record boundary and makes
 // the truncation durable before anything is appended past it.
-func truncateSegment(path string, at int64) error {
-	f, err := os.OpenFile(path, os.O_WRONLY, 0o644)
+func truncateSegment(fsys vfs.FS, path string, at int64) error {
+	f, err := fsys.OpenFile(path, os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("wal: opening %s to truncate: %w", path, err)
 	}

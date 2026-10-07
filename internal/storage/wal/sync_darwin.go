@@ -18,7 +18,7 @@ const fFullFsync = 51
 
 // fullSync flushes the file all the way to stable storage, as far as the
 // platform allows.
-func fullSync(f *os.File) error {
+func fullSyncOS(f *os.File) error {
 	for {
 		_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, f.Fd(), uintptr(fFullFsync), 0)
 		switch errno {
@@ -38,7 +38,7 @@ func fullSync(f *os.File) error {
 // do not. Rather than either failing to open or silently degrading, the WAL
 // probes once at open time and reports the answer, so that a weaker guarantee
 // is a fact the caller can see rather than an assumption it cannot check.
-func supportsFullSync(f *os.File) bool {
+func supportsFullSyncOS(f *os.File) bool {
 	_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, f.Fd(), uintptr(fFullFsync), 0)
 	return errno == 0
 }

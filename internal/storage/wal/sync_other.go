@@ -10,13 +10,13 @@ import "os"
 // cache as well, so there is no separate call to make. Whether the hardware
 // honours the barrier is a different question, and one no system call can
 // answer — see docs/FAILURE_MODEL.md §4.
-func fullSync(f *os.File) error {
+func fullSyncOS(f *os.File) error {
 	return f.Sync()
 }
 
 // supportsFullSync reports whether a full flush is available. On these
 // platforms fsync is the full flush, so it always is.
-func supportsFullSync(f *os.File) bool {
+func supportsFullSyncOS(f *os.File) bool {
 	return f.Sync() == nil
 }
 

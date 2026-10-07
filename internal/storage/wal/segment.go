@@ -2,11 +2,12 @@ package wal
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/adivishall/quorum/internal/vfs"
 )
 
 // Segment files are named %06d.log and numbered from 1 (docs/DESIGN.md §6).
@@ -71,8 +72,8 @@ func parseSegmentName(name string) (uint64, bool) {
 // missing from the *start* is not, because nothing records which segment number
 // the log begins at. That metadata arrives with the MANIFEST's log number in
 // Phase 4. Until then, this is a documented limitation rather than a guarantee.
-func listSegments(dir string) (nums []uint64, ignored int, err error) {
-	entries, err := os.ReadDir(dir)
+func listSegments(fsys vfs.FS, dir string) (nums []uint64, ignored int, err error) {
+	entries, err := fsys.ReadDir(dir)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -101,21 +102,4 @@ func listSegments(dir string) (nums []uint64, ignored int, err error) {
 	}
 
 	return nums, ignored, nil
-}
-
-// syncDir fsyncs a directory so that file creations and renames within it are
-// durable. Creating a file is not durable until its parent directory is
-// flushed: after a crash the file can exist in the page cache but be absent
-// from the directory, which for a freshly rotated WAL segment means the newest
-// records vanish while the older segments survive.
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	if err := d.Sync(); err != nil {
-		_ = d.Close()
-		return err
-	}
-	return d.Close()
 }
