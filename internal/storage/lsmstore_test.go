@@ -1048,6 +1048,11 @@ func TestFlushEveryWriteReallyFlushes(t *testing.T) {
 	opts := storage.DefaultOptions()
 	opts.MemTableSize = flushEveryWrite
 	opts.BlockSize = 64
+	// The assertion counts tables: the background compactor, signalled by
+	// every flush and triggered at four level-0 tables, would merge the
+	// first four underneath it — and did, once, under a full parallel test
+	// run. The test is about flushing, not compaction.
+	opts.DisableAutoCompaction = true
 
 	s := openLSM(t, dir, opts)
 	defer func() { _ = s.Close() }()
