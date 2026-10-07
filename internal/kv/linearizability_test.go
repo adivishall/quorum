@@ -432,11 +432,26 @@ func requireSessionEffects(t *testing.T, st workload.Stats) {
 // completed on the leader that the follower has not yet applied. The checker must
 // reject the history — which is why Phase 12 never offers follower reads, and
 // why a mutant that let a follower serve ReadIndex would be killed.
+//
+// The follower is isolated — from every member, both ways — not merely cut
+// off from the leader's messages. Cut off one way only, it campaigns once the
+// write outlasts its election timeout; its vote request reaches the leader,
+// which steps down with the write in flight, and the write is rightly answered
+// ErrLost: the follower's new term deposed it, and another entry committed at
+// its index. CI's load made the write that slow once (the mutation job's
+// clean-tree check). Isolated, the follower campaigns into the void. The test
+// waits until it has, so every run takes the path CI took by chance, and the
+// leader must keep its term through the write.
 func TestFollowerLocalReadIsCaughtAsNonLinearizable(t *testing.T) {
+	withPremise(t, func() { followerLocalRead(t) })
+}
+
+// followerLocalRead is one attempt at TestFollowerLocalReadIsCaughtAsNonLinearizable.
+func followerLocalRead(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := startCluster(t, ctx, 3, true)
-	l := c.waitLeader(0, 10*time.Second)
+	l, tm := c.waitSettled(10 * time.Second)
 	var follower *endpoint
 	for _, id := range c.ids {
 		if id != l {
@@ -450,6 +465,7 @@ func TestFollowerLocalReadIsCaughtAsNonLinearizable(t *testing.T) {
 	// Establish a value everyone has.
 	id := rec.Begin("c1", lincheck.Put, "k", []byte("old"))
 	m, err := srvL.Put(ctx, []byte("k"), []byte("old"))
+	c.premise(c.node(l).Term() == tm, "%s was deposed during the first write: %v", l, err)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,14 +480,29 @@ func TestFollowerLocalReadIsCaughtAsNonLinearizable(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	// Cut the follower's inbound traffic so it cannot learn the next write.
-	c.net.Block(string(l), follower.Name())
+	// Isolate the follower so it cannot learn the next write, and let it
+	// campaign: the hostile timing, every run.
+	c.net.Isolate(follower.Name(), c.members())
+	fid := raftnode.NodeID(follower.Name())
+	deadline = time.Now().Add(10 * time.Second)
+	for c.node(fid).Term() <= tm {
+		if time.Now().After(deadline) {
+			t.Fatalf("the isolated follower %s never campaigned", fid)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	id = rec.Begin("c1", lincheck.Put, "k", []byte("new"))
-	if m, err = srvL.Put(ctx, []byte("k"), []byte("new")); err != nil {
-		t.Fatalf("write with one follower blocked (the other forms a quorum): %v", err)
+	m, err = srvL.Put(ctx, []byte("k"), []byte("new"))
+	// The leader keeps its term: the follower's campaign reaches nobody. Only
+	// a spurious election with the other follower could depose it now, and its
+	// own term says whether one did. (Were the isolation to leak, every attempt
+	// would be voided, and the test would fail.)
+	c.premise(c.node(l).Term() == tm, "%s was deposed during the write: %v", l, err)
+	if err != nil || m.Term != tm {
+		t.Fatalf("write with one follower isolated (the other forms a quorum): term %d, %v", m.Term, err)
 	}
 	rec.End(id, lincheck.OK, nil, string(l), m.Term, m.Index)
-	// A local read on the blocked follower — bypassing ReadIndex — after the
+	// A local read on the isolated follower — bypassing ReadIndex — after the
 	// write completed.
 	id = rec.Begin("c2", lincheck.Get, "k", nil)
 	v, ok := srvF.Store().Get([]byte("k"))
@@ -494,10 +525,14 @@ func TestFollowerLocalReadIsCaughtAsNonLinearizable(t *testing.T) {
 	if _, _, err := srvF.Get(ctx, []byte("k")); err == nil {
 		t.Fatal("a follower served a linearizable read")
 	}
+	// Healed, the follower's higher term deposes the leader; its log lacks the
+	// write, so it cannot win, and the group settles on a leader that has it.
+	leader, lt := c.waitSettled(10 * time.Second)
 	srvF.SetForwarding(true)
 	resp, _ := srvF.Do(ctx, kv.Request{Op: kv.ReqGet, Key: []byte("k")})
-	if resp.Status != kv.StatusOK || string(resp.Value) != "new" || resp.Node != string(l) || resp.Via != follower.Name() {
-		t.Fatalf("a forwarded read must be the leader's fresh answer: %+v", resp)
+	c.premise(resp.Status == kv.StatusOK || c.node(leader).Term() == lt, "%s was deposed during the forwarded read: %+v", leader, resp)
+	if resp.Status != kv.StatusOK || string(resp.Value) != "new" || resp.Node != string(leader) || resp.Via != follower.Name() {
+		t.Fatalf("a forwarded read must be the leader's (%s) fresh answer: %+v", leader, resp)
 	}
 }
 
