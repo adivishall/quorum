@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -158,11 +160,12 @@ func TestOpenSweepsOnlyAgainstADurableManifest(t *testing.T) {
 
 // TestAFailedOpenClosesItsManifest: an open that fails after installing its
 // fresh manifest — here removing an obsolete one — closes it. The error path
-// closed the tables but not the manifest, leaking its descriptor.
+// closed the tables but not the manifest, leaking its descriptor. Every
+// platform counts the manifest files opened through its file system and not
+// closed; Linux also checks every descriptor through /proc/self/fd. (The
+// check was Linux-only, so on any other platform the test could not fail, and
+// mutant 287 survived every local mutation run there.)
 func TestAFailedOpenClosesItsManifest(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("counts descriptors through /proc/self/fd")
-	}
 	dir := t.TempDir()
 	s := openLSM(t, dir, lsmOpts(storage.DefaultMemTableSize))
 	mustPut(t, s, "k", "v")
@@ -172,8 +175,21 @@ func TestAFailedOpenClosesItsManifest(t *testing.T) {
 	}
 	inj := injectManifest(t)
 	inj.Arm(fault.Injection{Op: fault.OpRemove})
+	handles := &handleFS{FS: inj, open: map[string]int{}}
+	manifest.FS = handles // injectManifest's cleanup restores the original
 	if _, err := storage.OpenLSMStore(dir, lsmOpts(storage.DefaultMemTableSize)); err == nil {
 		t.Fatal("premise: the open with a failing RemoveObsolete succeeded")
+	}
+	if handles.opened == 0 {
+		t.Fatal("premise: the open never opened a manifest file through its file system")
+	}
+	for name, n := range handles.open {
+		if n != 0 {
+			t.Fatalf("the failed open left the manifest file %s open", name)
+		}
+	}
+	if runtime.GOOS != "linux" {
+		return
 	}
 	ents, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
@@ -184,6 +200,42 @@ func TestAFailedOpenClosesItsManifest(t *testing.T) {
 			t.Fatalf("the failed open left %s open", target)
 		}
 	}
+}
+
+// handleFS counts the files opened through it and not yet closed, by name.
+type handleFS struct {
+	vfs.FS
+	mu     sync.Mutex
+	open   map[string]int
+	opened int
+}
+
+func (h *handleFS) OpenFile(name string, flag int, perm fs.FileMode) (vfs.File, error) {
+	f, err := h.FS.OpenFile(name, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	h.mu.Lock()
+	h.open[name]++
+	h.opened++
+	h.mu.Unlock()
+	return &handleFile{File: f, fs: h, name: name}, nil
+}
+
+type handleFile struct {
+	vfs.File
+	fs     *handleFS
+	name   string
+	closed sync.Once
+}
+
+func (f *handleFile) Close() error {
+	f.closed.Do(func() {
+		f.fs.mu.Lock()
+		f.fs.open[f.name]--
+		f.fs.mu.Unlock()
+	})
+	return f.File.Close()
 }
 
 // TestAnExplicitCompactionAfterAFailureRunsNothing (audit M11): after a
