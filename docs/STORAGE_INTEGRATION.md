@@ -935,3 +935,176 @@ and the engine's WAL runs in its default batch mode, so the engine adds a write 
 fsync per write. The cost that shows is the engine's write path per entry — the record, the
 memtable, the session record rewrite — on the actor goroutine. The replicated apply path is what
 S6 measures and optimizes; the figures here are the before.
+
+---
+
+## 9. S3 — durable watermarks, WAL truncation, and R2-gated compaction
+
+S3 makes the engine's applied index and last sequence **authoritative in the MANIFEST**, so the
+engine's WAL can be truncated without losing the numbering replay derives; it establishes the
+crash-safe ordering between a flush, the MANIFEST commit and WAL-segment deletion; and it enforces
+**R2** in the real Raft compaction path. R1 (§7.2) is unchanged and must stay intact.
+
+The design was audited against the merged code at S2 (`main` after PR #16). The rule of §1 still
+governs: Raft decides order; the engine makes the result durable; the engine invents no order.
+
+### 9.1 Audit: what is authoritative today, and what truncation would break
+
+| # | Question | Answer at S2 |
+|---|---|---|
+| 1 | Where is the applied index durable? | The engine's WAL, as `KindApplyBatch`/`KindAppliedIndex` records (S1). On open, `LSMStore.applied` is seeded from the MANIFEST's `Applied` field and then **overridden** by replaying every WAL record. The MANIFEST's `Applied` is written only by the open-time snapshot and is otherwise never advanced, so the WAL is the sole authority. |
+| 2 | Where is the sequence durable? | Nowhere. `LSMStore.seq` lives in memory and is **re-derived** on open by counting every mutation in the WAL from 1. The MANIFEST's `LastSequence` is written at each flush but never read back as an authority. |
+| 3 | What makes this sound today? | Nothing deletes a WAL segment (`docs/WAL.md` §10, `docs/MANIFEST.md` §4, §11). Replay always reads the whole log from segment 1, so counting reproduces the exact numbering and the last apply record reproduces the applied index. |
+| 4 | What would truncation break? | Both derivations. Delete segment 1 and replay starts at segment 2 and numbers its first record `seq = 1` — but that record's true sequence is far higher, so every table's sequence range and the memtable would disagree, and the applied index of the deleted prefix would be lost. Truncation is therefore impossible until the MANIFEST is the authority for both numbers. |
+| 5 | Is R2 enforced? | No. `raftnode.Durable.compact` discards the Raft log through `snapshotIndex − Retain`, gated only by the snapshot schedule. Nothing consults the engine's durable applied index. In S2 this is safe only because the published snapshot — fsynced before the log is compacted — is itself a durable copy of the compacted prefix (§9.6 states this precisely). |
+| 6 | Does the MANIFEST format need to change? | No. The edit format already carries `SetLogNumber` (tag `0x05`) and `SetApplied` (tag `0x06`), round-tripped and strictly decoded since Phase 4 (`docs/MANIFEST.md` §3). S3 starts **writing** them at each flush and **reading** them at open. No version bump, no migration. |
+
+### 9.2 The authoritative MANIFEST metadata
+
+Three fields in the MANIFEST become authoritative, all already in the format:
+
+- **`Applied` (index, term).** The applied index the flushed tables bring the engine to. Set in
+  the same edit that adds a flush's SSTable, so it advances atomically with the data it covers
+  (R1's shape, now in the MANIFEST as well as the WAL).
+- **`LastSequence`.** The highest sequence number any flushed table holds. Already written at each
+  flush; S3 makes open **seed** the sequence counter from it instead of counting from 1.
+- **`LogNumber`.** The WAL segment replay must start from. Every segment below it holds only
+  records already in a flushed table, and may be deleted. S3 maintains the invariant that
+  **segment `LogNumber` begins exactly at sequence `LastSequence + 1`.**
+
+Recovery decodes all three strictly (an out-of-range or internally inconsistent value is
+`ErrCorrupt`) and validates them against the live file set: `LastSequence` must be at least the
+maximum `LargestSeq` of the live tables, and `Applied` must not move backwards across reopen.
+
+`LogNumber == 0` means "no truncation has happened": replay starts at the first segment present
+and counts from 0, exactly as before S3. This is what a pre-S3 directory decodes to, so such a
+directory opens and replays unchanged (§9.8).
+
+### 9.3 The watermark commit point
+
+A flush is the only place the watermark advances, and the MANIFEST append is the instant it
+becomes durable. The order, with each step chosen for what a crash immediately after it leaves:
+
+1. **Freeze** the memtable at `(seq = L, applied = A)`; install a fresh one. (as today)
+2. **Write the table:** `N.sst.tmp`, fsync, rename, **fsync the directory**. The table's bytes and
+   name are durable. (as today)
+3. **Rotate the WAL:** sync and close the active segment, create a new empty segment `A+1`, and
+   **fsync the WAL directory** so the new segment's creation is durable. The new segment will hold
+   `seq L+1` onward, so it begins exactly at `LastSequence + 1`. (`s.w == nil` during a replay
+   flush: no WAL yet, so this step and `LogNumber` are skipped — §9.7.)
+4. **Append the MANIFEST edit** — `AddFile(N)`, `SetNextFileNum`, `SetLastSequence(L)`,
+   `SetApplied(A)`, `SetLogNumber(A+1)` — as **one record**, fsynced by `manifest.Append`. **This
+   is the commit point.** Before it, the flush has not happened; after it, the table is live and
+   the watermark is `(L, A)` with the log starting at segment `A+1`.
+5. **Swap** the in-memory version to include table `N`. (as today)
+6. **Delete** WAL segments below `A+1`, then **fsync the WAL directory**. A failure here is logged,
+   not fatal: the segments are redundant (their records are in table `N`) and the next open sweeps
+   them. This mirrors obsolete-SSTable removal (`lsmcompact.go`).
+
+The rotation in step 3 is what lets `LastSequence` double as the replay seed: because the new
+segment is empty at the freeze, its first record is `L+1`, so `LogNumber`'s segment starts at
+`LastSequence + 1` by construction and no separate "log start sequence" field is needed.
+
+### 9.4 The WAL truncation eligibility rule
+
+> A WAL segment may be deleted only once a durable MANIFEST edit names a `LogNumber` above it.
+
+Equivalently: a segment is eligible exactly when every record it holds has `seq ≤ LastSequence`
+and is therefore in a flushed, MANIFEST-recorded table. Eligibility is never decided by a
+filename, an age, or a sequence guess — only by the durable `LogNumber`. Because `LogNumber`
+advances only at step 4, and step 4 is preceded by the table (step 2) and the new segment (step 3)
+being made durable, a segment is deleted only after its contents provably survive elsewhere.
+
+### 9.5 Crash safety of the ordering
+
+| Crash … | MANIFEST holds | On disk | Recovery | Correct because |
+|---|---|---|---|---|
+| before step 4 | old watermark | table `N` orphaned; maybe empty segment `A+1`; old segments present | replay from old `LogNumber`, old seed; sweep `N` and any stray segment | the flush did not happen durably |
+| step 4 torn | old watermark (torn edit truncated) | as above | as above | `manifest.Recover` truncates the torn final record; the edit never took effect |
+| after step 4, before/during step 6 | `(L, A)`, `LogNumber = A+1` | table `N` live; some or all of segments `< A+1` still present | replay from `A+1`, seed `L`; sweep leftover low segments | segment `A+1` was made durable in step 3 **before** the commit, so `LogNumber` never names a non-durable segment; low segments are redundant |
+| power loss after step 4, new segment's post-commit writes unsynced | `(L, A)`, `LogNumber = A+1` | `A+1` reverts to empty (its durable creation); old segments gone or present | replay from `A+1` (empty) → engine recovers to `(L, A)`; the entries above `A` come back from the **Raft log** (R2) | R2 keeps the Raft log from discarding entries above the engine's durable applied index `A` |
+| partial deletion in step 6 | `(L, A)`, `LogNumber = A+1` | an arbitrary subset of `< A+1` present | replay ignores everything below `LogNumber`; sweep the rest | deletion order is irrelevant; `LogNumber` alone decides what replay reads |
+
+Two refusals make missing segments detectable now that deletion exists: if the lowest segment
+present is **above** `LogNumber`, the segment replay needs is gone — `ErrCorrupt`. A gap between
+present segments at or above `LogNumber` is `ErrCorrupt`, as before. A segment **below** `LogNumber`
+that is still present is a harmless leftover and is swept. This closes the Phase 2 gap that a
+missing oldest segment was undetectable (`docs/WAL.md` §10).
+
+### 9.6 R2 in the real Raft compaction path
+
+R2 is enforced where the log is actually discarded. The engine exposes its **durable applied
+index** — the applied index it is guaranteed to recover after a power loss without the Raft log,
+which is the MANIFEST's flushed `Applied` — up through a small optional interface:
+
+```go
+// raftnode: a state machine that bounds log compaction by the applied index it
+// can recover after a crash without the Raft log (R2).
+type DurableApplier interface { DurableAppliedIndex() uint64 }
+```
+
+`Durable.compact` clamps its compaction point `c` to `min(c, sm.DurableAppliedIndex())` when the
+state machine implements the interface. The in-memory store does **not** implement it: its durable
+copy of the compacted prefix is the published snapshot, so it compacts exactly as before. The LSM
+machine does: `DurableAppliedIndex` returns the engine's flushed `Applied`, and the Raft log is
+never compacted past it.
+
+What this does and does not change. In S2's architecture a compaction is always immediately
+preceded by a snapshot that is fsynced at an index at or above the compaction point, and that
+snapshot file is itself a durable copy of the compacted prefix — so S2 is not losing data, and S3
+does not claim to fix a live loss. R2 makes the guarantee hold **by construction** rather than by
+that timing argument: the compaction boundary provably never passes the engine's durable applied
+index, which is exactly the property the engine-WAL-truncation argument of §9.5 (the power-loss
+row) relies on, and the property §4's options B and C and S6's batched apply will need once the
+Raft log stops being shadowed by a fresh snapshot at every compaction. The clamp only ever makes a
+node **retain more** log, so it cannot break replication, membership or catch-up. If the durable
+index cannot be read it reads as 0, which compacts nothing — fail-safe.
+
+The boundary distinctions this rests on, stated explicitly:
+
+- **committed** — in a majority's durable Raft logs; a write may be acknowledged.
+- **applied** — the state machine has decided the entry (`core.AppliedIndex()`), in memory.
+- **engine-durable (synced)** — the entry's effect survives a power loss in the engine: the
+  flushed `Applied`. This, not "applied", is what bounds compaction.
+
+### 9.7 Restart and recovery
+
+At open, after recovering the MANIFEST and before replaying the WAL:
+
+- Seed `applied = Applied` (the MANIFEST floor) and, when `LogNumber > 0`, `seq = LastSequence`.
+- Delete any WAL segment below `LogNumber` (a leftover from an interrupted step 6), then verify the
+  lowest segment present equals `LogNumber`; a higher lowest segment is `ErrCorrupt`.
+- Replay from `LogNumber` (or segment 1 when `LogNumber == 0`): each mutation advances `seq`; a
+  record at or below the flushed sequence is already in a table and is skipped; each apply record
+  advances `applied`, which may only move forward from the MANIFEST floor.
+
+A flush triggered **during** replay (recovering a log larger than memory) records `AddFile`,
+`LastSequence` and `Applied` but **not** `LogNumber`, and rotates nothing: the segments it builds
+tables from are still being read, so the log start must not move until the next real flush after
+open. Nothing is deleted during replay.
+
+The result is R1's recovery, now with a truncated log: the engine is exactly its flushed state at
+the MANIFEST watermark plus the surviving WAL suffix, applied once. Replay is **idempotent** — a
+second crash immediately after open recovers the identical state — and the engine accepts new
+writes afterward, numbered above everything durable (no durable sequence is ever reused, §9.8).
+
+### 9.8 Compatibility and sequence continuity
+
+- A pre-S3 directory decodes to `LogNumber == 0` and replays from segment 1 counting from 0, with
+  `Applied` as it was — identical to S2. The first S3 flush then rotates and sets `LogNumber`,
+  enabling truncation from that point. No migration, no format change.
+- After restart the next sequence is strictly above `LastSequence` and above every surviving
+  record's sequence, so a durable sequence is never reused and live tables keep pairwise-disjoint
+  ranges (the read path's correctness rests on this). A sequence lost to a power loss (an unsynced
+  record above the watermark) is re-consumed deterministically when the Raft log replays the same
+  entry — the same mutation, the same number.
+
+### 9.9 What is deliberately deferred
+
+- Snapshots as engine checkpoints and ingest; the 512 MiB snapshot bound (S4).
+- The two-log durability measurement — whether to fsync the engine WAL per batch, sync at the
+  compaction gate, or drop it — and any tightening of the R2 bound in `sync` mode (S5).
+- Group commit, pipelining, batched apply, and any optimization of the per-cycle write path (S6).
+- Real-device power-loss certification: the crash matrix uses the software model (`internal/fault`),
+  which assumes an honest fsync and models unsynced data as lost or as a torn prefix, never as
+  reordering or bit rot (`docs/FAILURE_MODEL.md`).
