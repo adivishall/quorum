@@ -368,11 +368,11 @@ covered. It is not evidence about a disk. The matrix found two gaps, both fixed:
 | Limitation | Removed in |
 |---|---|
 | ~~Entire live data set held in memory~~ | **removed in Phase 3** (memtable + SSTables, `docs/LSM.md`) |
-| Entire log replayed on every open; startup grows with total bytes ever written | Phase 4 (truncation via the MANIFEST log number) |
-| No log truncation, so the WAL grows without bound | Phase 4 |
-| Segments missing from the *start* of the sequence are undetectable | Phase 4 (MANIFEST log number) |
+| ~~Entire log replayed on every open; startup grows with total bytes ever written~~ | **removed in S3**: a flush rotates the WAL, records the log number, and deletes the segments below it (`docs/STORAGE_INTEGRATION.md` §9); replay starts at the log number |
+| ~~No log truncation, so the WAL grows without bound~~ | **removed in S3**: the log is reclaimed behind each flush |
+| ~~Segments missing from the *start* of the sequence are undetectable~~ | **removed in S3**: recovery refuses a WAL whose lowest segment is above the MANIFEST's log number |
 | Mis-classification possible if a length field is corrupted within range | inherent to this framing; see §8 |
 | `sync` mode serialises writers behind the flush | Phase 5 may add group commit, if measured to matter |
 | Power-loss durability untested on a real device, in every mode (modeled since S1, §9) | not testable here |
-| The current sequence and applied index are derived from the whole log; nothing deletes a segment, and S3 must make both authoritative in the MANIFEST before truncating (`docs/STORAGE_INTEGRATION.md` §7.4) | S3 |
+| ~~The current sequence and applied index are derived from the whole log~~ | **removed in S3**: the MANIFEST's `LastSequence` and `Applied` are authoritative; recovery seeds both and the surviving log only extends them (`docs/STORAGE_INTEGRATION.md` §9.2) |
 | ~~Open does not sync the recovered segments before a replay flush records a table (§5)~~ | **fixed in S1**: `RecoverWith` fsyncs the newest segment before replaying it (older ones were fsynced at rotation), except in `off` mode |

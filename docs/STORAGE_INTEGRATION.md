@@ -1,6 +1,6 @@
 # STORAGE INTEGRATION — the LSM engine as the replicated state machine
 
-Status: **S1 and S2 are implemented (§7, §8); S3–S6 are design.** The design was audited against the code at
+Status: **S1, S2 and S3 are implemented (§7, §8, §9); S4–S6 are design.** The design was audited against the code at
 PR #10's head (`a8eb9e1`, 2026-10-07), and S1's audit against `main` after it. This document fixes
 who owns each invariant, so that no code moves before that is clear. `docs/ENGINEERING_ROADMAP.md`
 §0 states the project's thesis, and this is its layer-2 plan.
@@ -207,7 +207,7 @@ leaves `main` green.
 |---|---|---|---|
 | **S1** ✓ | **Atomic apply batches in the engine** (§7) | `internal/storage`, its WAL on `internal/vfs` | **R1**'s storage half proven in isolation by a deterministic crash and power-loss matrix — done, §7.9–§7.11 |
 | **S2** ✓ | **The engine behind the state-machine interface** (§8), sessions under a reserved tag; `dkvd -state-machine memory\|lsm` | `internal/kv`, `raftnode` (a cycle hook, the term on restore), `multiraft`, `cmd/dkvd` | every existing linearizability, dedup, snapshot, membership and chaos tier passes on both machines; the engine's applied index is the durable authority at restart — done, §8.9–§8.12 |
-| S3 | Recovery from the engine's applied index (exactly-once across restarts); log compaction gated by **R2**; the engine's WAL truncated, with its applied index and last sequence made authoritative in the MANIFEST first (§7.1, §7.4) | `raftnode`, `kv`, `storage` | the hosted crash matrix (§3.2, and `docs/ENGINEERING_ROADMAP.md` §3 item 4) and a replaced INV-CR4 |
+| **S3** ✓ | **Durable watermarks, WAL truncation, R2-gated compaction** (§9): the applied index and last sequence authoritative in the MANIFEST, the WAL truncated behind each flush, and the Raft log never compacted past the engine's durable applied index | `storage`, `raftnode`, `kv` | the crash matrix extended to the truncation protocol, deterministic R2 gating, and the existing tiers on both machines — done, §9.10–§9.13 |
 | S4 | Snapshots as checkpoints, streamed, installed by ingest | `storage`, `snapshot`, `raftnode` | the snapshot crash matrix on the hosted engine |
 | S5 | The two-log decision: A, B and C measured | `storage`, `dkvlab` | a published comparison against the baseline, and the chosen option |
 | S6 | Performance: group commit, pipelining, batched apply | `raftnode`, `raft` | before-and-after measurements |
@@ -1108,3 +1108,91 @@ writes afterward, numbered above everything durable (no durable sequence is ever
 - Real-device power-loss certification: the crash matrix uses the software model (`internal/fault`),
   which assumes an honest fsync and models unsynced data as lost or as a torn prefix, never as
   reordering or bit rot (`docs/FAILURE_MODEL.md`).
+
+### 9.10 What was built, and what building it found
+
+- The MANIFEST's `Applied` and `LogNumber` tags were present and strictly decoded since Phase 4 but
+  never written during operation. S3 writes both (and keeps writing `LastSequence`) in the one edit
+  a flush appends, and reads all three at open. No format version changed; a pre-S3 directory
+  decodes `LogNumber == 0` and replays exactly as before.
+- The flush rotates the WAL so the log number's segment begins at `LastSequence + 1`. That one
+  decision is what lets `LastSequence` double as the replay seed and removes the need for a separate
+  "log start sequence" field — the smallest change that makes truncation recoverable.
+- Dropping the explicit pre-MANIFEST `WAL.Sync()` was safe only because the rotation already syncs
+  and closes the outgoing segment. The S1 mutants that guarded that sync (`flush-syncs-the-wal-first`,
+  `replay-flush-has-no-wal-to-sync`, `syncoff-flush-does-not-fsync`) were re-anchored to the
+  rotation, which now provides the same ordering.
+- The S1 crash matrix had encoded the recovered prefix as the count of surviving WAL batch records.
+  Truncation moves the flushed prefix out of the WAL and into the tables, so that count no longer
+  described recovery. The matrix now identifies the prefix by its recovered applied index, checks it
+  whole, and bounds it by `durable..attempted` — a stronger check that is medium-agnostic.
+- Found while building: a process crash at a batch's fsync can still recover that batch (its record
+  reached the kernel), so the matrix's upper bound is *attempted*, not *written* — the §7.2 contract
+  that a failed `Apply` "may or may not be recovered."
+- R2 turned out not to fix a live loss in S2's architecture — a compaction is always preceded by a
+  durable snapshot at or above the compaction point, which is itself a durable copy of the prefix.
+  S3 makes the guarantee hold by construction instead of by that timing argument, and it is what the
+  WAL-truncation-plus-batch-mode power-loss case (§9.5) actually relies on.
+
+### 9.11 Tests, mutants, fuzzing
+
+| Concern | Test |
+|---|---|
+| WAL segments reclaimed, data intact after reopen | `TestWALTruncationReclaimsSegments` |
+| The durable watermark advances only at a flush | `TestDurableAppliedAdvancesOnlyAtFlush` |
+| The applied index comes from the MANIFEST when the WAL is empty after a flush | `TestAppliedIndexRecoveredFromTheManifestAfterAFlush` |
+| Sequence and applied-index continuity across many reopens; no durable sequence reused | `TestSequenceAndAppliedContinuityAcrossReopen` |
+| A leftover low segment is swept; recovery is idempotent | `TestLeftoverLowSegmentsAreSweptOnOpen` |
+| A missing required segment is refused | `TestARequiredWALSegmentMissingIsRefused` |
+| The replay-flush path records no log number and rotates nothing | `TestFlushWithoutWALRotatesNothingDuringReplay` |
+| A truncated engine takes new writes and reopens | `TestTruncatedEngineAcceptsWritesAndReopens` |
+| R1 through the extended crash matrix (truncation, rotation, deletion ops; process and power loss) | `TestApplyCrashMatrix` |
+| Reopen skip/replay counts under truncation | `TestReopenAfterCleanClose`, `TestReopenWithEverythingFlushed`, `TestApplyBatchesAndRecovery` |
+| R2: the compaction clamp arithmetic | `TestCompactPointClampsToDurable` |
+| R2: the machine reports the engine's durable index, not the live one | `TestLSMMachineDurableAppliedIsTheEnginesFlushedIndex` |
+| R2 end to end: a real three-node LSM cluster never compacts past a durable copy, with the clamp in force | `TestR2CompactionStaysWithinADurableCopy` |
+
+Mutation: twelve correctness-critical mutants for S3 — the applied index and log number recorded at
+a flush, the rotation before the record, the SyncOff fsync skip, truncation bounded to below the log
+number, the sequence seeded from the MANIFEST, a missing required segment refused, a leftover
+segment swept, the R2 clamp, the watermark advancing at a flush, and the machine reporting the
+durable index — each killed by the intended regression above. The existing WAL and apply fuzz
+targets run unchanged over the new record usage.
+
+### 9.12 Evidence
+
+_(Filled from the final gate run — see the PR body and §11 of the final report.)_
+
+### 9.13 What S3 proves, and what it does not
+
+**S3 proves:**
+- **The WAL is truncated safely.** A segment is deleted only after a durable MANIFEST edit records a
+  higher log number, which requires the segment's records to be in a flushed table and that table
+  recorded. Recovery starts at the log number, seeded from the MANIFEST's `LastSequence`, and the
+  crash matrix confirms R1 holds at every rotation, MANIFEST and deletion boundary under a process
+  crash and the modeled power loss.
+- **The MANIFEST is authoritative** for the applied index and the last sequence: an empty WAL after
+  a flush still recovers the applied index, and the sequence continues upward across reopens with no
+  durable sequence reused. A missing required segment is refused; a leftover one is swept; recovery
+  is idempotent.
+- **R2 holds in the real compaction path.** A self-compacting node never advances its log-compaction
+  boundary past the engine's durable applied index, proven by the clamp's unit test and a real
+  three-node cluster; the in-memory store is unchanged, covered by its published snapshot.
+- **R1 is intact.** Every applied transition is still recorded atomically with its applied index; the
+  extended matrix checks state, applied index, term and both sequences together.
+
+**S3 does not prove (supported but not fully proven):**
+- **Real-device power-loss durability.** The matrix uses the software fault model (`internal/fault`),
+  which assumes an honest fsync and models unsynced data as lost or as a torn prefix, never as
+  reordering or bit rot (`docs/FAILURE_MODEL.md`). Modeled power loss is not device certification.
+- **The engine's SSTable and compaction code under power loss inside the hosted machine.** The crash
+  tests put the WAL and MANIFEST on the model; SSTable file writes still use `os` directly (as in
+  S1/S2).
+- **The tightest R2 bound.** The durable watermark is the flushed applied index; in `sync` WAL mode
+  the synced-but-unflushed suffix is also recoverable, so the log could be retained less
+  conservatively. That optimization is the two-log decision (S5).
+
+**Deferred to S4+:**
+- Snapshots as engine checkpoints and streamed ingest; the 512 MiB snapshot bound (S4).
+- The two-log durability measurement and any WAL-mode-dependent R2 tightening (S5).
+- Group commit, batched apply, and per-cycle write-path optimization (S6).

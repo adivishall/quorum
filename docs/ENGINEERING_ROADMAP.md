@@ -23,7 +23,7 @@ work is organized into four layers, and **a lower layer takes priority over a hi
 | Layer | What it holds | State (after PR #10) |
 |---|---|---|
 | **1. Correctness foundation** | Raft, its durable log and crash recovery; linearizability; sessions and deduplication; snapshots; membership; Multi-Raft. Verified by the simulator, the crash matrices, the linearizability checker, real-process fault and chaos tests, mutation testing and fuzzing. | **Built and verified** (§1.5) |
-| **2. Durable storage integration** | The LSM engine as the replicated state machine: atomic apply with a durable applied index, exactly-once recovery, snapshots as engine checkpoints, the two-log decision | **S1 and S2 done:** the engine records an application's mutations and applied index as one recovery unit (§7), and `dkvd -state-machine lsm` runs each group's state machine on it, one apply batch per Raft cycle, recovering from the engine's applied index; every existing correctness tier passes on both machines (`docs/STORAGE_INTEGRATION.md` §8). R2, WAL truncation and engine-backed snapshots are S3 and S4. |
+| **2. Durable storage integration** | The LSM engine as the replicated state machine: atomic apply with a durable applied index, exactly-once recovery, snapshots as engine checkpoints, the two-log decision | **S1, S2 and S3 done:** the engine records an application's mutations and applied index as one recovery unit (§7); `dkvd -state-machine lsm` runs each group's state machine on it, one apply batch per Raft cycle (§8); and the applied index and last sequence are authoritative in the MANIFEST, the WAL is truncated behind each flush, and the Raft log is never compacted past the engine's durable applied index (R2, §9). Engine-backed snapshots as checkpoints (S4) and the two-log measurement (S5) remain. |
 | **3. Distributed performance** | Group commit, replication pipelining, batched apply, each measured before and after | **Baseline measured** (`docs/CLUSTER_BENCHMARKS.md`); nothing optimized |
 | **4. Operational and demo surface** | `dkvctl`, health and readiness, the chaos and load labs; then a network client, Docker Compose, a dashboard, the demo and the write-ups | Operator tool and labs **built**; the rest waits for layers 2 and 3 |
 
@@ -302,18 +302,19 @@ log and more configuration on top of exactly these paths, so they must hold firs
   the start path; mutants.
 - **Docs:** MULTI_RAFT, DEDUP, LIMITATIONS, a configuration reference.
 
-### 3. Storage-engine prerequisites (§1.6) — S1 and S2 done; S3 next
+### 3. Storage-engine prerequisites (§1.6) — S1, S2 and S3 done; S4 next
 
-S1 (`docs/STORAGE_INTEGRATION.md` §7) is done:
-- atomic apply batches with their applied index, inside the engine;
-- the WAL on `vfs`;
-- two power-loss gaps closed;
-- a crash and power-loss matrix.
+S1–S3 (`docs/STORAGE_INTEGRATION.md` §7–§9) are done:
+- atomic apply batches with their applied index, inside the engine (S1);
+- the WAL on `vfs`, two power-loss gaps closed, a crash and power-loss matrix (S1);
+- the engine behind the state-machine interface, one batch per cycle (S2);
+- the applied index and last sequence authoritative in the MANIFEST, the WAL truncated behind each
+  flush, and R2 enforced in the Raft compaction path (S3).
 
-Still open from §1.6, spread over S2–S5 there:
-- durable sequence numbers and WAL truncation (S3);
+Still open from §1.6, spread over S4–S5 there:
 - an ordered iterator and a consistent checkpoint, ingest (S4);
-- SSTables on `vfs` (S4).
+- SSTables on `vfs` (S4);
+- the two-log measurement and a tighter R2 bound (S5).
 
 - **Problem:** the engine cannot host the replicated state machine, and cannot be tested under the
   faults the node is.

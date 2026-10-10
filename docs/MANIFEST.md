@@ -91,19 +91,24 @@ startup path. Phase 3 had to read every byte of every SSTable to recover it, bec
 nowhere on disk to write it down (`docs/LSM.md` §8). Now it is recorded, and startup cross-checks
 each file's footer against the MANIFEST's record of it instead — see §6.
 
-## 4. What is not in it
+## 4. `SetLogNumber` and `SetApplied` since S3
 
-**`SetLogNumber` round-trips but is not acted on.** Retiring WAL segments a flush has superseded is
-a later concern; deleting a log on the strength of a field nothing yet tests would be the wrong
-order of operations. The WAL is still never truncated (`docs/LIMITATIONS.md`).
+Through Phase 4, S1 and S2 these two fields round-tripped but nothing acted on them: the WAL was
+never truncated, and the WAL record was the sole authority for the applied index. **S3 makes both
+authoritative** (`docs/STORAGE_INTEGRATION.md` §9).
 
-**`SetApplied` is recorded, but the WAL remains the authority** for the applied index, as in Phases
-2 and 3. The snapshot written at each open records the recovered value so the field is meaningful
-and round-trips, but nothing reads it back in preference to the log. Two authorities for one number
-would be worse than having the wrong one. S1 kept it that way on purpose: its apply batches carry
-the index in the WAL record with their data (`docs/STORAGE_INTEGRATION.md` §7.1). The MANIFEST
-becomes the authority for the applied index and the last sequence only in S3, together with the WAL
-truncation that first needs it.
+**`SetLogNumber`** is now written by every flush, naming the WAL segment recovery must start from —
+the segment the flush rotated to, which begins at `LastSequence + 1`. Segments below it hold only
+records already in a flushed table and are deleted. Recovery starts replay there, and a missing
+required segment is `ErrCorrupt`.
+
+**`SetApplied`** is now written by every flush, recording the applied index the flushed tables bring
+the engine to, atomically with the data (`AddFile`) and the sequence (`SetLastSequence`). Recovery
+seeds the applied index from it and the sequence from `LastSequence`, then advances both by replaying
+the surviving log. It is still not a *second* authority competing with the WAL: after truncation the
+WAL below the log number is gone, so the MANIFEST is the only place the flushed prefix's index and
+sequence live, and the surviving WAL only extends them. A pre-S3 directory, whose flushes never set
+these, decodes `LogNumber == 0` and replays from segment 1 as before — no migration.
 
 ## 5. The publication protocol
 
@@ -252,10 +257,11 @@ Same 20,000 keys, 20 SSTables:
 | Full verification (Phase 3 behaviour) | 3,340 | ~26.9 ms | 20 |
 | After compaction | **0** | ~19.9 ms | 1 |
 
-The block count is the claim; the milliseconds are incidental. Note that the elapsed times are
-dominated by WAL replay, which is unchanged: the WAL is never truncated, so every arm still replays
-all 20,000 mutations and skips them. That is the remaining startup cost and it is a listed
-limitation, not something this phase fixed.
+The block count is the claim; the milliseconds are incidental. At the time of this measurement the
+elapsed times were dominated by WAL replay, because the WAL was never truncated and every arm
+replayed all 20,000 mutations and skipped them. S3 truncates the WAL behind each flush
+(`docs/STORAGE_INTEGRATION.md` §9), so that startup cost no longer scales with total history; the
+block-count claim here is unaffected.
 
 ## 10. What the tests establish
 
@@ -293,8 +299,8 @@ limitation, not something this phase fixed.
 
 | Limitation | Removed in |
 |---|---|
-| The WAL is never truncated, so startup replays every mutation ever written even though compaction absorbed most of them long ago. `SetLogNumber` is recorded but not acted on | a later phase |
-| Segments missing from the *start* of the WAL remain undetectable | a later phase, using `SetLogNumber` |
+| The WAL was never truncated, so startup replayed every mutation ever written. `SetLogNumber` was recorded but not acted on | **removed in S3**: a flush records the log number and truncates the segments below it (`docs/STORAGE_INTEGRATION.md` §9) |
+| Segments missing from the *start* of the WAL were undetectable | **removed in S3**: recovery refuses a WAL whose lowest segment is above the MANIFEST's log number |
 | A manifest grows within one session (one record per flush and per compaction) and is only compacted by reopening | deferred; a within-session rotation threshold would be the fix |
 | A Phase 3 directory needs an explicit opt-in to open | deliberate, §8 |
 | Damage inside a data block is found at read time rather than at startup, unless `VerifySSTablesOnOpen` is set | deliberate trade, §6 |

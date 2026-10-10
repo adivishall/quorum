@@ -13,7 +13,7 @@ replicated state machine without weakening the guarantees already proven.
 | Layer | State |
 |---|---|
 | 1. Correctness foundation: Raft, crash recovery, linearizability, sessions, snapshots, membership, Multi-Raft | built, and verified by simulation, crash matrices, recorded histories, real-process chaos, mutation and fuzzing |
-| 2. Durable storage integration: the LSM engine as the replicated state machine | **S1 and S2 of six done:** `dkvd -state-machine lsm` runs each group's state machine on the engine, one apply batch per Raft cycle, recovering from the engine's applied index; every correctness tier passes on both machines. Memory is still the default; R2 and engine-backed snapshots are next. Design and status: [`docs/STORAGE_INTEGRATION.md`](docs/STORAGE_INTEGRATION.md) |
+| 2. Durable storage integration: the LSM engine as the replicated state machine | **S1, S2 and S3 of six done:** `dkvd -state-machine lsm` runs each group's state machine on the engine, one apply batch per Raft cycle, recovering from the engine's applied index; the applied index and last sequence are authoritative in the MANIFEST, the WAL is truncated behind each flush, and the Raft log is never compacted past the engine's durable applied index (R2). Every correctness tier passes on both machines. Memory is still the default; engine-backed snapshots (S4) are next. Design and status: [`docs/STORAGE_INTEGRATION.md`](docs/STORAGE_INTEGRATION.md) |
 | 3. Distributed performance | baseline measured ([`docs/CLUSTER_BENCHMARKS.md`](docs/CLUSTER_BENCHMARKS.md)); nothing optimized yet |
 | 4. Operational and demo surface | `dkvctl`, health and readiness, chaos and load labs; the rest waits for layers 2 and 3 |
 
