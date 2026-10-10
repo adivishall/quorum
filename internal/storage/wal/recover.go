@@ -43,6 +43,10 @@ type Recovery struct {
 	// IgnoredEntries counts directory entries that are not segment files.
 	IgnoredEntries int
 
+	// SegmentsRemoved counts leftover segments below the log number that an
+	// interrupted truncation left behind and recovery deleted (S3).
+	SegmentsRemoved int
+
 	// Truncated records a repaired torn tail.
 	Truncated       bool
 	TruncatedFile   string
@@ -79,7 +83,8 @@ func Recover(dir string, h Handler) (Recovery, error) {
 	return RecoverWith(dir, DefaultOptions(), h)
 }
 
-// RecoverWith is Recover on opts.FS, under opts.SyncMode.
+// RecoverWith is Recover on opts.FS, under opts.SyncMode. It replays every
+// segment present, as before log truncation existed (logNumber 0).
 //
 // Since S1 it fsyncs the newest segment before replaying it, unless the sync
 // mode is off (docs/STORAGE_INTEGRATION.md §7.5, gap (b)). A process killed with
@@ -89,10 +94,37 @@ func Recover(dir string, h Handler) (Recovery, error) {
 // everything replayed is durable: after open, recovered implies durable. Older
 // segments were fsynced when they were rotated out.
 func RecoverWith(dir string, opts Options, h Handler) (Recovery, error) {
+	return RecoverFrom(dir, opts, 0, h)
+}
+
+// RecoverFrom replays the WAL from segment logNumber onward (S3,
+// docs/STORAGE_INTEGRATION.md §9.7). logNumber is the MANIFEST's LogNumber: the
+// segment whose first record is sequence LastSequence+1, so that the caller may
+// seed its sequence counter from LastSequence and skip the flushed prefix. A
+// logNumber of 0 means no truncation has ever happened — replay from the first
+// segment present, exactly as RecoverWith always did (a pre-S3 directory).
+//
+// With logNumber > 0 it completes an interrupted truncation and detects a lost
+// segment:
+//   - every segment below logNumber is a leftover from a deletion that a crash
+//     interrupted; it is removed (and the removal fsynced), because its records
+//     are already in a flushed table and replaying them would double-count;
+//   - the lowest segment that remains must be logNumber. A higher one means the
+//     segment replay needs is gone, which a crash cannot produce once the
+//     segment's creation was fsynced before the MANIFEST named it (§9.5) — so it
+//     is ErrCorrupt, not something to work around.
+func RecoverFrom(dir string, opts Options, logNumber uint64, h Handler) (Recovery, error) {
 	var rec Recovery
 	fsys := vfs.Or(opts.FS)
 
 	if _, err := fsys.Stat(dir); errors.Is(err, fs.ErrNotExist) {
+		if logNumber > 0 {
+			// The MANIFEST names a WAL segment, but the WAL directory is gone.
+			// The directory is created once and never removed, and it lives in
+			// the durable data directory, so this is damage, not a crash state.
+			return rec, fmt.Errorf("wal: the MANIFEST requires segment %s but %s does not exist: %w",
+				segmentName(logNumber), dir, ErrCorrupt)
+		}
 		// A directory that does not exist is an empty log, not an error: this
 		// is what a brand-new database looks like.
 		return rec, nil
@@ -100,9 +132,29 @@ func RecoverWith(dir string, opts Options, h Handler) (Recovery, error) {
 		return rec, fmt.Errorf("wal: stat %s: %w", dir, err)
 	}
 
-	nums, ignored, err := listSegments(fsys, dir)
-	if err != nil {
-		return rec, err
+	var (
+		nums    []uint64
+		ignored int
+		err     error
+	)
+	if logNumber > 0 {
+		// A truncation may have deleted a prefix of the segments, so list raw
+		// (a missing prefix is expected), drop everything below the log number,
+		// and only then require what remains to be contiguous.
+		nums, ignored, err = listSegmentsRaw(fsys, dir)
+		if err != nil {
+			return rec, err
+		}
+		if nums, err = truncateBelow(fsys, opts, dir, logNumber, nums, &rec); err != nil {
+			return rec, err
+		}
+		if err := checkContiguous(nums); err != nil {
+			return rec, err
+		}
+	} else {
+		if nums, ignored, err = listSegments(fsys, dir); err != nil {
+			return rec, err
+		}
 	}
 	rec.IgnoredEntries = ignored
 
@@ -120,6 +172,43 @@ func RecoverWith(dir string, opts Options, h Handler) (Recovery, error) {
 		rec.SegmentsScanned++
 	}
 	return rec, nil
+}
+
+// truncateBelow removes the leftover segments below logNumber (a deletion a
+// crash interrupted), fsyncs the directory, and returns the segments at or above
+// logNumber. It refuses a state a crash cannot produce: the lowest remaining
+// segment must be logNumber itself, because the segment's creation was fsynced
+// before the MANIFEST named it (docs/STORAGE_INTEGRATION.md §9.5).
+func truncateBelow(fsys vfs.FS, opts Options, dir string, logNumber uint64, nums []uint64, rec *Recovery) ([]uint64, error) {
+	var kept []uint64
+	removed := false
+	for _, s := range nums {
+		if s < logNumber {
+			if err := fsys.Remove(segmentPath(dir, s)); err != nil {
+				return nil, fmt.Errorf("wal: removing leftover segment %s below log number %s: %w",
+					segmentName(s), segmentName(logNumber), err)
+			}
+			rec.SegmentsRemoved++
+			removed = true
+			continue
+		}
+		kept = append(kept, s)
+	}
+	if removed && opts.SyncMode != SyncOff {
+		if err := fsys.SyncDir(dir); err != nil {
+			return nil, fmt.Errorf("wal: syncing %s after removing leftover segments: %w", dir, err)
+		}
+	}
+	if len(kept) == 0 || kept[0] != logNumber {
+		lowest := "none"
+		if len(kept) > 0 {
+			lowest = segmentName(kept[0])
+		}
+		return nil, fmt.Errorf(
+			"wal: the MANIFEST requires segment %s but the lowest present at or above it is %s: %w",
+			segmentName(logNumber), lowest, ErrCorrupt)
+	}
+	return kept, nil
 }
 
 // syncSegment fsyncs a segment as it stands, torn tail and all: syncing bytes

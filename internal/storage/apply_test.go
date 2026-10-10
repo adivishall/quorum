@@ -172,8 +172,12 @@ func TestApplyBatchesAndRecovery(t *testing.T) {
 	if d := diff(s, final, append(keys, "e")); d != "" {
 		t.Fatalf("after a flush and a reopen: %s", d)
 	}
-	if r := s.Recovery(); r.OpsSkipped != int64(want[len(script)].seq) {
-		t.Fatalf("replay skipped %d mutations already in a table, want %d", r.OpsSkipped, want[len(script)].seq)
+	// S3: the flush truncated the WAL segments holding the script's mutations,
+	// so the reopen does not replay-and-skip them — they are in the table now.
+	// Only the one mutation applied after the flush is in the log and replayed.
+	if r := s.Recovery(); r.OpsSkipped != 0 || r.OpsReplayed != 1 {
+		t.Fatalf("after a flush and a reopen, replay skipped %d and applied %d, want 0 and 1",
+			r.OpsSkipped, r.OpsReplayed)
 	}
 }
 

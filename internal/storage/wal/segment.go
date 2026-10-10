@@ -73,11 +73,25 @@ func parseSegmentName(name string) (uint64, bool) {
 // the log begins at. That metadata arrives with the MANIFEST's log number in
 // Phase 4. Until then, this is a documented limitation rather than a guarantee.
 func listSegments(fsys vfs.FS, dir string) (nums []uint64, ignored int, err error) {
+	nums, ignored, err = listSegmentsRaw(fsys, dir)
+	if err != nil {
+		return nil, ignored, err
+	}
+	if err := checkContiguous(nums); err != nil {
+		return nil, ignored, err
+	}
+	return nums, ignored, nil
+}
+
+// listSegmentsRaw lists the segment numbers present in dir, ascending, without
+// checking for gaps. Truncation (S3) legitimately deletes a prefix of the
+// segments, so a caller that is about to drop everything below a log number
+// must list raw, drop, and only then check that what remains is contiguous.
+func listSegmentsRaw(fsys vfs.FS, dir string) (nums []uint64, ignored int, err error) {
 	entries, err := fsys.ReadDir(dir)
 	if err != nil {
 		return nil, 0, err
 	}
-
 	for _, e := range entries {
 		if e.IsDir() {
 			ignored++
@@ -90,16 +104,21 @@ func listSegments(fsys vfs.FS, dir string) (nums []uint64, ignored int, err erro
 		}
 		nums = append(nums, n)
 	}
-
 	sort.Slice(nums, func(i, j int) bool { return nums[i] < nums[j] })
+	return nums, ignored, nil
+}
 
+// checkContiguous refuses a gap in an ascending segment list. Nothing but
+// truncation (which removes a whole prefix) ever deletes a segment, so a gap in
+// the middle means records were lost, and replaying around it would produce a
+// state that never existed.
+func checkContiguous(nums []uint64) error {
 	for i := 1; i < len(nums); i++ {
 		if nums[i] != nums[i-1]+1 {
-			return nil, ignored, fmt.Errorf(
+			return fmt.Errorf(
 				"wal: segment sequence has a gap: %s is followed by %s (%d segments missing): %w",
 				segmentName(nums[i-1]), segmentName(nums[i]), nums[i]-nums[i-1]-1, ErrCorrupt)
 		}
 	}
-
-	return nums, ignored, nil
+	return nil
 }

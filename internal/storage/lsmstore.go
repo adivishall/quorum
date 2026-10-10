@@ -104,12 +104,20 @@ type LSMStore struct {
 	applied    AppliedIndex // the last applied index recorded; mu (written under writeMu too)
 	appliedSeq uint64       // the sequence of the last mutation the last apply batch held; mu
 
+	// flushedApplied is the applied index the engine's flushed tables bring it
+	// to — the MANIFEST's durable Applied (S3, docs/STORAGE_INTEGRATION.md §9.6).
+	// It is what the engine is guaranteed to recover after a power loss without
+	// its WAL, and therefore the index Raft log compaction must not pass (R2).
+	// Set from the MANIFEST at open and after every flush records its edit; mu.
+	flushedApplied AppliedIndex
+
 	w        *wal.WAL
 	recovery LSMRecovery
 
 	compactMu      sync.Mutex
 	compactStats   compactionCounters
 	flushStats     flushCounters
+	truncStats     truncationCounters
 	compactWake    chan struct{}
 	compactQuit    chan struct{}
 	compactStopped chan struct{}
@@ -138,14 +146,15 @@ type LSMRecovery struct {
 	MaxFlushedSeq    uint64
 
 	// WAL replay.
-	SegmentsScanned int
-	BytesScanned    int64
-	RecordsApplied  int64
-	BatchesApplied  int64
-	ApplyBatches    int64 // apply records replayed (S1)
-	OpsReplayed     int64
-	OpsSkipped      int64 // already durable in an SSTable
-	FlushesOnReplay int
+	SegmentsScanned       int
+	SegmentsRemovedOnOpen int // leftover truncated segments an interrupted truncation left (S3)
+	BytesScanned          int64
+	RecordsApplied        int64
+	BatchesApplied        int64
+	ApplyBatches          int64 // apply records replayed (S1)
+	OpsReplayed           int64
+	OpsSkipped            int64 // already durable in an SSTable
+	FlushesOnReplay       int
 
 	// Sequence is the last sequence number assigned during replay, which is the
 	// total number of mutations the WAL holds.
@@ -236,6 +245,10 @@ func OpenLSMStore(dir string, opts Options) (*LSMStore, error) {
 		s.nextNum = 1
 	}
 	s.applied = AppliedIndex{Index: state.Applied.Index, Term: state.Applied.Term}
+	// The MANIFEST's Applied is the engine's durable applied index: the flushed
+	// tables bring it here, and a power loss without the WAL recovers exactly it
+	// (S3, docs/STORAGE_INTEGRATION.md §9.6). Replay only advances it.
+	s.flushedApplied = s.applied
 	s.install(newVersion(memtable.New(opts.MemTableSeed), nil, files))
 
 	s.recovery.SSTablesLoaded = len(files)
@@ -266,7 +279,7 @@ func OpenLSMStore(dir string, opts Options) (*LSMStore, error) {
 		return nil, classify("open", nil, err)
 	}
 
-	if err := s.replayWAL(); err != nil {
+	if err := s.replayWAL(state.LogNumber, state.LastSequence); err != nil {
 		s.closeManifest()
 		s.closeAllReaders()
 		return nil, classify("open", nil, err)
@@ -613,8 +626,21 @@ func (s *LSMStore) closeManifest() {
 
 // replayWAL rebuilds the memtable from the portion of the log that is not yet in
 // an SSTable.
-func (s *LSMStore) replayWAL() error {
+//
+// logNumber and lastSeq are the MANIFEST's authority for where the surviving log
+// begins (S3, docs/STORAGE_INTEGRATION.md §9.7). When logNumber > 0 the segments
+// below it have been truncated, so replay starts at logNumber and seeds the
+// sequence counter from lastSeq — segment logNumber begins at lastSeq+1 by the
+// flush protocol. When logNumber is 0 (a pre-S3 directory, or one that never
+// flushed) replay starts at the first segment and counts from 0, as before.
+func (s *LSMStore) replayWAL(logNumber, lastSeq uint64) error {
 	maxFlushed := s.recovery.MaxFlushedSeq
+	if logNumber > 0 {
+		// The flushed prefix is gone from the WAL and lives in the tables; the
+		// surviving records continue the numbering from the watermark.
+		s.seq = lastSeq
+		s.appliedSeq = lastSeq
+	}
 
 	replay := func(b wal.Batch) error {
 		for _, op := range b {
@@ -642,7 +668,7 @@ func (s *LSMStore) replayWAL() error {
 		}
 		return nil
 	}
-	rec, err := wal.RecoverWith(filepath.Join(s.dir, walDirName), s.opts.WAL, wal.Handler{
+	rec, err := wal.RecoverFrom(filepath.Join(s.dir, walDirName), s.opts.WAL, logNumber, wal.Handler{
 		Batch: replay,
 		Applied: func(a wal.AppliedIndex) error {
 			s.applied = AppliedIndex{Index: a.Index, Term: a.Term}
@@ -675,6 +701,7 @@ func (s *LSMStore) replayWAL() error {
 	}
 
 	s.recovery.SegmentsScanned = rec.SegmentsScanned
+	s.recovery.SegmentsRemovedOnOpen = rec.SegmentsRemoved
 	s.recovery.BytesScanned = rec.BytesScanned
 	s.recovery.RecordsApplied = rec.RecordsApplied
 	s.recovery.BatchesApplied = rec.BatchesApplied
@@ -915,23 +942,42 @@ func (s *LSMStore) flushLocked() error {
 	edit.AddFile(fm)
 	edit.SetNextFileNum(s.nextNum)
 	edit.SetLastSequence(s.seq)
-	// The edit declares everything through s.seq persisted in a table; the
-	// WAL must hold it durably first. In batch mode it may not yet, and a
-	// power loss would then leave the manifest ahead of the durable WAL — a
-	// state the next open refuses (audit D10). A flush during replay at open
-	// has no WAL yet: its records come from the segments on disk, which this
-	// does not sync (docs/WAL.md §5). SyncOff promises no durability and
-	// never fsyncs.
-	if s.w != nil && s.opts.WAL.SyncMode != wal.SyncOff {
-		if err := s.w.Sync(); err != nil {
+	// S3: the applied index the flushed tables bring the engine to becomes
+	// durable in the MANIFEST, atomically with the data (docs/STORAGE_INTEGRATION.md
+	// §9.2). It is the engine's power-loss-recoverable applied index, and the
+	// floor replay starts from. s.applied is stable here — writeMu is held — so
+	// it is exactly the applied index the frozen memtable covers.
+	edit.SetApplied(manifest.Applied{Index: s.applied.Index, Term: s.applied.Term})
+
+	// S3: rotate the WAL so the next record (sequence s.seq+1) begins a fresh
+	// segment, and record that segment as the log number (§9.3). Segment
+	// LogNumber then begins at LastSequence+1 by construction, so recovery seeds
+	// the sequence from LastSequence and may delete every lower segment. The
+	// rotation also syncs and closes the outgoing segment, so every record
+	// through s.seq is durable in the WAL before the MANIFEST names the table
+	// that holds it — the D10 ordering, now satisfied by the rotation. A flush
+	// during replay at open has no WAL yet (s.w == nil): it advances the
+	// watermark but not the log number, because the segments it builds tables
+	// from are still being read (§9.7).
+	var logNumber uint64
+	if s.w != nil {
+		n, rerr := s.w.Rotate()
+		if rerr != nil {
 			_ = r.Close()
-			return fmt.Errorf("lsm: syncing the WAL before recording %s: %w", sstName(num), err)
+			return fmt.Errorf("lsm: rotating the WAL before recording %s: %w", sstName(num), rerr)
 		}
+		logNumber = n
+		edit.SetLogNumber(n)
 	}
 	if err := s.manifest.Append(&edit); err != nil {
 		_ = r.Close()
 		return fmt.Errorf("lsm: recording %s in the manifest: %w", sstName(num), err)
 	}
+	// The MANIFEST edit is durable: the flushed applied index is now the engine's
+	// durable watermark (R2), and segments below LogNumber may be deleted.
+	s.mu.Lock()
+	s.flushedApplied = s.applied
+	s.mu.Unlock()
 
 	s.mu.RLock()
 	cur2 := s.cur
@@ -942,6 +988,18 @@ func (s *LSMStore) flushLocked() error {
 	}
 	s.install(newVersion(cur2.mem, dropMemtable(cur2.imm, old),
 		append(append([]*sstFile(nil), cur2.files...), &sstFile{meta: fm, r: r, path: finalPath})))
+
+	// Truncate the WAL: the segments below LogNumber hold only records now in a
+	// table (§9.4). A failed deletion is redundant-space, not a correctness
+	// problem — the next open sweeps it — so it is counted, never fatal.
+	if logNumber > 0 {
+		if removed, terr := s.w.DeleteSegmentsBelow(logNumber); terr != nil {
+			s.truncStats.failures.Add(1)
+			s.truncStats.segmentsRemoved.Add(int64(removed))
+		} else {
+			s.truncStats.segmentsRemoved.Add(int64(removed))
+		}
+	}
 
 	// Record the flush's output. This is the flush half of the bytes the engine
 	// writes to disk; compaction's half is in CompactionStats. Together they are
@@ -1067,6 +1125,18 @@ func (s *LSMStore) AppliedIndex() AppliedIndex {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.applied
+}
+
+// DurableApplied returns the applied index the engine is guaranteed to recover
+// after a power loss without its WAL: the MANIFEST's flushed Applied (S3,
+// docs/STORAGE_INTEGRATION.md §9.6). It is the floor the Raft log must not be
+// compacted past (R2), and it never exceeds AppliedIndex. It advances only when
+// a flush records its MANIFEST edit, so between flushes it lags the applied
+// index by at most one memtable's worth of entries.
+func (s *LSMStore) DurableApplied() AppliedIndex {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.flushedApplied
 }
 
 // Sync flushes the WAL regardless of the configured sync mode.
@@ -1202,6 +1272,29 @@ func (s *LSMStore) FlushStats() FlushStats {
 		Flushes: s.flushStats.flushes.Load(),
 		Bytes:   s.flushStats.bytes.Load(),
 		Entries: s.flushStats.entries.Load(),
+	}
+}
+
+// truncationCounters records WAL truncation since the store was opened (S3).
+type truncationCounters struct {
+	segmentsRemoved atomic.Int64
+	failures        atomic.Int64
+}
+
+// WALTruncationStats reports how many WAL segments flushes have deleted since the
+// store was opened, and how many deletions failed (a failure costs space, not
+// correctness: the segment is redundant and the next open sweeps it). It is for
+// tests and observability (S3, docs/STORAGE_INTEGRATION.md §9.4).
+type WALTruncationStats struct {
+	SegmentsRemoved int64
+	Failures        int64
+}
+
+// WALTruncationStats returns the truncation counters.
+func (s *LSMStore) WALTruncationStats() WALTruncationStats {
+	return WALTruncationStats{
+		SegmentsRemoved: s.truncStats.segmentsRemoved.Load(),
+		Failures:        s.truncStats.failures.Load(),
 	}
 }
 

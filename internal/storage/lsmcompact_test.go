@@ -13,9 +13,40 @@ import (
 
 	"github.com/adivishall/quorum/internal/storage"
 	"github.com/adivishall/quorum/internal/storage/manifest"
+	"github.com/adivishall/quorum/internal/storage/wal"
 )
 
 // ---------------------------------------------------------------- helpers
+
+// writeLegacyWAL replaces dir's WAL with a single segment holding puts from
+// sequence 1, the way Phase 3 left a directory: a full log, no truncation. The
+// S3 engine truncates the WAL at a flush, so a directory it built is not the
+// Phase 3 layout AdoptLegacySSTables consumes until the log is restored.
+func writeLegacyWAL(t *testing.T, dir string, puts [][2]string) {
+	t.Helper()
+	walDir := filepath.Join(dir, "wal")
+	entries, err := os.ReadDir(walDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if err := os.Remove(filepath.Join(walDir, e.Name())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w, err := wal.Create(walDir, wal.DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range puts {
+		if err := w.AppendBatch(wal.Batch{{Kind: wal.OpPut, Key: []byte(p[0]), Value: []byte(p[1])}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // flushWith writes one key and flushes, producing exactly one L0 SSTable.
 func flushWith(t *testing.T, s *storage.LSMStore, key, value string) {
@@ -733,6 +764,10 @@ func TestSSTablesWithoutACurrentFileAreRefused(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, manifest.CurrentName)); err != nil {
 		t.Fatal(err)
 	}
+	// The S3 flush truncated the WAL segment the table was built from, so restore
+	// it: a genuine Phase 3 directory — the layout AdoptLegacySSTables upgrades —
+	// has its full WAL from sequence 1, and adopt replays it over the tables.
+	writeLegacyWAL(t, dir, [][2]string{{"k", "v"}})
 	_, err := storage.OpenLSMStore(dir, opts)
 	if !errors.Is(err, storage.ErrCorrupt) {
 		t.Fatalf("opening SSTables with no CURRENT = %v, want ErrCorrupt", err)

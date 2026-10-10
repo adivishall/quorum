@@ -477,10 +477,12 @@ func TestReopenAfterCleanClose(t *testing.T) {
 	if rec.SSTablesLoaded != 1 {
 		t.Errorf("loaded %d SSTables, want 1", rec.SSTablesLoaded)
 	}
-	// The two mutations already in the table are skipped; the three that came
-	// after it are replayed.
-	if rec.OpsSkipped != 2 || rec.OpsReplayed != 3 {
-		t.Errorf("replay skipped %d and applied %d, want 2 and 3", rec.OpsSkipped, rec.OpsReplayed)
+	// S3: the flush truncated the WAL segment holding the two flushed mutations,
+	// so they are not replayed-and-skipped — they live only in the table now.
+	// The three mutations written after the flush are in the post-flush segment
+	// and are replayed.
+	if rec.OpsSkipped != 0 || rec.OpsReplayed != 3 {
+		t.Errorf("replay skipped %d and applied %d, want 0 and 3", rec.OpsSkipped, rec.OpsReplayed)
 	}
 	if rec.MaxFlushedSeq != 2 {
 		t.Errorf("MaxFlushedSeq = %d, want 2", rec.MaxFlushedSeq)
@@ -525,9 +527,12 @@ func TestReopenWithEverythingFlushed(t *testing.T) {
 	defer func() { _ = reopened.Close() }()
 
 	rec := reopened.Recovery()
-	if rec.OpsReplayed != 0 || rec.OpsSkipped != 30 {
-		t.Fatalf("replay applied %d and skipped %d, want 0 and 30: "+
-			"everything was already in an SSTable", rec.OpsReplayed, rec.OpsSkipped)
+	// S3: the flush truncated the WAL, so the 30 flushed mutations are gone from
+	// the log entirely — not replayed, not skipped. The table holds them, and
+	// the MANIFEST holds the sequence and applied watermark.
+	if rec.OpsReplayed != 0 || rec.OpsSkipped != 0 {
+		t.Fatalf("replay applied %d and skipped %d, want 0 and 0: "+
+			"everything was flushed and the WAL truncated", rec.OpsReplayed, rec.OpsSkipped)
 	}
 	if reopened.MemTableSize() != 0 {
 		t.Fatalf("the memtable is %d bytes after recovering a fully flushed store",
@@ -830,10 +835,14 @@ func TestTruncatedSSTableRefusesToOpen(t *testing.T) {
 	}
 }
 
-// TestSSTableAheadOfTheLogIsRefused covers the one inconsistency Phase 3 can
-// detect without a MANIFEST: tables that cover sequence numbers the log never
-// held, which means the log was truncated or replaced.
-func TestSSTableAheadOfTheLogIsRefused(t *testing.T) {
+// TestARequiredWALSegmentMissingIsRefused: once the WAL has been truncated, the
+// MANIFEST's log number names the oldest segment recovery still needs. Losing
+// that segment is damage a crash cannot produce — its creation was fsynced
+// before the MANIFEST named it (docs/STORAGE_INTEGRATION.md §9.5) — so the
+// engine refuses rather than replay a log missing committed records. This is the
+// S3 replacement for Phase 3's "SSTable ahead of the log" check, now that a
+// truncated log is the normal state rather than corruption.
+func TestARequiredWALSegmentMissingIsRefused(t *testing.T) {
 	dir := t.TempDir()
 	opts := lsmOpts(storage.DefaultMemTableSize)
 
@@ -841,19 +850,24 @@ func TestSSTableAheadOfTheLogIsRefused(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		mustPut(t, s, fmt.Sprintf("k%02d", i), "v")
 	}
-	mustFlush(t, s)
+	mustFlush(t, s) // rotates to segment 2 and truncates segment 1
+	for i := 0; i < 5; i++ {
+		mustPut(t, s, fmt.Sprintf("later%02d", i), "v") // segment 2 holds committed records
+	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	// Throw the log away, keeping the table built from it.
-	if err := os.Truncate(walPath(dir, 1), 0); err != nil {
+	// The flush truncated segment 1; segment 2 is the log number the MANIFEST
+	// requires. Confirm the truncation, then lose the required segment.
+	if _, err := os.Stat(walPath(dir, 1)); !os.IsNotExist(err) {
+		t.Fatalf("premise: the flush should have truncated segment 1, Stat = %v", err)
+	}
+	if err := os.Remove(walPath(dir, 2)); err != nil {
 		t.Fatal(err)
 	}
-
-	_, err := storage.OpenLSMStore(dir, opts)
-	if !errors.Is(err, storage.ErrCorrupt) {
-		t.Fatalf("opening with a log shorter than its tables = %v, want ErrCorrupt", err)
+	if _, err := storage.OpenLSMStore(dir, opts); !errors.Is(err, storage.ErrCorrupt) {
+		t.Fatalf("opening with the required WAL segment missing = %v, want ErrCorrupt", err)
 	}
 }
 
@@ -900,9 +914,11 @@ func TestWALCorruptionStillRefusesWithSSTablesPresent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Damage a record in the middle of the log. Having valid SSTables on disk
-	// must not make the engine any more willing to skip past it.
-	f, err := os.OpenFile(walPath(dir, 1), os.O_RDWR, 0o644)
+	// Damage a record in the middle of the log. The flush truncated segment 1,
+	// so the surviving records (the "later" puts) are in segment 2 — the log
+	// number the MANIFEST points recovery at. Having valid SSTables on disk must
+	// not make the engine any more willing to skip past the damage.
+	f, err := os.OpenFile(walPath(dir, 2), os.O_RDWR, 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
