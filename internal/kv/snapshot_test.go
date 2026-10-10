@@ -52,7 +52,7 @@ func TestSnapshotRoundTripIsCanonical(t *testing.T) {
 		applyAll(t, a, 1, genSessionCommands(rng, 1+rng.Intn(80)))
 		idx, b := encoded(t, a)
 		r := NewStoreWithLimits(limits)
-		if err := r.RestoreSnapshot(idx, b); err != nil {
+		if err := r.RestoreSnapshot(idx, 0, b); err != nil {
 			t.Fatalf("run %d: %v", run, err)
 		}
 		if idx2, b2 := encoded(t, r); idx2 != idx || !bytes.Equal(b, b2) {
@@ -85,7 +85,7 @@ func TestSnapshotPlusSuffixEqualsFullReplay(t *testing.T) {
 			applyAll(t, a, 1, cmds[:cut])
 			idx, snap := encoded(t, a)
 			b := NewStoreWithLimits(limits)
-			if err := b.RestoreSnapshot(idx, snap); err != nil {
+			if err := b.RestoreSnapshot(idx, 0, snap); err != nil {
 				t.Fatalf("run %d cut %d: %v", run, cut, err)
 			}
 			got := applyAll(t, b, uint64(cut+1), cmds[cut:])
@@ -127,7 +127,7 @@ func TestRestoredStateMatchesTheModel(t *testing.T) {
 		}
 		idx, b := encoded(t, a)
 		r := NewStoreWithLimits(limits)
-		if err := r.RestoreSnapshot(idx, b); err != nil {
+		if err := r.RestoreSnapshot(idx, 0, b); err != nil {
 			t.Fatal(err)
 		}
 		requireSameSessions(t, r, model)
@@ -255,28 +255,28 @@ func invalidStates() map[string]badState {
 // integer — and a refused restore leaves the store untouched.
 func TestRestoreRefusesImpossibleState(t *testing.T) {
 	good := validSpec().encode()
-	if err := NewStoreWithLimits(corpusLimits).RestoreSnapshot(20, good); err != nil {
+	if err := NewStoreWithLimits(corpusLimits).RestoreSnapshot(20, 0, good); err != nil {
 		t.Fatalf("the valid base state: %v", err)
 	}
 	s := NewStoreWithLimits(corpusLimits)
 	applyAll(t, s, 1, []Command{{Op: OpPut, Key: []byte("keep"), Value: []byte("me")}})
 	_, before := encoded(t, s)
 	for name, bad := range invalidStates() {
-		err := s.RestoreSnapshot(bad.spec.applied, bad.spec.encode())
+		err := s.RestoreSnapshot(bad.spec.applied, 0, bad.spec.encode())
 		if !errors.Is(err, ErrSnapshotState) || !strings.Contains(err.Error(), bad.rule) {
 			t.Errorf("%s: %v (want the rule %q)", name, err, bad.rule)
 		}
 	}
-	if err := s.RestoreSnapshot(19, good); !errors.Is(err, ErrSnapshotState) {
+	if err := s.RestoreSnapshot(19, 0, good); !errors.Is(err, ErrSnapshotState) {
 		t.Errorf("state at 20 restored as a snapshot at 19: %v", err)
 	}
 	for n := 0; n < len(good); n++ {
-		if err := s.RestoreSnapshot(20, good[:n]); err == nil {
+		if err := s.RestoreSnapshot(20, 0, good[:n]); err == nil {
 			t.Fatalf("a state truncated to %d bytes restored", n)
 		}
 	}
 	nc := append([]byte{1, 0x94, 0x00}, good[2:]...) // applied 20 written in two bytes
-	if err := s.RestoreSnapshot(20, nc); !errors.Is(err, ErrSnapshotState) {
+	if err := s.RestoreSnapshot(20, 0, nc); !errors.Is(err, ErrSnapshotState) {
 		t.Errorf("non-canonical integer: %v", err)
 	}
 	if _, after := encoded(t, s); !bytes.Equal(before, after) {
@@ -363,7 +363,7 @@ func TestSnapshotStateCorpus(t *testing.T) {
 		}
 		s := NewStoreWithLimits(corpusLimits)
 		verr := s.ValidateSnapshot(m.Index, state)
-		err = s.RestoreSnapshot(m.Index, state)
+		err = s.RestoreSnapshot(m.Index, 0, state)
 		if (verr == nil) != (err == nil) {
 			t.Errorf("%s: ValidateSnapshot says %v, RestoreSnapshot %v", name, verr, err)
 		}
@@ -389,7 +389,7 @@ func FuzzRestoreSnapshot(f *testing.F) {
 	}
 	f.Fuzz(func(t *testing.T, index uint64, b []byte) {
 		s := NewStoreWithLimits(corpusLimits)
-		if err := s.RestoreSnapshot(index, b); err != nil {
+		if err := s.RestoreSnapshot(index, 0, b); err != nil {
 			return
 		}
 		if _, again, _ := s.EncodeSnapshot(); !bytes.Equal(again, b) {

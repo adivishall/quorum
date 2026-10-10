@@ -25,6 +25,18 @@ type Store struct {
 	mu       sync.RWMutex
 	m        map[string][]byte
 	applied  uint64 // highest index applied, for observability
+	sessions sessionTable
+}
+
+// sessionTable is the session half of the replicated state: every session's
+// recency, watermark and remembered results, the limits that bound it, and the
+// decision function over it (docs/CLIENT_SEMANTICS.md §4). Both machines hold
+// one — it is the one decision function (S2, docs/STORAGE_INTEGRATION.md §8.2)
+// — and differ only in where they record what it decided: the in-memory store
+// applies an executed command to its map at once; the LSM machine stages the
+// command's write and the session records the decision changed, and records
+// them with the cycle.
+type sessionTable struct {
 	limits   Limits
 	sessions map[uint64]*session
 	stats    ApplyStats
@@ -33,6 +45,25 @@ type Store struct {
 	// restore does not reset them. Nil: none.
 	observe        func(Decision)
 	observeEvicted func()
+}
+
+// effect is what deciding one command changed in the table, so a durable
+// machine can record exactly that: the session whose record changed (0: none)
+// and the sessions evicted.
+type effect struct {
+	touched uint64
+	evicted []uint64
+}
+
+func newSessionTable(l Limits) sessionTable {
+	return sessionTable{limits: l, sessions: map[uint64]*session{}}
+}
+
+// setObserve installs the decision counters (Machine).
+func (s *Store) setObserve(observe func(Decision), evicted func()) {
+	s.mu.Lock()
+	s.sessions.observe, s.sessions.observeEvicted = observe, evicted
+	s.mu.Unlock()
 }
 
 // Limits bound the session table (docs/CLIENT_SEMANTICS.md §8). They are part
@@ -111,7 +142,7 @@ func NewStoreWithLimits(l Limits) *Store {
 	if l.MaxSessions < 1 || l.MaxUnacked < 1 {
 		panic("kv: session limits must be at least 1")
 	}
-	return &Store{m: map[string][]byte{}, limits: l, sessions: map[uint64]*session{}}
+	return &Store{m: map[string][]byte{}, sessions: newSessionTable(l)}
 }
 
 // Apply applies one committed log entry (replication.StateMachine). A nil or
@@ -150,55 +181,50 @@ func (s *Store) ApplyResult(index uint64, command []byte) (any, error) {
 		return nil, fmt.Errorf("kv: apply index %d: %w", index, err)
 	}
 	s.applied = index
-	r := s.decide(index, c)
-	if s.observe != nil {
-		s.observe(r.Decision)
-	}
-	switch r.Decision {
-	case Executed:
-		s.stats.Executed++
-	case Duplicate:
-		s.stats.Duplicate++
-	case Conflict:
-		s.stats.Conflict++
-	case Stale:
-		s.stats.Stale++
-	case Expired:
-		s.stats.Expired++
-	case Limit:
-		s.stats.Limit++
-	case Registered:
-		s.stats.Registered++
+	r, _ := s.sessions.decide(index, c)
+	s.sessions.count(r.Decision)
+	if r.Decision == Executed {
+		s.write(c)
 	}
 	return r, nil
 }
 
-func (s *Store) decide(index uint64, c Command) Result {
+// decide decides one command against the table and applies the decision's
+// session-table effects — a session registered (and the least recently used
+// evicted beyond the limit), marked used, its watermark raised and results
+// below it forgotten, a result recorded — returning the Result and what it
+// changed. An Executed result means the caller must apply the command's write;
+// nothing else changes the data. Every replica, decided from the same command
+// and table, decides the same.
+func (t *sessionTable) decide(index uint64, c Command) (Result, effect) {
 	if c.Op == OpRegister {
-		s.sessions[index] = &session{last: index, ackedBelow: 1, results: map[uint64]execution{}}
-		for len(s.sessions) > s.limits.MaxSessions {
+		t.sessions[index] = &session{last: index, ackedBelow: 1, results: map[uint64]execution{}}
+		var ef effect
+		ef.touched = index
+		for len(t.sessions) > t.limits.MaxSessions {
 			var lru uint64
-			for id, ss := range s.sessions {
-				if lru == 0 || ss.last < s.sessions[lru].last {
+			for id, ss := range t.sessions {
+				if lru == 0 || ss.last < t.sessions[lru].last {
 					lru = id
 				}
 			}
-			delete(s.sessions, lru)
-			s.stats.Evicted++
-			if s.observeEvicted != nil {
-				s.observeEvicted()
+			delete(t.sessions, lru)
+			ef.evicted = append(ef.evicted, lru)
+			t.stats.Evicted++
+			if t.observeEvicted != nil {
+				t.observeEvicted()
 			}
 		}
-		return Result{Decision: Registered, Index: index}
+		return Result{Decision: Registered, Index: index}, ef
 	}
 	if c.ClientID == 0 {
-		s.write(c)
-		return Result{Decision: Executed, Index: index}
+		return Result{Decision: Executed, Index: index}, effect{}
 	}
-	ss := s.sessions[c.ClientID]
+	ss := t.sessions[c.ClientID]
 	if ss == nil {
-		return Result{Decision: Expired}
+		return Result{Decision: Expired}, effect{}
 	}
+	ef := effect{touched: c.ClientID}
 	ss.last = index
 	w := c.AckedBelow
 	if w > c.RequestID {
@@ -213,21 +239,57 @@ func (s *Store) decide(index uint64, c Command) Result {
 		}
 	}
 	if c.RequestID < ss.ackedBelow {
-		return Result{Decision: Stale}
+		return Result{Decision: Stale}, ef
 	}
 	fp := c.Fingerprint()
 	if rec, ok := ss.results[c.RequestID]; ok {
 		if rec.fp == fp {
-			return Result{Decision: Duplicate, Index: rec.index}
+			return Result{Decision: Duplicate, Index: rec.index}, ef
 		}
-		return Result{Decision: Conflict}
+		return Result{Decision: Conflict}, ef
 	}
-	if len(ss.results) >= s.limits.MaxUnacked {
-		return Result{Decision: Limit}
+	if len(ss.results) >= t.limits.MaxUnacked {
+		return Result{Decision: Limit}, ef
 	}
 	ss.results[c.RequestID] = execution{fp: fp, index: index}
-	s.write(c)
-	return Result{Decision: Executed, Index: index}
+	return Result{Decision: Executed, Index: index}, ef
+}
+
+// count counts a decision into the stats and the observer.
+func (t *sessionTable) count(d Decision) {
+	if t.observe != nil {
+		t.observe(d)
+	}
+	switch d {
+	case Executed:
+		t.stats.Executed++
+	case Duplicate:
+		t.stats.Duplicate++
+	case Conflict:
+		t.stats.Conflict++
+	case Stale:
+		t.stats.Stale++
+	case Expired:
+		t.stats.Expired++
+	case Limit:
+		t.stats.Limit++
+	case Registered:
+		t.stats.Registered++
+	}
+}
+
+// snapshot copies the table, for Sessions.
+func (t *sessionTable) snapshot() map[uint64]SessionState {
+	out := make(map[uint64]SessionState, len(t.sessions))
+	for id, ss := range t.sessions {
+		st := SessionState{Last: ss.last, AckedBelow: ss.ackedBelow}
+		for rid := range ss.results {
+			st.Requests = append(st.Requests, rid)
+		}
+		sort.Slice(st.Requests, func(i, j int) bool { return st.Requests[i] < st.Requests[j] })
+		out[id] = st
+	}
+	return out
 }
 
 func (s *Store) write(c Command) {
@@ -250,6 +312,15 @@ func (s *Store) Get(key []byte) ([]byte, bool) {
 	}
 	return append([]byte{}, v...), true
 }
+
+// Lookup is Get (Machine); the in-memory store cannot fail to read.
+func (s *Store) Lookup(key []byte) ([]byte, bool, error) {
+	v, ok := s.Get(key)
+	return v, ok, nil
+}
+
+// Contents is Snapshot (Machine).
+func (s *Store) Contents() (map[string][]byte, error) { return s.Snapshot(), nil }
 
 // Applied returns the highest index applied to this store.
 func (s *Store) Applied() uint64 {
@@ -288,21 +359,12 @@ type SessionState struct {
 func (s *Store) Sessions() map[uint64]SessionState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make(map[uint64]SessionState, len(s.sessions))
-	for id, ss := range s.sessions {
-		st := SessionState{Last: ss.last, AckedBelow: ss.ackedBelow}
-		for rid := range ss.results {
-			st.Requests = append(st.Requests, rid)
-		}
-		sort.Slice(st.Requests, func(i, j int) bool { return st.Requests[i] < st.Requests[j] })
-		out[id] = st
-	}
-	return out
+	return s.sessions.snapshot()
 }
 
 // Stats returns the decision counters.
 func (s *Store) Stats() ApplyStats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.stats
+	return s.sessions.stats
 }

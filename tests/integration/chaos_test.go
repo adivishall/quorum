@@ -18,7 +18,7 @@ import (
 func chaosConfig(t *testing.T, bin string, seed int64) lab.ChaosConfig {
 	return lab.ChaosConfig{
 		Name: t.Name(),
-		Cluster: lab.ClusterConfig{Bin: bin, Mode: "raft", Nodes: 3, Spares: 1, Tick: 25 * time.Millisecond,
+		Cluster: lab.ClusterConfig{Bin: bin, Mode: "raft", StateMachine: stateMachineKind(), Nodes: 3, Spares: 1, Tick: 25 * time.Millisecond,
 			SnapshotEvery: 200, DataRoot: t.TempDir(), PortBase: 25000, Start: labStart(t)},
 		Load: load.Config{Clients: 4, Duration: 12 * time.Second, Warmup: time.Second, ReadPct: 50, DeletePct: 10, Keys: 16},
 		Seed: seed, Every: 1500 * time.Millisecond, Hold: time.Second, Quiet: 1500 * time.Millisecond,

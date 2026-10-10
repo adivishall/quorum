@@ -34,7 +34,7 @@ func TestHostMetrics(t *testing.T) {
 	tr := &chanTransport{id: "a", ch: make(chan transport.Envelope, 16)}
 	h, err := Start(context.Background(), Config{
 		ID: "a", DataDir: t.TempDir(), Transport: tr, InboxSize: 4,
-		NewStateMachine: func(GroupID) raftnode.StateMachine { return &recSM{} },
+		NewStateMachine: func(GroupID) (raftnode.StateMachine, error) { return &recSM{}, nil },
 		TickInterval:    time.Hour, DisableSync: true, Metrics: reg,
 	})
 	if err != nil {

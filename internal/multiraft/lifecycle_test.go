@@ -47,7 +47,7 @@ func (g *gate) block() {
 	}
 }
 
-func lifecycleHost(t *testing.T, c *hostCluster, id NodeID, newSM func(GroupID) raftnode.StateMachine, onGroup func(GroupID, *raftnode.Node, raftnode.StateMachine)) *Host {
+func lifecycleHost(t *testing.T, c *hostCluster, id NodeID, newSM func(GroupID) (raftnode.StateMachine, error), onGroup func(GroupID, *raftnode.Node, raftnode.StateMachine)) *Host {
 	t.Helper()
 	h, err := Start(c.ctx, Config{
 		ID: id, DataDir: c.dirs[id], Transport: c.trs[id],
@@ -72,12 +72,12 @@ func TestAStartingGroupCannotBeStartedOrStoppedAgain(t *testing.T) {
 	g := newGate(t)
 	var mu sync.Mutex
 	made := 0
-	h := lifecycleHost(t, c, "n1", func(GroupID) raftnode.StateMachine {
+	h := lifecycleHost(t, c, "n1", func(GroupID) (raftnode.StateMachine, error) {
 		mu.Lock()
 		made++
 		mu.Unlock()
 		g.block() // the first start waits here, its group reserved
-		return &recSM{}
+		return &recSM{}, nil
 	}, nil)
 	boot := c.genesis("n1")
 	first := make(chan error, 1)
@@ -119,7 +119,7 @@ func TestAStoppingGroupCannotBeStartedUntilItsNodeIsClosed(t *testing.T) {
 	g := newGate(t)
 	var stopping sync.Mutex
 	block := false
-	h := lifecycleHost(t, c, "n1", func(GroupID) raftnode.StateMachine { return &recSM{} },
+	h := lifecycleHost(t, c, "n1", func(GroupID) (raftnode.StateMachine, error) { return &recSM{}, nil },
 		func(_ GroupID, node *raftnode.Node, _ raftnode.StateMachine) {
 			stopping.Lock()
 			b := block
@@ -187,7 +187,7 @@ func TestConcurrentLifecycleOperations(t *testing.T) {
 	attached := map[GroupID]*raftnode.Node{}
 	var everyNode []*raftnode.Node
 	var violations []string
-	h := lifecycleHost(t, c, "n1", func(GroupID) raftnode.StateMachine { return &recSM{} },
+	h := lifecycleHost(t, c, "n1", func(GroupID) (raftnode.StateMachine, error) { return &recSM{}, nil },
 		func(g GroupID, node *raftnode.Node, _ raftnode.StateMachine) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -256,7 +256,7 @@ func TestConcurrentLifecycleOperations(t *testing.T) {
 // failed group at every later start.
 func TestAFailedFirstStartLeavesNoDirectory(t *testing.T) {
 	c := newHostCluster(t, "n1")
-	h := lifecycleHost(t, c, "n1", func(GroupID) raftnode.StateMachine { return &recSM{} }, nil)
+	h := lifecycleHost(t, c, "n1", func(GroupID) (raftnode.StateMachine, error) { return &recSM{}, nil }, nil)
 	if _, err := h.Open(12345); err == nil {
 		t.Fatal("Open of a group with no state succeeded")
 	}

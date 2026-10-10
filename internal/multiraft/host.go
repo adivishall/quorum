@@ -26,6 +26,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -81,8 +82,9 @@ type Config struct {
 	// StaticPeers are transport peers the host never removes (the operator's
 	// -peers). A joiner reaches its group's members through them.
 	StaticPeers map[NodeID]string
-	// NewStateMachine makes a group's state machine (the key-value store).
-	NewStateMachine func(GroupID) raftnode.StateMachine
+	// NewStateMachine makes a group's state machine (the key-value store, in
+	// memory or in the engine). An error fails the group's start.
+	NewStateMachine func(GroupID) (raftnode.StateMachine, error)
 	// Node settings every group uses (raftnode.Config).
 	TickInterval                  time.Duration
 	DisableSync                   bool
@@ -308,10 +310,17 @@ func (h *Host) start(g GroupID, nc raftnode.Config) (*Group, error) {
 			return nil, err
 		}
 	}
-	sm := h.cfg.NewStateMachine(g)
+	sm, err := h.cfg.NewStateMachine(g)
+	if err != nil {
+		if created {
+			_ = os.Remove(GroupDir(h.cfg.DataDir, g))
+		}
+		return nil, fmt.Errorf("multiraft: group %d: its state machine: %w", g, err)
+	}
 	inbox := make(chan transport.Envelope, h.cfg.InboxSize)
 	node, err := raftnode.Start(h.ctx, h.nodeConfig(g, nc, logPath, sm, inbox))
 	if err != nil {
+		_ = closeMachine(sm)
 		if created {
 			// A start that failed before recording anything (an unknown
 			// group, no genesis) leaves no directory behind to be found and
@@ -327,6 +336,7 @@ func (h *Host) start(g GroupID, nc raftnode.Config) (*Group, error) {
 	if h.closed {
 		h.mu.Unlock()
 		_ = node.Close()
+		_ = closeMachine(sm)
 		return nil, ErrClosed
 	}
 	h.groups[g] = &hosted{g: grp, inbox: inbox}
@@ -430,9 +440,22 @@ func (h *Host) stop(g GroupID, announce func()) error {
 		h.cfg.OnGroup(g, nil, nil)
 	}
 	err := hg.g.Node.Close()
+	if cerr := closeMachine(hg.g.SM); cerr != nil && err == nil {
+		err = cerr
+	}
 	h.logf("event=group_stopped node=%s group=%d", h.cfg.ID, g)
 	h.syncPeers()
 	return err
+}
+
+// closeMachine closes a state machine that holds resources — the LSM-backed
+// one holds its engine (S2) — once its node has stopped applying to it. The
+// in-memory store holds none and is not an io.Closer.
+func closeMachine(sm raftnode.StateMachine) error {
+	if c, ok := sm.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
 }
 
 // Group returns hosted group g, or nil.
@@ -498,6 +521,9 @@ func (h *Host) Close() error {
 	var first error
 	for _, hg := range groups {
 		if err := hg.g.Node.Close(); err != nil && first == nil {
+			first = err
+		}
+		if err := closeMachine(hg.g.SM); err != nil && first == nil {
 			first = err
 		}
 	}

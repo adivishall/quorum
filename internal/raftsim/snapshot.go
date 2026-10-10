@@ -47,8 +47,8 @@ func (s *snapSM) ValidateSnapshot(index uint64, data []byte) error {
 	return s.n.store.ValidateSnapshot(index, data)
 }
 
-func (s *snapSM) RestoreSnapshot(index uint64, data []byte) error {
-	if err := s.n.store.RestoreSnapshot(index, data); err != nil {
+func (s *snapSM) RestoreSnapshot(index, term uint64, data []byte) error {
+	if err := s.n.store.RestoreSnapshot(index, term, data); err != nil {
 		return err
 	}
 	s.n.applied = index

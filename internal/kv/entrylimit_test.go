@@ -81,7 +81,10 @@ func TestEntryLimitEndToEnd(t *testing.T) {
 	idx := putUntilOK(t, ctx, c, key, value)
 	for _, id := range c.ids {
 		c.waitApplied(id, idx)
-		got, ok := c.eps[id].srv.Store().Get(key)
+		got, ok, lerr := c.eps[id].srv.Store().Lookup(key)
+		if lerr != nil {
+			t.Fatal(lerr)
+		}
 		if !ok || !bytes.Equal(got, value) {
 			t.Fatalf("%s holds %d bytes for the key, want the %d-byte value", id, len(got), len(value))
 		}
@@ -140,7 +143,7 @@ func TestEntryLimitEndToEnd(t *testing.T) {
 	}
 	for _, id := range c.ids {
 		c.waitApplied(id, idx)
-		if got, ok := c.eps[id].srv.Store().Get(key); !ok || !bytes.Equal(got, value) {
+		if got, ok, err := c.eps[id].srv.Store().Lookup(key); err != nil || !ok || !bytes.Equal(got, value) {
 			t.Fatalf("after the restarts %s holds %d bytes for the key, want the %d-byte value", id, len(got), len(value))
 		}
 	}

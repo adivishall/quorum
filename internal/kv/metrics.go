@@ -152,9 +152,9 @@ func (m *Metrics) servedForward(g replication.GroupID, req Request, resp Respons
 	c.Inc()
 }
 
-// Observe makes store count its decisions into m under group g.
-func (m *Metrics) Observe(store *Store, g replication.GroupID) {
-	if m == nil || store == nil {
+// Observe makes the machine count its decisions into m under group g.
+func (m *Metrics) Observe(machine Machine, g replication.GroupID) {
+	if m == nil || machine == nil {
 		return
 	}
 	gl := groupOf(g)
@@ -163,8 +163,5 @@ func (m *Metrics) Observe(store *Store, g replication.GroupID) {
 		counters[d] = m.decisions.With(gl, name)
 	}
 	evicted := m.decisions.With(gl, "evicted")
-	store.mu.Lock()
-	store.observe = func(d Decision) { counters[d].Inc() }
-	store.observeEvicted = evicted.Inc
-	store.mu.Unlock()
+	machine.setObserve(func(d Decision) { counters[d].Inc() }, evicted.Inc)
 }

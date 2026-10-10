@@ -371,7 +371,7 @@ func Recover(cfg Config) (*Recovered, error) {
 	}
 	var restored *snapshot.Meta
 	if found {
-		if err := ssm.RestoreSnapshot(meta.Index, data); err != nil {
+		if err := ssm.RestoreSnapshot(meta.Index, meta.Term, data); err != nil {
 			return fail(fmt.Errorf("%w: restoring the published snapshot: %w", ErrSnapshot, err))
 		}
 		if err := mlog.Apply(meta.Index); err != nil {
@@ -1026,7 +1026,14 @@ func (n *Node) processReady() error {
 	if err := ApplyCommitted(n.core, n.sm, n.cfg.Hook, n.applied); err != nil {
 		// The entries applied before the failure complete all the same
 		// (completeApplied, deferred): publish the Status that covers them
-		// first, as a cycle that succeeds does.
+		// first, as a cycle that succeeds does. Not with a CycleStateMachine:
+		// its effects are staged until EndCycle records them, so nothing of
+		// a failed cycle has been applied in the sense a completion reports.
+		// The node stops (fail), and its waiters — these included — fail:
+		// UNKNOWN to their clients, who retry under the same request id.
+		if _, cycle := n.sm.(CycleStateMachine); cycle {
+			n.completed = n.completed[:0]
+		}
 		n.snapshotStatus()
 		return err // ErrApply, or a crash point fired
 	}

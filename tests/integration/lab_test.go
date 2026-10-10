@@ -30,7 +30,7 @@ func TestLabLeaderKillOnRealProcesses(t *testing.T) {
 		// Ports from this binary's own range (testport.Integration, below every
 		// ephemeral range): 29000 and up belong to internal/raftnode's tests,
 		// which `go test ./...` runs concurrently with this package.
-		Cluster: lab.ClusterConfig{Bin: bin, Mode: "raft", Nodes: 3, Tick: 25 * time.Millisecond, DataRoot: t.TempDir(), PortBase: 25000,
+		Cluster: lab.ClusterConfig{Bin: bin, Mode: "raft", StateMachine: stateMachineKind(), Nodes: 3, Tick: 25 * time.Millisecond, DataRoot: t.TempDir(), PortBase: 25000,
 			Start: labStart(t)},
 		Load: load.Config{Clients: 4, Duration: 6 * time.Second, Warmup: time.Second, ReadPct: 50, Keys: 200, Seed: 3},
 	})
@@ -80,7 +80,7 @@ func TestALabProcessDiesWithItsTest(t *testing.T) {
 	starts := 0
 	t.Run("cluster", func(t *testing.T) {
 		start := labStart(t)
-		cfg := lab.ClusterConfig{Bin: bin, Mode: "raft", Nodes: 1, Tick: 25 * time.Millisecond, DataRoot: root, PortBase: 25000,
+		cfg := lab.ClusterConfig{Bin: bin, Mode: "raft", StateMachine: stateMachineKind(), Nodes: 1, Tick: 25 * time.Millisecond, DataRoot: root, PortBase: 25000,
 			Start: func(cmd *exec.Cmd) error { starts++; return start(cmd) }}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -157,7 +157,7 @@ func TestLabPartitionsAndPausesARealCluster(t *testing.T) {
 	bin := buildDkvd(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	c, err := lab.Start(ctx, lab.ClusterConfig{Bin: bin, Mode: "raft", Nodes: 3, Tick: 25 * time.Millisecond, DataRoot: t.TempDir(),
+	c, err := lab.Start(ctx, lab.ClusterConfig{Bin: bin, Mode: "raft", StateMachine: stateMachineKind(), Nodes: 3, Tick: 25 * time.Millisecond, DataRoot: t.TempDir(),
 		PortBase: 25000, Start: labStart(t), Links: true})
 	if err != nil {
 		t.Fatal(err)
