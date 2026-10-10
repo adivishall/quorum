@@ -279,7 +279,7 @@ func OpenLSMStore(dir string, opts Options) (*LSMStore, error) {
 		return nil, classify("open", nil, err)
 	}
 
-	if err := s.replayWAL(state.LogNumber, state.LastSequence); err != nil {
+	if err := s.replayWAL(state.LogNumber, state.LogStartSeq); err != nil {
 		s.closeManifest()
 		s.closeAllReaders()
 		return nil, classify("open", nil, err)
@@ -627,19 +627,22 @@ func (s *LSMStore) closeManifest() {
 // replayWAL rebuilds the memtable from the portion of the log that is not yet in
 // an SSTable.
 //
-// logNumber and lastSeq are the MANIFEST's authority for where the surviving log
-// begins (S3, docs/STORAGE_INTEGRATION.md §9.7). When logNumber > 0 the segments
-// below it have been truncated, so replay starts at logNumber and seeds the
-// sequence counter from lastSeq — segment logNumber begins at lastSeq+1 by the
-// flush protocol. When logNumber is 0 (a pre-S3 directory, or one that never
-// flushed) replay starts at the first segment and counts from 0, as before.
-func (s *LSMStore) replayWAL(logNumber, lastSeq uint64) error {
+// logNumber and logStartSeq are the MANIFEST's authority for where the surviving
+// log begins (S3, docs/STORAGE_INTEGRATION.md §9.7). When logNumber > 0 the
+// segments below it have been truncated, so replay starts at logNumber and seeds
+// the sequence counter from logStartSeq — segment logNumber begins at
+// logStartSeq+1 by the flush protocol. logStartSeq is the dedicated seed, not
+// LastSequence: a flush during an earlier open advances the flushed sequence
+// without moving the log, so only logStartSeq stays consistent with logNumber.
+// When logNumber is 0 (a pre-S3 directory, or one that never flushed) replay
+// starts at the first segment and counts from 0, as before.
+func (s *LSMStore) replayWAL(logNumber, logStartSeq uint64) error {
 	maxFlushed := s.recovery.MaxFlushedSeq
 	if logNumber > 0 {
 		// The flushed prefix is gone from the WAL and lives in the tables; the
-		// surviving records continue the numbering from the watermark.
-		s.seq = lastSeq
-		s.appliedSeq = lastSeq
+		// surviving records continue the numbering from where the log begins.
+		s.seq = logStartSeq
+		s.appliedSeq = logStartSeq
 	}
 
 	replay := func(b wal.Batch) error {
@@ -941,26 +944,26 @@ func (s *LSMStore) flushLocked() error {
 	var edit manifest.Edit
 	edit.AddFile(fm)
 	edit.SetNextFileNum(s.nextNum)
-	edit.SetLastSequence(s.seq)
-	// S3: the applied index the flushed tables bring the engine to becomes
-	// durable in the MANIFEST, atomically with the data (docs/STORAGE_INTEGRATION.md
-	// §9.2). It is the engine's power-loss-recoverable applied index, and the
-	// floor replay starts from. s.applied is stable here — writeMu is held — so
-	// it is exactly the applied index the frozen memtable covers.
-	edit.SetApplied(manifest.Applied{Index: s.applied.Index, Term: s.applied.Term})
+	edit.SetLastSequence(s.seq) // the highest flushed sequence; set by every flush
 
-	// S3: rotate the WAL so the next record (sequence s.seq+1) begins a fresh
-	// segment, and record that segment as the log number (§9.3). Segment
-	// LogNumber then begins at LastSequence+1 by construction, so recovery seeds
-	// the sequence from LastSequence and may delete every lower segment. The
-	// rotation also syncs and closes the outgoing segment, so every record
-	// through s.seq is durable in the WAL before the MANIFEST names the table
-	// that holds it — the D10 ordering, now satisfied by the rotation. A flush
-	// during replay at open has no WAL yet (s.w == nil): it advances the
-	// watermark but not the log number, because the segments it builds tables
-	// from are still being read (§9.7).
+	// S3: a REAL flush (s.w != nil) rotates the WAL so the next record (sequence
+	// s.seq+1) begins a fresh segment, and records the watermark trio TOGETHER so
+	// they stay mutually consistent (docs/STORAGE_INTEGRATION.md §9.2, §9.7):
+	//   - LogNumber: the new segment, where recovery begins;
+	//   - LogStartSeq = s.seq: the sequence before that segment's first record,
+	//     which recovery seeds its counter from — distinct from LastSequence,
+	//     which a replay flush advances without moving the log;
+	//   - Applied: the applied index the flushed tables bring the engine to, the
+	//     floor replay starts from and the durable index R2 clamps to.
+	// The rotation also syncs and closes the outgoing segment, so every record
+	// through s.seq is durable before the MANIFEST names the table that holds it
+	// (the D10 ordering). A flush DURING replay at open has no WAL yet (s.w ==
+	// nil) and must not move the watermark: the segments it builds tables from
+	// are still being read and the recovered LogNumber still names where replay
+	// begins. It records only the file and the flushed sequence.
 	var logNumber uint64
-	if s.w != nil {
+	recordWatermark := s.w != nil
+	if recordWatermark {
 		n, rerr := s.w.Rotate()
 		if rerr != nil {
 			_ = r.Close()
@@ -968,16 +971,21 @@ func (s *LSMStore) flushLocked() error {
 		}
 		logNumber = n
 		edit.SetLogNumber(n)
+		edit.SetLogStartSeq(s.seq)
+		edit.SetApplied(manifest.Applied{Index: s.applied.Index, Term: s.applied.Term})
 	}
 	if err := s.manifest.Append(&edit); err != nil {
 		_ = r.Close()
 		return fmt.Errorf("lsm: recording %s in the manifest: %w", sstName(num), err)
 	}
-	// The MANIFEST edit is durable: the flushed applied index is now the engine's
-	// durable watermark (R2), and segments below LogNumber may be deleted.
-	s.mu.Lock()
-	s.flushedApplied = s.applied
-	s.mu.Unlock()
+	// The MANIFEST edit is durable: a real flush's applied index is now the
+	// engine's durable watermark (R2), and segments below LogNumber may be
+	// deleted. A replay flush moved no watermark, so flushedApplied is unchanged.
+	if recordWatermark {
+		s.mu.Lock()
+		s.flushedApplied = s.applied
+		s.mu.Unlock()
+	}
 
 	s.mu.RLock()
 	cur2 := s.cur

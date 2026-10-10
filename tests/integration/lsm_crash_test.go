@@ -298,13 +298,13 @@ func TestLSMCrashAfterFlush(t *testing.T) {
 	if rec.SSTablesLoaded != 1 {
 		t.Fatalf("loaded %d SSTables, want 1", rec.SSTablesLoaded)
 	}
-	// The first n mutations are in the table and must NOT be replayed; the
-	// rest must be. Replaying the flushed prefix would still give the right
-	// answers, but it would mean the engine had learned nothing from the file
-	// and memory use would not be bounded by the memtable.
-	if rec.OpsSkipped != int64(n) || rec.OpsReplayed != int64(n) {
-		t.Fatalf("replay skipped %d and applied %d, want %d and %d",
-			rec.OpsSkipped, rec.OpsReplayed, n, n)
+	// S3: the flush truncated the WAL segment holding the first n mutations, so
+	// they are neither replayed nor skipped — they live only in the table now,
+	// and recovery starts at the log number the flush recorded. The second n
+	// mutations, written after the flush, are replayed.
+	if rec.OpsSkipped != 0 || rec.OpsReplayed != int64(n) {
+		t.Fatalf("replay skipped %d and applied %d, want 0 and %d",
+			rec.OpsSkipped, rec.OpsReplayed, n)
 	}
 	t.Logf("recovered from %d-entry SSTable + %d replayed WAL ops", rec.SSTableEntries, rec.OpsReplayed)
 }

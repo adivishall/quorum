@@ -108,9 +108,9 @@ func TestDecodeEditRejectsMalformedPayloads(t *testing.T) {
 		payload []byte
 	}{
 		{"unknown tag", []byte{0x7f}},
-		// 0x06 (SetApplied) is the highest tag this version knows, so 0x07 is the
-		// first one a future format could add. It must be refused, not skipped.
-		{"tag just past the known range", []byte{0x07}},
+		// 0x07 (SetLogStartSeq) is the highest tag this version knows, so 0x08 is
+		// the first one a future format could add. It must be refused, not skipped.
+		{"tag just past the known range", []byte{0x08}},
 		{"truncated after a tag", []byte{0x01}},
 		{"truncated mid-record", goodBytes[:len(goodBytes)-3]},
 		{"truncated at one byte", goodBytes[:1]},
@@ -258,6 +258,7 @@ func TestSnapshotReproducesState(t *testing.T) {
 	e.SetLastSequence(30)
 	e.SetLogNumber(2)
 	e.SetApplied(manifest.Applied{Index: 3, Term: 1})
+	e.SetLogStartSeq(25)
 	if err := s.Apply(e); err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +272,8 @@ func TestSnapshotReproducesState(t *testing.T) {
 			sortedFiles(rebuilt), sortedFiles(s))
 	}
 	if rebuilt.NextFileNum != s.NextFileNum || rebuilt.LastSequence != s.LastSequence ||
-		rebuilt.LogNumber != s.LogNumber || rebuilt.Applied != s.Applied {
+		rebuilt.LogNumber != s.LogNumber || rebuilt.Applied != s.Applied ||
+		rebuilt.LogStartSeq != s.LogStartSeq {
 		t.Fatalf("snapshot lost a scalar: %+v vs %+v", rebuilt, s)
 	}
 }

@@ -103,7 +103,8 @@ const (
 	tagLastSequence   = 0x04
 	tagLogNumber      = 0x05
 	tagApplied        = 0x06
-	tagMaxKnown       = tagApplied
+	tagLogStartSeq    = 0x07
+	tagMaxKnown       = tagLogStartSeq
 	maxFilesPerEdit   = 1 << 20 // bounds an allocation driven by a decoded count
 	maxKeyLenInEdit   = 1 << 20 // a key is at most 4 KiB; this is slack, not a limit
 	maxLevelsPerEdit  = 64      // a level number this large means damage
@@ -191,12 +192,15 @@ type Edit struct {
 
 	HasApplied bool
 	Applied    Applied
+
+	HasLogStartSeq bool
+	LogStartSeq    uint64
 }
 
 // Empty reports whether the edit would change nothing.
 func (e *Edit) Empty() bool {
 	return len(e.Added) == 0 && len(e.Deleted) == 0 &&
-		!e.HasNextFileNum && !e.HasLastSequence && !e.HasLogNumber && !e.HasApplied
+		!e.HasNextFileNum && !e.HasLastSequence && !e.HasLogNumber && !e.HasApplied && !e.HasLogStartSeq
 }
 
 // AddFile records a new live file.
@@ -223,6 +227,15 @@ func (e *Edit) SetLogNumber(n uint64) { e.HasLogNumber, e.LogNumber = true, n }
 
 // SetApplied records Raft progress metadata.
 func (e *Edit) SetApplied(a Applied) { e.HasApplied, e.Applied = true, a }
+
+// SetLogStartSeq records the sequence before the log number's first record — the
+// value recovery seeds its sequence counter from (S3,
+// docs/STORAGE_INTEGRATION.md §9.2). It is set together with the log number at a
+// flush, so segment LogNumber begins at LogStartSeq+1. It is distinct from
+// LastSequence (the highest flushed sequence): a flush during replay advances the
+// flushed sequence without moving the log number, so the two diverge and only
+// this one is a safe seed.
+func (e *Edit) SetLogStartSeq(n uint64) { e.HasLogStartSeq, e.LogStartSeq = true, n }
 
 // AppendTo encodes the edit onto dst.
 //
@@ -262,6 +275,10 @@ func (e *Edit) AppendTo(dst []byte) []byte {
 		dst = binary.AppendUvarint(dst, tagApplied)
 		dst = binary.AppendUvarint(dst, e.Applied.Index)
 		dst = binary.AppendUvarint(dst, e.Applied.Term)
+	}
+	if e.HasLogStartSeq {
+		dst = binary.AppendUvarint(dst, tagLogStartSeq)
+		dst = binary.AppendUvarint(dst, e.LogStartSeq)
 	}
 	return dst
 }
@@ -401,6 +418,14 @@ func DecodeEdit(payload []byte) (Edit, error) {
 			e.SetApplied(Applied{Index: idx, Term: term})
 			p = rest
 
+		case tagLogStartSeq:
+			v, rest, err := takeUvarint(p, "log start sequence")
+			if err != nil {
+				return Edit{}, err
+			}
+			e.SetLogStartSeq(v)
+			p = rest
+
 		default:
 			return Edit{}, fmt.Errorf(
 				"manifest: unknown field tag %#x (this version understands tags up to %#x): %w",
@@ -443,6 +468,7 @@ type State struct {
 	LastSequence uint64
 	LogNumber    uint64
 	Applied      Applied
+	LogStartSeq  uint64 // the sequence before LogNumber's first record (S3)
 }
 
 // Clone returns a deep copy.
@@ -497,6 +523,9 @@ func (s *State) Apply(e Edit) error {
 	if e.HasApplied {
 		s.Applied = e.Applied
 	}
+	if e.HasLogStartSeq {
+		s.LogStartSeq = e.LogStartSeq
+	}
 	return nil
 }
 
@@ -517,6 +546,7 @@ func (s State) Snapshot() Edit {
 	e.SetLastSequence(s.LastSequence)
 	e.SetLogNumber(s.LogNumber)
 	e.SetApplied(s.Applied)
+	e.SetLogStartSeq(s.LogStartSeq)
 	return e
 }
 

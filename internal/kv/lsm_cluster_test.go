@@ -107,8 +107,13 @@ func TestLSMEngineFailureFailsStopsTheNode(t *testing.T) {
 func TestR2CompactionStaysWithinADurableCopy(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// The default (large) memtable: the engine does not flush on its own over
+	// this short run, so the ONLY thing that advances its durable index — and so
+	// lets the log compact at all (R2) — is SyncApplied, which snapshot creation
+	// calls. If that step were skipped the durable index would stay 0, the log
+	// would never compact, and the `compacted` premise below would fail.
 	c := &cluster{t: t, ctx: ctx, dir: t.TempDir(), addrs: map[raftnode.NodeID]string{}, lsm: true,
-		snapEvery: 8, snapRetain: 2, memTableSize: 1 << 10,
+		snapEvery: 8, snapRetain: 2,
 		trs: map[raftnode.NodeID]*transport.TCPTransport{}, nodes: map[raftnode.NodeID]*raftnode.Node{}, eps: map[raftnode.NodeID]*endpoint{}}
 	for i := 0; i < 3; i++ {
 		id := raftnode.NodeID("n" + string(rune('1'+i)))

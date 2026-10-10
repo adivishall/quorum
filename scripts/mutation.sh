@@ -2926,9 +2926,25 @@ mutant "failed-machine-leaves-no-directory" internal/multiraft/host.go \
 #      truncation the reopen seeds a stale applied index and loses the entries
 #      between the old and new watermark.
 mutant "flush-records-the-applied-index" internal/storage/lsmstore.go \
-  '	edit.SetApplied(manifest.Applied{Index: s.applied.Index, Term: s.applied.Term})' \
-  '	_ = s.applied' \
+  '		edit.SetApplied(manifest.Applied{Index: s.applied.Index, Term: s.applied.Term})' \
+  '		_ = s.applied' \
   ./internal/storage '^TestAppliedIndexRecoveredFromTheManifestAfterAFlush$'
+
+# 344b. S3: a flush does not record the log start sequence — recovery seeds the
+#       sequence from zero (or a stale value) and the surviving records collide
+#       with the tables.
+mutant "flush-records-the-log-start-sequence" internal/storage/lsmstore.go \
+  '		edit.SetLogStartSeq(s.seq)' \
+  '		_ = s.seq' \
+  ./internal/storage '^TestWALTruncationReclaimsSegments$'
+
+# 344c. S3 (R2): creating a snapshot does not make the engine durable, so a node
+#       whose engine has not flushed never advances its durable index and its log
+#       never compacts — a lagging follower is never sent a snapshot.
+mutant "snapshot-makes-the-engine-durable" internal/raftnode/snapshot.go \
+  '		if err := da.SyncApplied(); err != nil {' \
+  '		if err := error(nil); err != nil {' \
+  ./internal/kv '^TestR2CompactionStaysWithinADurableCopy$'
 
 # 345. S3: a flush does not record the log number — the reopen cannot tell where
 #      the truncated log begins and mis-numbers or mis-reads the surviving records.

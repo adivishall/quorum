@@ -57,6 +57,14 @@ type DurableApplier interface {
 	// recover after a crash without the Raft log. Compaction never passes it. A
 	// value it cannot vouch for must be reported as 0, which compacts nothing.
 	DurableAppliedIndex() uint64
+	// SyncApplied makes the state through the current applied index durable in
+	// the engine, advancing DurableAppliedIndex to it. The driver calls it when
+	// it creates a snapshot, so the log can then be compacted behind that
+	// snapshot without the boundary passing the engine's durable index (R2):
+	// the snapshot's prefix is durable in the engine's own tables, not only in
+	// the published snapshot file. A failure is a durability failure; the node
+	// stops. The in-memory store does not implement DurableApplier.
+	SyncApplied() error
 }
 
 // LogStore is the durable Raft log as the driver uses it: *raftlog.Log, or the
@@ -319,6 +327,17 @@ func (d *Durable) Snapshot(core *raft.Raft, at Hook) error {
 	s.meta, s.file = meta, file
 	if err := at.hit(AfterSnapshotPublish, idx); err != nil {
 		return err
+	}
+	// R2: make the engine durable through the snapshot's index before compacting
+	// the log behind it, so the compaction boundary does not pass the engine's
+	// durable applied index (docs/STORAGE_INTEGRATION.md §9.6). Without this a
+	// node whose engine rarely flushes would hold its log forever, never sending
+	// a lagging follower a snapshot. The in-memory store needs nothing: its
+	// durable copy of the prefix is the snapshot file just published.
+	if da, ok := s.SM.(DurableApplier); ok {
+		if err := da.SyncApplied(); err != nil {
+			return fmt.Errorf("%w: making the engine durable through %d for compaction: %w", ErrSnapshot, idx, err)
+		}
 	}
 	return d.compact(core, at)
 }
