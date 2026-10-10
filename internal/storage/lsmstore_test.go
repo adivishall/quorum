@@ -845,30 +845,52 @@ func TestTruncatedSSTableRefusesToOpen(t *testing.T) {
 func TestARequiredWALSegmentMissingIsRefused(t *testing.T) {
 	dir := t.TempDir()
 	opts := lsmOpts(storage.DefaultMemTableSize)
+	opts.WAL.SegmentSize = 256 // small, so the post-flush writes span several segments
 
 	s := openLSM(t, dir, opts)
 	for i := 0; i < 20; i++ {
 		mustPut(t, s, fmt.Sprintf("k%02d", i), "v")
 	}
-	mustFlush(t, s) // rotates to segment 2 and truncates segment 1
-	for i := 0; i < 5; i++ {
-		mustPut(t, s, fmt.Sprintf("later%02d", i), "v") // segment 2 holds committed records
+	mustFlush(t, s) // rotates and truncates every segment below the new log number
+	for i := 0; i < 40; i++ {
+		mustPut(t, s, fmt.Sprintf("later%02d", i), "vvvvvvvvvvvv") // fills the log number's segment and rotates onward
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	// The flush truncated segment 1; segment 2 is the log number the MANIFEST
-	// requires. Confirm the truncation, then lose the required segment.
-	if _, err := os.Stat(walPath(dir, 1)); !os.IsNotExist(err) {
-		t.Fatalf("premise: the flush should have truncated segment 1, Stat = %v", err)
+	// The flush truncated the early segments and later writes spilled onward, so
+	// several segments remain. The lowest present is the log number the MANIFEST
+	// requires. Lose it while a higher one remains: the lowest present is then
+	// above the log number, which a crash cannot produce.
+	segs := walSegments(t, dir)
+	if len(segs) < 2 {
+		t.Fatalf("premise: want several WAL segments after the spill, have %v", segs)
 	}
-	if err := os.Remove(walPath(dir, 2)); err != nil {
+	if err := os.Remove(walPath(dir, int(segs[0]))); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := storage.OpenLSMStore(dir, opts); !errors.Is(err, storage.ErrCorrupt) {
 		t.Fatalf("opening with the required WAL segment missing = %v, want ErrCorrupt", err)
 	}
+}
+
+// walSegments returns the WAL segment numbers present under dir, ascending.
+func walSegments(t *testing.T, dir string) []uint64 {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(dir, "wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nums []uint64
+	for _, e := range entries {
+		var n uint64
+		if _, err := fmt.Sscanf(e.Name(), "%06d.log", &n); err == nil {
+			nums = append(nums, n)
+		}
+	}
+	sort.Slice(nums, func(i, j int) bool { return nums[i] < nums[j] })
+	return nums
 }
 
 func TestStrayFilesAreIgnored(t *testing.T) {

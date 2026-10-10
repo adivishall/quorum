@@ -68,6 +68,35 @@ func TestWALTruncationReclaimsSegments(t *testing.T) {
 	}
 }
 
+// TestAppliedIndexRecoveredFromTheManifestAfterAFlush: when the last thing before
+// close is a flush, the surviving WAL holds no apply records, so the applied index
+// can only come from the MANIFEST's Applied. The reopen must recover it, which
+// proves the flush recorded the applied index durably (not just the data).
+func TestAppliedIndexRecoveredFromTheManifestAfterAFlush(t *testing.T) {
+	dir := t.TempDir()
+	opts := lsmOpts(storage.DefaultMemTableSize) // large: only the explicit flush flushes
+	s := openLSM(t, dir, opts)
+	for i := 1; i <= 10; i++ {
+		mustApply(t, s, applyStep{[]storage.Mutation{mput(fmt.Sprintf("k%02d", i), "v")}, ai(uint64(i), 3)})
+	}
+	mustFlush(t, s) // covers index 10 and truncates the WAL; nothing is written after
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := openLSM(t, dir, opts)
+	defer reopened.Close()
+	if got := reopened.Recovery().ApplyBatches; got != 0 {
+		t.Fatalf("replay read %d apply batches; the WAL should be empty after the final flush", got)
+	}
+	if got := reopened.AppliedIndex(); got != ai(10, 3) {
+		t.Fatalf("recovered applied index %+v, want (10,3): with an empty WAL it must come from the MANIFEST", got)
+	}
+	for i := 1; i <= 10; i++ {
+		assertValue(t, reopened, fmt.Sprintf("k%02d", i), "v")
+	}
+}
+
 // TestDurableAppliedAdvancesOnlyAtFlush: the engine's durable applied index —
 // what Raft log compaction must not pass (R2) — advances only when a flush makes
 // its MANIFEST edit durable, never merely because an entry was applied into the

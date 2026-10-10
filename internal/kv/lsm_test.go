@@ -222,6 +222,33 @@ func anonPut(k, v string) []byte {
 }
 func anonDel(k string) []byte { return Command{Op: OpDelete, Key: []byte(k)}.Encode() }
 
+// TestLSMMachineDurableAppliedIsTheEnginesFlushedIndex: the machine reports the
+// engine's durable (flushed) applied index for R2 (raftnode.DurableApplier), not
+// the live index applied into the unsynced WAL. They differ until a flush records
+// the watermark — which is exactly what keeps Raft log compaction behind what the
+// engine can recover after a power loss (docs/STORAGE_INTEGRATION.md §9.6).
+func TestLSMMachineDurableAppliedIsTheEnginesFlushedIndex(t *testing.T) {
+	p := newPair(t, DefaultLimits, nil)
+	defer p.lsm.Close()
+	p.cycle(anonPut("k0", "v"), anonPut("k1", "v"))
+	p.cycle(anonPut("k2", "v"))
+	// Applied into the WAL and memtable, but not flushed: the durable index lags.
+	if d := p.lsm.DurableAppliedIndex(); d != 0 {
+		t.Fatalf("durable applied index %d before any flush, want 0", d)
+	}
+	if a := p.lsm.Applied(); a == 0 {
+		t.Fatal("premise: nothing applied")
+	}
+	// Flush the engine: the durable index advances to the applied index the
+	// flushed tables cover.
+	if err := p.lsm.db.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if d, a := p.lsm.DurableAppliedIndex(), p.lsm.Applied(); d != a {
+		t.Fatalf("durable applied index %d after a flush, want the applied index %d", d, a)
+	}
+}
+
 // TestLSMMachineMatchesTheStoreOnAScript: a hand-written script that reaches
 // every decision — registered, executed, duplicate, conflict, stale, expired,
 // limit, evicted — with overwrites, deletes, no-ops and an empty value, cycle
