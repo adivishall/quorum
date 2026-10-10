@@ -9,6 +9,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/adivishall/quorum/internal/raftnode"
 	"github.com/adivishall/quorum/internal/record"
 	"github.com/adivishall/quorum/internal/storage"
 	"github.com/adivishall/quorum/internal/vfs"
@@ -68,7 +69,10 @@ const cycleFlushBytes = 32 << 20
 // ErrMachineClosed is returned by every operation of a closed machine.
 var ErrMachineClosed = errors.New("kv: the state machine is closed")
 
-var _ Machine = (*LSMMachine)(nil)
+var (
+	_ Machine                 = (*LSMMachine)(nil)
+	_ raftnode.DurableApplier = (*LSMMachine)(nil)
+)
 
 // OpenLSMMachine opens the machine's engine in dir (creating it) under limits
 // — the same limits every replica of the group uses — and engine options opts,
@@ -291,6 +295,19 @@ func (m *LSMMachine) Applied() uint64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.applied
+}
+
+// DurableAppliedIndex returns the applied index the engine recovers after a
+// crash without the Raft log (raftnode.DurableApplier, R2): the engine's flushed
+// applied index, which the Raft log is never compacted past. A closed machine
+// vouches for nothing and reports 0 (compact nothing).
+func (m *LSMMachine) DurableAppliedIndex() uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return 0
+	}
+	return m.db.DurableApplied().Index
 }
 
 // Sessions returns a copy of the session table.

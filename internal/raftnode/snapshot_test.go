@@ -116,6 +116,33 @@ func userCommands(cmds []string) []string {
 }
 
 // TestReconcileTable is docs/SNAPSHOTS.md §6, row by row.
+// TestCompactPointClampsToDurable: the log-compaction point is the published
+// snapshot's index less Retain, but never past the engine's durable applied
+// index (R2, docs/STORAGE_INTEGRATION.md §9.6). A machine that reports no durable
+// index — the in-memory store, whose durable copy is the snapshot — is not
+// clamped; one that reports 0, because it has flushed nothing or cannot vouch
+// for an index, compacts nothing.
+func TestCompactPointClampsToDurable(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		snapIndex, retain, durable uint64
+		hasDurable                 bool
+		want                       uint64
+	}{
+		{"no durable applier: the snapshot drives it", 100, 10, 0, false, 90},
+		{"durable ahead of the point: no clamp", 100, 10, 95, true, 90},
+		{"durable at the point: no clamp", 100, 10, 90, true, 90},
+		{"durable behind the point: clamp to it", 100, 10, 42, true, 42},
+		{"durable zero: compact nothing", 100, 10, 0, true, 0},
+		{"retain past the index: zero either way", 5, 10, 3, true, 0},
+	} {
+		if got := compactPoint(tc.snapIndex, tc.retain, tc.durable, tc.hasDurable); got != tc.want {
+			t.Errorf("%s: compactPoint(%d, %d, %d, %v) = %d, want %d",
+				tc.name, tc.snapIndex, tc.retain, tc.durable, tc.hasDurable, got, tc.want)
+		}
+	}
+}
+
 func TestReconcileTable(t *testing.T) {
 	e := func(i, term uint64) raftlog.Entry { return raftlog.Entry{Index: i, Term: term} }
 	snap := snapshot.Meta{Index: 10, Term: 3}
