@@ -3093,6 +3093,82 @@ mutant "empty-log-under-a-log-number-is-refused" internal/storage/wal/recover.go
   '	if len(kept) > 0 && kept[0] != logNumber {' \
   ./internal/storage '^TestALostWALUnderALogNumberIsRefused$'
 
+# 364. S3 (R2, final review): compact does not read the machine's durable
+#      applied index, so the clamp is never applied in the real path.
+mutant "compact-reads-the-machines-durable-index" internal/raftnode/snapshot.go \
+  '		durable, hasDurable = da.DurableAppliedIndex(), true' \
+  '		_ = da' \
+  ./internal/raftnode '^TestSnapshotSyncsTheEngineFirstAndCompactsOnlyToItsDurableIndex$'
+
+# 365. S3 (final review): the snapshot is published before the engine is synced
+#      through it — a power loss between them leaves a published snapshot above
+#      an engine that lost its tail, which the restart must restore whole.
+mutant "engine-synced-before-the-snapshot-is-published" internal/raftnode/snapshot.go \
+  '	if da, ok := s.SM.(DurableApplier); ok {
+		if err := da.SyncApplied(); err != nil {
+			return fmt.Errorf("%w: making the engine durable through %d for compaction: %w", ErrSnapshot, idx, err)
+		}
+	}
+	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
+		return err
+	}
+	if err := s.Files.Publish(file); err != nil {
+		return err
+	}
+	s.meta, s.file = meta, file
+	if err := at.hit(AfterSnapshotPublish, idx); err != nil {
+		return err
+	}' \
+  '	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
+		return err
+	}
+	if err := s.Files.Publish(file); err != nil {
+		return err
+	}
+	s.meta, s.file = meta, file
+	if err := at.hit(AfterSnapshotPublish, idx); err != nil {
+		return err
+	}
+	if da, ok := s.SM.(DurableApplier); ok {
+		if err := da.SyncApplied(); err != nil {
+			return fmt.Errorf("%w: making the engine durable through %d for compaction: %w", ErrSnapshot, idx, err)
+		}
+	}' \
+  ./internal/raftnode '^TestSnapshotSyncsTheEngineFirstAndCompactsOnlyToItsDurableIndex$'
+
+# 366. S3 (final review): the restore measures the state before deciding it has
+#      nothing to do — a node whose state is too large for one restore batch can
+#      never restart on its own snapshot.
+mutant "restore-decides-the-noop-first" internal/kv/lsm.go \
+  '	if m.engine.Index >= index {
+		return nil
+	}
+	st, err := m.checkSnapshot(index, data)
+	if err != nil {
+		return err
+	}' \
+  '	st, err := m.checkSnapshot(index, data)
+	if err != nil {
+		return err
+	}
+	if m.engine.Index >= index {
+		return nil
+	}' \
+  ./internal/kv '^TestLSMMachineRestartsOnItsOwnSnapshotBeyondOneRestoreBatch$'
+
+# 367. S3 (final review): the restore deletes the old engine in place — a crash
+#      part-way leaves an engine the next open refuses.
+mutant "restore-sets-the-old-engine-aside" internal/kv/lsm.go \
+  '	if err := os.Rename(m.dir, aside); err != nil {' \
+  '	if err := removeAll(m.dir); err != nil {' \
+  ./internal/kv '^TestLSMMachineACrashWhileReplacingTheEngineLeavesOneThatOpens$'
+
+# 368. S3 (final review): an engine a crashed restore set aside is never removed.
+mutant "open-removes-the-engine-set-aside" internal/kv/lsm.go \
+  '	if err := removeAll(asidePath(dir)); err != nil {' \
+  '	if err := error(nil); err != nil {' \
+  ./internal/kv '^TestLSMMachineACrashWhileReplacingTheEngineLeavesOneThatOpens$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then

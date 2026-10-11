@@ -59,11 +59,13 @@ type DurableApplier interface {
 	DurableAppliedIndex() uint64
 	// SyncApplied makes the state through the current applied index durable in
 	// the engine, advancing DurableAppliedIndex to it. The driver calls it when
-	// it creates a snapshot, so the log can then be compacted behind that
-	// snapshot without the boundary passing the engine's durable index (R2):
-	// the snapshot's prefix is durable in the engine's own tables, not only in
-	// the published snapshot file. A failure is a durability failure; the node
-	// stops. The in-memory store does not implement DurableApplier.
+	// it creates a snapshot, before publishing it, so the log can then be
+	// compacted behind that snapshot without the boundary passing the engine's
+	// durable index (R2), and a restart never finds its own snapshot above the
+	// engine. The snapshot's prefix is then durable in the engine's own tables,
+	// not only in the published snapshot file. A failure is a durability
+	// failure; the node stops. The in-memory store does not implement
+	// DurableApplier.
 	SyncApplied() error
 }
 
@@ -258,7 +260,8 @@ func (d *Durable) MaybeSnapshot(core *raft.Raft, at Hook) error {
 
 // Snapshot creates a snapshot of the state machine at the applied index,
 // publishes it, and compacts the log behind it, in this order
-// (docs/SNAPSHOTS.md §5): encode (memory); publish (temporary file, fsync,
+// (docs/SNAPSHOTS.md §5): encode (memory); make an engine-backed machine
+// durable through the index (SyncApplied, S3); publish (temporary file, fsync,
 // rename, directory fsync); rewrite the durable log without the prefix; discard
 // the prefix in the core. The log is never compacted before the snapshot that
 // covers it is durable, so a crash anywhere leaves a state recovery accepts.
@@ -318,6 +321,22 @@ func (d *Durable) Snapshot(core *raft.Raft, at Hook) error {
 	if err != nil {
 		return err
 	}
+	// R2: make the engine durable through the snapshot's index before compacting
+	// the log behind it, so the compaction boundary does not pass the engine's
+	// durable applied index (docs/STORAGE_INTEGRATION.md §9.6). Without this a
+	// node whose engine rarely flushes would hold its log forever, never sending
+	// a lagging follower a snapshot. It comes BEFORE the publish: a power loss
+	// between the two would otherwise leave a published snapshot above an engine
+	// that lost its unsynced tail, and the restart would replace the whole
+	// engine from the file — refused outright for a state too large for one
+	// restore batch — when the engine itself could have been made durable
+	// first. The in-memory store needs nothing: its durable copy of the prefix
+	// is the snapshot file.
+	if da, ok := s.SM.(DurableApplier); ok {
+		if err := da.SyncApplied(); err != nil {
+			return fmt.Errorf("%w: making the engine durable through %d for compaction: %w", ErrSnapshot, idx, err)
+		}
+	}
 	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
 		return err
 	}
@@ -327,17 +346,6 @@ func (d *Durable) Snapshot(core *raft.Raft, at Hook) error {
 	s.meta, s.file = meta, file
 	if err := at.hit(AfterSnapshotPublish, idx); err != nil {
 		return err
-	}
-	// R2: make the engine durable through the snapshot's index before compacting
-	// the log behind it, so the compaction boundary does not pass the engine's
-	// durable applied index (docs/STORAGE_INTEGRATION.md §9.6). Without this a
-	// node whose engine rarely flushes would hold its log forever, never sending
-	// a lagging follower a snapshot. The in-memory store needs nothing: its
-	// durable copy of the prefix is the snapshot file just published.
-	if da, ok := s.SM.(DurableApplier); ok {
-		if err := da.SyncApplied(); err != nil {
-			return fmt.Errorf("%w: making the engine durable through %d for compaction: %w", ErrSnapshot, idx, err)
-		}
 	}
 	return d.compact(core, at)
 }
