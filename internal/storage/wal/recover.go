@@ -32,7 +32,7 @@ type Recovery struct {
 	BatchesApplied  int64
 	ApplyBatches    int64 // apply records replayed (S1)
 	OpsApplied      int64
-	AppliedIndex    AppliedIndex // the last applied index replayed, from either record kind
+	AppliedIndex    AppliedIndex // the last applied index replayed, from either record kind; from a log number, it starts at the caller's anchor
 	SawAppliedIndex bool
 
 	// SyncedNewest reports that the newest segment was fsynced before it was
@@ -94,15 +94,24 @@ func Recover(dir string, h Handler) (Recovery, error) {
 // everything replayed is durable: after open, recovered implies durable. Older
 // segments were fsynced when they were rotated out.
 func RecoverWith(dir string, opts Options, h Handler) (Recovery, error) {
-	return RecoverFrom(dir, opts, 0, h)
+	return RecoverFrom(dir, opts, 0, AppliedIndex{}, h)
 }
 
 // RecoverFrom replays the WAL from segment logNumber onward (S3,
 // docs/STORAGE_INTEGRATION.md §9.7). logNumber is the MANIFEST's LogNumber: the
-// segment whose first record is sequence LastSequence+1, so that the caller may
-// seed its sequence counter from LastSequence and skip the flushed prefix. A
-// logNumber of 0 means no truncation has ever happened — replay from the first
-// segment present, exactly as RecoverWith always did (a pre-S3 directory).
+// segment whose first record is sequence LogStartSeq+1, so that the caller may
+// seed its sequence counter from LogStartSeq and skip the flushed prefix. A
+// logNumber of 0 means no truncation has ever happened, so the log must begin at
+// the first segment; replay from there, exactly as RecoverWith always did (a
+// pre-S3 directory). A lowest segment above the first is refused: its start is
+// gone — an S3 directory whose MANIFEST was lost, say — and counting the rest
+// from zero would mis-number every record.
+//
+// applied is the MANIFEST's Applied, the applied index the flushed prefix
+// brings the caller to. With logNumber > 0 the check that every apply batch
+// advances the applied index starts there, as the truncated records below
+// logNumber would have left it; with logNumber 0 it is ignored and the check
+// starts from zero, as before.
 //
 // With logNumber > 0 it completes an interrupted truncation and detects a lost
 // segment:
@@ -113,8 +122,11 @@ func RecoverWith(dir string, opts Options, h Handler) (Recovery, error) {
 //     segment replay needs is gone, which a crash cannot produce once the
 //     segment's creation was fsynced before the MANIFEST named it (§9.5) — so it
 //     is ErrCorrupt, not something to work around.
-func RecoverFrom(dir string, opts Options, logNumber uint64, h Handler) (Recovery, error) {
+func RecoverFrom(dir string, opts Options, logNumber uint64, applied AppliedIndex, h Handler) (Recovery, error) {
 	var rec Recovery
+	if logNumber > 0 {
+		rec.AppliedIndex = applied
+	}
 	fsys := vfs.Or(opts.FS)
 
 	if _, err := fsys.Stat(dir); errors.Is(err, fs.ErrNotExist) {
@@ -154,6 +166,12 @@ func RecoverFrom(dir string, opts Options, logNumber uint64, h Handler) (Recover
 	} else {
 		if nums, ignored, err = listSegments(fsys, dir); err != nil {
 			return rec, err
+		}
+		// No log number, so nothing was ever truncated: a segment is deleted
+		// only after a durable MANIFEST edit names a log number above it.
+		if len(nums) > 0 && nums[0] != firstSegment {
+			return rec, fmt.Errorf("wal: no log number is recorded, so the log must begin at %s, but its lowest segment is %s: %w",
+				segmentName(firstSegment), segmentName(nums[0]), ErrCorrupt)
 		}
 	}
 	rec.IgnoredEntries = ignored

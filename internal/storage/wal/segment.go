@@ -62,16 +62,16 @@ func parseSegmentName(name string) (uint64, bool) {
 // along with the number of entries that were ignored because they are not
 // segment files.
 //
-// A gap in the sequence is an error. Nothing in Quorum deletes a WAL segment yet,
-// so a missing segment means a segment was removed from underneath us, and
-// every record it held is gone. Replaying the surviving segments would produce
+// A gap in the sequence is an error. Truncation (S3) deletes only a prefix, so
+// a segment missing from the middle was removed from underneath us, and every
+// record it held is gone. Replaying the surviving segments would produce
 // a state that never existed — a later write applied without the earlier one it
 // overwrote. Refusing is the only correct response.
 //
-// Note the asymmetry: a gap in the middle is detectable, a run of segments
-// missing from the *start* is not, because nothing records which segment number
-// the log begins at. That metadata arrives with the MANIFEST's log number in
-// Phase 4. Until then, this is a documented limitation rather than a guarantee.
+// A run of segments missing from the *start* is not a gap, and listSegments
+// cannot see it. RecoverFrom checks the start (S3): against the MANIFEST's log
+// number when one is recorded, and against the first segment when none is,
+// since nothing truncates a log without first recording a log number.
 func listSegments(fsys vfs.FS, dir string) (nums []uint64, ignored int, err error) {
 	nums, ignored, err = listSegmentsRaw(fsys, dir)
 	if err != nil {

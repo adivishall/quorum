@@ -3027,6 +3027,70 @@ mutant "empty-flush-truncates-the-log" internal/storage/lsmstore.go \
   '	_ = n' \
   ./internal/storage '^TestAFlushRecordsAnAppliedIndexThatMovedWithoutData$'
 
+# 356. S3 (final review): with no log number recorded, a log whose lowest
+#      segment is above the first is replayed counted from zero — adopting an S3
+#      directory that lost its MANIFEST silently drops acknowledged writes.
+mutant "legacy-log-begins-at-the-first-segment" internal/storage/wal/recover.go \
+  '		if len(nums) > 0 && nums[0] != firstSegment {' \
+  '		if false {' \
+  ./internal/storage '^TestAdoptingATruncatedLogIsRefused$'
+
+# 357. S3 (final review): after truncation, replay checks the first surviving
+#      apply batch against zero, not the MANIFEST's Applied — a record below the
+#      durable watermark is accepted and drops the applied index under it.
+mutant "replay-is-anchored-to-the-manifest-applied" internal/storage/wal/recover.go \
+  '	if logNumber > 0 {
+		rec.AppliedIndex = applied
+	}' \
+  '	_ = applied' \
+  ./internal/storage '^TestReplayIsAnchoredToTheManifestApplied$'
+
+# 358. S3 (final review): a flush does not record the applied sequence — the
+#      reopen credits writes made outside apply batches to the applied index.
+mutant "flush-records-the-applied-sequence" internal/storage/lsmstore.go \
+  '		edit.SetAppliedSeq(s.appliedSeq)' \
+  '		_ = s.appliedSeq' \
+  ./internal/storage '^TestAppliedSequenceSurvivesAFlushAfterWritesOutsideBatches$'
+
+# 359. S3 (final review): the empty-memtable record does not carry the applied
+#      sequence either.
+mutant "empty-flush-records-the-applied-sequence" internal/storage/lsmstore.go \
+  '	edit.SetApplied(manifest.Applied{Index: applied.Index, Term: applied.Term})
+	edit.SetAppliedSeq(s.appliedSeq)' \
+  '	edit.SetApplied(manifest.Applied{Index: applied.Index, Term: applied.Term})' \
+  ./internal/storage '^TestAppliedSequenceSurvivesAFlushAfterWritesOutsideBatches$'
+
+# 360. S3 (final review): recovery seeds the applied sequence from the log start
+#      sequence, not the recorded one.
+mutant "recovery-seeds-the-applied-sequence" internal/storage/lsmstore.go \
+  '		s.appliedSeq = appliedSeq' \
+  '		s.appliedSeq = logStartSeq' \
+  ./internal/storage '^TestAppliedSequenceSurvivesAFlushAfterWritesOutsideBatches$'
+
+# 361. S3 (final review): a WAL directory that is gone although the MANIFEST
+#      names a log number is taken for an empty log — the store opens from its
+#      tables and loses every unflushed write.
+mutant "missing-wal-directory-under-a-log-number" internal/storage/wal/recover.go \
+  '		if logNumber > 0 {
+			// The MANIFEST names a WAL segment, but the WAL directory is gone.' \
+  '		if false {
+			// The MANIFEST names a WAL segment, but the WAL directory is gone.' \
+  ./internal/storage '^TestALostWALUnderALogNumberIsRefused$'
+
+# 362. S3 (final review): the segments from the log number on are not checked for
+#      a gap — replay skips a lost middle segment.
+mutant "truncated-log-must-be-contiguous" internal/storage/wal/recover.go \
+  '		if err := checkContiguous(nums); err != nil {' \
+  '		if err := checkContiguous(nil); err != nil {' \
+  ./internal/storage '^TestALostWALUnderALogNumberIsRefused$'
+
+# 363. S3 (final review): a WAL with no segment left under a log number is taken
+#      for an empty log.
+mutant "empty-log-under-a-log-number-is-refused" internal/storage/wal/recover.go \
+  '	if len(kept) == 0 || kept[0] != logNumber {' \
+  '	if len(kept) > 0 && kept[0] != logNumber {' \
+  ./internal/storage '^TestALostWALUnderALogNumberIsRefused$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then

@@ -279,7 +279,7 @@ func OpenLSMStore(dir string, opts Options) (*LSMStore, error) {
 		return nil, classify("open", nil, err)
 	}
 
-	if err := s.replayWAL(state.LogNumber, state.LogStartSeq); err != nil {
+	if err := s.replayWAL(state.LogNumber, state.LogStartSeq, state.AppliedSeq); err != nil {
 		s.closeManifest()
 		s.closeAllReaders()
 		return nil, classify("open", nil, err)
@@ -634,15 +634,18 @@ func (s *LSMStore) closeManifest() {
 // logStartSeq+1 by the flush protocol. logStartSeq is the dedicated seed, not
 // LastSequence: a flush during an earlier open advances the flushed sequence
 // without moving the log, so only logStartSeq stays consistent with logNumber.
-// When logNumber is 0 (a pre-S3 directory, or one that never flushed) replay
-// starts at the first segment and counts from 0, as before.
-func (s *LSMStore) replayWAL(logNumber, logStartSeq uint64) error {
+// appliedSeq seeds AppliedSequence: the apply batch it came from may be among
+// the truncated records, and writes outside apply batches may have followed it,
+// so it is recorded rather than assumed equal to logStartSeq. When logNumber is 0
+// (a pre-S3 directory, or one that never flushed) replay starts at the first
+// segment and counts from 0, as before.
+func (s *LSMStore) replayWAL(logNumber, logStartSeq, appliedSeq uint64) error {
 	maxFlushed := s.recovery.MaxFlushedSeq
 	if logNumber > 0 {
 		// The flushed prefix is gone from the WAL and lives in the tables; the
 		// surviving records continue the numbering from where the log begins.
 		s.seq = logStartSeq
-		s.appliedSeq = logStartSeq
+		s.appliedSeq = appliedSeq
 	}
 
 	replay := func(b wal.Batch) error {
@@ -671,7 +674,10 @@ func (s *LSMStore) replayWAL(logNumber, logStartSeq uint64) error {
 		}
 		return nil
 	}
-	rec, err := wal.RecoverFrom(filepath.Join(s.dir, walDirName), s.opts.WAL, logNumber, wal.Handler{
+	// s.applied is still the MANIFEST's Applied here: the anchor every surviving
+	// apply batch must advance past, as the truncated records left it.
+	anchor := wal.AppliedIndex{Index: s.applied.Index, Term: s.applied.Term}
+	rec, err := wal.RecoverFrom(filepath.Join(s.dir, walDirName), s.opts.WAL, logNumber, anchor, wal.Handler{
 		Batch: replay,
 		Applied: func(a wal.AppliedIndex) error {
 			s.applied = AppliedIndex{Index: a.Index, Term: a.Term}
@@ -956,7 +962,9 @@ func (s *LSMStore) flushLocked() error {
 	//     which recovery seeds its counter from — distinct from LastSequence,
 	//     which a replay flush advances without moving the log;
 	//   - Applied: the applied index the flushed tables bring the engine to, the
-	//     floor replay starts from and the durable index R2 clamps to.
+	//     floor replay starts from and the durable index R2 clamps to;
+	//   - AppliedSeq: the sequence of the last mutation Applied covers, which
+	//     AppliedSequence reports and the truncated apply batch no longer holds.
 	// The rotation also syncs and closes the outgoing segment, so every record
 	// through s.seq is durable before the MANIFEST names the table that holds it
 	// (the D10 ordering). A flush DURING replay at open has no WAL yet (s.w ==
@@ -975,6 +983,7 @@ func (s *LSMStore) flushLocked() error {
 		edit.SetLogNumber(n)
 		edit.SetLogStartSeq(s.seq)
 		edit.SetApplied(manifest.Applied{Index: s.applied.Index, Term: s.applied.Term})
+		edit.SetAppliedSeq(s.appliedSeq)
 	}
 	if err := s.manifest.Append(&edit); err != nil {
 		_ = r.Close()
@@ -1028,7 +1037,7 @@ func (s *LSMStore) flushLocked() error {
 // latches, so no frozen memtable is left behind), and the applied index is the
 // only thing to record. The steps are a flush's without the table: rotate the
 // WAL, which syncs the outgoing segment; append one fsynced edit with the
-// watermark trio — the commit point; then truncate below the new log number. A
+// watermark (and AppliedSeq) — the commit point; then truncate below the new log number. A
 // crash before the edit recovers from the old log number, as before.
 //
 // During replay at open there is no WAL (s.w == nil), and nothing to record:
@@ -1047,6 +1056,7 @@ func (s *LSMStore) recordAppliedLocked() error {
 	edit.SetLogNumber(n)
 	edit.SetLogStartSeq(s.seq)
 	edit.SetApplied(manifest.Applied{Index: applied.Index, Term: applied.Term})
+	edit.SetAppliedSeq(s.appliedSeq)
 	if err := s.manifest.Append(&edit); err != nil {
 		return fmt.Errorf("lsm: recording applied index %d in the manifest: %w", applied.Index, err)
 	}
