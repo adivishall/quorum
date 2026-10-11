@@ -896,7 +896,9 @@ func (s *LSMStore) flushLocked() error {
 		return ErrClosed
 	}
 	if cur.mem.Empty() {
-		return nil
+		// No table to write — but the applied index may still be ahead of the
+		// durable watermark, moved by apply batches that carry no mutation.
+		return s.recordAppliedLocked()
 	}
 
 	old := cur.mem
@@ -998,15 +1000,9 @@ func (s *LSMStore) flushLocked() error {
 		append(append([]*sstFile(nil), cur2.files...), &sstFile{meta: fm, r: r, path: finalPath})))
 
 	// Truncate the WAL: the segments below LogNumber hold only records now in a
-	// table (§9.4). A failed deletion is redundant-space, not a correctness
-	// problem — the next open sweeps it — so it is counted, never fatal.
+	// table (§9.4).
 	if logNumber > 0 {
-		if removed, terr := s.w.DeleteSegmentsBelow(logNumber); terr != nil {
-			s.truncStats.failures.Add(1)
-			s.truncStats.segmentsRemoved.Add(int64(removed))
-		} else {
-			s.truncStats.segmentsRemoved.Add(int64(removed))
-		}
+		s.truncateWALBelow(logNumber)
 	}
 
 	// Record the flush's output. This is the flush half of the bytes the engine
@@ -1018,6 +1014,59 @@ func (s *LSMStore) flushLocked() error {
 	s.flushStats.bytes.Add(meta.FileSize)
 	s.flushStats.entries.Add(int64(meta.NumEntries))
 	return nil
+}
+
+// recordAppliedLocked makes the applied index the durable watermark when the
+// memtable is empty (S3, docs/STORAGE_INTEGRATION.md §9.6). writeMu must be held.
+//
+// An apply batch with no mutation — the election no-op, a configuration entry —
+// and SetAppliedIndex advance the applied index without adding to the
+// memtable. Were an empty memtable a no-op, a Flush after them would leave the
+// durable watermark behind the applied index, and SyncApplied would not do what
+// raftnode.DurableApplier promises. With the memtable empty, every sequence
+// through s.seq is already in a table the MANIFEST names (a flush failure
+// latches, so no frozen memtable is left behind), and the applied index is the
+// only thing to record. The steps are a flush's without the table: rotate the
+// WAL, which syncs the outgoing segment; append one fsynced edit with the
+// watermark trio — the commit point; then truncate below the new log number. A
+// crash before the edit recovers from the old log number, as before.
+//
+// During replay at open there is no WAL (s.w == nil), and nothing to record:
+// the recovered MANIFEST still names where replay begins.
+func (s *LSMStore) recordAppliedLocked() error {
+	if s.w == nil || s.applied == s.flushedApplied {
+		return nil
+	}
+	applied := s.applied
+	n, err := s.w.Rotate()
+	if err != nil {
+		return fmt.Errorf("lsm: rotating the WAL before recording applied index %d: %w", applied.Index, err)
+	}
+	var edit manifest.Edit
+	edit.SetLastSequence(s.seq)
+	edit.SetLogNumber(n)
+	edit.SetLogStartSeq(s.seq)
+	edit.SetApplied(manifest.Applied{Index: applied.Index, Term: applied.Term})
+	if err := s.manifest.Append(&edit); err != nil {
+		return fmt.Errorf("lsm: recording applied index %d in the manifest: %w", applied.Index, err)
+	}
+	s.mu.Lock()
+	s.flushedApplied = applied
+	s.mu.Unlock()
+	s.truncateWALBelow(n)
+	return nil
+}
+
+// truncateWALBelow deletes the WAL segments below n, which a durable MANIFEST
+// edit has just named as where recovery begins (§9.4). A failed deletion is
+// redundant space, not a correctness problem — the next open sweeps it — so it
+// is counted, never fatal.
+func (s *LSMStore) truncateWALBelow(n uint64) {
+	removed, err := s.w.DeleteSegmentsBelow(n)
+	s.truncStats.segmentsRemoved.Add(int64(removed))
+	if err != nil {
+		s.truncStats.failures.Add(1)
+	}
 }
 
 func dropMemtable(list []*memtable.MemTable, m *memtable.MemTable) []*memtable.MemTable {
@@ -1102,11 +1151,11 @@ func (s *LSMStore) lookup(v *version, key []byte) (value []byte, kind ikey.Kind,
 
 // SetAppliedIndex durably records applied-index metadata.
 //
-// The WAL remains the authority for it, as in Phase 2 and 3. The MANIFEST carries
-// the field too, because docs/DESIGN.md §6 defines it and the snapshot written at
-// each open records the recovered value — but nothing reads it back in preference
-// to the log, and having two authorities for one number would be worse than
-// having the wrong one.
+// The record goes to the WAL. Since S3 the authority is split by position, not
+// shared: the MANIFEST's Applied is the index the flushed tables bring the
+// engine to, recovery seeds from it, and the WAL records after the log number
+// advance it (docs/STORAGE_INTEGRATION.md §9.6). The next Flush records the
+// index in the MANIFEST even when nothing else has changed.
 func (s *LSMStore) SetAppliedIndex(ctx context.Context, a AppliedIndex) error {
 	if err := ctx.Err(); err != nil {
 		return opErr("set-applied-index", nil, err)
@@ -1139,8 +1188,9 @@ func (s *LSMStore) AppliedIndex() AppliedIndex {
 // after a power loss without its WAL: the MANIFEST's flushed Applied (S3,
 // docs/STORAGE_INTEGRATION.md §9.6). It is the floor the Raft log must not be
 // compacted past (R2), and it never exceeds AppliedIndex. It advances only when
-// a flush records its MANIFEST edit, so between flushes it lags the applied
-// index by at most one memtable's worth of entries.
+// a flush records its MANIFEST edit — including a Flush with an empty memtable
+// after the applied index moved without data — so between flushes it lags the
+// applied index; a Flush brings it to the applied index.
 func (s *LSMStore) DurableApplied() AppliedIndex {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

@@ -1007,6 +1007,15 @@ becomes durable. The order, with each step chosen for what a crash immediately a
    not fatal: the segments are redundant (their records are in table `N`) and the next open sweeps
    them. This mirrors obsolete-SSTable removal (`lsmcompact.go`).
 
+**An empty memtable.** An apply batch with no mutation — the election no-op, a configuration
+entry — advances the applied index without adding to the memtable. A `Flush` with an empty memtable
+whose applied index has moved since the last record therefore still records it: steps 3, 4 and 6
+without a table — rotate, append `SetLastSequence(L)`, `SetLogNumber`, `SetLogStartSeq(L)`,
+`SetApplied(A)` as one fsynced edit with no `AddFile`, truncate. With the memtable empty every
+sequence through `L` is already in a recorded table (a flush failure latches, so no frozen memtable
+is left behind), so the edit is exact. With nothing new it records nothing. (Found in the final
+review, §9.10.)
+
 The rotation in step 3 is what makes the seed exact: because the new segment is empty at the
 freeze, its first record is `L+1`, so `LogNumber`'s segment starts at `LogStartSeq + 1` by
 construction. `LogStartSeq` is recorded as its own field rather than read off `LastSequence`, for the
@@ -1060,7 +1069,8 @@ The clamp alone would starve compaction: an engine with the default 4 MiB memtab
 its durable index would sit at 0, the log would never compact, and a lagging follower would never be
 sent a snapshot (§9.10). So the interface has a second method, **`SyncApplied`**, which snapshot
 creation calls after publishing the snapshot and before compacting: the LSM machine flushes its
-engine, advancing the durable index to the snapshot's index, and `compact` then proceeds to
+engine, advancing the durable index to the snapshot's index — even when the cycles since the last
+flush wrote nothing (§9.3's empty-memtable record) — and `compact` then proceeds to
 `snapshotIndex − Retain`. The compacted prefix is thereby durable in the engine's **own tables**,
 not only in the snapshot file — the stronger property — at the cost of one engine flush per
 snapshot, on the actor (measured in S5 with the two-log decision). A failed `SyncApplied` is a
@@ -1154,6 +1164,17 @@ writes afterward, numbered above everything durable (no durable sequence is ever
   never compacted, and eight `TestReal*Snapshot*` tests failed because no follower was ever sent a
   snapshot. The fix is `SyncApplied` (§9.6): snapshot creation flushes the engine through the
   snapshot's index before the log is compacted behind it.
+- **Found by the final review: `SyncApplied` did not keep its contract after a cycle that wrote
+  nothing.** `Flush` returned early on an empty memtable, so when the entries since the last flush
+  were all election no-ops or configuration entries — which advance the applied index without a
+  write — the durable index stayed behind the applied index, contrary to
+  `raftnode.DurableApplier`'s "advancing DurableAppliedIndex to it". R2 still held (the clamp kept
+  the boundary at the older durable index, retaining more log), so this was a liveness and contract
+  defect, not a data loss; but it also meant a `Flush` that returned nil had synced nothing. The fix
+  records the applied index alone when the memtable is empty (§9.3). Regression tests:
+  `TestAFlushRecordsAnAppliedIndexThatMovedWithoutData`,
+  `TestLSMMachineSyncAppliedCoversACycleWithoutWrites`, and the crash matrix, whose script now ends
+  with a data-less entry and a watermark-only flush; all three fail on the old behaviour.
 - Dropping the explicit pre-MANIFEST `WAL.Sync()` was safe only because the rotation already syncs
   and closes the outgoing segment. The S1 mutants that guarded that sync (`flush-syncs-the-wal-first`,
   `replay-flush-has-no-wal-to-sync`, `syncoff-flush-does-not-fsync`) were re-anchored to the
@@ -1182,18 +1203,21 @@ writes afterward, numbered above everything durable (no durable sequence is ever
 | A missing required segment is refused | `TestARequiredWALSegmentMissingIsRefused` |
 | The replay-flush path records no log number and rotates nothing | `TestFlushWithoutWALRotatesNothingDuringReplay` |
 | A truncated engine takes new writes and reopens | `TestTruncatedEngineAcceptsWritesAndReopens` |
-| R1 through the extended crash matrix (truncation, rotation, deletion ops; process and power loss) | `TestApplyCrashMatrix` |
+| R1 through the extended crash matrix (truncation, rotation, deletion ops; process and power loss; a MANIFEST failure at each of the script's three flushes, the last a watermark-only record) | `TestApplyCrashMatrix` |
 | Reopen skip/replay counts under truncation | `TestReopenAfterCleanClose`, `TestReopenWithEverythingFlushed`, `TestApplyBatchesAndRecovery` |
 | R2: the compaction clamp arithmetic | `TestCompactPointClampsToDurable` |
 | R2: the machine reports the engine's durable index, not the live one | `TestLSMMachineDurableAppliedIsTheEnginesFlushedIndex` |
+| A flush with an empty memtable records an applied index that moved without data; with nothing new it records nothing | `TestAFlushRecordsAnAppliedIndexThatMovedWithoutData` |
+| R2: `SyncApplied` brings the durable index to the applied index after a cycle that wrote nothing | `TestLSMMachineSyncAppliedCoversACycleWithoutWrites` |
 | R2 end to end: a real three-node LSM cluster never compacts past a durable copy, with the clamp in force | `TestR2CompactionStaysWithinADurableCopy` |
 
-Mutation: eleven correctness-critical mutants for S3 — the applied index, the log number and the
+Mutation: fourteen correctness-critical mutants for S3 — the applied index, the log number and the
 log start sequence each recorded at a flush; truncation bounded to below the log number; the
 sequence seeded from the MANIFEST; a missing required segment refused; a leftover segment swept;
 the R2 clamp; the watermark advancing only at a flush; the machine reporting the engine's durable
-index rather than the live one; and snapshot creation making the engine durable (`SyncApplied`) —
-each killed by the intended regression above, none by an unrelated failure. Three S1 mutants whose
+index rather than the live one; snapshot creation making the engine durable (`SyncApplied`); and,
+from the final review, the empty-memtable record — made at all, made after a rotation, and followed
+by truncation — each killed by the intended regression above, none by an unrelated failure. Three S1 mutants whose
 anchor (the explicit pre-MANIFEST `WAL.Sync()`) S3 removed were re-anchored to the rotation that now
 provides the same ordering: the rotation before the record, the replay flush skipping the rotation,
 and the `SyncOff` fsync skip. The existing WAL, apply-batch and MANIFEST fuzz targets run unchanged
@@ -1253,16 +1277,20 @@ micro-benchmarks; the cluster-level cost of S3 is not measured here (the S2 stea
 **S3 proves:**
 - **The WAL is truncated safely.** A segment is deleted only after a durable MANIFEST edit records a
   higher log number, which requires the segment's records to be in a flushed table and that table
-  recorded. Recovery starts at the log number, seeded from the MANIFEST's `LastSequence`, and the
-  crash matrix confirms R1 holds at every rotation, MANIFEST and deletion boundary under a process
-  crash and the modeled power loss.
-- **The MANIFEST is authoritative** for the applied index and the last sequence: an empty WAL after
-  a flush still recovers the applied index, and the sequence continues upward across reopens with no
+  recorded. Recovery starts at the log number, its sequence seeded from the MANIFEST's
+  `LogStartSeq`, and the crash matrix confirms R1 holds at every rotation, MANIFEST and deletion
+  boundary — of a data flush and of a watermark-only record — under a process crash and the modeled
+  power loss.
+- **The MANIFEST is authoritative** for the applied index, the log number and the replay seed: an
+  empty WAL after a flush still recovers the applied index, including one moved by entries that
+  wrote nothing, and the sequence continues upward across reopens with no
   durable sequence reused. A missing required segment is refused; a leftover one is swept; recovery
   is idempotent.
 - **R2 holds in the real compaction path.** A self-compacting node never advances its log-compaction
   boundary past the engine's durable applied index, proven by the clamp's unit test and a real
-  three-node cluster; the in-memory store is unchanged, covered by its published snapshot.
+  three-node cluster; snapshot creation brings that index to the snapshot's (`SyncApplied`), also
+  after cycles that wrote nothing; the in-memory store is unchanged, covered by its published
+  snapshot.
 - **R1 is intact.** Every applied transition is still recorded atomically with its applied index; the
   extended matrix checks state, applied index, term and both sequences together.
 

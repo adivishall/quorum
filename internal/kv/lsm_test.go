@@ -249,6 +249,35 @@ func TestLSMMachineDurableAppliedIsTheEnginesFlushedIndex(t *testing.T) {
 	}
 }
 
+// TestLSMMachineSyncAppliedCoversACycleWithoutWrites: a cycle of entries that
+// write nothing — the election no-op, a configuration entry — advances the
+// applied index without touching the engine's memtable. SyncApplied must still
+// bring the durable index to it (raftnode.DurableApplier): otherwise the log
+// behind the next snapshot is compacted only as far as the last write (R2).
+func TestLSMMachineSyncAppliedCoversACycleWithoutWrites(t *testing.T) {
+	p := newPair(t, DefaultLimits, nil)
+	defer p.lsm.Close()
+	p.cycle(anonPut("k0", "v"))
+	if err := p.lsm.SyncApplied(); err != nil {
+		t.Fatal(err)
+	}
+	if d, a := p.lsm.DurableAppliedIndex(), p.lsm.Applied(); d != a {
+		t.Fatalf("premise: durable applied index %d after SyncApplied, want %d", d, a)
+	}
+
+	p.cycle(nil, nil) // two entries that write nothing
+	d, a := p.lsm.DurableAppliedIndex(), p.lsm.Applied()
+	if a <= d {
+		t.Fatalf("premise: the cycle did not advance the applied index past the durable one (%d, %d)", a, d)
+	}
+	if err := p.lsm.SyncApplied(); err != nil {
+		t.Fatal(err)
+	}
+	if d := p.lsm.DurableAppliedIndex(); d != a {
+		t.Fatalf("durable applied index %d after SyncApplied, want the applied index %d", d, a)
+	}
+}
+
 // TestLSMMachineMatchesTheStoreOnAScript: a hand-written script that reaches
 // every decision — registered, executed, duplicate, conflict, stale, expired,
 // limit, evicted — with overwrites, deletes, no-ops and an empty value, cycle

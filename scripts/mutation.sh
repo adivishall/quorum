@@ -3004,6 +3004,29 @@ mutant "machine-reports-the-durable-index" internal/kv/lsm.go \
   '	return m.applied' \
   ./internal/kv '^TestLSMMachineDurableAppliedIsTheEnginesFlushedIndex$'
 
+# 353. S3 (R2, final review): a Flush with an empty memtable records nothing,
+#      so an applied index moved by entries that write nothing (the election
+#      no-op, a configuration entry) never becomes durable and SyncApplied leaves
+#      the durable index behind the applied index.
+mutant "empty-flush-records-the-applied-index" internal/storage/lsmstore.go \
+  '	if s.w == nil || s.applied == s.flushedApplied {' \
+  '	if true {' \
+  ./internal/storage '^TestAFlushRecordsAnAppliedIndexThatMovedWithoutData$'
+
+# 354. S3: the watermark-only record names the active segment instead of
+#      rotating — the segment holding the entries it covers is kept and replayed
+#      on top of a seed that already counts them.
+mutant "empty-flush-rotates-before-recording" internal/storage/lsmstore.go \
+  '	n, err := s.w.Rotate()' \
+  '	n, err := s.w.Stats().ActiveSegment, error(nil)' \
+  ./internal/storage '^TestAFlushRecordsAnAppliedIndexThatMovedWithoutData$'
+
+# 355. S3: the watermark-only record does not truncate the WAL below it.
+mutant "empty-flush-truncates-the-log" internal/storage/lsmstore.go \
+  '	s.truncateWALBelow(n)' \
+  '	_ = n' \
+  ./internal/storage '^TestAFlushRecordsAnAppliedIndexThatMovedWithoutData$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then

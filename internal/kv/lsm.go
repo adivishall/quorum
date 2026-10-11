@@ -313,8 +313,10 @@ func (m *LSMMachine) DurableAppliedIndex() uint64 {
 // SyncApplied flushes the engine so its durable applied index reaches the
 // applied index (raftnode.DurableApplier, R2). The driver calls it when creating
 // a snapshot, so the log may be compacted behind that snapshot. The driver calls
-// it between cycles, so nothing is staged; a flush of an empty memtable is a
-// no-op, and the durable index is already the applied index.
+// it between cycles, so nothing is staged and the engine's applied index is the
+// machine's. The engine's Flush records that index even when its memtable is
+// empty — a cycle of election no-ops and configuration entries advances it
+// without a write.
 func (m *LSMMachine) SyncApplied() error {
 	m.mu.RLock()
 	db, closed := m.db, m.closed

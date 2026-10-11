@@ -207,10 +207,16 @@ func (st matrixStep) String() string {
 	}
 }
 
+// matrixScript ends with a flush, an entry that writes nothing, and a flush: the
+// last flush has an empty memtable and records the applied index alone (a
+// rotation and a MANIFEST edit with no table), the path SyncApplied takes after
+// a cycle of election no-ops and configuration entries.
 func matrixScript() ([]matrixStep, []applyStep) {
-	batches := append(applyScript(), applyStep{[]storage.Mutation{mput("e", "6"), mdel("c")}, ai(10, 3)})
+	batches := append(applyScript(),
+		applyStep{[]storage.Mutation{mput("e", "6"), mdel("c")}, ai(10, 3)},
+		applyStep{nil, ai(11, 4)})
 	b := func(i int) matrixStep { return matrixStep{batch: &batches[i]} }
-	return []matrixStep{b(0), b(1), {sync: true}, b(2), b(3), {flush: true}, b(4), b(5)}, batches
+	return []matrixStep{b(0), b(1), {sync: true}, b(2), b(3), {flush: true}, b(4), b(5), {flush: true}, b(6), {flush: true}}, batches
 }
 
 // crashKind is what the crash leaves on the disk.
@@ -234,7 +240,8 @@ type matrixCell struct {
 	after    int  // or crash after this many steps (when at is 0)
 	torn     bool // a crashing write is torn halfway
 	kind     crashKind
-	manifest *fault.Injection // a failure of the flush's MANIFEST append, then a crash
+	manifest *fault.Injection // a failure of a flush's MANIFEST append, then a crash
+	flushN   int              // which flush of the script (1-based) the manifest failure hits
 }
 
 func (c matrixCell) String() string {
@@ -246,7 +253,7 @@ func (c matrixCell) String() string {
 		where += " (torn)"
 	}
 	if c.manifest != nil {
-		where = fmt.Sprintf("manifest %s short %d", c.manifest.Op, c.manifest.Short)
+		where = fmt.Sprintf("manifest %s short %d at flush %d", c.manifest.Op, c.manifest.Short, c.flushN)
 	}
 	return fmt.Sprintf("%s/%s/%s", c.mode, where, c.kind.name)
 }
@@ -270,6 +277,7 @@ func matrixOpts(mode wal.SyncMode, cfs *crashFS) storage.Options {
 func runScript(t *testing.T, s *storage.LSMStore, cfs *crashFS, cell matrixCell, inj *fault.InjectFS) (written, durable, attempted int) {
 	steps, _ := matrixScript()
 	ctx := context.Background()
+	flushes := 0
 	for i, st := range steps {
 		if cfs.isDead() {
 			return
@@ -288,11 +296,13 @@ func runScript(t *testing.T, s *storage.LSMStore, cfs *crashFS, cell matrixCell,
 				durable = written
 			}
 		case st.flush:
-			if cell.manifest != nil {
+			flushes++
+			armed := cell.manifest != nil && flushes == cell.flushN
+			if armed {
 				inj.Arm(*cell.manifest)
 			}
 			err := s.Flush()
-			if cell.manifest != nil {
+			if armed {
 				if err == nil {
 					t.Fatalf("%s: premise: the flush succeeded although its MANIFEST append failed", cell)
 				}
@@ -477,16 +487,23 @@ func runCell(t *testing.T, cell matrixCell, opNames []string) int {
 // segment creation, every append (whole or torn halfway), every fsync, every
 // rotation — and every point between steps, in sync and batch mode, under a
 // process crash, a power loss, and a power loss keeping a torn prefix of what
-// was not fsynced; and the flush's MANIFEST append failed before, during and
-// after its write. Each cell must recover exactly the batches whose records
-// survived — state, applied index and sequences together (R1) — at least those
-// the contract made durable, durably, and go on.
+// was not fsynced; and each flush's MANIFEST append — the last one a
+// watermark-only record — failed before, during and after its write. Each cell
+// must recover exactly the batches whose records survived — state, applied
+// index and sequences together (R1) — at least those the contract made durable,
+// durably, and go on.
 func TestApplyCrashMatrix(t *testing.T) {
 	cells := 0
 	byM := map[string]map[int]int{}
 	for _, mode := range []wal.SyncMode{wal.SyncAlways, wal.SyncBatch} {
 		nOps, opNames := dryRun(t, mode)
 		steps, _ := matrixScript()
+		nFlushes := 0
+		for _, st := range steps {
+			if st.flush {
+				nFlushes++
+			}
+		}
 		var all []matrixCell
 		for _, kind := range crashKinds {
 			for at := 1; at <= nOps; at++ {
@@ -498,13 +515,15 @@ func TestApplyCrashMatrix(t *testing.T) {
 			for after := 1; after <= len(steps); after++ {
 				all = append(all, matrixCell{mode: mode, after: after, kind: kind})
 			}
-			for _, inj := range []fault.Injection{
-				{Op: fault.OpWrite},           // nothing of the edit is written
-				{Op: fault.OpWrite, Short: 9}, // a torn edit
-				{Op: fault.OpSync},            // the edit written, its fsync failed
-			} {
-				inj := inj
-				all = append(all, matrixCell{mode: mode, kind: kind, manifest: &inj})
+			for flushN := 1; flushN <= nFlushes; flushN++ {
+				for _, inj := range []fault.Injection{
+					{Op: fault.OpWrite},           // nothing of the edit is written
+					{Op: fault.OpWrite, Short: 9}, // a torn edit
+					{Op: fault.OpSync},            // the edit written, its fsync failed
+				} {
+					inj := inj
+					all = append(all, matrixCell{mode: mode, kind: kind, manifest: &inj, flushN: flushN})
+				}
 			}
 		}
 		for _, cell := range all {

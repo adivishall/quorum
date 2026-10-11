@@ -135,6 +135,83 @@ func TestDurableAppliedAdvancesOnlyAtFlush(t *testing.T) {
 	}
 }
 
+// TestAFlushRecordsAnAppliedIndexThatMovedWithoutData: an apply batch with no
+// mutation (the election no-op, a configuration entry) and SetAppliedIndex
+// advance the applied index without adding to the memtable. A Flush must still
+// make that index the durable watermark and record it in the MANIFEST — the LSM
+// machine's SyncApplied relies on it to let the Raft log compact behind a
+// snapshot (R2) — so a reopen with nothing left in the WAL recovers it. A Flush
+// with nothing new records and rotates nothing. Found by the final S3 review:
+// an empty memtable used to make Flush a no-op that left the watermark behind.
+func TestAFlushRecordsAnAppliedIndexThatMovedWithoutData(t *testing.T) {
+	dir := t.TempDir()
+	opts := lsmOpts(storage.DefaultMemTableSize) // large: only the explicit flushes flush
+	s := openLSM(t, dir, opts)
+	for i := 1; i <= 5; i++ {
+		mustApply(t, s, applyStep{[]storage.Mutation{mput(fmt.Sprintf("k%d", i), "v")}, ai(uint64(i), 1)})
+	}
+	mustFlush(t, s)
+	if got := s.DurableApplied(); got != ai(5, 1) {
+		t.Fatalf("premise: durable applied %+v after the first flush, want (5,1)", got)
+	}
+
+	// Entries that write nothing: the memtable stays empty.
+	mustApply(t, s, applyStep{nil, ai(6, 2)})
+	mustApply(t, s, applyStep{nil, ai(7, 2)})
+	if got := s.DurableApplied(); got != ai(5, 1) {
+		t.Fatalf("durable applied %+v before the flush, want still (5,1)", got)
+	}
+	seg := s.WALStats().ActiveSegment
+	mustFlush(t, s)
+	if got := s.DurableApplied(); got != ai(7, 2) {
+		t.Fatalf("durable applied %+v after a flush, want the applied index (7,2): an empty memtable left the watermark behind", got)
+	}
+	if got := s.WALStats().ActiveSegment; got <= seg {
+		t.Fatalf("the flush recorded the index without rotating the WAL (segment %d, was %d)", got, seg)
+	}
+	if segs := countWALSegments(t, dir); segs != 1 {
+		t.Fatalf("%d WAL segments after the flush, want 1: those below the new log number are truncated", segs)
+	}
+
+	// Nothing new: a second flush records nothing and rotates nothing.
+	seg = s.WALStats().ActiveSegment
+	mustFlush(t, s)
+	if got := s.WALStats().ActiveSegment; got != seg {
+		t.Fatalf("a flush with nothing to record rotated the WAL to segment %d (was %d)", got, seg)
+	}
+
+	// SetAppliedIndex moves the index without data too.
+	if err := s.SetAppliedIndex(context.Background(), ai(9, 3)); err != nil {
+		t.Fatal(err)
+	}
+	mustFlush(t, s)
+	if got := s.DurableApplied(); got != ai(9, 3) {
+		t.Fatalf("durable applied %+v after SetAppliedIndex and a flush, want (9,3)", got)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The MANIFEST alone carries the index: the WAL holds nothing to replay.
+	reopened := openLSM(t, dir, opts)
+	defer reopened.Close()
+	if got := reopened.Recovery().ApplyBatches; got != 0 {
+		t.Fatalf("replay read %d apply batches; the WAL should be empty after the final flush", got)
+	}
+	if got := reopened.AppliedIndex(); got != ai(9, 3) {
+		t.Fatalf("recovered applied index %+v, want (9,3) from the MANIFEST", got)
+	}
+	if got := reopened.DurableApplied(); got != ai(9, 3) {
+		t.Fatalf("recovered durable applied %+v, want (9,3)", got)
+	}
+	for i := 1; i <= 5; i++ {
+		assertValue(t, reopened, fmt.Sprintf("k%d", i), "v")
+	}
+	// And the engine goes on from there.
+	mustApply(t, reopened, applyStep{[]storage.Mutation{mput("k6", "v")}, ai(10, 3)})
+	assertValue(t, reopened, "k6", "v")
+}
+
 // TestSequenceAndAppliedContinuityAcrossReopen: after truncation the next
 // sequence is seeded from the MANIFEST and continues strictly upward — no
 // durable sequence is reused — and the applied index is monotonic across many
