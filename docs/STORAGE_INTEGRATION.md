@@ -1353,9 +1353,13 @@ both).
 
 ### 9.12 Evidence
 
-Every gate below ran sequentially on the branch's final code revision, `2408d73` (Apple M4, macOS,
-**go1.27.2**; nothing else running; the commit after it adds only this evidence), after the defects
-of §9.10 — both reviews' — were fixed. Earlier runs, including the ones that *found* defects, are
+Every gate below ran sequentially on `2408d73` (Apple M4, macOS, **go1.27.2**; nothing else
+running), after the defects of §9.10 — both reviews' — were fixed. Two commits follow it: this
+evidence, and a test-only fix CI exposed — `TestWireClientReportsUnknownWhenTheConnectionDies`
+(Phase 13, `internal/kv`) synchronized on the server's listener closing but not on its connection
+closing, a race the CI runner lost (the old connection answered UNKNOWN); nothing in that path
+changed in S3, and the test now asserts its contract on every attempt. CI runs every gate on the
+final commit. Earlier runs, including the ones that *found* defects, are
 not reported as evidence; they are §9.10's history.
 
 | Gate | What it covers | Result |
