@@ -112,9 +112,11 @@ from `LastSequence`, which a flush *during replay* advances without moving the l
 both by replaying the surviving log. **`SetAppliedSeq`** (tag `0x08`, added in S3) records the
 sequence of the last mutation the last apply batch held — what `AppliedSequence` reports — because
 the batch it was read from is truncated with the rest. The three watermark fields and `AppliedSeq`
-are written together by a real flush only, so they are always mutually consistent (`docs/STORAGE_INTEGRATION.md` §9.2, §9.7). A `Flush`
-with an empty memtable whose applied index has moved — entries that wrote nothing — appends the same
-three fields and `SetLastSequence` with no `AddFile` (§9.3 there); with nothing new it appends nothing. It is still not a *second* authority competing with the WAL: after truncation the
+are written together, by a flush that has a WAL to rotate and never by a flush during replay, so
+they are always mutually consistent (`docs/STORAGE_INTEGRATION.md` §9.2, §9.7). A `Flush` with an
+empty memtable whose applied index has moved — entries that wrote nothing — appends the same four
+fields and `SetLastSequence`, with no `AddFile` (§9.3 there); with nothing new it appends nothing.
+It is still not a *second* authority competing with the WAL: after truncation the
 WAL below the log number is gone, so the MANIFEST is the only place the flushed prefix's index and
 sequence live, and the surviving WAL only extends them. A pre-S3 directory, whose flushes never set
 these, decodes `LogNumber == 0` and replays from segment 1 as before — no migration.
