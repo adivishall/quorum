@@ -306,7 +306,7 @@ Claim a guarantee it has not verified. Specifically:
 
 ## Quickstart
 
-Requires Go 1.27+.
+Requires Go 1.27.2+ (the patch release `go.mod` pins; with the default `GOTOOLCHAIN=auto` an older Go 1.27 fetches it).
 
 ```bash
 make build
@@ -474,7 +474,7 @@ it is being answered out of memory.
 
 ## Development
 
-Requires Go 1.27+.
+Requires Go 1.27.2+ (the patch release `go.mod` pins; with the default `GOTOOLCHAIN=auto` an older Go 1.27 fetches it).
 
 ```bash
 make check        # gofmt + gitignore guard + go vet + the unit packages under -race — the phase gate

@@ -62,8 +62,13 @@ jobs:
 
       # Correctness checks only (SA*): the style checks would churn code that
       # is not wrong. Pinned versions, run with the module's toolchain.
+      # staticcheck is pinned to a master commit, not a release: go1.27.2 writes
+      # export data version 5, which the latest release (v0.8.1, built on
+      # golang.org/x/tools before V5) cannot read, so it fails to load any
+      # package. This commit moved to x/tools v0.51.0. Return to a tagged release
+      # once one reads go1.27.2's export data.
       - name: staticcheck (correctness checks)
-        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 -checks 'SA*' ./...
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0-0.dev.0.20261009230814-452d5bb86b45 -checks 'SA*' ./...
 
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
