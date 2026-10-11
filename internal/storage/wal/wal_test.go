@@ -452,6 +452,86 @@ func TestSegmentGapIsRefused(t *testing.T) {
 	}
 }
 
+// TestRecoverFromRefusesAGapBeforeReplaying: from a log number (S3), the
+// segments below it are leftovers of a truncation and are removed, but those at
+// and above it must be contiguous — and the check comes before replay, so not
+// one record of a log with a hole in it reaches the engine, whose replay
+// flushes could otherwise make tables of it.
+func TestRecoverFromRefusesAGapBeforeReplaying(t *testing.T) {
+	dir := testDir(t)
+	opts := wal.DefaultOptions()
+	opts.SegmentSize = 256
+
+	w, err := wal.Create(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 60; i++ {
+		op := wal.Op{Kind: wal.OpPut, Key: []byte(fmt.Sprintf("k%03d", i)), Value: bytes.Repeat([]byte("v"), 32)}
+		if err := w.AppendBatch(one(op)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	names := segments(t, dir)
+	if len(names) < 4 {
+		t.Fatalf("need at least four segments, got %v", names)
+	}
+	// Segment 1 is a truncation's leftover below log number 2; segment 3 is a
+	// hole above it.
+	for _, n := range []string{names[0], names[2]} {
+		if err := os.Remove(filepath.Join(dir, n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	replayed := 0
+	_, err = wal.RecoverFrom(dir, opts, 2, wal.AppliedIndex{}, wal.Handler{
+		Batch: func(wal.Batch) error { replayed++; return nil },
+	})
+	if !errors.Is(err, wal.ErrCorrupt) || !bytes.Contains([]byte(err.Error()), []byte("gap")) {
+		t.Fatalf("RecoverFrom over a gap above the log number = %v, want ErrCorrupt naming the gap", err)
+	}
+	if replayed != 0 {
+		t.Fatalf("%d batches were replayed before the gap was refused", replayed)
+	}
+}
+
+// TestRecoverWithoutALogNumberRequiresTheFirstSegment: with no log number
+// recorded nothing has ever been truncated, so a log whose first segment is
+// missing has lost its start — refused, not replayed counted from zero.
+func TestRecoverWithoutALogNumberRequiresTheFirstSegment(t *testing.T) {
+	dir := testDir(t)
+	opts := wal.DefaultOptions()
+	opts.SegmentSize = 256
+
+	w, err := wal.Create(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 40; i++ {
+		op := wal.Op{Kind: wal.OpPut, Key: []byte(fmt.Sprintf("k%03d", i)), Value: bytes.Repeat([]byte("v"), 32)}
+		if err := w.AppendBatch(one(op)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	names := segments(t, dir)
+	if len(names) < 2 {
+		t.Fatalf("need at least two segments, got %v", names)
+	}
+	if err := os.Remove(filepath.Join(dir, names[0])); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wal.RecoverWith(dir, opts, wal.Handler{}); !errors.Is(err, wal.ErrCorrupt) {
+		t.Fatalf("RecoverWith with the first segment missing = %v, want ErrCorrupt", err)
+	}
+}
+
 func TestNonSegmentFilesAreIgnored(t *testing.T) {
 	dir := testDir(t)
 	w, err := wal.Create(dir, wal.DefaultOptions())

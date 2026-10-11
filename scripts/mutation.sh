@@ -3078,11 +3078,13 @@ mutant "missing-wal-directory-under-a-log-number" internal/storage/wal/recover.g
   ./internal/storage '^TestALostWALUnderALogNumberIsRefused$'
 
 # 362. S3 (final review): the segments from the log number on are not checked for
-#      a gap — replay skips a lost middle segment.
+#      a gap before replay — the records after a lost middle segment reach the
+#      engine mis-numbered (the WAL writer's own listing refuses the gap later,
+#      after a replay flush may already have made tables of them).
 mutant "truncated-log-must-be-contiguous" internal/storage/wal/recover.go \
   '		if err := checkContiguous(nums); err != nil {' \
   '		if err := checkContiguous(nil); err != nil {' \
-  ./internal/storage '^TestALostWALUnderALogNumberIsRefused$'
+  ./internal/storage/wal '^TestRecoverFromRefusesAGapBeforeReplaying$'
 
 # 363. S3 (final review): a WAL with no segment left under a log number is taken
 #      for an empty log.
