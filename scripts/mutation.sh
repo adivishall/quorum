@@ -3169,6 +3169,29 @@ mutant "open-removes-the-engine-set-aside" internal/kv/lsm.go \
   '	if err := error(nil); err != nil {' \
   ./internal/kv '^TestLSMMachineACrashWhileReplacingTheEngineLeavesOneThatOpens$'
 
+# 369. S3 (review of the fixes): a restore that fails after the engine is closed
+#      leaves the machine open over an empty or partial engine, which then
+#      reports a key that exists as absent.
+mutant "failed-restore-fails-stop" internal/kv/lsm.go \
+  '			_ = m.db.Close()
+			m.closed = true' \
+  '			_ = m.db.Close()' \
+  ./internal/kv '^TestLSMMachineAFailedRestoreFailsStop$'
+
+# 370. S3 (review of the fixes): a newly created engine directory is not synced
+#      into its parent, so a power loss can take the whole engine.
+mutant "new-engine-directory-is-synced" internal/storage/lsmstore.go \
+  '	if errors.Is(statErr, os.ErrNotExist) {' \
+  '	if false {' \
+  ./internal/storage '^TestANewEngineDirectoryIsSyncedIntoItsParent$'
+
+# 371. S3 (review of the fixes): a failed engine sync is ignored — the snapshot
+#      is published and the log compacted although the engine is not durable.
+mutant "failed-sync-stops-the-snapshot" internal/raftnode/snapshot.go \
+  '			return fmt.Errorf("%w: making the engine durable through %d for compaction: %w", ErrSnapshot, idx, err)' \
+  '			_ = err' \
+  ./internal/raftnode '^TestAFailedEngineSyncStopsTheNodeBeforeAnythingIsPublished$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then

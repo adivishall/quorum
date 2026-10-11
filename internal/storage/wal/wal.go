@@ -403,8 +403,8 @@ func (w *WAL) rotateLocked() error {
 // A flush calls it so that, having frozen the memtable at sequence L, the next
 // WAL record — sequence L+1 — begins a fresh segment. That segment becomes the
 // MANIFEST's LogNumber, and the invariant "segment LogNumber begins at sequence
-// LastSequence+1" holds by construction, which is what lets recovery seed the
-// sequence counter from LastSequence and delete every lower segment.
+// LogStartSeq+1" holds by construction, which is what lets recovery seed the
+// sequence counter from LogStartSeq and delete every lower segment.
 //
 // The outgoing segment is synced and closed (rotateLocked), and the new one's
 // creation is made durable by a directory fsync, so after Rotate returns the new

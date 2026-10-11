@@ -52,7 +52,8 @@ const (
 	// fsynced); the log still holds the prefix it covers.
 	AfterSnapshotPublish
 	// AfterLogCompact: the durable log is rewritten without the prefix (Arg =
-	// the compaction index, the snapshot's less Retain); the core still holds it.
+	// the compaction index: the snapshot's less Retain, clamped since S3 to the
+	// engine's durable applied index); the core still holds it.
 	AfterLogCompact
 
 	// Phase 14 — installing a leader's snapshot (§8; Arg = its index).

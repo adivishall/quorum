@@ -172,6 +172,9 @@ type LSMRecovery struct {
 	TruncatedReason string
 }
 
+// syncDir fsyncs a directory; a test replaces it to observe the sync.
+var syncDir = sstable.SyncDir
+
 // OpenLSMStore opens or creates a durable LSM store in dir.
 //
 // The startup sequence, and why it is in this order:
@@ -209,8 +212,18 @@ func OpenLSMStore(dir string, opts Options) (*LSMStore, error) {
 	if dir == "" {
 		return nil, opErr("open", nil, fmt.Errorf("%w: data directory is empty", ErrInvalidOptions))
 	}
+	_, statErr := os.Stat(dir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, classify("open", nil, err)
+	}
+	if errors.Is(statErr, os.ErrNotExist) {
+		// A new directory is not durable until its parent is synced (as the WAL
+		// directory's creation is, inside it): a power loss would take the
+		// directory's own entry, and with it every table and MANIFEST record the
+		// engine fsynced — the durable applied index R2 compacts against (S3).
+		if err := syncDir(filepath.Dir(filepath.Clean(dir))); err != nil {
+			return nil, classify("open", nil, fmt.Errorf("lsm: syncing the parent of new directory %s: %w", dir, err))
+		}
 	}
 
 	s := &LSMStore{
@@ -247,7 +260,9 @@ func OpenLSMStore(dir string, opts Options) (*LSMStore, error) {
 	s.applied = AppliedIndex{Index: state.Applied.Index, Term: state.Applied.Term}
 	// The MANIFEST's Applied is the engine's durable applied index: the flushed
 	// tables bring it here, and a power loss without the WAL recovers exactly it
-	// (S3, docs/STORAGE_INTEGRATION.md §9.6). Replay only advances it.
+	// (S3, docs/STORAGE_INTEGRATION.md §9.6). Replay advances it: every apply
+	// batch must (the anchor), though an applied-index record written by
+	// SetAppliedIndex, which may lower the index, is taken as written.
 	s.flushedApplied = s.applied
 	s.install(newVersion(memtable.New(opts.MemTableSeed), nil, files))
 
@@ -1197,10 +1212,13 @@ func (s *LSMStore) AppliedIndex() AppliedIndex {
 // DurableApplied returns the applied index the engine is guaranteed to recover
 // after a power loss without its WAL: the MANIFEST's flushed Applied (S3,
 // docs/STORAGE_INTEGRATION.md §9.6). It is the floor the Raft log must not be
-// compacted past (R2), and it never exceeds AppliedIndex. It advances only when
-// a flush records its MANIFEST edit — including a Flush with an empty memtable
-// after the applied index moved without data — so between flushes it lags the
-// applied index; a Flush brings it to the applied index.
+// compacted past (R2). It moves only when a flush records its MANIFEST edit —
+// including a Flush with an empty memtable after the applied index moved
+// without data — so between flushes it lags the applied index, and a Flush
+// brings it to the applied index. It never exceeds AppliedIndex while the index
+// only advances, as Apply requires; SetAppliedIndex, which predates S3 and
+// checks nothing, can lower the applied index below it until the next Flush
+// records the lower value. The LSM state machine never calls SetAppliedIndex.
 func (s *LSMStore) DurableApplied() AppliedIndex {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

@@ -698,6 +698,65 @@ func TestLSMMachineACrashWhileReplacingTheEngineLeavesOneThatOpens(t *testing.T)
 	}
 }
 
+// TestLSMMachineAFailedRestoreFailsStop: once a restore has closed the engine
+// that held the state, a later failure leaves no engine holding it — the new
+// one is empty or partial. The machine must then fail stop: refuse every read
+// and write, never report a key that exists as absent from an empty engine
+// (INV-L7). Found by the review of the S3 fixes; a failed restore used to leave
+// the machine open over the new, empty engine. The next start reopens the
+// engine and restores the snapshot again.
+func TestLSMMachineAFailedRestoreFailsStop(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "lsm")
+	m, err := OpenLSMMachine(dir, DefaultLimits, engineOpts(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	for i := uint64(1); i <= 3; i++ {
+		if err := m.Apply(i, anonPut(fmt.Sprintf("old%d", i), "v")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	src := NewStoreWithLimits(DefaultLimits)
+	for i := uint64(1); i <= 6; i++ {
+		if _, err := src.ApplyResult(i, anonPut(fmt.Sprintf("new%d", i), "w")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	si, data, err := src.EncodeSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A zero term: the new engine refuses the restore's batch, after the old
+	// engine is gone and the new one is open.
+	if err := m.RestoreSnapshot(si, 0, data); err == nil {
+		t.Fatal("premise: a restore at term 0 succeeded")
+	}
+	if _, ok, err := m.Lookup([]byte("new1")); !errors.Is(err, ErrMachineClosed) {
+		t.Fatalf("Lookup after a failed restore: present %v, err %v; want ErrMachineClosed, not an answer from an empty engine", ok, err)
+	}
+	if _, ok, err := m.Lookup([]byte("old1")); !errors.Is(err, ErrMachineClosed) {
+		t.Fatalf("Lookup of a key the machine held, after a failed restore: present %v, err %v; want ErrMachineClosed", ok, err)
+	}
+	if _, err := m.ApplyEntry(4, 1, anonPut("x", "y")); !errors.Is(err, ErrMachineClosed) {
+		t.Fatalf("ApplyEntry after a failed restore: %v, want ErrMachineClosed", err)
+	}
+
+	// The next start reopens the engine, and the restore completes.
+	r, err := OpenLSMMachine(dir, DefaultLimits, engineOpts(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if err := r.RestoreSnapshot(si, 2, data); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok, err := r.Lookup([]byte("new6")); err != nil || !ok || string(v) != "w" {
+		t.Fatalf("after the restart's restore: new6 present %v, %v", ok, err)
+	}
+}
+
 // TestLSMMachineRefusesAForeignSessionRecord: a session record the machine
 // did not write — malformed, or a session the limits cannot hold — refuses
 // the open rather than being guessed at.

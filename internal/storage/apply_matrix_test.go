@@ -333,9 +333,10 @@ func dryRun(t *testing.T, mode wal.SyncMode) (int, []string) {
 	cfs := &crashFS{mem: mem}
 	s := openLSM(t, dir, matrixOpts(mode, cfs))
 	defer s.Close()
-	steps, _ := matrixScript()
+	steps, batches := matrixScript()
 	segs := map[uint64]bool{}
-	for _, st := range steps {
+	var lastFlushTables int64
+	for i, st := range steps {
 		switch {
 		case st.batch != nil:
 			mustApply(t, s, *st.batch)
@@ -345,12 +346,23 @@ func dryRun(t *testing.T, mode wal.SyncMode) (int, []string) {
 				t.Fatal(err)
 			}
 		case st.flush:
+			before := s.FlushStats().Flushes
 			mustFlush(t, s)
 			segs[s.WALStats().ActiveSegment] = true
+			if i == len(steps)-1 {
+				lastFlushTables = s.FlushStats().Flushes - before
+			}
 		}
 	}
 	if len(segs) < 2 {
 		t.Fatalf("premise: the script should span WAL segments, it used %d", len(segs))
+	}
+	// The script's last flush must be the watermark-only record: no table
+	// written, and the durable index brought to the last, data-less batch.
+	if last := batches[len(batches)-1]; !steps[len(steps)-1].flush || len(last.muts) != 0 ||
+		lastFlushTables != 0 || s.DurableApplied() != last.applied {
+		t.Fatalf("premise: the script's last flush wrote %d tables and left the durable index at %+v; "+
+			"want a watermark-only record of %+v", lastFlushTables, s.DurableApplied(), last.applied)
 	}
 	return cfs.n, append([]string(nil), cfs.ops...)
 }

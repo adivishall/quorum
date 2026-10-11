@@ -464,7 +464,7 @@ func restoreBatchBytes(st *state) int {
 // segment that was gone) before the published snapshot could replace it. Set
 // aside, the engine's directory is the whole old engine or absent, and either
 // opens (S3 final review).
-func (m *LSMMachine) RestoreSnapshot(index, term uint64, data []byte) error {
+func (m *LSMMachine) RestoreSnapshot(index, term uint64, data []byte) (err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -483,6 +483,18 @@ func (m *LSMMachine) RestoreSnapshot(index, term uint64, data []byte) error {
 	if err := m.db.Close(); err != nil {
 		return fmt.Errorf("kv: closing the engine to restore: %w", err)
 	}
+	// From here the engine that held the state at m.applied is closed and being
+	// replaced. A failure leaves no engine that holds it — the old one closed or
+	// set aside, the new one empty or partial — so the machine fails stop:
+	// closed, every operation ErrMachineClosed, never absence served from an
+	// engine that lost the data (INV-L7). raftnode stops the node on the error,
+	// and the next start reopens the engine and restores the snapshot again.
+	defer func() {
+		if err != nil {
+			_ = m.db.Close()
+			m.closed = true
+		}
+	}()
 	aside := asidePath(m.dir)
 	if err := removeAll(aside); err != nil {
 		return fmt.Errorf("kv: removing an engine an earlier restore set aside: %w", err)

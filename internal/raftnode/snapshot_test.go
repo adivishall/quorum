@@ -152,6 +152,7 @@ type heldSM struct {
 	held    uint64
 	durable uint64
 	events  []string
+	syncErr error // SyncApplied fails with it, when set
 }
 
 func (h *heldSM) DurableAppliedIndex() uint64 {
@@ -164,6 +165,9 @@ func (h *heldSM) SyncApplied() error {
 	applied, _, _ := h.state()
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.syncErr != nil {
+		return h.syncErr
+	}
 	h.durable = min(applied, h.held)
 	h.events = append(h.events, fmt.Sprintf("sync %d", applied))
 	return nil
@@ -233,6 +237,44 @@ func TestSnapshotSyncsTheEngineFirstAndCompactsOnlyToItsDurableIndex(t *testing.
 	}
 	if publishes == 0 {
 		t.Fatalf("premise: no snapshot was published: %v", events)
+	}
+}
+
+// TestAFailedEngineSyncStopsTheNodeBeforeAnythingIsPublished: a SyncApplied
+// that fails is a durability failure — the engine could not make the
+// snapshot's prefix durable — so the node fail-stops, and since the sync comes
+// before the publish, nothing is published and nothing is compacted. Found by
+// the review of the S3 fixes: no test made the sync fail.
+func TestAFailedEngineSyncStopsTheNodeBeforeAnythingIsPublished(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "raft.log")
+	errSync := errors.New("engine flush failed")
+	sm := &heldSM{snapSM: &snapSM{}, held: 1 << 62, syncErr: errSync}
+	n, tr := startSnapSingle(t, ctx, path, sm, 8, 2, nil, nil)
+	defer tr.Close()
+	waitLeaderNode(t, n)
+	for i := 0; i < 12; i++ {
+		pctx, cancel := context.WithTimeout(ctx, time.Second)
+		err := n.Propose(pctx, []byte(fmt.Sprintf("c%d", i)))
+		cancel()
+		if err != nil {
+			break
+		}
+	}
+	select {
+	case <-n.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the node did not fail-stop when the engine could not be made durable")
+	}
+	if err := n.Err(); !errors.Is(err, errSync) || !errors.Is(err, ErrSnapshot) {
+		t.Fatalf("fail-stop cause: %v, want the engine's sync failure as a snapshot error", err)
+	}
+	n.Close()
+	if _, err := os.Stat(path + ".snap"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a snapshot was published although the engine could not be synced through it: %v", err)
+	}
+	if rec, err := raftlog.Inspect(path); err != nil || rec.Boundary.Index != 0 {
+		t.Fatalf("the log was compacted although the engine could not be synced: %+v %v", rec.Boundary, err)
 	}
 }
 
