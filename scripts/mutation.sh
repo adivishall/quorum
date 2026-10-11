@@ -3182,7 +3182,7 @@ mutant "failed-restore-fails-stop" internal/kv/lsm.go \
 #      into its parent, so a power loss can take the whole engine.
 mutant "new-engine-directory-is-synced" internal/storage/lsmstore.go \
   '	if errors.Is(statErr, os.ErrNotExist) {' \
-  '	if false {' \
+  '	if _ = statErr; false {' \
   ./internal/storage '^TestANewEngineDirectoryIsSyncedIntoItsParent$'
 
 # 371. S3 (review of the fixes): a failed engine sync is ignored — the snapshot
