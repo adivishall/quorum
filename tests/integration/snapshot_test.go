@@ -288,8 +288,29 @@ func TestRealFollowerReceivesSnapshot(t *testing.T) {
 	if b := c.liveLog(lag).Boundary; b.Index == 0 || b.Index > m.Index {
 		t.Fatalf("%s's durable log after the install: boundary %+v, snapshot %d", lag, b, m.Index)
 	}
-	if !strings.Contains(c.procs[leader].out.String(), "event=raft_snapshot_sent node="+leader+" to="+lag) {
-		t.Fatalf("%s did not stream the snapshot", leader)
+	// The snapshot is streamed by a leader: the one in office when the follower
+	// returned, which need not be the one found before it was stopped. Since S3
+	// an LSM leader flushes its engine at every snapshot, on its actor, and
+	// under I/O contention that can cost it its term while the follower is down
+	// (docs/STORAGE_INTEGRATION.md §9.13). So the sender is read from the
+	// follower's own record of the install and checked against its log — it
+	// sent this follower a snapshot, and it was a leader — never assumed.
+	senders := regexp.MustCompile(`event=raft_snapshot_received node=`+regexp.QuoteMeta(lag)+` from=(\S+)`).
+		FindAllStringSubmatch(c.procs[lag].out.String(), -1)
+	if len(senders) == 0 {
+		t.Fatalf("%s logged no snapshot install naming its sender", lag)
+	}
+	for _, m := range senders {
+		from := m[1]
+		p := c.procs[from]
+		if p == nil {
+			t.Fatalf("%s received a snapshot from %s, which is not running", lag, from)
+		}
+		// The sender logs the stream once it completes: wait for it, never read once.
+		waitForLine(t, p, "event=raft_snapshot_sent node="+from+" to="+lag, 10*time.Second)
+		if !strings.Contains(p.out.String(), "event=raft_leader node="+from+" ") {
+			t.Fatalf("%s streamed a snapshot to %s but was never leader (the leader found before the lag was %s)", from, lag, leader)
+		}
 	}
 	c.finishSnapshots(w)
 }
