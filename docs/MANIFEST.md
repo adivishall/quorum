@@ -74,6 +74,7 @@ DESIGN's operation numbers are preserved as **field tags inside the payload**:
 | `0x04` | SetLastSequence | `u` |
 | `0x05` | SetLogNumber | `u` |
 | `0x06` | SetApplied | `raftIndex`, `raftTerm` |
+| `0x07` | SetLogStartSeq | `u` — the sequence before the log number's first record (S3) |
 
 Integers are uvarints and byte strings are uvarint-length-prefixed, matching the WAL's payload
 convention (`docs/DESIGN.md` §3, "all lengths are uvarint") rather than introducing a second style
@@ -98,14 +99,17 @@ never truncated, and the WAL record was the sole authority for the applied index
 authoritative** (`docs/STORAGE_INTEGRATION.md` §9).
 
 **`SetLogNumber`** is now written by every flush, naming the WAL segment recovery must start from —
-the segment the flush rotated to, which begins at `LastSequence + 1`. Segments below it hold only
+the segment the flush rotated to, which begins at `LogStartSeq + 1`. Segments below it hold only
 records already in a flushed table and are deleted. Recovery starts replay there, and a missing
 required segment is `ErrCorrupt`.
 
-**`SetApplied`** is now written by every flush, recording the applied index the flushed tables bring
-the engine to, atomically with the data (`AddFile`) and the sequence (`SetLastSequence`). Recovery
-seeds the applied index from it and the sequence from `LastSequence`, then advances both by replaying
-the surviving log. It is still not a *second* authority competing with the WAL: after truncation the
+**`SetApplied`** is now written by every real flush, recording the applied index the flushed tables
+bring the engine to, atomically with the data (`AddFile`) and the sequence (`SetLastSequence`).
+**`SetLogStartSeq`** (tag `0x07`, added in S3) records the sequence before the log number's first
+record. Recovery seeds the applied index from `Applied` and the sequence from `LogStartSeq` — not
+from `LastSequence`, which a flush *during replay* advances without moving the log — then advances
+both by replaying the surviving log. The three watermark fields are written together by a real flush
+only, so they are always mutually consistent (`docs/STORAGE_INTEGRATION.md` §9.2, §9.7). It is still not a *second* authority competing with the WAL: after truncation the
 WAL below the log number is gone, so the MANIFEST is the only place the flushed prefix's index and
 sequence live, and the surviving WAL only extends them. A pre-S3 directory, whose flushes never set
 these, decodes `LogNumber == 0` and replays from segment 1 as before — no migration.
