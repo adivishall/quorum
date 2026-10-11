@@ -103,7 +103,9 @@ const (
 	tagLastSequence   = 0x04
 	tagLogNumber      = 0x05
 	tagApplied        = 0x06
-	tagMaxKnown       = tagApplied
+	tagLogStartSeq    = 0x07
+	tagAppliedSeq     = 0x08
+	tagMaxKnown       = tagAppliedSeq
 	maxFilesPerEdit   = 1 << 20 // bounds an allocation driven by a decoded count
 	maxKeyLenInEdit   = 1 << 20 // a key is at most 4 KiB; this is slack, not a limit
 	maxLevelsPerEdit  = 64      // a level number this large means damage
@@ -191,12 +193,19 @@ type Edit struct {
 
 	HasApplied bool
 	Applied    Applied
+
+	HasLogStartSeq bool
+	LogStartSeq    uint64
+
+	HasAppliedSeq bool
+	AppliedSeq    uint64
 }
 
 // Empty reports whether the edit would change nothing.
 func (e *Edit) Empty() bool {
 	return len(e.Added) == 0 && len(e.Deleted) == 0 &&
-		!e.HasNextFileNum && !e.HasLastSequence && !e.HasLogNumber && !e.HasApplied
+		!e.HasNextFileNum && !e.HasLastSequence && !e.HasLogNumber && !e.HasApplied && !e.HasLogStartSeq &&
+		!e.HasAppliedSeq
 }
 
 // AddFile records a new live file.
@@ -213,16 +222,30 @@ func (e *Edit) SetNextFileNum(n uint64) { e.HasNextFileNum, e.NextFileNum = true
 // SetLastSequence records the highest assigned sequence number.
 func (e *Edit) SetLastSequence(n uint64) { e.HasLastSequence, e.LastSequence = true, n }
 
-// SetLogNumber records the oldest WAL segment the database still needs.
-//
-// Phase 4 writes it so that the field exists and round-trips, and does not act
-// on it: retiring WAL segments is a later concern, and doing it here would mean
-// deleting a log on the strength of a field nothing yet tests. See
-// docs/LIMITATIONS.md.
+// SetLogNumber records the oldest WAL segment the database still needs. Since
+// S3 a real flush sets it to the segment it rotated to, recovery replays from
+// it, and the segments below it are deleted (docs/STORAGE_INTEGRATION.md §9.4).
 func (e *Edit) SetLogNumber(n uint64) { e.HasLogNumber, e.LogNumber = true, n }
 
 // SetApplied records Raft progress metadata.
 func (e *Edit) SetApplied(a Applied) { e.HasApplied, e.Applied = true, a }
+
+// SetLogStartSeq records the sequence before the log number's first record — the
+// value recovery seeds its sequence counter from (S3,
+// docs/STORAGE_INTEGRATION.md §9.2). It is set together with the log number at a
+// flush, so segment LogNumber begins at LogStartSeq+1. It is distinct from
+// LastSequence (the highest flushed sequence): a flush during replay advances the
+// flushed sequence without moving the log number, so the two diverge and only
+// this one is a safe seed.
+func (e *Edit) SetLogStartSeq(n uint64) { e.HasLogStartSeq, e.LogStartSeq = true, n }
+
+// SetAppliedSeq records the sequence of the last mutation the last apply batch
+// held — the data Applied covers is exactly the mutations through it (S3,
+// docs/STORAGE_INTEGRATION.md §9.2). It is set with the watermark at a flush,
+// because truncation deletes the apply batch recovery would otherwise read it
+// from, and it differs from LogStartSeq when writes outside apply batches (Put,
+// Delete) followed the last one.
+func (e *Edit) SetAppliedSeq(n uint64) { e.HasAppliedSeq, e.AppliedSeq = true, n }
 
 // AppendTo encodes the edit onto dst.
 //
@@ -262,6 +285,14 @@ func (e *Edit) AppendTo(dst []byte) []byte {
 		dst = binary.AppendUvarint(dst, tagApplied)
 		dst = binary.AppendUvarint(dst, e.Applied.Index)
 		dst = binary.AppendUvarint(dst, e.Applied.Term)
+	}
+	if e.HasLogStartSeq {
+		dst = binary.AppendUvarint(dst, tagLogStartSeq)
+		dst = binary.AppendUvarint(dst, e.LogStartSeq)
+	}
+	if e.HasAppliedSeq {
+		dst = binary.AppendUvarint(dst, tagAppliedSeq)
+		dst = binary.AppendUvarint(dst, e.AppliedSeq)
 	}
 	return dst
 }
@@ -401,6 +432,22 @@ func DecodeEdit(payload []byte) (Edit, error) {
 			e.SetApplied(Applied{Index: idx, Term: term})
 			p = rest
 
+		case tagLogStartSeq:
+			v, rest, err := takeUvarint(p, "log start sequence")
+			if err != nil {
+				return Edit{}, err
+			}
+			e.SetLogStartSeq(v)
+			p = rest
+
+		case tagAppliedSeq:
+			v, rest, err := takeUvarint(p, "applied sequence")
+			if err != nil {
+				return Edit{}, err
+			}
+			e.SetAppliedSeq(v)
+			p = rest
+
 		default:
 			return Edit{}, fmt.Errorf(
 				"manifest: unknown field tag %#x (this version understands tags up to %#x): %w",
@@ -443,6 +490,8 @@ type State struct {
 	LastSequence uint64
 	LogNumber    uint64
 	Applied      Applied
+	LogStartSeq  uint64 // the sequence before LogNumber's first record (S3)
+	AppliedSeq   uint64 // the sequence of the last mutation Applied covers (S3)
 }
 
 // Clone returns a deep copy.
@@ -497,6 +546,12 @@ func (s *State) Apply(e Edit) error {
 	if e.HasApplied {
 		s.Applied = e.Applied
 	}
+	if e.HasLogStartSeq {
+		s.LogStartSeq = e.LogStartSeq
+	}
+	if e.HasAppliedSeq {
+		s.AppliedSeq = e.AppliedSeq
+	}
 	return nil
 }
 
@@ -517,6 +572,8 @@ func (s State) Snapshot() Edit {
 	e.SetLastSequence(s.LastSequence)
 	e.SetLogNumber(s.LogNumber)
 	e.SetApplied(s.Applied)
+	e.SetLogStartSeq(s.LogStartSeq)
+	e.SetAppliedSeq(s.AppliedSeq)
 	return e
 }
 

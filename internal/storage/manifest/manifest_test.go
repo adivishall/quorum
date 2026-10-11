@@ -69,6 +69,8 @@ func TestEditRoundTripCarriesEveryField(t *testing.T) {
 	e.SetLastSequence(999)
 	e.SetLogNumber(3)
 	e.SetApplied(manifest.Applied{Index: 17, Term: 5})
+	e.SetLogStartSeq(990)
+	e.SetAppliedSeq(985)
 
 	got, err := manifest.DecodeEdit(e.AppendTo(nil))
 	if err != nil {
@@ -108,9 +110,9 @@ func TestDecodeEditRejectsMalformedPayloads(t *testing.T) {
 		payload []byte
 	}{
 		{"unknown tag", []byte{0x7f}},
-		// 0x06 (SetApplied) is the highest tag this version knows, so 0x07 is the
-		// first one a future format could add. It must be refused, not skipped.
-		{"tag just past the known range", []byte{0x07}},
+		// 0x08 (SetAppliedSeq) is the highest tag this version knows, so 0x09 is
+		// the first one a future format could add. It must be refused, not skipped.
+		{"tag just past the known range", []byte{0x09}},
 		{"truncated after a tag", []byte{0x01}},
 		{"truncated mid-record", goodBytes[:len(goodBytes)-3]},
 		{"truncated at one byte", goodBytes[:1]},
@@ -258,6 +260,8 @@ func TestSnapshotReproducesState(t *testing.T) {
 	e.SetLastSequence(30)
 	e.SetLogNumber(2)
 	e.SetApplied(manifest.Applied{Index: 3, Term: 1})
+	e.SetLogStartSeq(25)
+	e.SetAppliedSeq(24)
 	if err := s.Apply(e); err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +275,8 @@ func TestSnapshotReproducesState(t *testing.T) {
 			sortedFiles(rebuilt), sortedFiles(s))
 	}
 	if rebuilt.NextFileNum != s.NextFileNum || rebuilt.LastSequence != s.LastSequence ||
-		rebuilt.LogNumber != s.LogNumber || rebuilt.Applied != s.Applied {
+		rebuilt.LogNumber != s.LogNumber || rebuilt.Applied != s.Applied ||
+		rebuilt.LogStartSeq != s.LogStartSeq || rebuilt.AppliedSeq != s.AppliedSeq {
 		t.Fatalf("snapshot lost a scalar: %+v vs %+v", rebuilt, s)
 	}
 }
@@ -878,6 +883,7 @@ func FuzzDecodeEditIsTotal(f *testing.F) {
 	f.Add([]byte{0x01, 0x00, 0x01, 0x01, 0x01, 0x00, 0x00, 0x01, 0x01})
 	f.Add([]byte{0x7f})
 	f.Add([]byte{})
+	f.Add([]byte{0x07, 0x05, 0x08, 0x04}) // LogStartSeq 5, AppliedSeq 4 (S3)
 
 	f.Fuzz(func(t *testing.T, payload []byte) {
 		e, err := manifest.DecodeEdit(payload)

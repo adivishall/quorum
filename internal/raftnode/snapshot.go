@@ -42,6 +42,33 @@ type SnapshotStateMachine interface {
 	RestoreSnapshot(index, term uint64, data []byte) error
 }
 
+// DurableApplier is a state machine whose durable applied index bounds how far
+// the Raft log may be compacted (R2, docs/STORAGE_INTEGRATION.md §9.6).
+//
+// A machine that does not implement it does not bound compaction, because its
+// durable copy of the compacted prefix is the published snapshot, which is made
+// durable before the log is compacted (the in-memory store). A machine that does
+// — the LSM engine — recovers only to its flushed applied index after a power
+// loss without the log, so the log must keep every entry above that index, or a
+// crash would lose the entries the engine applied but had not flushed, with
+// nothing left to replay them.
+type DurableApplier interface {
+	// DurableAppliedIndex returns the applied index the machine is guaranteed to
+	// recover after a crash without the Raft log. Compaction never passes it. A
+	// value it cannot vouch for must be reported as 0, which compacts nothing.
+	DurableAppliedIndex() uint64
+	// SyncApplied makes the state through the current applied index durable in
+	// the engine, advancing DurableAppliedIndex to it. The driver calls it when
+	// it creates a snapshot, before publishing it, so the log can then be
+	// compacted behind that snapshot without the boundary passing the engine's
+	// durable index (R2), and a restart never finds its own snapshot above the
+	// engine. The snapshot's prefix is then durable in the engine's own tables,
+	// not only in the published snapshot file. A failure is a durability
+	// failure; the node stops. The in-memory store does not implement
+	// DurableApplier.
+	SyncApplied() error
+}
+
 // LogStore is the durable Raft log as the driver uses it: *raftlog.Log, or the
 // simulator's recording wrapper around one.
 type LogStore interface {
@@ -233,7 +260,8 @@ func (d *Durable) MaybeSnapshot(core *raft.Raft, at Hook) error {
 
 // Snapshot creates a snapshot of the state machine at the applied index,
 // publishes it, and compacts the log behind it, in this order
-// (docs/SNAPSHOTS.md §5): encode (memory); publish (temporary file, fsync,
+// (docs/SNAPSHOTS.md §5): encode (memory); make an engine-backed machine
+// durable through the index (SyncApplied, S3); publish (temporary file, fsync,
 // rename, directory fsync); rewrite the durable log without the prefix; discard
 // the prefix in the core. The log is never compacted before the snapshot that
 // covers it is durable, so a crash anywhere leaves a state recovery accepts.
@@ -293,6 +321,22 @@ func (d *Durable) Snapshot(core *raft.Raft, at Hook) error {
 	if err != nil {
 		return err
 	}
+	// R2: make the engine durable through the snapshot's index before compacting
+	// the log behind it, so the compaction boundary does not pass the engine's
+	// durable applied index (docs/STORAGE_INTEGRATION.md §9.6). Without this a
+	// node whose engine rarely flushes would hold its log forever, never sending
+	// a lagging follower a snapshot. It comes BEFORE the publish: a power loss
+	// between the two would otherwise leave a published snapshot above an engine
+	// that lost its unsynced tail, and the restart would replace the whole
+	// engine from the file — refused outright for a state too large for one
+	// restore batch — when the engine itself could have been made durable
+	// first. The in-memory store needs nothing: its durable copy of the prefix
+	// is the snapshot file.
+	if da, ok := s.SM.(DurableApplier); ok {
+		if err := da.SyncApplied(); err != nil {
+			return fmt.Errorf("%w: making the engine durable through %d for compaction: %w", ErrSnapshot, idx, err)
+		}
+	}
 	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
 		return err
 	}
@@ -306,12 +350,31 @@ func (d *Durable) Snapshot(core *raft.Raft, at Hook) error {
 	return d.compact(core, at)
 }
 
-// compact discards the log through the published snapshot's index less
-// Retain: durably first, then in the core. The core then offers a snapshot to
-// any follower that needs a discarded entry.
+// compactPoint is how far the log may be compacted: the published snapshot's
+// index less Retain, clamped to the engine's durable applied index when the
+// state machine reports one (R2). It is pure, so the clamp is tested directly.
+func compactPoint(snapIndex, retain, durable uint64, hasDurable bool) uint64 {
+	c := snapIndex - min(snapIndex, retain)
+	if hasDurable && durable < c {
+		c = durable
+	}
+	return c
+}
+
+// compact discards the log through the published snapshot's index less Retain,
+// never past the engine's durable applied index (R2): durably first, then in the
+// core. The core then offers a snapshot to any follower that needs a discarded
+// entry. When the clamp holds the point at or below the current boundary —
+// because the engine has not yet flushed that far, or cannot vouch for a durable
+// index (0) — nothing is compacted and the log simply retains more, which is
+// always safe.
 func (d *Durable) compact(core *raft.Raft, at Hook) error {
 	s := d.Snap
-	c := s.meta.Index - min(s.meta.Index, s.Retain)
+	durable, hasDurable := uint64(0), false
+	if da, ok := s.SM.(DurableApplier); ok {
+		durable, hasDurable = da.DurableAppliedIndex(), true
+	}
+	c := compactPoint(s.meta.Index, s.Retain, durable, hasDurable)
 	if b, _ := core.Boundary(); c <= b {
 		return nil
 	}

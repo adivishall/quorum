@@ -397,6 +397,70 @@ func (w *WAL) rotateLocked() error {
 	return w.openSegment(w.seg+1, true)
 }
 
+// Rotate closes the active segment and starts the next one, returning the new
+// active segment's number (S3, docs/STORAGE_INTEGRATION.md §9.3).
+//
+// A flush calls it so that, having frozen the memtable at sequence L, the next
+// WAL record — sequence L+1 — begins a fresh segment. That segment becomes the
+// MANIFEST's LogNumber, and the invariant "segment LogNumber begins at sequence
+// LogStartSeq+1" holds by construction, which is what lets recovery seed the
+// sequence counter from LogStartSeq and delete every lower segment.
+//
+// The outgoing segment is synced and closed (rotateLocked), and the new one's
+// creation is made durable by a directory fsync, so after Rotate returns the new
+// segment is durable and every record in the old ones has been flushed.
+func (w *WAL) Rotate() (uint64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return 0, ErrClosed
+	}
+	if w.syncErr != nil {
+		return 0, w.syncErr
+	}
+	if err := w.rotateLocked(); err != nil {
+		return 0, err
+	}
+	return w.seg, nil
+}
+
+// DeleteSegmentsBelow removes every WAL segment numbered below n and makes the
+// removals durable (S3, docs/STORAGE_INTEGRATION.md §9.4). It is how a flush
+// truncates the log: n is the MANIFEST's LogNumber, every segment below it holds
+// only records already in a flushed table, and the active segment (n or above)
+// is never touched.
+//
+// A deletion that fails is reported but not latched: the segments are redundant,
+// so a leftover costs space, not correctness, and the next open sweeps it. The
+// count returned is how many were removed.
+func (w *WAL) DeleteSegmentsBelow(n uint64) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return 0, ErrClosed
+	}
+	nums, _, err := listSegments(w.fs, w.dir)
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, s := range nums {
+		if s >= n {
+			break // ascending: nothing below n remains
+		}
+		if err := w.fs.Remove(segmentPath(w.dir, s)); err != nil {
+			return removed, fmt.Errorf("wal: removing truncated segment %s: %w", segmentName(s), err)
+		}
+		removed++
+	}
+	if removed > 0 && w.opts.SyncMode != SyncOff {
+		if err := w.fs.SyncDir(w.dir); err != nil {
+			return removed, fmt.Errorf("wal: syncing %s after removing truncated segments: %w", w.dir, err)
+		}
+	}
+	return removed, nil
+}
+
 // syncLocked flushes the active segment. The caller must hold w.mu.
 func (w *WAL) syncLocked() error {
 	if w.unsynced == 0 {

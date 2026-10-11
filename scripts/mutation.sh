@@ -2243,12 +2243,13 @@ mutant "latched-compactor-stops" internal/storage/lsmcompact.go \
   '			if false {' \
   ./internal/storage '^TestALatchedCompactionErrorStopsTheCompactor$'
 
-# 260. A flush makes the WAL durable before its manifest edit (audit D10).
-mutant "flush-syncs-the-wal-first" internal/storage/lsmstore.go \
-  '		if err := s.w.Sync(); err != nil {
-			_ = r.Close()' \
-  '		if err := error(nil); err != nil {
-			_ = r.Close()' \
+# 260. A flush rotates the WAL before recording its edit (audit D10, S3 §9.3):
+#      the rotation syncs and closes the outgoing segment, so the edit is written
+#      with no unsynced WAL data. Skipping the rotation leaves the flushed records
+#      unsynced in the active segment at the edit.
+mutant "flush-rotates-before-recording" internal/storage/lsmstore.go \
+  '		n, rerr := s.w.Rotate()' \
+  '		n, rerr := s.w.Stats().ActiveSegment, error(nil)' \
   ./internal/storage '^TestAFlushMakesTheWALDurableBeforeItsEdit$'
 
 # 261. A failed WAL append latches.
@@ -2264,13 +2265,12 @@ mutant "wal-close-reports-the-latch" internal/storage/wal/wal.go \
   '	var syncErr error' \
   ./internal/storage/wal '^TestCloseAfterAFailedFlushReportsItAndDoesNotFlushAgain$'
 
-# 263. A flush during replay at open, before the store has a WAL, does not
-# sync a WAL that does not exist.
-mutant "replay-flush-has-no-wal-to-sync" internal/storage/lsmstore.go \
-  '	if s.w != nil && s.opts.WAL.SyncMode != wal.SyncOff {
-		if err := s.w.Sync(); err != nil {' \
-  '	if s.opts.WAL.SyncMode != wal.SyncOff {
-		if err := s.w.Sync(); err != nil {' \
+# 263. A flush during replay at open, before the store has a WAL (s.w == nil),
+# does not rotate a WAL that does not exist (S3 §9.7). Dropping the guard makes
+# the replay flush dereference a nil WAL.
+mutant "replay-flush-skips-the-rotation" internal/storage/lsmstore.go \
+  '	recordWatermark := s.w != nil' \
+  '	recordWatermark := true' \
   ./internal/storage '^TestAReplayThatFlushesOpens$'
 
 # 264. Close after a failed WRITE still flushes the records acknowledged before it.
@@ -2473,9 +2473,11 @@ mutant "explicit-compaction-honours-the-latch" internal/storage/lsmcompact.go \
   ./internal/storage '^TestAnExplicitCompactionAfterAFailureRunsNothing$'
 
 # 289. SyncOff never fsyncs the WAL, a flush included.
-mutant "syncoff-flush-does-not-fsync" internal/storage/lsmstore.go \
-  '	if s.w != nil && s.opts.WAL.SyncMode != wal.SyncOff {' \
-  '	if s.w != nil {' \
+mutant "syncoff-flush-does-not-fsync" internal/storage/wal/wal.go \
+  '	if w.opts.SyncMode != SyncOff {
+		if err := w.syncLocked(); err != nil {' \
+  '	if true {
+		if err := w.syncLocked(); err != nil {' \
   ./internal/storage '^TestSyncOffNeverFsyncsTheWAL$'
 
 # 290. The options bound a put to what one WAL record holds.
@@ -2912,6 +2914,283 @@ mutant "failed-machine-leaves-no-directory" internal/multiraft/host.go \
   '	if err != nil {
 		return nil, fmt.Errorf("multiraft: group %d: its state machine: %w", g, err)' \
   ./internal/multiraft '^TestAFailedMachineLeavesNoDirectory$'
+
+# ----------------------------------------------------------------------------
+# S3: durable watermarks, WAL truncation, and R2-gated compaction
+# (docs/STORAGE_INTEGRATION.md §9).
+# ----------------------------------------------------------------------------
+
+# 344. S3: a flush does not record the applied index in the MANIFEST — after a
+#      truncation the reopen seeds a stale applied index and loses the entries
+#      between the old and new watermark.
+mutant "flush-records-the-applied-index" internal/storage/lsmstore.go \
+  '		edit.SetApplied(manifest.Applied{Index: s.applied.Index, Term: s.applied.Term})' \
+  '		_ = s.applied' \
+  ./internal/storage '^TestAppliedIndexRecoveredFromTheManifestAfterAFlush$'
+
+# 344b. S3: a flush does not record the log start sequence — recovery seeds the
+#       sequence from zero (or a stale value) and the surviving records collide
+#       with the tables.
+mutant "flush-records-the-log-start-sequence" internal/storage/lsmstore.go \
+  '		edit.SetLogStartSeq(s.seq)' \
+  '		_ = s.seq' \
+  ./internal/storage '^TestWALTruncationReclaimsSegments$'
+
+# 344c. S3 (R2): creating a snapshot does not make the engine durable, so a node
+#       whose engine has not flushed never advances its durable index and its log
+#       never compacts — a lagging follower is never sent a snapshot.
+mutant "snapshot-makes-the-engine-durable" internal/raftnode/snapshot.go \
+  '		if err := da.SyncApplied(); err != nil {' \
+  '		if err := error(nil); da == nil || err != nil {' \
+  ./internal/kv '^TestR2CompactionStaysWithinADurableCopy$'
+
+# 345. S3: a flush does not record the log number — the reopen cannot tell where
+#      the truncated log begins and mis-numbers or mis-reads the surviving records.
+mutant "flush-records-the-log-number" internal/storage/lsmstore.go \
+  '		edit.SetLogNumber(n)' \
+  '		_ = n' \
+  ./internal/storage '^TestWALTruncationReclaimsSegments$'
+
+# 346. S3: truncation deletes the log number's own segment, not only those below
+#      it — the segment recovery needs is gone.
+mutant "truncation-keeps-the-log-number-segment" internal/storage/wal/wal.go \
+  '		if s >= n {' \
+  '		if s > n {' \
+  ./internal/storage '^TestWALTruncationReclaimsSegments$'
+
+# 347. S3: recovery does not seed the sequence from the MANIFEST's LastSequence —
+#      the surviving records are numbered from zero and collide with the tables.
+mutant "recovery-seeds-the-sequence" internal/storage/lsmstore.go \
+  '		s.seq = logStartSeq' \
+  '		s.seq = 0' \
+  ./internal/storage '^TestSequenceAndAppliedContinuityAcrossReopen$'
+
+# 348. S3: a missing required WAL segment (the lowest present is above the log
+#      number) is not refused — recovery replays a log missing committed records.
+mutant "missing-required-segment-is-refused" internal/storage/wal/recover.go \
+  '	if len(kept) == 0 || kept[0] != logNumber {' \
+  '	if len(kept) == 0 {' \
+  ./internal/storage '^TestARequiredWALSegmentMissingIsRefused$'
+
+# 349. S3: a leftover segment below the log number (an interrupted truncation) is
+#      not swept, so it is mistaken for a gap or the start of the log.
+mutant "leftover-low-segments-are-swept" internal/storage/wal/recover.go \
+  '		if s < logNumber {' \
+  '		if s < 0 {' \
+  ./internal/storage '^TestLeftoverLowSegmentsAreSweptOnOpen$'
+
+# 350. S3 (R2): compaction is not clamped to the engine's durable applied index —
+#      the Raft log is discarded past what the engine can recover.
+mutant "compaction-clamps-to-the-durable-index" internal/raftnode/snapshot.go \
+  '	if hasDurable && durable < c {' \
+  '	if hasDurable && durable > c {' \
+  ./internal/raftnode '^TestCompactPointClampsToDurable$'
+
+# 351. S3 (R2): the durable watermark does not advance at a flush, so it never
+#      reflects what the engine has made recoverable.
+mutant "durable-watermark-advances-at-flush" internal/storage/lsmstore.go \
+  '		s.mu.Lock()
+		s.flushedApplied = s.applied
+		s.mu.Unlock()' \
+  '		s.mu.Lock()
+		_ = s.applied
+		s.mu.Unlock()' \
+  ./internal/storage '^TestDurableAppliedAdvancesOnlyAtFlush$'
+
+# 352. S3 (R2): the machine reports the live applied index, not the engine's
+#      durable one — compaction would gate on state the engine has not flushed.
+mutant "machine-reports-the-durable-index" internal/kv/lsm.go \
+  '	return m.db.DurableApplied().Index' \
+  '	return m.applied' \
+  ./internal/kv '^TestLSMMachineDurableAppliedIsTheEnginesFlushedIndex$'
+
+# 353. S3 (R2, final review): a Flush with an empty memtable records nothing,
+#      so an applied index moved by entries that write nothing (the election
+#      no-op, a configuration entry) never becomes durable and SyncApplied leaves
+#      the durable index behind the applied index.
+mutant "empty-flush-records-the-applied-index" internal/storage/lsmstore.go \
+  '	if s.w == nil || s.applied == s.flushedApplied {' \
+  '	if true {' \
+  ./internal/storage '^TestAFlushRecordsAnAppliedIndexThatMovedWithoutData$'
+
+# 354. S3: the watermark-only record names the active segment instead of
+#      rotating — the segment holding the entries it covers is kept and replayed
+#      on top of a seed that already counts them.
+mutant "empty-flush-rotates-before-recording" internal/storage/lsmstore.go \
+  '	n, err := s.w.Rotate()' \
+  '	n, err := s.w.Stats().ActiveSegment, error(nil)' \
+  ./internal/storage '^TestAFlushRecordsAnAppliedIndexThatMovedWithoutData$'
+
+# 355. S3: the watermark-only record does not truncate the WAL below it.
+mutant "empty-flush-truncates-the-log" internal/storage/lsmstore.go \
+  '	s.truncateWALBelow(n)' \
+  '	_ = n' \
+  ./internal/storage '^TestAFlushRecordsAnAppliedIndexThatMovedWithoutData$'
+
+# 356. S3 (final review): with no log number recorded, a log whose lowest
+#      segment is above the first is replayed counted from zero — adopting an S3
+#      directory that lost its MANIFEST silently drops acknowledged writes.
+mutant "legacy-log-begins-at-the-first-segment" internal/storage/wal/recover.go \
+  '		if len(nums) > 0 && nums[0] != firstSegment {' \
+  '		if false {' \
+  ./internal/storage '^TestAdoptingATruncatedLogIsRefused$'
+
+# 357. S3 (final review): after truncation, replay checks the first surviving
+#      apply batch against zero, not the MANIFEST's Applied — a record below the
+#      durable watermark is accepted and drops the applied index under it.
+mutant "replay-is-anchored-to-the-manifest-applied" internal/storage/wal/recover.go \
+  '	if logNumber > 0 {
+		rec.AppliedIndex = applied
+	}' \
+  '	_ = applied' \
+  ./internal/storage '^TestReplayIsAnchoredToTheManifestApplied$'
+
+# 358. S3 (final review): a flush does not record the applied sequence — the
+#      reopen credits writes made outside apply batches to the applied index.
+mutant "flush-records-the-applied-sequence" internal/storage/lsmstore.go \
+  '		edit.SetAppliedSeq(s.appliedSeq)' \
+  '		_ = s.appliedSeq' \
+  ./internal/storage '^TestAppliedSequenceSurvivesAFlushAfterWritesOutsideBatches$'
+
+# 359. S3 (final review): the empty-memtable record does not carry the applied
+#      sequence either.
+mutant "empty-flush-records-the-applied-sequence" internal/storage/lsmstore.go \
+  '	edit.SetApplied(manifest.Applied{Index: applied.Index, Term: applied.Term})
+	edit.SetAppliedSeq(s.appliedSeq)' \
+  '	edit.SetApplied(manifest.Applied{Index: applied.Index, Term: applied.Term})' \
+  ./internal/storage '^TestAppliedSequenceSurvivesAFlushAfterWritesOutsideBatches$'
+
+# 360. S3 (final review): recovery seeds the applied sequence from the log start
+#      sequence, not the recorded one.
+mutant "recovery-seeds-the-applied-sequence" internal/storage/lsmstore.go \
+  '		s.appliedSeq = appliedSeq' \
+  '		s.appliedSeq = logStartSeq' \
+  ./internal/storage '^TestAppliedSequenceSurvivesAFlushAfterWritesOutsideBatches$'
+
+# 361. S3 (final review): a WAL directory that is gone although the MANIFEST
+#      names a log number is taken for an empty log — the store opens from its
+#      tables and loses every unflushed write.
+mutant "missing-wal-directory-under-a-log-number" internal/storage/wal/recover.go \
+  '		if logNumber > 0 {
+			// The MANIFEST names a WAL segment, but the WAL directory is gone.' \
+  '		if false {
+			// The MANIFEST names a WAL segment, but the WAL directory is gone.' \
+  ./internal/storage '^TestALostWALUnderALogNumberIsRefused$'
+
+# 362. S3 (final review): the segments from the log number on are not checked for
+#      a gap before replay — the records after a lost middle segment reach the
+#      engine mis-numbered (the WAL writer's own listing refuses the gap later,
+#      after a replay flush may already have made tables of them).
+mutant "truncated-log-must-be-contiguous" internal/storage/wal/recover.go \
+  '		if err := checkContiguous(nums); err != nil {' \
+  '		if err := checkContiguous(nil); err != nil {' \
+  ./internal/storage/wal '^TestRecoverFromRefusesAGapBeforeReplaying$'
+
+# 363. S3 (final review): a WAL with no segment left under a log number is taken
+#      for an empty log.
+mutant "empty-log-under-a-log-number-is-refused" internal/storage/wal/recover.go \
+  '	if len(kept) == 0 || kept[0] != logNumber {' \
+  '	if len(kept) > 0 && kept[0] != logNumber {' \
+  ./internal/storage '^TestALostWALUnderALogNumberIsRefused$'
+
+# 364. S3 (R2, final review): compact does not read the machine's durable
+#      applied index, so the clamp is never applied in the real path.
+mutant "compact-reads-the-machines-durable-index" internal/raftnode/snapshot.go \
+  '		durable, hasDurable = da.DurableAppliedIndex(), true' \
+  '		_ = da' \
+  ./internal/raftnode '^TestSnapshotSyncsTheEngineFirstAndCompactsOnlyToItsDurableIndex$'
+
+# 365. S3 (final review): the snapshot is published before the engine is synced
+#      through it — a power loss between them leaves a published snapshot above
+#      an engine that lost its tail, which the restart must restore whole.
+mutant "engine-synced-before-the-snapshot-is-published" internal/raftnode/snapshot.go \
+  '	if da, ok := s.SM.(DurableApplier); ok {
+		if err := da.SyncApplied(); err != nil {
+			return fmt.Errorf("%w: making the engine durable through %d for compaction: %w", ErrSnapshot, idx, err)
+		}
+	}
+	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
+		return err
+	}
+	if err := s.Files.Publish(file); err != nil {
+		return err
+	}
+	s.meta, s.file = meta, file
+	if err := at.hit(AfterSnapshotPublish, idx); err != nil {
+		return err
+	}' \
+  '	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
+		return err
+	}
+	if err := s.Files.Publish(file); err != nil {
+		return err
+	}
+	s.meta, s.file = meta, file
+	if err := at.hit(AfterSnapshotPublish, idx); err != nil {
+		return err
+	}
+	if da, ok := s.SM.(DurableApplier); ok {
+		if err := da.SyncApplied(); err != nil {
+			return fmt.Errorf("%w: making the engine durable through %d for compaction: %w", ErrSnapshot, idx, err)
+		}
+	}' \
+  ./internal/raftnode '^TestSnapshotSyncsTheEngineFirstAndCompactsOnlyToItsDurableIndex$'
+
+# 366. S3 (final review): the restore measures the state before deciding it has
+#      nothing to do — a node whose state is too large for one restore batch can
+#      never restart on its own snapshot.
+mutant "restore-decides-the-noop-first" internal/kv/lsm.go \
+  '	if m.engine.Index >= index {
+		return nil
+	}
+	st, err := m.checkSnapshot(index, data)
+	if err != nil {
+		return err
+	}' \
+  '	st, err := m.checkSnapshot(index, data)
+	if err != nil {
+		return err
+	}
+	if m.engine.Index >= index {
+		return nil
+	}' \
+  ./internal/kv '^TestLSMMachineRestartsOnItsOwnSnapshotBeyondOneRestoreBatch$'
+
+# 367. S3 (final review): the restore deletes the old engine in place — a crash
+#      part-way leaves an engine the next open refuses.
+mutant "restore-sets-the-old-engine-aside" internal/kv/lsm.go \
+  '	if err := os.Rename(m.dir, aside); err != nil {' \
+  '	if err := removeAll(m.dir); err != nil {' \
+  ./internal/kv '^TestLSMMachineACrashWhileReplacingTheEngineLeavesOneThatOpens$'
+
+# 368. S3 (final review): an engine a crashed restore set aside is never removed.
+mutant "open-removes-the-engine-set-aside" internal/kv/lsm.go \
+  '	if err := removeAll(asidePath(dir)); err != nil {' \
+  '	if err := error(nil); err != nil {' \
+  ./internal/kv '^TestLSMMachineACrashWhileReplacingTheEngineLeavesOneThatOpens$'
+
+# 369. S3 (review of the fixes): a restore that fails after the engine is closed
+#      leaves the machine open over an empty or partial engine, which then
+#      reports a key that exists as absent.
+mutant "failed-restore-fails-stop" internal/kv/lsm.go \
+  '			_ = m.db.Close()
+			m.closed = true' \
+  '			_ = m.db.Close()' \
+  ./internal/kv '^TestLSMMachineAFailedRestoreFailsStop$'
+
+# 370. S3 (review of the fixes): a newly created engine directory is not synced
+#      into its parent, so a power loss can take the whole engine.
+mutant "new-engine-directory-is-synced" internal/storage/lsmstore.go \
+  '	if errors.Is(statErr, os.ErrNotExist) {' \
+  '	if _ = statErr; false {' \
+  ./internal/storage '^TestANewEngineDirectoryIsSyncedIntoItsParent$'
+
+# 371. S3 (review of the fixes): a failed engine sync is ignored — the snapshot
+#      is published and the log compacted although the engine is not durable.
+mutant "failed-sync-stops-the-snapshot" internal/raftnode/snapshot.go \
+  '			return fmt.Errorf("%w: making the engine durable through %d for compaction: %w", ErrSnapshot, idx, err)' \
+  '			_ = err' \
+  ./internal/raftnode '^TestAFailedEngineSyncStopsTheNodeBeforeAnythingIsPublished$'
 
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"

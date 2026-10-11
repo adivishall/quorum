@@ -9,6 +9,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/adivishall/quorum/internal/raftnode"
 	"github.com/adivishall/quorum/internal/record"
 	"github.com/adivishall/quorum/internal/storage"
 	"github.com/adivishall/quorum/internal/vfs"
@@ -68,7 +69,10 @@ const cycleFlushBytes = 32 << 20
 // ErrMachineClosed is returned by every operation of a closed machine.
 var ErrMachineClosed = errors.New("kv: the state machine is closed")
 
-var _ Machine = (*LSMMachine)(nil)
+var (
+	_ Machine                 = (*LSMMachine)(nil)
+	_ raftnode.DurableApplier = (*LSMMachine)(nil)
+)
 
 // OpenLSMMachine opens the machine's engine in dir (creating it) under limits
 // — the same limits every replica of the group uses — and engine options opts,
@@ -81,6 +85,11 @@ func OpenLSMMachine(dir string, limits Limits, opts storage.Options) (*LSMMachin
 	}
 	opts.MaxKeySize = MaxKeyLen + 1
 	opts.MaxValueSize = MaxValueLen
+	// A restore that a crash interrupted may have left the old engine renamed
+	// aside (RestoreSnapshot); it is never read again.
+	if err := removeAll(asidePath(dir)); err != nil {
+		return nil, fmt.Errorf("kv: removing the engine a restore set aside: %w", err)
+	}
 	db, err := storage.OpenLSMStore(dir, opts)
 	if err != nil {
 		return nil, fmt.Errorf("kv: opening the engine in %s: %w", dir, err)
@@ -293,6 +302,36 @@ func (m *LSMMachine) Applied() uint64 {
 	return m.applied
 }
 
+// DurableAppliedIndex returns the applied index the engine recovers after a
+// crash without the Raft log (raftnode.DurableApplier, R2): the engine's flushed
+// applied index, which the Raft log is never compacted past. A closed machine
+// vouches for nothing and reports 0 (compact nothing).
+func (m *LSMMachine) DurableAppliedIndex() uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return 0
+	}
+	return m.db.DurableApplied().Index
+}
+
+// SyncApplied flushes the engine so its durable applied index reaches the
+// applied index (raftnode.DurableApplier, R2). The driver calls it when creating
+// a snapshot, so the log may be compacted behind that snapshot. The driver calls
+// it between cycles, so nothing is staged and the engine's applied index is the
+// machine's. The engine's Flush records that index even when its memtable is
+// empty — a cycle of election no-ops and configuration entries advances it
+// without a write.
+func (m *LSMMachine) SyncApplied() error {
+	m.mu.RLock()
+	db, closed := m.db, m.closed
+	m.mu.RUnlock()
+	if closed {
+		return ErrMachineClosed
+	}
+	return db.Flush()
+}
+
 // Sessions returns a copy of the session table.
 func (m *LSMMachine) Sessions() map[uint64]SessionState {
 	m.mu.RLock()
@@ -412,11 +451,20 @@ func restoreBatchBytes(st *state) int {
 // as ONE apply batch at (index, term). Under R1 that is atomic: after a crash
 // the engine holds the batch whole, or is empty at index 0, below the published
 // snapshot, which the next open restores again.
-func (m *LSMMachine) RestoreSnapshot(index, term uint64, data []byte) error {
-	st, err := m.checkSnapshot(index, data)
-	if err != nil {
-		return err
-	}
+//
+// The no-op is decided first, before the state is decoded or measured: at a
+// restart raftnode restores the published snapshot, which for a node's own
+// snapshot the engine already holds (SyncApplied made it durable before the
+// publish), and a state too large to install as one batch must not stop that
+// node from starting (S3 final review).
+//
+// The old engine is renamed aside, the rename made durable, and only then
+// deleted: deleting a directory in place is not atomic, and a crash part-way
+// left an engine the next open refused (a MANIFEST naming a table or a WAL
+// segment that was gone) before the published snapshot could replace it. Set
+// aside, the engine's directory is the whole old engine or absent, and either
+// opens (S3 final review).
+func (m *LSMMachine) RestoreSnapshot(index, term uint64, data []byte) (err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -425,14 +473,40 @@ func (m *LSMMachine) RestoreSnapshot(index, term uint64, data []byte) error {
 	if m.engine.Index >= index {
 		return nil
 	}
+	st, err := m.checkSnapshot(index, data)
+	if err != nil {
+		return err
+	}
 	if m.last.Index != 0 {
 		return fmt.Errorf("kv: a restore inside a cycle (entries through %d staged)", m.last.Index)
 	}
 	if err := m.db.Close(); err != nil {
 		return fmt.Errorf("kv: closing the engine to restore: %w", err)
 	}
-	if err := os.RemoveAll(m.dir); err != nil {
-		return fmt.Errorf("kv: removing the engine to restore: %w", err)
+	// From here the engine that held the state at m.applied is closed and being
+	// replaced. A failure leaves no engine that holds it — the old one closed or
+	// set aside, the new one empty or partial — so the machine fails stop:
+	// closed, every operation ErrMachineClosed, never absence served from an
+	// engine that lost the data (INV-L7). raftnode stops the node on the error,
+	// and the next start reopens the engine and restores the snapshot again.
+	defer func() {
+		if err != nil {
+			_ = m.db.Close()
+			m.closed = true
+		}
+	}()
+	aside := asidePath(m.dir)
+	if err := removeAll(aside); err != nil {
+		return fmt.Errorf("kv: removing an engine an earlier restore set aside: %w", err)
+	}
+	if err := os.Rename(m.dir, aside); err != nil {
+		return fmt.Errorf("kv: setting the engine aside to restore: %w", err)
+	}
+	if err := (vfs.OS{}).SyncDir(filepath.Dir(filepath.Clean(m.dir))); err != nil {
+		return fmt.Errorf("kv: syncing the engine's parent after setting it aside: %w", err)
+	}
+	if err := removeAll(aside); err != nil {
+		return fmt.Errorf("kv: removing the engine set aside to restore: %w", err)
 	}
 	db, err := storage.OpenLSMStore(m.dir, m.opts)
 	if err != nil {
@@ -470,6 +544,14 @@ func (m *LSMMachine) RestoreSnapshot(index, term uint64, data []byte) error {
 	m.resetCycle()
 	return nil
 }
+
+// asidePath is where RestoreSnapshot sets the old engine aside before deleting
+// it: a sibling of the engine's directory, so the rename never crosses a
+// filesystem.
+func asidePath(dir string) string { return filepath.Clean(dir) + ".restore-aside" }
+
+// removeAll deletes a directory tree; a test replaces it to crash part-way.
+var removeAll = os.RemoveAll
 
 // Close closes the engine. It is idempotent.
 func (m *LSMMachine) Close() error {

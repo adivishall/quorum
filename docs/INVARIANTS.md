@@ -308,8 +308,14 @@ matrix cell and chaos seed; INV-F2 remains the umbrella and INV-R1..R10 stay in 
 
 INV-CR1..3 are proven against a **process crash** on real files and processes, and against a
 **modeled** power loss (`fault.MemFS`) in the simulator — real power loss is untested, as everywhere
-in this project. INV-CR4 states the replay contract the driver actually provides — at-least-once
-across restarts — and deliberately claims no more: the applied index is volatile by design.
+in this project. INV-CR4 states the replay contract the driver provides **with the in-memory state
+machine** (the default): at-least-once across restarts, claiming no more, because that machine's
+applied index is volatile by design. The **LSM-backed** state machine (`dkvd -state-machine lsm`,
+S2–S3) strengthens it to **exactly-once across restarts**: its applied index is durable in the
+engine, atomic with the data it covers (R1), so a restart replays only the committed entries above
+it — an entry whose effect the engine already holds is skipped. S3's WAL truncation preserves this:
+the MANIFEST's `Applied` is the recovered floor and the surviving log only extends it, so replay
+still resumes exactly after the last durably applied entry (`docs/STORAGE_INTEGRATION.md` §9.7).
 What Phase 13 adds on top is a different property — at most one execution per client request
 identity (INV-X2), decided by the state machine from its replicated session table, which replay
 rebuilds exactly (`docs/DEDUP.md` §4) — not a property of the driver. The order of a

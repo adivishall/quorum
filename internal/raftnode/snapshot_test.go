@@ -116,6 +116,168 @@ func userCommands(cmds []string) []string {
 }
 
 // TestReconcileTable is docs/SNAPSHOTS.md §6, row by row.
+// TestCompactPointClampsToDurable: the log-compaction point is the published
+// snapshot's index less Retain, but never past the engine's durable applied
+// index (R2, docs/STORAGE_INTEGRATION.md §9.6). A machine that reports no durable
+// index — the in-memory store, whose durable copy is the snapshot — is not
+// clamped; one that reports 0, because it has flushed nothing or cannot vouch
+// for an index, compacts nothing.
+func TestCompactPointClampsToDurable(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		snapIndex, retain, durable uint64
+		hasDurable                 bool
+		want                       uint64
+	}{
+		{"no durable applier: the snapshot drives it", 100, 10, 0, false, 90},
+		{"durable ahead of the point: no clamp", 100, 10, 95, true, 90},
+		{"durable at the point: no clamp", 100, 10, 90, true, 90},
+		{"durable behind the point: clamp to it", 100, 10, 42, true, 42},
+		{"durable zero: compact nothing", 100, 10, 0, true, 0},
+		{"retain past the index: zero either way", 5, 10, 3, true, 0},
+	} {
+		if got := compactPoint(tc.snapIndex, tc.retain, tc.durable, tc.hasDurable); got != tc.want {
+			t.Errorf("%s: compactPoint(%d, %d, %d, %v) = %d, want %d",
+				tc.name, tc.snapIndex, tc.retain, tc.durable, tc.hasDurable, got, tc.want)
+		}
+	}
+}
+
+// heldSM is snapSM with an engine's durable applied index (DurableApplier, R2)
+// that SyncApplied cannot raise past held — an engine whose flushes lag — and a
+// record of the order of its syncs and the snapshot publishes.
+type heldSM struct {
+	*snapSM
+	mu      sync.Mutex
+	held    uint64
+	durable uint64
+	events  []string
+	syncErr error // SyncApplied fails with it, when set
+}
+
+func (h *heldSM) DurableAppliedIndex() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.durable
+}
+
+func (h *heldSM) SyncApplied() error {
+	applied, _, _ := h.state()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.syncErr != nil {
+		return h.syncErr
+	}
+	h.durable = min(applied, h.held)
+	h.events = append(h.events, fmt.Sprintf("sync %d", applied))
+	return nil
+}
+
+func (h *heldSM) hook(p Point, arg uint64) error {
+	if p == BeforeSnapshotPublish {
+		h.mu.Lock()
+		h.events = append(h.events, fmt.Sprintf("publish %d", arg))
+		h.mu.Unlock()
+	}
+	return nil
+}
+
+// TestSnapshotSyncsTheEngineFirstAndCompactsOnlyToItsDurableIndex: in the real
+// snapshot path (not the pure compactPoint), a machine that reports a durable
+// applied index bounds compaction by it — an engine that cannot make the
+// snapshot's prefix durable keeps its log — and the engine is synced through
+// the snapshot's index BEFORE the snapshot is published, so a power loss
+// between them never leaves a published snapshot above an engine that lost its
+// tail. Found by the final S3 review: the clamp's wiring had no test, and the
+// sync came after the publish.
+func TestSnapshotSyncsTheEngineFirstAndCompactsOnlyToItsDurableIndex(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "raft.log")
+	sm := &heldSM{snapSM: &snapSM{}, held: 7}
+	n, tr := startSnapSingle(t, ctx, path, sm, 8, 2, sm.hook, nil)
+	defer tr.Close()
+	defer n.Close()
+	waitLeaderNode(t, n)
+	for i := 0; i < 40; i++ {
+		if err := n.Propose(ctx, []byte(fmt.Sprintf("c%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitApplied(t, n, n.Status().LastIndex)
+	st := n.Status()
+	if st.Snapshot < 16 {
+		t.Fatalf("premise: status %+v, want snapshots well past the held durable index 7", st)
+	}
+	// Unclamped, the boundary would be the snapshot less Retain (at least 14).
+	if st.Boundary > 7 {
+		t.Fatalf("status %+v: the log was compacted to %d, past the engine's durable index 7 (R2)", st, st.Boundary)
+	}
+	if st.Boundary == 0 {
+		t.Fatalf("status %+v: nothing compacted; the clamp must allow compaction up to the durable index", st)
+	}
+
+	// Every snapshot was published only after the engine was synced through it.
+	sm.mu.Lock()
+	events := append([]string(nil), sm.events...)
+	sm.mu.Unlock()
+	synced := map[uint64]bool{}
+	publishes := 0
+	for _, e := range events {
+		var idx uint64
+		if _, err := fmt.Sscanf(e, "sync %d", &idx); err == nil {
+			synced[idx] = true
+			continue
+		}
+		if _, err := fmt.Sscanf(e, "publish %d", &idx); err == nil {
+			publishes++
+			if !synced[idx] {
+				t.Fatalf("the snapshot at %d was published before the engine was synced through it: %v", idx, events)
+			}
+		}
+	}
+	if publishes == 0 {
+		t.Fatalf("premise: no snapshot was published: %v", events)
+	}
+}
+
+// TestAFailedEngineSyncStopsTheNodeBeforeAnythingIsPublished: a SyncApplied
+// that fails is a durability failure — the engine could not make the
+// snapshot's prefix durable — so the node fail-stops, and since the sync comes
+// before the publish, nothing is published and nothing is compacted. Found by
+// the review of the S3 fixes: no test made the sync fail.
+func TestAFailedEngineSyncStopsTheNodeBeforeAnythingIsPublished(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "raft.log")
+	errSync := errors.New("engine flush failed")
+	sm := &heldSM{snapSM: &snapSM{}, held: 1 << 62, syncErr: errSync}
+	n, tr := startSnapSingle(t, ctx, path, sm, 8, 2, nil, nil)
+	defer tr.Close()
+	waitLeaderNode(t, n)
+	for i := 0; i < 12; i++ {
+		pctx, cancel := context.WithTimeout(ctx, time.Second)
+		err := n.Propose(pctx, []byte(fmt.Sprintf("c%d", i)))
+		cancel()
+		if err != nil {
+			break
+		}
+	}
+	select {
+	case <-n.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the node did not fail-stop when the engine could not be made durable")
+	}
+	if err := n.Err(); !errors.Is(err, errSync) || !errors.Is(err, ErrSnapshot) {
+		t.Fatalf("fail-stop cause: %v, want the engine's sync failure as a snapshot error", err)
+	}
+	n.Close()
+	if _, err := os.Stat(path + ".snap"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a snapshot was published although the engine could not be synced through it: %v", err)
+	}
+	if rec, err := raftlog.Inspect(path); err != nil || rec.Boundary.Index != 0 {
+		t.Fatalf("the log was compacted although the engine could not be synced: %+v %v", rec.Boundary, err)
+	}
+}
+
 func TestReconcileTable(t *testing.T) {
 	e := func(i, term uint64) raftlog.Entry { return raftlog.Entry{Index: i, Term: term} }
 	snap := snapshot.Meta{Index: 10, Term: 3}
@@ -145,7 +307,7 @@ func TestReconcileTable(t *testing.T) {
 }
 
 // startSnapSingle starts a durable single-node group with snapshots.
-func startSnapSingle(t *testing.T, ctx context.Context, logPath string, sm *snapSM, every, retain uint64, hook Hook, logf func(string, ...any)) (*Node, *transport.TCPTransport) {
+func startSnapSingle(t *testing.T, ctx context.Context, logPath string, sm StateMachine, every, retain uint64, hook Hook, logf func(string, ...any)) (*Node, *transport.TCPTransport) {
 	t.Helper()
 	tr, err := transport.NewTCPTransport(transport.Config{NodeID: "n0", ListenAddr: "127.0.0.1:0"})
 	if err != nil {

@@ -106,6 +106,13 @@ type cluster struct {
 	// engineFS puts a node's engine WAL on a filesystem of the test's (S2).
 	lsm      bool
 	engineFS map[raftnode.NodeID]vfs.FS
+	// snapEvery and snapRetain, when non-zero, make every node snapshot and
+	// compact on that schedule (S3: exercising the R2-gated compaction path).
+	snapEvery, snapRetain uint64
+	// memTableSize, when non-zero, is every LSM node's memtable flush threshold,
+	// small so that flushes — and the durable-watermark advance — happen in a
+	// short test (S3).
+	memTableSize int64
 	// tick is every node's Raft tick (zero: 15 ms).
 	tick time.Duration
 	// hook, if set, is consulted at every driver crash point of every node: it
@@ -177,6 +184,7 @@ func (c *cluster) startNode(id raftnode.NodeID) {
 		ID: id, Peers: c.ids, Transport: wrapped,
 		LogPath:      filepath.Join(c.dir, string(id)+".log"),
 		StateMachine: store, TickInterval: tick, DisableSync: true,
+		SnapshotEvery: c.snapEvery, SnapshotRetain: c.snapRetain,
 		Hook: func(p raftnode.Point, arg uint64) error {
 			if h := c.hook.Load(); h != nil {
 				return (*h)(id, p, arg)
@@ -210,6 +218,9 @@ func (c *cluster) newMachine(id raftnode.NodeID) kv.Machine {
 	}
 	opts := storage.DefaultOptions()
 	opts.WAL.SyncMode = wal.SyncOff // as the nodes' logs: DisableSync
+	if c.memTableSize > 0 {
+		opts.MemTableSize = c.memTableSize // flush often, so the durable watermark moves (S3)
+	}
 	if fsys := c.engineFS[id]; fsys != nil {
 		opts.WAL.FS = fsys // a test's fault injector under one node's engine
 	}

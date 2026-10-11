@@ -140,13 +140,15 @@ adds truncation. Phase 5 is where a number earns the right to be called tuned. B
 records are never split, a segment can exceed the threshold by up to one record — a 4 MiB
 value produces a 4 MiB segment.
 
-A gap is refused because nothing deletes segments yet, so a missing one means records are
-gone; replaying the survivors would produce a state that never existed, with a later write
-applied without the earlier write it overwrote.
+A gap is refused because truncation (S3) deletes only a prefix, so a missing middle segment
+means records are gone; replaying the survivors would produce a state that never existed, with a
+later write applied without the earlier write it overwrote.
 
-**Known gap in that check:** segments missing from the *start* of the sequence are
-undetectable, because nothing records which segment number the log begins at. That metadata
-is the MANIFEST's log number in Phase 4.
+Segments missing from the *start* are checked by `RecoverFrom` since S3: against the MANIFEST's log
+number when one is recorded (the segments below it are a truncation's leftovers and are removed),
+and against segment 1 when none is — nothing truncates a log without first recording a log number
+(`docs/STORAGE_INTEGRATION.md` §9.7). Both checks, and the gap check, run before any record is
+replayed.
 
 ---
 
@@ -368,11 +370,11 @@ covered. It is not evidence about a disk. The matrix found two gaps, both fixed:
 | Limitation | Removed in |
 |---|---|
 | ~~Entire live data set held in memory~~ | **removed in Phase 3** (memtable + SSTables, `docs/LSM.md`) |
-| Entire log replayed on every open; startup grows with total bytes ever written | Phase 4 (truncation via the MANIFEST log number) |
-| No log truncation, so the WAL grows without bound | Phase 4 |
-| Segments missing from the *start* of the sequence are undetectable | Phase 4 (MANIFEST log number) |
+| ~~Entire log replayed on every open; startup grows with total bytes ever written~~ | **removed in S3**: a flush rotates the WAL, records the log number, and deletes the segments below it (`docs/STORAGE_INTEGRATION.md` §9); replay starts at the log number |
+| ~~No log truncation, so the WAL grows without bound~~ | **removed in S3**: the log is reclaimed behind each flush |
+| ~~Segments missing from the *start* of the sequence are undetectable~~ | **removed in S3**: recovery refuses a WAL whose lowest segment is above the MANIFEST's log number, or above segment 1 when no log number is recorded |
 | Mis-classification possible if a length field is corrupted within range | inherent to this framing; see §8 |
 | `sync` mode serialises writers behind the flush | Phase 5 may add group commit, if measured to matter |
 | Power-loss durability untested on a real device, in every mode (modeled since S1, §9) | not testable here |
-| The current sequence and applied index are derived from the whole log; nothing deletes a segment, and S3 must make both authoritative in the MANIFEST before truncating (`docs/STORAGE_INTEGRATION.md` §7.4) | S3 |
+| ~~The current sequence and applied index are derived from the whole log~~ | **removed in S3**: the MANIFEST's `LogStartSeq`, `Applied` and `AppliedSeq` are authoritative; recovery seeds from them and the surviving log only extends them (`docs/STORAGE_INTEGRATION.md` §9.2) |
 | ~~Open does not sync the recovered segments before a replay flush records a table (§5)~~ | **fixed in S1**: `RecoverWith` fsyncs the newest segment before replaying it (older ones were fsynced at rotation), except in `off` mode |

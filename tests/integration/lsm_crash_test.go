@@ -298,13 +298,13 @@ func TestLSMCrashAfterFlush(t *testing.T) {
 	if rec.SSTablesLoaded != 1 {
 		t.Fatalf("loaded %d SSTables, want 1", rec.SSTablesLoaded)
 	}
-	// The first n mutations are in the table and must NOT be replayed; the
-	// rest must be. Replaying the flushed prefix would still give the right
-	// answers, but it would mean the engine had learned nothing from the file
-	// and memory use would not be bounded by the memtable.
-	if rec.OpsSkipped != int64(n) || rec.OpsReplayed != int64(n) {
-		t.Fatalf("replay skipped %d and applied %d, want %d and %d",
-			rec.OpsSkipped, rec.OpsReplayed, n, n)
+	// S3: the flush truncated the WAL segment holding the first n mutations, so
+	// they are neither replayed nor skipped — they live only in the table now,
+	// and recovery starts at the log number the flush recorded. The second n
+	// mutations, written after the flush, are replayed.
+	if rec.OpsSkipped != 0 || rec.OpsReplayed != int64(n) {
+		t.Fatalf("replay skipped %d and applied %d, want 0 and %d",
+			rec.OpsSkipped, rec.OpsReplayed, n)
 	}
 	t.Logf("recovered from %d-entry SSTable + %d replayed WAL ops", rec.SSTableEntries, rec.OpsReplayed)
 }
@@ -533,6 +533,13 @@ func TestCrashWithOverwritesAndDeletesAcrossFiles(t *testing.T) {
 
 // TestCrashedFlushLeavesReplayableLog inspects the directory directly rather
 // than trusting the store's view of itself, and replays the WAL independently.
+//
+// Since S3 a flush that reached its MANIFEST commit also truncated the segments
+// below its log number, so a raw replay from segment 1 is the right check only
+// in the window before the commit; the MANIFEST says which window the kill
+// landed in. In every window the engine recovers every acknowledged mutation,
+// from its tables and the surviving log. (Before the S3 review the test assumed
+// the first window, and failed whenever the flush finished before the kill.)
 func TestCrashedFlushLeavesReplayableLog(t *testing.T) {
 	const n = 1500
 	dir := t.TempDir()
@@ -544,19 +551,37 @@ func TestCrashedFlushLeavesReplayableLog(t *testing.T) {
 	st := inspectDir(t, dir)
 	t.Logf("after the crash: sstables=%v temps=%v", st.sstables, st.temps)
 
-	// Replay the log with no engine involved at all. Whatever happened to the
-	// flush, the log still holds every acknowledged mutation.
-	var ops int
-	rec, err := wal.Recover(filepath.Join(dir, "wal"), wal.Handler{
-		Batch: func(b wal.Batch) error { ops += len(b); return nil },
-	})
+	state, _, err := manifest.Recover(dir)
 	if err != nil {
-		t.Fatalf("replaying the crashed log: %v", err)
+		t.Fatalf("reading the MANIFEST after the crash: %v", err)
 	}
-	if ops != n {
-		t.Fatalf("the log holds %d operations, want %d", ops, n)
+	if state.LogNumber == 0 {
+		// The flush had not committed, so nothing was truncated: replay the log
+		// with no engine involved at all. It holds every acknowledged mutation.
+		var ops int
+		rec, err := wal.Recover(filepath.Join(dir, "wal"), wal.Handler{
+			Batch: func(b wal.Batch) error { ops += len(b); return nil },
+		})
+		if err != nil {
+			t.Fatalf("replaying the crashed log: %v", err)
+		}
+		if ops != n {
+			t.Fatalf("the log holds %d operations, want %d", ops, n)
+		}
+		t.Logf("window: before the flush's commit; wal recovery: %+v", rec)
+	} else {
+		t.Logf("window: after the flush's commit (log number %d); the segments below it are truncated", state.LogNumber)
 	}
-	t.Logf("wal recovery: %+v", rec)
+
+	// In every window, every acknowledged mutation is recovered.
+	s := reopenLSM(t, dir, 256<<20)
+	assertPrefixIntact(t, s, n, paddedValueFor)
+	if got := s.Len(); got != n {
+		t.Fatalf("recovered %d keys, want %d", got, n)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // ============================================================ compaction crashes

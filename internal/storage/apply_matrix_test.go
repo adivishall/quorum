@@ -207,10 +207,16 @@ func (st matrixStep) String() string {
 	}
 }
 
+// matrixScript ends with a flush, an entry that writes nothing, and a flush: the
+// last flush has an empty memtable and records the applied index alone (a
+// rotation and a MANIFEST edit with no table), the path SyncApplied takes after
+// a cycle of election no-ops and configuration entries.
 func matrixScript() ([]matrixStep, []applyStep) {
-	batches := append(applyScript(), applyStep{[]storage.Mutation{mput("e", "6"), mdel("c")}, ai(10, 3)})
+	batches := append(applyScript(),
+		applyStep{[]storage.Mutation{mput("e", "6"), mdel("c")}, ai(10, 3)},
+		applyStep{nil, ai(11, 4)})
 	b := func(i int) matrixStep { return matrixStep{batch: &batches[i]} }
-	return []matrixStep{b(0), b(1), {sync: true}, b(2), b(3), {flush: true}, b(4), b(5)}, batches
+	return []matrixStep{b(0), b(1), {sync: true}, b(2), b(3), {flush: true}, b(4), b(5), {flush: true}, b(6), {flush: true}}, batches
 }
 
 // crashKind is what the crash leaves on the disk.
@@ -234,7 +240,8 @@ type matrixCell struct {
 	after    int  // or crash after this many steps (when at is 0)
 	torn     bool // a crashing write is torn halfway
 	kind     crashKind
-	manifest *fault.Injection // a failure of the flush's MANIFEST append, then a crash
+	manifest *fault.Injection // a failure of a flush's MANIFEST append, then a crash
+	flushN   int              // which flush of the script (1-based) the manifest failure hits
 }
 
 func (c matrixCell) String() string {
@@ -246,7 +253,7 @@ func (c matrixCell) String() string {
 		where += " (torn)"
 	}
 	if c.manifest != nil {
-		where = fmt.Sprintf("manifest %s short %d", c.manifest.Op, c.manifest.Short)
+		where = fmt.Sprintf("manifest %s short %d at flush %d", c.manifest.Op, c.manifest.Short, c.flushN)
 	}
 	return fmt.Sprintf("%s/%s/%s", c.mode, where, c.kind.name)
 }
@@ -261,18 +268,23 @@ func matrixOpts(mode wal.SyncMode, cfs *crashFS) storage.Options {
 	return o
 }
 
-// runScript runs the script until the process dies and reports how many
-// batches were acknowledged written (Apply returned nil) and acknowledged
-// durable (by the sync mode, or a Sync or Flush that returned nil since).
-func runScript(t *testing.T, s *storage.LSMStore, cfs *crashFS, cell matrixCell, inj *fault.InjectFS) (written, durable int) {
+// runScript runs the script until the process dies and reports how many batches
+// were acknowledged written (Apply returned nil), acknowledged durable (by the
+// sync mode, or a Sync or Flush that returned nil since), and attempted (Apply
+// was called, whether or not it succeeded). A batch whose Apply failed at its
+// fsync can still be recovered after a PROCESS crash — its record reached the
+// kernel — so attempted, not written, bounds what recovery may observe (§7.2).
+func runScript(t *testing.T, s *storage.LSMStore, cfs *crashFS, cell matrixCell, inj *fault.InjectFS) (written, durable, attempted int) {
 	steps, _ := matrixScript()
 	ctx := context.Background()
+	flushes := 0
 	for i, st := range steps {
 		if cfs.isDead() {
 			return
 		}
 		switch {
 		case st.batch != nil:
+			attempted++
 			if err := s.Apply(ctx, st.batch.muts, st.batch.applied); err == nil {
 				written++
 				if cell.mode == wal.SyncAlways {
@@ -284,11 +296,13 @@ func runScript(t *testing.T, s *storage.LSMStore, cfs *crashFS, cell matrixCell,
 				durable = written
 			}
 		case st.flush:
-			if cell.manifest != nil {
+			flushes++
+			armed := cell.manifest != nil && flushes == cell.flushN
+			if armed {
 				inj.Arm(*cell.manifest)
 			}
 			err := s.Flush()
-			if cell.manifest != nil {
+			if armed {
 				if err == nil {
 					t.Fatalf("%s: premise: the flush succeeded although its MANIFEST append failed", cell)
 				}
@@ -307,30 +321,11 @@ func runScript(t *testing.T, s *storage.LSMStore, cfs *crashFS, cell matrixCell,
 	return
 }
 
-// survivors counts the batches whose records are whole in what is left on the
-// disk: the prefix the store must recover, no more and no less.
-func survivors(t *testing.T, mem *fault.MemFS, walDir string, ends []batchEnd) int {
-	t.Helper()
-	m := 0
-	for _, e := range ends {
-		data, ok := mem.Cached(filepath.Join(walDir, fmt.Sprintf("%06d.log", e.seg)))
-		if !ok || int64(len(data)) < e.end {
-			break
-		}
-		m++
-	}
-	return m
-}
-
-// batchEnd is where a batch's record ends: its segment and offset.
-type batchEnd struct {
-	seg uint64
-	end int64
-}
-
-// dryRun runs the script with no crash and returns how many WAL operations it
-// performs and where each batch's record ends.
-func dryRun(t *testing.T, mode wal.SyncMode) (int, []batchEnd, []string) {
+// dryRun runs the script with no crash and returns how many filesystem
+// operations it performs and what each one was. Since S3 a flush rotates the WAL
+// and truncates the segments below the new one, so the script spans several
+// segments by construction; the operation list drives the crash iteration.
+func dryRun(t *testing.T, mode wal.SyncMode) (int, []string) {
 	t.Helper()
 	dir := t.TempDir()
 	mem := fault.NewMemFS()
@@ -338,28 +333,38 @@ func dryRun(t *testing.T, mode wal.SyncMode) (int, []batchEnd, []string) {
 	cfs := &crashFS{mem: mem}
 	s := openLSM(t, dir, matrixOpts(mode, cfs))
 	defer s.Close()
-	steps, _ := matrixScript()
-	var ends []batchEnd
+	steps, batches := matrixScript()
 	segs := map[uint64]bool{}
-	for _, st := range steps {
+	var lastFlushTables int64
+	for i, st := range steps {
 		switch {
 		case st.batch != nil:
 			mustApply(t, s, *st.batch)
-			ws := s.WALStats()
-			ends = append(ends, batchEnd{seg: ws.ActiveSegment, end: ws.ActiveBytes})
-			segs[ws.ActiveSegment] = true
+			segs[s.WALStats().ActiveSegment] = true
 		case st.sync:
 			if err := s.Sync(); err != nil {
 				t.Fatal(err)
 			}
 		case st.flush:
+			before := s.FlushStats().Flushes
 			mustFlush(t, s)
+			segs[s.WALStats().ActiveSegment] = true
+			if i == len(steps)-1 {
+				lastFlushTables = s.FlushStats().Flushes - before
+			}
 		}
 	}
 	if len(segs) < 2 {
 		t.Fatalf("premise: the script should span WAL segments, it used %d", len(segs))
 	}
-	return cfs.n, ends, append([]string(nil), cfs.ops...)
+	// The script's last flush must be the watermark-only record: no table
+	// written, and the durable index brought to the last, data-less batch.
+	if last := batches[len(batches)-1]; !steps[len(steps)-1].flush || len(last.muts) != 0 ||
+		lastFlushTables != 0 || s.DurableApplied() != last.applied {
+		t.Fatalf("premise: the script's last flush wrote %d tables and left the durable index at %+v; "+
+			"want a watermark-only record of %+v", lastFlushTables, s.DurableApplied(), last.applied)
+	}
+	return cfs.n, append([]string(nil), cfs.ops...)
 }
 
 // durableStoreRoot makes dir a durable directory of mem, as the store's data
@@ -378,13 +383,12 @@ func durableStoreRoot(t *testing.T, mem *fault.MemFS, dir string) {
 }
 
 // runCell runs one cell and checks it. It reports the batches recovered.
-func runCell(t *testing.T, cell matrixCell, ends []batchEnd, opNames []string) int {
+func runCell(t *testing.T, cell matrixCell, opNames []string) int {
 	t.Helper()
 	_, batches := matrixScript()
 	want := models(batches)
 	keys := keysOf(batches)
 	dir := t.TempDir()
-	walDir := filepath.Join(dir, "wal")
 	mem := fault.NewMemFS()
 	durableStoreRoot(t, mem, dir)
 	cfs := &crashFS{mem: mem, at: cell.at, torn: cell.torn}
@@ -400,9 +404,9 @@ func runCell(t *testing.T, cell matrixCell, ends []batchEnd, opNames []string) i
 	}
 
 	s, err := storage.OpenLSMStore(dir, matrixOpts(cell.mode, cfs))
-	written, durable := 0, 0
+	written, durable, attempted := 0, 0, 0
 	if err == nil {
-		written, durable = runScript(t, s, cfs, cell, inj)
+		written, durable, attempted = runScript(t, s, cfs, cell, inj)
 		cfs.kill() // whatever is left of the script, the process dies here
 		if cell.kind.power {
 			mem.CrashPowerLoss(cell.kind.torn)
@@ -427,19 +431,38 @@ func runCell(t *testing.T, cell matrixCell, ends []batchEnd, opNames []string) i
 	if err != nil {
 		t.Fatalf("%s: the store does not open after the crash: %v\nops: %v", describe(), err, opNames)
 	}
-	// 2. R1, the prefix and the sequences: exactly the surviving batches.
-	m := survivors(t, mem, walDir, ends)
-	if d := diff(s, want[m], keys); d != "" {
-		t.Fatalf("%s: recovered state is not the model after the %d surviving batches: %s", describe(), m, d)
+	// 2. R1: the recovered state is a WHOLE prefix of the script. Each batch has
+	//    a distinct applied index, so the recovered applied index names the
+	//    prefix; the state, both sequences and every key must then match that
+	//    prefix entirely — never a batch in part. Since S3 the flushed prefix is
+	//    recovered from the table and the MANIFEST watermark (its WAL segments
+	//    are truncated), the rest from the surviving WAL suffix; this check does
+	//    not care which medium holds which, only that the whole is a clean prefix.
+	got := s.AppliedIndex()
+	m := -1
+	for i := range want {
+		if want[i].applied == got {
+			m = i
+			break
+		}
 	}
-	// 3. Durability as the contract promised it.
+	if m < 0 {
+		t.Fatalf("%s: recovered applied index %+v is no prefix of the script\nops: %v", describe(), got, opNames)
+	}
+	if d := diff(s, want[m], keys); d != "" {
+		t.Fatalf("%s: recovered state is not prefix %d whole (R1): %s\nops: %v", describe(), m, d, opNames)
+	}
+	// 3. The contract's bounds: recovery keeps at least everything acknowledged
+	//    durable — a Sync, or the flush, advances `durable`; a process crash also
+	//    keeps everything written, since its records reached the kernel — and
+	//    never observes a batch that was never attempted (§7.2).
 	floor := written
 	if cell.kind.power {
 		floor = durable
 	}
-	if m < floor {
-		t.Fatalf("%s: recovered %d batches, but %d were acknowledged %s", describe(), m, floor,
-			map[bool]string{true: "durable", false: "written"}[cell.kind.power])
+	if m < floor || m > attempted {
+		t.Fatalf("%s: recovered %d batches, outside the contract's [%d,%d] (floor..attempted)\nops: %v",
+			describe(), m, floor, attempted, opNames)
 	}
 	// 4. Recovered implies durable: a power loss right after the open changes nothing.
 	cfs.kill()
@@ -476,16 +499,23 @@ func runCell(t *testing.T, cell matrixCell, ends []batchEnd, opNames []string) i
 // segment creation, every append (whole or torn halfway), every fsync, every
 // rotation — and every point between steps, in sync and batch mode, under a
 // process crash, a power loss, and a power loss keeping a torn prefix of what
-// was not fsynced; and the flush's MANIFEST append failed before, during and
-// after its write. Each cell must recover exactly the batches whose records
-// survived — state, applied index and sequences together (R1) — at least those
-// the contract made durable, durably, and go on.
+// was not fsynced; and each flush's MANIFEST append — the last one a
+// watermark-only record — failed before, during and after its write. Each cell
+// must recover exactly the batches whose records survived — state, applied
+// index and sequences together (R1) — at least those the contract made durable,
+// durably, and go on.
 func TestApplyCrashMatrix(t *testing.T) {
 	cells := 0
 	byM := map[string]map[int]int{}
 	for _, mode := range []wal.SyncMode{wal.SyncAlways, wal.SyncBatch} {
-		nOps, ends, opNames := dryRun(t, mode)
+		nOps, opNames := dryRun(t, mode)
 		steps, _ := matrixScript()
+		nFlushes := 0
+		for _, st := range steps {
+			if st.flush {
+				nFlushes++
+			}
+		}
 		var all []matrixCell
 		for _, kind := range crashKinds {
 			for at := 1; at <= nOps; at++ {
@@ -497,17 +527,19 @@ func TestApplyCrashMatrix(t *testing.T) {
 			for after := 1; after <= len(steps); after++ {
 				all = append(all, matrixCell{mode: mode, after: after, kind: kind})
 			}
-			for _, inj := range []fault.Injection{
-				{Op: fault.OpWrite},           // nothing of the edit is written
-				{Op: fault.OpWrite, Short: 9}, // a torn edit
-				{Op: fault.OpSync},            // the edit written, its fsync failed
-			} {
-				inj := inj
-				all = append(all, matrixCell{mode: mode, kind: kind, manifest: &inj})
+			for flushN := 1; flushN <= nFlushes; flushN++ {
+				for _, inj := range []fault.Injection{
+					{Op: fault.OpWrite},           // nothing of the edit is written
+					{Op: fault.OpWrite, Short: 9}, // a torn edit
+					{Op: fault.OpSync},            // the edit written, its fsync failed
+				} {
+					inj := inj
+					all = append(all, matrixCell{mode: mode, kind: kind, manifest: &inj, flushN: flushN})
+				}
 			}
 		}
 		for _, cell := range all {
-			m := runCell(t, cell, ends, opNames)
+			m := runCell(t, cell, opNames)
 			cells++
 			key := mode.String() + "/" + cell.kind.name
 			if byM[key] == nil {

@@ -104,8 +104,10 @@ more entries — and the log then keeps growing (§16).
 1. encode the state (memory only), and ask the core for the term and the **configuration** at `S`
    (`ConfAt`, Phase 15). If the core does not know the configuration there — only a joiner that has
    not yet applied its group's first configuration entry — nothing is written and the node tries
-   again at the next applied entry; it never guesses (§19). Crash point `before-snapshot-publish`
-   follows;
+   again at the next applied entry; it never guesses (§19). A machine with a durable engine (the
+   LSM machine, S3) is then made durable through `S` (`SyncApplied`), before anything is published,
+   so a restart never finds the node's own snapshot above its engine
+   (`docs/STORAGE_INTEGRATION.md` §9.6). Crash point `before-snapshot-publish` follows;
 2. write `<log>.snap.tmp`, fsync it;
 3. rename it over `<log>.snap`, fsync the directory — **publication**: the snapshot is now the
    durable record of `[1, S]` — crash point `after-snapshot-publish`;
@@ -115,7 +117,8 @@ more entries — and the log then keeps growing (§16).
    (`raftlog.Log.Compact`) — crash point `after-log-compact`;
 5. discard the prefix in memory (`core.Compact(c)`).
 
-`c = S − SnapshotRetain` never exceeds the durable commit (`Compact` refuses otherwise) nor the
+`c = S − SnapshotRetain` — clamped, on a machine with a durable engine, to that engine's durable
+applied index (R2, S3) — never exceeds the durable commit (`Compact` refuses otherwise) nor the
 applied index (`MemoryLog.Compact` refuses otherwise). The log is never compacted before the
 snapshot covering it is durable: after every step recovery finds either the old state or the new
 one (§7). A failed write, fsync, rename or directory fsync fail-stops the node, as a failed Save
