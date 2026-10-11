@@ -1332,19 +1332,19 @@ writes afterward, numbered above everything durable (no durable sequence is ever
 | A crash part-way through replacing the engine leaves one that opens | `TestLSMMachineACrashWhileReplacingTheEngineLeavesOneThatOpens` |
 | R2 end to end: a real three-node LSM cluster compacts, and every boundary stays within a durable copy (a smoke check — with `SyncApplied` before every publish the clamp is never binding there; its wiring is pinned by the next row but one) | `TestR2CompactionStaysWithinADurableCopy` |
 
-Mutation: fourteen correctness-critical mutants for S3 — the applied index, the log number and the
-log start sequence each recorded at a flush; truncation bounded to below the log number; the
+Mutation: thirty correctness-critical mutants for S3, each killed by the intended regression above
+and none by an unrelated failure. Eleven from the first cut — the applied index, the log number and
+the log start sequence each recorded at a flush; truncation bounded to below the log number; the
 sequence seeded from the MANIFEST; a missing required segment refused; a leftover segment swept;
 the R2 clamp; the watermark advancing only at a flush; the machine reporting the engine's durable
-index rather than the live one; snapshot creation making the engine durable (`SyncApplied`); and,
-from the final review, the empty-memtable record — made at all, made after a rotation, and followed
-by truncation — then (mutants 356–368) the first-segment rule, the replay anchor, the applied
-sequence recorded at both kinds of flush and seeded at recovery, the missing-directory, gap and
-empty-log refusals, `compact` reading the durable index, the sync before the publish, the restore's
-no-op first, the old engine set aside, and open removing it; and (369–371, from the review of
-those fixes) a failed restore failing stop, a new engine directory synced into its parent, and a
-failed engine sync stopping the snapshot: thirty in all, each killed by the intended regression
-above, none by an unrelated failure. Three S1 mutants whose
+index rather than the live one; snapshot creation making the engine durable (`SyncApplied`). Three
+(353–355) for the empty-memtable record — made at all, made after a rotation, followed by
+truncation. Thirteen (356–368) from the final review — the first-segment rule, the replay anchor,
+the applied sequence recorded at both kinds of flush and seeded at recovery, the missing-directory,
+gap and empty-log refusals, `compact` reading the durable index, the sync before the publish, the
+restore's no-op first, the old engine set aside, and open removing it. And three (369–371) from the
+review of those fixes — a failed restore failing stop, a new engine directory synced into its
+parent, a failed engine sync stopping the snapshot. Three S1 mutants whose
 anchor (the explicit pre-MANIFEST `WAL.Sync()`) S3 removed were re-anchored to the rotation that now
 provides the same ordering: the rotation before the record, the replay flush skipping the rotation,
 and the `SyncOff` fsync skip. The existing WAL, apply-batch and MANIFEST fuzz targets run unchanged
@@ -1353,24 +1353,38 @@ both).
 
 ### 9.12 Evidence
 
-Every gate below ran sequentially on the branch's final code revision, `137b28b` (Apple M4, macOS;
-the two docs-only commits after it change no Go code), after the two defects of §9.10 were fixed.
-The earlier run that *found* those defects is not reported here.
+Every gate below ran sequentially on the branch's final code revision, `2408d73` (Apple M4, macOS,
+**go1.27.2**; nothing else running; the commit after it adds only this evidence), after the defects
+of §9.10 — both reviews' — were fixed. Earlier runs, including the ones that *found* defects, are
+not reported as evidence; they are §9.10's history.
 
 | Gate | What it covers | Result |
 |---|---|---|
-| `make check` (fmt, ignore, vet, every unit package under `-race`) | storage, WAL, MANIFEST, kv on both machines, raftnode, raftsim, multiraft | pass, 191 s |
-| `make integration` | 89 real-process tests on the in-memory machine: linearizability, dedup/retry, snapshots, membership, chaos, the engine crash tests (`lsm_crash_test`, `crash_test`) | pass, 395 s |
-| `make integration-lsm` | the same 89 tests with every `dkvd` on the LSM machine (`event=state_machine kind=lsm`), including the eight `TestReal*Snapshot*` tests that the first cut failed | pass, 403 s |
-| `make faults FAULT_SEEDS=200` | the deterministic simulator: 200-seed fault schedules, the crash, snapshot and membership matrices, seeded KV histories checked for linearizability, multi-group isolation, the bounded membership model at depth 4 | pass, 154 s |
-| `make fuzz` | 35 of 35 fuzz targets, 10 s each — the WAL and apply-batch decoders, the MANIFEST edit decoder (now with tag `0x07`), the record framing | pass, 393 s |
-| `make mutation` | all 354 mutants, including the eleven S3 mutants and the three re-anchored S1 ones (§9.11); each killed by its intended test, none by an unrelated failure | 354 / 354 killed, 942 s |
+| `make check` (fmt, ignore, vet, every unit package under `-race`) | storage, WAL, MANIFEST, kv on both machines, raftnode, raftsim, multiraft | pass, 189 s |
+| `make race-lsm` | every `internal/kv` test again with the group's machine in the engine | pass, 67 s |
+| staticcheck (`SA*`, the CI pin) and govulncheck v1.8.0 | correctness checks; known vulnerabilities in the code's call graph and imports | pass; **"No vulnerabilities found."** |
+| `make integration` | 89 real-process tests on the in-memory machine: linearizability, dedup/retry, snapshots, membership, chaos, the engine crash tests (`lsm_crash_test`, `crash_test`) | 89 pass, 401 s |
+| `make integration-lsm` | the same 89 tests with every `dkvd` on the LSM machine, including the `TestReal*Snapshot*` tests that the first cut failed | 89 pass, 390 s |
+| `make faults FAULT_SEEDS=200` | the deterministic simulator: 200-seed fault schedules, the crash, snapshot and membership matrices, seeded KV histories checked for linearizability, multi-group isolation, the bounded membership model at depth 4 | pass, 132 s |
+| `make fuzz` | 35 of 35 fuzz targets, 10 s each — the WAL and apply-batch decoders, the MANIFEST edit decoder (now with tags `0x07` and `0x08`), the record framing | pass, 389 s |
+| `make mutation` | all 373 mutants, including the thirty S3 mutants and the three re-anchored S1 ones (§9.11); each killed by its intended test, none by an unrelated failure | 373 / 373 killed, 966 s |
+
+**Toolchain.** `go.mod` pins `go 1.27.2`, which CI installs (`setup-go` reads `go-version-file`).
+On go1.27.1 the check job's govulncheck found nine reachable standard-library vulnerabilities
+(`net/http`, its HTTP/2 implementation, `net/textproto`, `crypto/tls`: GO-2026-6603, 6605, 6607,
+6608, 6610, 6611, 6612, 6613, 6617) and four more imported or required but not called (GO-2026-6599,
+6600, 6604, 6609), all fixed in go1.27.2; under it govulncheck finds none. go1.27.2 writes export
+data version 5, which the latest staticcheck release (v0.8.1) cannot read, so CI pins staticcheck to
+the master commit that moved to `golang.org/x/tools` v0.51.0 (same `SA*` checks; it flags a planted
+bug and reports nothing on this tree). No application code changed for the toolchain.
 
 Real multi-node evidence specific to S3: `TestR2CompactionStaysWithinADurableCopy` (three LSM
 nodes, snapshots every 8 entries, the default memtable so only `SyncApplied` flushes) shows every
-node's compaction boundary at or below both its engine's durable applied index and its published
-snapshot, with the clamp in force; `integration-lsm` shows real `dkvd` processes compacting their logs
-and sending followers snapshots on the engine, which the first cut could not.
+node's compaction boundary at or below its published snapshot and its engine's durable applied
+index — a smoke check, since with the sync before every publish the clamp is not binding there;
+`TestSnapshotSyncsTheEngineFirstAndCompactsOnlyToItsDurableIndex` pins the clamp's wiring with a
+lagging durable index; `integration-lsm` shows real `dkvd` processes compacting their logs and
+sending followers snapshots on the engine, which the first cut could not.
 
 Power-loss model and its boundary (unchanged from S1, §7.6): `fault.MemFS` keeps only fsynced bytes
 and only names whose directory was fsynced, optionally with a torn prefix of unsynced appends; it
@@ -1380,7 +1394,9 @@ the model; SSTable writes still use `os` directly. Modeled power loss is not dev
 **Benchmark (micro, not a cluster measurement).** `BenchmarkLSMPut` (the write path, `off` and
 `batch` modes) and `BenchmarkLSMRecovery` (restart after 50,000 puts into 512 KiB memtables), on
 `main` at S2 (`09e421c`) and on S3 (`137b28b`), each built in its own worktree, `-count=5`,
-medians:
+medians. Not re-run on the final revision: the fixes after `137b28b` add one varint to a flush's
+edit and a record when a flush finds the memtable empty, which neither benchmark exercises; the
+toolchain moved from go1.27.1 to go1.27.2.
 
 | Benchmark | S2 (`main`) | S3 | Change |
 |---|---|---|---|
