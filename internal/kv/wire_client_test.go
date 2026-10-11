@@ -270,9 +270,27 @@ func TestWireClientReportsUnknownWhenTheConnectionDies(t *testing.T) {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	_, err = cl.Put(ctx, []byte("k"), []byte("w"))
-	if !errors.Is(err, kv.ErrUnknown) && !errors.Is(err, kv.ErrUnavailable) {
-		t.Fatalf("after the server died: %v, want ErrUnknown or ErrUnavailable", err)
+	// The listener closing is one goroutine's reaction to the cancellation;
+	// closing each open connection is another's, and it can lag (seen in CI).
+	// Until it runs, the server answers on the old connection — UNKNOWN, its
+	// context being canceled — and the client rightly keeps a connection that
+	// answers. So the test does not assume which attempt finds the connection
+	// gone: every attempt after the server died is ErrUnknown or ErrUnavailable,
+	// never a success or anything else, and once the connection is gone the
+	// reconnect to the dead address is ErrUnavailable.
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		_, err = cl.Put(ctx, []byte("k"), []byte("w"))
+		if errors.Is(err, kv.ErrUnavailable) {
+			break // the connection is gone, and the dead address refused the reconnect
+		}
+		if !errors.Is(err, kv.ErrUnknown) {
+			t.Fatalf("after the server died: %v, want ErrUnknown or ErrUnavailable", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the client never reported the dead address as ErrUnavailable; last: %v", err)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 	if _, err := cl.Put(ctx, []byte("k"), []byte("w")); !errors.Is(err, kv.ErrUnavailable) {
 		t.Fatalf("reconnect to a dead address: %v, want ErrUnavailable", err)
