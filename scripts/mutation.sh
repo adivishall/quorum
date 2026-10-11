@@ -2269,10 +2269,8 @@ mutant "wal-close-reports-the-latch" internal/storage/wal/wal.go \
 # does not rotate a WAL that does not exist (S3 §9.7). Dropping the guard makes
 # the replay flush dereference a nil WAL.
 mutant "replay-flush-skips-the-rotation" internal/storage/lsmstore.go \
-  '	var logNumber uint64
-	if s.w != nil {' \
-  '	var logNumber uint64
-	if s.w != nil || true {' \
+  '	recordWatermark := s.w != nil' \
+  '	recordWatermark := true' \
   ./internal/storage '^TestAReplayThatFlushesOpens$'
 
 # 264. Close after a failed WRITE still flushes the records acknowledged before it.
@@ -2943,7 +2941,7 @@ mutant "flush-records-the-log-start-sequence" internal/storage/lsmstore.go \
 #       never compacts — a lagging follower is never sent a snapshot.
 mutant "snapshot-makes-the-engine-durable" internal/raftnode/snapshot.go \
   '		if err := da.SyncApplied(); err != nil {' \
-  '		if err := error(nil); err != nil {' \
+  '		if err := error(nil); da == nil || err != nil {' \
   ./internal/kv '^TestR2CompactionStaysWithinADurableCopy$'
 
 # 345. S3: a flush does not record the log number — the reopen cannot tell where
@@ -2963,7 +2961,7 @@ mutant "truncation-keeps-the-log-number-segment" internal/storage/wal/wal.go \
 # 347. S3: recovery does not seed the sequence from the MANIFEST's LastSequence —
 #      the surviving records are numbered from zero and collide with the tables.
 mutant "recovery-seeds-the-sequence" internal/storage/lsmstore.go \
-  '		s.seq = lastSeq' \
+  '		s.seq = logStartSeq' \
   '		s.seq = 0' \
   ./internal/storage '^TestSequenceAndAppliedContinuityAcrossReopen$'
 
@@ -2991,12 +2989,12 @@ mutant "compaction-clamps-to-the-durable-index" internal/raftnode/snapshot.go \
 # 351. S3 (R2): the durable watermark does not advance at a flush, so it never
 #      reflects what the engine has made recoverable.
 mutant "durable-watermark-advances-at-flush" internal/storage/lsmstore.go \
-  '	s.mu.Lock()
-	s.flushedApplied = s.applied
-	s.mu.Unlock()' \
-  '	s.mu.Lock()
-	_ = s.applied
-	s.mu.Unlock()' \
+  '		s.mu.Lock()
+		s.flushedApplied = s.applied
+		s.mu.Unlock()' \
+  '		s.mu.Lock()
+		_ = s.applied
+		s.mu.Unlock()' \
   ./internal/storage '^TestDurableAppliedAdvancesOnlyAtFlush$'
 
 # 352. S3 (R2): the machine reports the live applied index, not the engine's
