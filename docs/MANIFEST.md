@@ -75,6 +75,7 @@ DESIGN's operation numbers are preserved as **field tags inside the payload**:
 | `0x05` | SetLogNumber | `u` |
 | `0x06` | SetApplied | `raftIndex`, `raftTerm` |
 | `0x07` | SetLogStartSeq | `u` — the sequence before the log number's first record (S3) |
+| `0x08` | SetAppliedSeq | `u` — the sequence of the last mutation the applied index covers (S3) |
 
 Integers are uvarints and byte strings are uvarint-length-prefixed, matching the WAL's payload
 convention (`docs/DESIGN.md` §3, "all lengths are uvarint") rather than introducing a second style
@@ -108,8 +109,10 @@ bring the engine to, atomically with the data (`AddFile`) and the sequence (`Set
 **`SetLogStartSeq`** (tag `0x07`, added in S3) records the sequence before the log number's first
 record. Recovery seeds the applied index from `Applied` and the sequence from `LogStartSeq` — not
 from `LastSequence`, which a flush *during replay* advances without moving the log — then advances
-both by replaying the surviving log. The three watermark fields are written together by a real flush
-only, so they are always mutually consistent (`docs/STORAGE_INTEGRATION.md` §9.2, §9.7). A `Flush`
+both by replaying the surviving log. **`SetAppliedSeq`** (tag `0x08`, added in S3) records the
+sequence of the last mutation the last apply batch held — what `AppliedSequence` reports — because
+the batch it was read from is truncated with the rest. The three watermark fields and `AppliedSeq`
+are written together by a real flush only, so they are always mutually consistent (`docs/STORAGE_INTEGRATION.md` §9.2, §9.7). A `Flush`
 with an empty memtable whose applied index has moved — entries that wrote nothing — appends the same
 three fields and `SetLastSequence` with no `AddFile` (§9.3 there); with nothing new it appends nothing. It is still not a *second* authority competing with the WAL: after truncation the
 WAL below the log number is gone, so the MANIFEST is the only place the flushed prefix's index and
@@ -306,7 +309,7 @@ block-count claim here is unaffected.
 | Limitation | Removed in |
 |---|---|
 | The WAL was never truncated, so startup replayed every mutation ever written. `SetLogNumber` was recorded but not acted on | **removed in S3**: a flush records the log number and truncates the segments below it (`docs/STORAGE_INTEGRATION.md` §9) |
-| Segments missing from the *start* of the WAL were undetectable | **removed in S3**: recovery refuses a WAL whose lowest segment is above the MANIFEST's log number |
+| Segments missing from the *start* of the WAL were undetectable | **removed in S3**: recovery refuses a WAL whose lowest segment is above the MANIFEST's log number, or, with no log number recorded, above segment 1 |
 | A manifest grows within one session (one record per flush and per compaction) and is only compacted by reopening | deferred; a within-session rotation threshold would be the fix |
 | A Phase 3 directory needs an explicit opt-in to open | deliberate, §8 |
 | Damage inside a data block is found at read time rather than at startup, unless `VerifySSTablesOnOpen` is set | deliberate trade, §6 |

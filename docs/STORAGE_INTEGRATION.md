@@ -957,11 +957,11 @@ governs: Raft decides order; the engine makes the result durable; the engine inv
 | 3 | What makes this sound today? | Nothing deletes a WAL segment (`docs/WAL.md` §10, `docs/MANIFEST.md` §4, §11). Replay always reads the whole log from segment 1, so counting reproduces the exact numbering and the last apply record reproduces the applied index. |
 | 4 | What would truncation break? | Both derivations. Delete segment 1 and replay starts at segment 2 and numbers its first record `seq = 1` — but that record's true sequence is far higher, so every table's sequence range and the memtable would disagree, and the applied index of the deleted prefix would be lost. Truncation is therefore impossible until the MANIFEST is the authority for both numbers. |
 | 5 | Is R2 enforced? | No. `raftnode.Durable.compact` discards the Raft log through `snapshotIndex − Retain`, gated only by the snapshot schedule. Nothing consults the engine's durable applied index. In S2 this is safe only because the published snapshot — fsynced before the log is compacted — is itself a durable copy of the compacted prefix (§9.6 states this precisely). |
-| 6 | Does the MANIFEST format need to change? | Minimally. The edit format already carries `SetLogNumber` (tag `0x05`) and `SetApplied` (tag `0x06`), round-tripped and strictly decoded since Phase 4 (`docs/MANIFEST.md` §3); S3 starts **writing** them at each flush and **reading** them at open. One tag is added — `SetLogStartSeq` (`0x07`), the replay seed (§9.2) — because reusing `LastSequence` as the seed is unsafe across a flush during replay (§9.10). No version bump; a pre-S3 directory still opens unchanged (§9.8). |
+| 6 | Does the MANIFEST format need to change? | Minimally. The edit format already carries `SetLogNumber` (tag `0x05`) and `SetApplied` (tag `0x06`), round-tripped and strictly decoded since Phase 4 (`docs/MANIFEST.md` §3); S3 starts **writing** them at each flush and **reading** them at open. Two tags are added — `SetLogStartSeq` (`0x07`), the replay seed (§9.2), because reusing `LastSequence` as the seed is unsafe across a flush during replay (§9.10), and `SetAppliedSeq` (`0x08`), because truncation deletes the apply batch the applied sequence was read from (§9.10). No version bump; a pre-S3 directory still opens unchanged (§9.8). |
 
 ### 9.2 The authoritative MANIFEST metadata
 
-Four fields in the MANIFEST become authoritative; three were already in the format and one is added:
+Five fields in the MANIFEST become authoritative; three were already in the format and two are added:
 
 - **`Applied` (index, term).** The applied index the flushed tables bring the engine to. Set in
   the same edit that adds a real flush's SSTable, so it advances atomically with the data it covers
@@ -972,19 +972,29 @@ Four fields in the MANIFEST become authoritative; three were already in the form
 - **`LogStartSeq`** (new, tag `0x07`). The sequence before segment `LogNumber`'s first record: the
   value replay **seeds** its counter from. S3 maintains the invariant that **segment `LogNumber`
   begins exactly at sequence `LogStartSeq + 1`.**
+- **`AppliedSeq`** (new, tag `0x08`). The sequence of the last mutation the last apply batch held:
+  the data `Applied` covers is exactly the mutations through it (`AppliedSequence`). It differs from
+  `LogStartSeq` when writes outside apply batches (`Put`, `Delete`) followed the last batch, and the
+  batch it would otherwise be read from is among the truncated records.
 - **`LastSequence`.** The highest sequence number any flushed table holds, as before. It is *not*
   the replay seed: a flush during replay advances it without moving the log (§9.7), so only
   `LogStartSeq` stays consistent with `LogNumber`.
 
-The three watermark fields — `LogNumber`, `LogStartSeq`, `Applied` — are written **together, in
-one edit, only by a real flush** (one with a WAL to rotate), so they are always mutually consistent.
-Recovery decodes every field strictly (an unknown tag or a truncated value is `ErrCorrupt`) and
-validates them against the live file set and the WAL: the lowest segment present must be
-`LogNumber` (§9.5), and `Applied` only moves forward from the MANIFEST floor.
+The three watermark fields — `LogNumber`, `LogStartSeq`, `Applied` — and `AppliedSeq` are written
+**together, in one edit, only by a real flush** (one with a WAL to rotate), so they are always
+mutually consistent. Recovery decodes every field strictly (an unknown tag or a truncated value is
+`ErrCorrupt`) and validates them against the live file set and the WAL: the lowest segment present
+must be `LogNumber` (§9.5), and every apply record replayed must advance the applied index past the
+MANIFEST's `Applied` — replay's advance check starts there, as the truncated records would have left
+it, so a record below the durable watermark is `ErrCorrupt`, as it was before S3 when the whole log
+was read.
 
-`LogNumber == 0` means "no truncation has happened": replay starts at the first segment present
-and counts from 0, exactly as before S3. This is what a pre-S3 directory decodes to, so such a
-directory opens and replays unchanged (§9.8).
+`LogNumber == 0` means "no truncation has happened": replay starts at segment 1 and counts from 0,
+exactly as before S3. Nothing truncates a log without first recording a log number, so with none
+recorded the log must begin at segment 1; a lowest segment above it means the log's start is gone
+(an S3 directory whose MANIFEST was lost, say) and is `ErrCorrupt` — counting the rest from zero
+would mis-number every record. This is what a pre-S3 directory decodes to, so such a directory
+opens and replays unchanged (§9.8).
 
 ### 9.3 The watermark commit point
 
@@ -999,7 +1009,7 @@ becomes durable. The order, with each step chosen for what a crash immediately a
    `seq L+1` onward, so it begins exactly at `LogStartSeq + 1`. (`s.w == nil` during a replay
    flush: no WAL yet, so this step and `LogNumber` are skipped — §9.7.)
 4. **Append the MANIFEST edit** — `AddFile(N)`, `SetNextFileNum`, `SetLastSequence(L)`,
-   `SetLogNumber(A+1)`, `SetLogStartSeq(L)`, `SetApplied(A)` — as **one record**, fsynced by
+   `SetLogNumber(A+1)`, `SetLogStartSeq(L)`, `SetApplied(A)`, `SetAppliedSeq` — as **one record**, fsynced by
    `manifest.Append`. **This is the commit point.** Before it, the flush has not happened; after
    it, the table is live and the watermark is `(L, A)` with the log starting at segment `A+1`.
 5. **Swap** the in-memory version to include table `N`. (as today)
@@ -1011,7 +1021,7 @@ becomes durable. The order, with each step chosen for what a crash immediately a
 entry — advances the applied index without adding to the memtable. A `Flush` with an empty memtable
 whose applied index has moved since the last record therefore still records it: steps 3, 4 and 6
 without a table — rotate, append `SetLastSequence(L)`, `SetLogNumber`, `SetLogStartSeq(L)`,
-`SetApplied(A)` as one fsynced edit with no `AddFile`, truncate. With the memtable empty every
+`SetApplied(A)`, `SetAppliedSeq` as one fsynced edit with no `AddFile`, truncate. With the memtable empty every
 sequence through `L` is already in a recorded table (a flush failure latches, so no frozen memtable
 is left behind), so the edit is exact. With nothing new it records nothing. (Found in the final
 review, §9.10.)
@@ -1068,13 +1078,17 @@ never compacted past it.
 The clamp alone would starve compaction: an engine with the default 4 MiB memtable rarely flushes,
 its durable index would sit at 0, the log would never compact, and a lagging follower would never be
 sent a snapshot (§9.10). So the interface has a second method, **`SyncApplied`**, which snapshot
-creation calls after publishing the snapshot and before compacting: the LSM machine flushes its
-engine, advancing the durable index to the snapshot's index — even when the cycles since the last
+creation calls **before publishing** the snapshot (and so before compacting): the LSM machine
+flushes its engine, advancing the durable index to the snapshot's index — even when the cycles since the last
 flush wrote nothing (§9.3's empty-memtable record) — and `compact` then proceeds to
 `snapshotIndex − Retain`. The compacted prefix is thereby durable in the engine's **own tables**,
 not only in the snapshot file — the stronger property — at the cost of one engine flush per
 snapshot, on the actor (measured in S5 with the two-log decision). A failed `SyncApplied` is a
-durability failure: the node stops, as on a failed publish.
+durability failure: the node stops, as on a failed publish. It comes before the publish, not after:
+otherwise a power loss between the two leaves a published snapshot above an engine that lost its
+unsynced tail, and the restart must replace the whole engine from the file — which the LSM machine
+refuses outright for a state larger than one restore batch (§9.10). Synced first, a node never
+finds its own snapshot above its engine, and restoring it at a restart is a no-op.
 
 What this does and does not change. In S2's architecture a compaction is always immediately
 preceded by a snapshot that is fsynced at an index at or above the compaction point, and that
@@ -1098,12 +1112,16 @@ The boundary distinctions this rests on, stated explicitly:
 
 At open, after recovering the MANIFEST and before replaying the WAL:
 
-- Seed `applied = Applied` (the MANIFEST floor) and, when `LogNumber > 0`, `seq = LogStartSeq`.
+- Seed `applied = Applied` (the MANIFEST floor) and, when `LogNumber > 0`, `seq = LogStartSeq` and
+  `appliedSeq = AppliedSeq`.
 - Delete any WAL segment below `LogNumber` (a leftover from an interrupted step 6), then verify the
-  lowest segment present equals `LogNumber`; a higher lowest segment is `ErrCorrupt`.
+  lowest segment present equals `LogNumber` and the rest are contiguous — before a single record is
+  replayed; a higher lowest segment, a gap, or a WAL directory that is gone is `ErrCorrupt`. With
+  `LogNumber == 0` the lowest segment must be segment 1.
 - Replay from `LogNumber` (or segment 1 when `LogNumber == 0`): each mutation advances `seq`; a
   record at or below the flushed sequence (the live tables' maximum `LargestSeq`) is already in a
-  table and is skipped; each apply record advances `applied` from the MANIFEST floor.
+  table and is skipped; each apply record must advance `applied` past the MANIFEST floor (or the
+  record before it), or it is `ErrCorrupt`.
 
 A flush triggered **during** replay (recovering a log larger than memory) has no WAL to rotate. It
 records only `AddFile`, `SetNextFileNum` and `SetLastSequence` — the file set and the flushed
@@ -1123,9 +1141,9 @@ writes afterward, numbered above everything durable (no durable sequence is ever
 
 - A pre-S3 directory decodes to `LogNumber == 0` (and no `LogStartSeq`) and replays from segment 1
   counting from 0, with `Applied` as it was — identical to S2. The first S3 flush then rotates and
-  sets the watermark trio, enabling truncation from that point. No migration. The one format change
-  is the added tag `0x07`; a pre-S3 binary refuses a MANIFEST that carries it, as it refuses any
-  unknown tag — but a downgrade was already unsupported, because a pre-S3 binary would replay a
+  sets the watermark trio, enabling truncation from that point. No migration. The format change is
+  the two added tags `0x07` and `0x08`; a pre-S3 binary refuses a MANIFEST that carries them, as it
+  refuses any unknown tag — but a downgrade was already unsupported, because a pre-S3 binary would replay a
   truncated WAL from segment 1 and renumber it.
 - After restart the next sequence is strictly above `LastSequence` and above every surviving
   record's sequence, so a durable sequence is never reused and live tables keep pairwise-disjoint
@@ -1175,6 +1193,61 @@ writes afterward, numbered above everything durable (no durable sequence is ever
   `TestAFlushRecordsAnAppliedIndexThatMovedWithoutData`,
   `TestLSMMachineSyncAppliedCoversACycleWithoutWrites`, and the crash matrix, whose script now ends
   with a data-less entry and a watermark-only flush; all three fail on the old behaviour.
+- **The rest of the final review.** Five independent reviewers (R1, MANIFEST authority, truncation
+  order, R2, recovery), every finding checked by two skeptics and the code read rather than the
+  docs, then a completeness critic. Besides the defect above it found these, each fixed with a
+  regression test that fails on the old code (each test is the intended killer of a mutant that
+  reverts its fix):
+  - *Adopting a truncated WAL lost writes.* With no log number recorded, replay started at the
+    lowest segment present and counted from zero. Before S3 that was always segment 1; S3 deletes
+    prefixes, so an S3 directory that lost its MANIFEST, opened with `AdoptLegacySSTables`, replayed
+    its surviving records mis-numbered, skipped the first of them as already flushed, and reported
+    success. Reachable only by that operator action after damage, never by a crash. With no log
+    number the log must now begin at segment 1 (`TestAdoptingATruncatedLogIsRefused`).
+  - *Replay's advance check was not anchored after truncation.* It started from zero instead of the
+    MANIFEST's `Applied`, so a record below the durable watermark — damage the CRC cannot see, or a
+    writer bug; the writer itself refuses one — was accepted and dropped the applied index under the
+    watermark R2 compacts against; §9.2 claimed the check existed. `RecoverFrom` now takes the
+    MANIFEST's `Applied` as the anchor (`TestReplayIsAnchoredToTheManifestApplied`).
+  - *`AppliedSequence` came back wrong after a flush.* Recovery seeded it from `LogStartSeq`,
+    crediting `Put`/`Delete` made after the last apply batch to the applied index; the batch that
+    held the true value had been truncated. A regression of the S1 contract, with no production
+    caller (the LSM machine writes only through apply batches). Tag `0x08` `AppliedSeq` records it
+    with the watermark (`TestAppliedSequenceSurvivesAFlushAfterWritesOutsideBatches`).
+  - *A node whose state exceeded one restore batch could never restart after its own snapshot.* At
+    every start raftnode restores the published snapshot; `RestoreSnapshot` measured the state
+    (about 63 MiB, one WAL record) before noticing its engine already held that index, and refused.
+    S2's ordering, but on the restart path S3's R2 work makes a no-op. The no-op is now decided
+    first (`TestLSMMachineRestartsOnItsOwnSnapshotBeyondOneRestoreBatch`). Installing such a state
+    from a leader is still refused — that is S4's limit.
+  - *`SyncApplied` ran after the publish* (above, §9.6), leaving the window in which a restart had
+    to restore the node's own snapshot whole. It now runs first
+    (`TestSnapshotSyncsTheEngineFirstAndCompactsOnlyToItsDurableIndex`, which also covers the next
+    item).
+  - *A crash while a restore deleted the old engine left a node that could not start.* `RemoveAll`
+    is not atomic; a crash part-way left an engine whose MANIFEST named a table or WAL segment that
+    was gone, the open refused it (S3 added two such refusals to S2's), and the node never reached
+    the restore that would replace it. Fail-stop, not loss. The old engine is now renamed aside,
+    the rename fsynced, then deleted; open removes anything left aside
+    (`TestLSMMachineACrashWhileReplacingTheEngineLeavesOneThatOpens`, which crashes the deletion
+    part-way through a test seam).
+  - *Test gaps.* Nothing exercised `compact` reading the machine's durable index — the cluster
+    test's clamp premise held without it, and a mutant removing the read survived every test — and
+    nothing pinned the refusal of a missing WAL directory, a gap above the log number, or a WAL
+    with no segment left. The gap refusal also turned out to be backed by a second check (the WAL
+    writer's listing, at the end of open), so the store-level test could not see it go; a WAL-level
+    test now requires the refusal before any record reaches the engine
+    (`TestRecoverFromRefusesAGapBeforeReplaying`).
+  - *Stale comments* that still named `LastSequence` as the seed, said nothing acts on the log
+    number, or that the MANIFEST's `Applied` is never read back, are corrected.
+
+  Reviewed and *not* changed: a duplicated field tag in one edit decodes last-wins (harmless: the
+  writer never emits one); under `SyncOff`, a power loss after a flush leaves a directory recovery
+  refuses (`SyncOff` is test-only and promises no durability; pre-S3 code refused the same state).
+  Recorded as limitations, not fixed here (§9.13): WAL segment and SSTable numbers are six digits
+  and never reused, and S3 consumes them faster (a rotation per flush and per snapshot); and no test
+  cuts power to a whole LSM-backed cluster, nor does the deterministic simulator run a machine with
+  a durable index.
 - Dropping the explicit pre-MANIFEST `WAL.Sync()` was safe only because the rotation already syncs
   and closes the outgoing segment. The S1 mutants that guarded that sync (`flush-syncs-the-wal-first`,
   `replay-flush-has-no-wal-to-sync`, `syncoff-flush-does-not-fsync`) were re-anchored to the
@@ -1209,6 +1282,13 @@ writes afterward, numbered above everything durable (no durable sequence is ever
 | R2: the machine reports the engine's durable index, not the live one | `TestLSMMachineDurableAppliedIsTheEnginesFlushedIndex` |
 | A flush with an empty memtable records an applied index that moved without data; with nothing new it records nothing | `TestAFlushRecordsAnAppliedIndexThatMovedWithoutData` |
 | R2: `SyncApplied` brings the durable index to the applied index after a cycle that wrote nothing | `TestLSMMachineSyncAppliedCoversACycleWithoutWrites` |
+| R2 in the real snapshot path: compaction bounded by a lagging durable index; the engine synced before every publish | `TestSnapshotSyncsTheEngineFirstAndCompactsOnlyToItsDurableIndex` |
+| A WAL directory gone, a gap above the log number, no segment left — all refused | `TestALostWALUnderALogNumberIsRefused`, `TestRecoverFromRefusesAGapBeforeReplaying` |
+| No log number: the log must begin at segment 1 (adopting a truncated WAL is refused) | `TestAdoptingATruncatedLogIsRefused`, `TestRecoverWithoutALogNumberRequiresTheFirstSegment` |
+| Replay's advance check is anchored to the MANIFEST's `Applied` | `TestReplayIsAnchoredToTheManifestApplied` |
+| `AppliedSequence` survives a flush after writes outside apply batches | `TestAppliedSequenceSurvivesAFlushAfterWritesOutsideBatches` |
+| A restart restores its own snapshot as a no-op, whatever the state's size | `TestLSMMachineRestartsOnItsOwnSnapshotBeyondOneRestoreBatch` |
+| A crash part-way through replacing the engine leaves one that opens | `TestLSMMachineACrashWhileReplacingTheEngineLeavesOneThatOpens` |
 | R2 end to end: a real three-node LSM cluster never compacts past a durable copy, with the clamp in force | `TestR2CompactionStaysWithinADurableCopy` |
 
 Mutation: fourteen correctness-critical mutants for S3 — the applied index, the log number and the
@@ -1217,11 +1297,16 @@ sequence seeded from the MANIFEST; a missing required segment refused; a leftove
 the R2 clamp; the watermark advancing only at a flush; the machine reporting the engine's durable
 index rather than the live one; snapshot creation making the engine durable (`SyncApplied`); and,
 from the final review, the empty-memtable record — made at all, made after a rotation, and followed
-by truncation — each killed by the intended regression above, none by an unrelated failure. Three S1 mutants whose
+by truncation — then (mutants 356–368) the first-segment rule, the replay anchor, the applied
+sequence recorded at both kinds of flush and seeded at recovery, the missing-directory, gap and
+empty-log refusals, `compact` reading the durable index, the sync before the publish, the restore's
+no-op first, the old engine set aside, and open removing it: twenty-seven in all, each killed by the
+intended regression above, none by an unrelated failure. Three S1 mutants whose
 anchor (the explicit pre-MANIFEST `WAL.Sync()`) S3 removed were re-anchored to the rotation that now
 provides the same ordering: the rotation before the record, the replay flush skipping the rotation,
 and the `SyncOff` fsync skip. The existing WAL, apply-batch and MANIFEST fuzz targets run unchanged
-over the new record usage, the MANIFEST one now also decoding tag `0x07`.
+over the new record usage, the MANIFEST one now also decoding tags `0x07` and `0x08` (seeded with
+both).
 
 ### 9.12 Evidence
 
@@ -1274,38 +1359,58 @@ micro-benchmarks; the cluster-level cost of S3 is not measured here (the S2 stea
 
 ### 9.13 What S3 proves, and what it does not
 
-**S3 proves:**
+**PROVEN** (by the tests and mutants of §9.11, on the final revision, §9.12):
 - **The WAL is truncated safely.** A segment is deleted only after a durable MANIFEST edit records a
   higher log number, which requires the segment's records to be in a flushed table and that table
   recorded. Recovery starts at the log number, its sequence seeded from the MANIFEST's
   `LogStartSeq`, and the crash matrix confirms R1 holds at every rotation, MANIFEST and deletion
   boundary — of a data flush and of a watermark-only record — under a process crash and the modeled
   power loss.
-- **The MANIFEST is authoritative** for the applied index, the log number and the replay seed: an
-  empty WAL after a flush still recovers the applied index, including one moved by entries that
-  wrote nothing, and the sequence continues upward across reopens with no
-  durable sequence reused. A missing required segment is refused; a leftover one is swept; recovery
-  is idempotent.
+- **The MANIFEST is authoritative** for the applied index, the log number, the replay seed and the
+  applied sequence: an empty WAL after a flush still recovers the applied index, including one
+  moved by entries that wrote nothing; the sequence continues upward across reopens with no durable
+  sequence reused; `AppliedSequence` survives truncation. Recovery refuses — before replaying
+  anything — a missing required segment, a gap, a WAL directory that is gone, and a log without a
+  log number that does not begin at segment 1; it refuses a replayed index below the MANIFEST's
+  `Applied`. A leftover segment is swept; recovery is idempotent.
 - **R2 holds in the real compaction path.** A self-compacting node never advances its log-compaction
-  boundary past the engine's durable applied index, proven by the clamp's unit test and a real
-  three-node cluster; snapshot creation brings that index to the snapshot's (`SyncApplied`), also
-  after cycles that wrote nothing; the in-memory store is unchanged, covered by its published
-  snapshot.
+  boundary past the engine's durable applied index — the clamp's arithmetic, its wiring in the real
+  snapshot path with a lagging durable index, and a real three-node LSM cluster. Snapshot creation
+  brings the durable index to the snapshot's (`SyncApplied`), also after cycles that wrote nothing,
+  and does so before publishing, so a node's own snapshot is never above its engine. The in-memory
+  store is unchanged, covered by its published snapshot.
 - **R1 is intact.** Every applied transition is still recorded atomically with its applied index; the
   extended matrix checks state, applied index, term and both sequences together.
+- **A node restarts on its own snapshot whatever its size, and a crash while a restore replaces the
+  engine leaves one that opens** (the crash injected part-way through the deletion).
 
-**S3 does not prove (supported but not fully proven):**
+**SUPPORTED BUT NOT FULLY PROVEN:**
 - **Real-device power-loss durability.** The matrix uses the software fault model (`internal/fault`),
   which assumes an honest fsync and models unsynced data as lost or as a torn prefix, never as
-  reordering or bit rot (`docs/FAILURE_MODEL.md`). Modeled power loss is not device certification.
+  reordering or bit rot (`docs/FAILURE_MODEL.md`). **Modeled power loss is not real-device
+  certification.**
 - **The engine's SSTable and compaction code under power loss inside the hosted machine.** The crash
   tests put the WAL and MANIFEST on the model; SSTable file writes still use `os` directly (as in
-  S1/S2).
+  S1/S2). Likewise the restore's set-aside rename and its directory fsync run on the real filesystem:
+  tested against a process crash, not a modeled power loss.
+- **R2 under cluster-wide crashes.** R2 is tested by unit, single-node and real-cluster tests, but no
+  test cuts power to a whole LSM-backed cluster, and the deterministic simulator's state machine
+  does not report a durable index, so its crash schedules do not exercise the clamp.
 - **The tightest R2 bound.** The durable watermark is the flushed applied index; in `sync` WAL mode
   the synced-but-unflushed suffix is also recoverable, so the log could be retained less
   conservatively. That optimization is the two-log decision (S5).
 
-**Deferred to S4+:**
-- Snapshots as engine checkpoints and streamed ingest; the 512 MiB snapshot bound (S4).
+**DEFERRED** (known, not fixed in S3):
+- Snapshots as engine checkpoints and streamed ingest; the effective limit that a snapshot the LSM
+  machine *installs from a leader* must fit one WAL record (about 63 MiB), and the 512 MiB snapshot
+  bound (S4).
 - The two-log durability measurement and any WAL-mode-dependent R2 tightening (S5).
-- Group commit, batched apply, and per-cycle write-path optimization (S6).
+- Group commit, batched apply, per-cycle write-path optimization, and taking the snapshot's engine
+  flush off the actor (S6).
+- **File-number exhaustion.** WAL segment and SSTable numbers are six digits and never reused. S3
+  rotates the WAL at every flush and flushes the engine at every snapshot, so it consumes them
+  several times faster than S2 did. Under a sustained 2,000 small writes per second with the default
+  `-snapshot-every 10000` — a snapshot every 5 s and a memtable flush about every 20 s, some 21,600
+  rotations a day — the 999,999 segment numbers last about 46 days, after which every flush fails and
+  the node fail-stops (no loss; a restart does not help). A wider name format is the fix; it is a
+  format change of its own, and should precede any long-running deployment.
