@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -211,16 +212,30 @@ func (s *Sending) Meta() Meta { return s.meta }
 func (s *Sending) Size() int64 { return s.size }
 
 // Verify validates the whole file by streaming it, so a leader never streams a
-// snapshot it has not proven whole.
-func (s *Sending) Verify() error {
+// snapshot it has not proven whole. It stops early, with ctx's error, once
+// ctx is done (a node shutting down does not wait for a large file's read).
+func (s *Sending) Verify(ctx context.Context) error {
 	if _, err := s.f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	rd, err := NewReader(s.f, s.size)
+	rd, err := NewReader(ctxReader{ctx: ctx, r: s.f}, s.size)
 	if err != nil {
 		return err
 	}
 	return rd.Verify()
+}
+
+// ctxReader fails its reads once ctx is done.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }
 
 // Chunks reads the file from its start and hands send each chunk, in order, of

@@ -76,27 +76,55 @@ func encodeFooter(m Meta) []byte {
 	return binary.AppendUvarint(f, m.Term)
 }
 
+// Measured is a state's length and SHA-256 — what a snapshot file's header
+// says of it — from Measure.
+type Measured struct {
+	Len uint64
+	Sum [32]byte
+}
+
+// Measure is the measuring pass: the state's length and SHA-256, refusing a
+// state over MaxData (ErrTooLarge) as soon as it passes the bound, before it is
+// read further. It writes nothing, so a caller decides about an oversized state
+// before any side effect.
+func Measure(src Source) (Measured, error) {
+	meas := &measurer{h: sha256.New()}
+	if _, err := src.WriteTo(meas); err != nil {
+		if errors.Is(err, errOverLimit) {
+			return Measured{}, fmt.Errorf("%w: more than %d bytes", ErrTooLarge, MaxData)
+		}
+		return Measured{}, fmt.Errorf("snapshot: measuring the state: %w", err)
+	}
+	var out Measured
+	out.Len = meas.n
+	copy(out.Sum[:], meas.h.Sum(nil))
+	return out, nil
+}
+
 // Write writes the snapshot file of src's state, described by m, to w — the
 // bytes Encode would return for the same state — and returns how many it
-// wrote. A state over MaxData is ErrTooLarge, found by the measuring pass
-// before anything is written. A source whose second pass differs from its
-// first is ErrSourceChanged; w then holds a file that does not validate.
+// wrote: Measure, then WriteMeasured.
 func Write(w io.Writer, m Meta, src Source) (int64, error) {
 	if err := m.validate(); err != nil {
 		return 0, err
 	}
-	meas := &measurer{h: sha256.New()}
-	if _, err := src.WriteTo(meas); err != nil {
-		if errors.Is(err, errOverLimit) {
-			return 0, fmt.Errorf("%w: more than %d bytes", ErrTooLarge, MaxData)
-		}
-		return 0, fmt.Errorf("snapshot: measuring the state: %w", err)
+	meas, err := Measure(src)
+	if err != nil {
+		return 0, err
 	}
-	var sum [32]byte
-	copy(sum[:], meas.h.Sum(nil))
+	return WriteMeasured(w, m, src, meas)
+}
 
+// WriteMeasured writes the file of a state Measure has measured: the header
+// with its length and SHA-256, the state in data records — hashing what it
+// writes — and the footer. A source whose bytes now differ from what was
+// measured is ErrSourceChanged; w then holds a file that does not validate.
+func WriteMeasured(w io.Writer, m Meta, src Source, meas Measured) (int64, error) {
+	if err := m.validate(); err != nil {
+		return 0, err
+	}
 	out := &recordWriter{w: w, h: sha256.New(), buf: make([]byte, 0, MaxDataRecord)}
-	if err := out.record(kindHeader, encodeHeader(m, meas.n, sum)); err != nil {
+	if err := out.record(kindHeader, encodeHeader(m, meas.Len, meas.Sum)); err != nil {
 		return out.written, err
 	}
 	if _, err := src.WriteTo(out); err != nil {
@@ -107,8 +135,8 @@ func Write(w io.Writer, m Meta, src Source) (int64, error) {
 	}
 	var again [32]byte
 	copy(again[:], out.h.Sum(nil))
-	if out.data != meas.n || again != sum {
-		return out.written, fmt.Errorf("%w: measured %d bytes, wrote %d", ErrSourceChanged, meas.n, out.data)
+	if out.data != meas.Len || again != meas.Sum {
+		return out.written, fmt.Errorf("%w: measured %d bytes, wrote %d", ErrSourceChanged, meas.Len, out.data)
 	}
 	if err := out.record(kindFooter, encodeFooter(m)); err != nil {
 		return out.written, err
@@ -179,6 +207,7 @@ func (r *recordWriter) record(kind record.Kind, payload []byte) error {
 // unvalidated. It holds one record at a time.
 type Reader struct {
 	rd   *record.Reader
+	src  *ioErrReader
 	size int64
 
 	meta    Meta
@@ -195,7 +224,8 @@ type Reader struct {
 // NewReader reads the header of the snapshot file r, which must hold exactly
 // size bytes.
 func NewReader(r io.Reader, size int64) (*Reader, error) {
-	rd := &Reader{rd: record.NewReader(r, "snapshot", size), size: size, h: sha256.New()}
+	src := &ioErrReader{r: r}
+	rd := &Reader{rd: record.NewReader(src, "snapshot", size), src: src, size: size, h: sha256.New()}
 	kind, p, err := rd.next()
 	if err != nil {
 		return nil, err
@@ -211,6 +241,11 @@ func NewReader(r io.Reader, size int64) (*Reader, error) {
 
 func (r *Reader) next() (record.Kind, []byte, error) {
 	k, p, err := r.rd.Next()
+	if r.src.err != nil {
+		// The disk failed, not the file: the framing reports any short read as
+		// damage, and a transient I/O error must not read as a corrupt snapshot.
+		return 0, nil, fmt.Errorf("snapshot: reading: %w", r.src.err)
+	}
 	if err == io.EOF {
 		return 0, nil, fmt.Errorf("%w: ends before its footer", ErrCorrupt)
 	}
@@ -218,6 +253,21 @@ func (r *Reader) next() (record.Kind, []byte, error) {
 		return 0, nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
 	return k, p, nil
+}
+
+// ioErrReader remembers the first failure of the stream under a Reader other
+// than its end, so it is reported as what it is.
+type ioErrReader struct {
+	r   io.Reader
+	err error
+}
+
+func (e *ioErrReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if err != nil && err != io.EOF && e.err == nil {
+		e.err = err
+	}
+	return n, err
 }
 
 // Meta returns the snapshot's metadata, from its header.

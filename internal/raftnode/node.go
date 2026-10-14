@@ -1341,7 +1341,7 @@ func (n *Node) transfer(peer NodeID, term uint64, snd *snapshot.Sending) {
 		n.mu.Unlock()
 	}()
 	meta := snd.Meta()
-	if err := snd.Verify(); err != nil {
+	if err := snd.Verify(n.ctx); err != nil {
 		n.m.snapFailed.Inc()
 		n.logf("event=raft_snapshot_send_failed node=%s to=%s index=%d group=%d err=%v", n.cfg.ID, peer, meta.Index, n.cfg.Group, err)
 		return

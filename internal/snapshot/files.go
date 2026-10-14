@@ -47,12 +47,21 @@ func (f Files) Publish(file []byte) error {
 }
 
 // PublishFrom is Publish for a snapshot streamed from a Source (S4,
-// docs/STORAGE_INTEGRATION.md §10.4): the file is written into the temporary
-// (Write: a measuring pass, then the file), fsynced, renamed over the published
-// name, and the directory fsynced. The state is never held in memory whole. A
-// refused or failed write publishes nothing: the temporary is removed if it
-// can be, and is an orphan RemoveOrphans deletes if not.
+// docs/STORAGE_INTEGRATION.md §10.4): Measure, then PublishMeasured.
 func (f Files) PublishFrom(m Meta, src Source) error {
+	meas, err := Measure(src)
+	if err != nil {
+		return err
+	}
+	return f.PublishMeasured(m, src, meas)
+}
+
+// PublishMeasured publishes the snapshot of a state Measure has measured: the
+// file is written into the temporary (WriteMeasured), fsynced, renamed over the
+// published name, and the directory fsynced. The state is never held in memory
+// whole. A refused or failed write publishes nothing: the temporary is removed
+// if it can be, and is an orphan RemoveOrphans deletes if not.
+func (f Files) PublishMeasured(m Meta, src Source, meas Measured) error {
 	file, err := f.fs().OpenFile(f.TmpPath(), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
@@ -62,7 +71,7 @@ func (f Files) PublishFrom(m Meta, src Source) error {
 		_ = f.fs().Remove(f.TmpPath())
 		return err
 	}
-	if _, err := Write(file, m, src); err != nil {
+	if _, err := WriteMeasured(file, m, src, meas); err != nil {
 		return fail(err)
 	}
 	if err := file.Sync(); err != nil {

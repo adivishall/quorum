@@ -361,26 +361,46 @@ func (d *Durable) MaybeSnapshot(core *raft.Raft, at Hook) error {
 
 // Snapshot creates a snapshot of the state machine at the applied index,
 // publishes it, and compacts the log behind it, in this order
-// (docs/SNAPSHOTS.md §5, docs/STORAGE_INTEGRATION.md §10.4): open the state
-// (an engine pins a checkpoint; memory encodes it); make an engine-backed
-// machine durable through the index (SyncApplied, S3); publish — the state
-// streamed into the temporary file, a measuring pass first, then fsync,
-// rename, directory fsync; rewrite the durable log without the prefix; discard
-// the prefix in the core. The log is never compacted before the snapshot that
+// (docs/SNAPSHOTS.md §5, docs/STORAGE_INTEGRATION.md §10.4): the cheap checks
+// first — something applied since the published snapshot, the term and the
+// configuration at the applied index; then open the state (an engine pins a
+// checkpoint; memory encodes it) and check it is at that index; measure it
+// (its length and hash, refusing an oversized state before any side effect);
+// make an engine-backed machine durable through the index (SyncApplied, S3);
+// publish — the state streamed into the temporary file, fsync, rename,
+// directory fsync; rewrite the durable log without the prefix; discard the
+// prefix in the core. The log is never compacted before the snapshot that
 // covers it is durable, so a crash anywhere leaves a state recovery accepts.
 //
 // A state larger than snapshot.MaxData is not snapshotted: the error wraps
-// snapshot.ErrTooLarge, nothing is published, and no new attempt is made until
+// snapshot.ErrTooLarge, nothing is written, and no new attempt is made until
 // Every more entries are applied — the log then keeps growing (documented, not
 // hidden). Nor is a state whose configuration the node does not know (Phase 15:
 // a joiner that has not yet applied its group's first configuration entry it
 // received; raft.ErrConfUnknown): the snapshot must carry the configuration, so
-// it waits for the next applied entry. Any other failure is a durability
-// failure: the node stops.
+// it waits for the next applied entry — without opening the state, which for
+// an engine is a flush and a pass over it (S4 review). Any other failure is a
+// durability failure: the node stops.
 func (d *Durable) Snapshot(core *raft.Raft, at Hook) error {
 	s := d.Snap
 	if s.SM == nil {
 		return fmt.Errorf("%w: this node's state machine cannot snapshot", ErrSnapshot)
+	}
+	applied := core.AppliedIndex()
+	if applied <= s.meta.Index {
+		return nil // nothing applied since the published snapshot
+	}
+	term, err := core.TermAt(applied)
+	if err != nil {
+		return fmt.Errorf("%w: the term of applied entry %d: %w", ErrSnapshot, applied, err)
+	}
+	conf, err := core.ConfAt(applied)
+	if errors.Is(err, raft.ErrConfUnknown) {
+		s.skip = applied + 1
+		return fmt.Errorf("%w: at %d: %w", ErrSnapshot, applied, err)
+	}
+	if err != nil {
+		return fmt.Errorf("%w: the configuration at %d: %w", ErrSnapshot, applied, err)
 	}
 	src, err := s.SM.OpenSnapshot()
 	if err != nil {
@@ -389,7 +409,7 @@ func (d *Durable) Snapshot(core *raft.Raft, at Hook) error {
 	defer src.Close()
 	idx := src.Index()
 	switch {
-	case idx > core.AppliedIndex():
+	case idx > applied:
 		// A machine whose durable state holds more than the core has applied
 		// (S2, docs/STORAGE_INTEGRATION.md §8.6): after a restart the core
 		// catches up through entries the machine already holds and skips. In
@@ -399,25 +419,18 @@ func (d *Durable) Snapshot(core *raft.Raft, at Hook) error {
 		// ever being taken at an index the core has not reached, which would
 		// compact a log the core still reads. None is taken until they agree.
 		return nil
-	case idx < core.AppliedIndex():
-		return fmt.Errorf("%w: the state machine is at %d, the core applied %d", ErrSnapshot, idx, core.AppliedIndex())
-	}
-	if idx <= s.meta.Index {
-		return nil // nothing applied since the published snapshot
-	}
-	term, err := core.TermAt(idx)
-	if err != nil {
-		return fmt.Errorf("%w: the term of applied entry %d: %w", ErrSnapshot, idx, err)
-	}
-	conf, err := core.ConfAt(idx)
-	if errors.Is(err, raft.ErrConfUnknown) {
-		s.skip = idx + 1
-		return fmt.Errorf("%w: at %d: %w", ErrSnapshot, idx, err)
-	}
-	if err != nil {
-		return fmt.Errorf("%w: the configuration at %d: %w", ErrSnapshot, idx, err)
+	case idx < applied:
+		return fmt.Errorf("%w: the state machine is at %d, the core applied %d", ErrSnapshot, idx, applied)
 	}
 	meta := snapshot.Meta{Group: s.Group, Conf: conf, Index: idx, Term: term}
+	meas, err := snapshot.Measure(src)
+	if errors.Is(err, snapshot.ErrTooLarge) {
+		s.skip = idx + max(s.Every, 1)
+		return err
+	}
+	if err != nil {
+		return fmt.Errorf("%w: measuring the state at %d: %w", ErrSnapshot, idx, err)
+	}
 	// R2: make the engine durable through the snapshot's index before compacting
 	// the log behind it, so the compaction boundary does not pass the engine's
 	// durable applied index (docs/STORAGE_INTEGRATION.md §9.6). Without this a
@@ -436,10 +449,7 @@ func (d *Durable) Snapshot(core *raft.Raft, at Hook) error {
 	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
 		return err
 	}
-	if err := s.Files.PublishFrom(meta, src); err != nil {
-		if errors.Is(err, snapshot.ErrTooLarge) {
-			s.skip = idx + max(s.Every, 1)
-		}
+	if err := s.Files.PublishMeasured(meta, src, meas); err != nil {
 		return err
 	}
 	s.meta, s.file = meta, nil

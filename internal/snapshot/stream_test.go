@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"syscall"
 	"testing"
 
 	"github.com/adivishall/quorum/internal/fault"
@@ -339,7 +341,7 @@ func TestASendReadsTheSnapshotItOpenedAcrossALaterPublish(t *testing.T) {
 			if err := f.PublishFrom(meta(300, 4), BytesSource("new")); err != nil {
 				t.Fatal(err)
 			}
-			if err := snd.Verify(); err != nil {
+			if err := snd.Verify(context.Background()); err != nil {
 				t.Fatalf("verifying the opened snapshot after a newer publish: %v", err)
 			}
 			recvFiles := Files{FS: f.FS, Base: filepath.Join(filepath.Dir(f.Base), "follower.log")}
@@ -502,5 +504,64 @@ func TestARetriedTransferStartsClean(t *testing.T) {
 	}
 	if b, _ := mem.Cached(base + ".snap.recv"); !bytes.Equal(b, small) {
 		t.Fatalf("the staged file is %d bytes, want exactly the %d of the retried snapshot", len(b), len(small))
+	}
+}
+
+// failAfter reads n bytes of r, then fails with err.
+type failAfter struct {
+	r   io.Reader
+	n   int
+	err error
+}
+
+func (f *failAfter) Read(p []byte) (int, error) {
+	if f.n <= 0 {
+		return 0, f.err
+	}
+	if len(p) > f.n {
+		p = p[:f.n]
+	}
+	k, err := f.r.Read(p)
+	f.n -= k
+	return k, err
+}
+
+// TestAReadFailureIsReportedAsItselfNotAsCorruption: a disk that fails while a
+// snapshot is streamed — EIO, a dead handle — is reported as that failure, not
+// as a corrupt snapshot (the framing reports any short read as damage; an
+// operator told "corrupt" might delete a good file). S4 review.
+func TestAReadFailureIsReportedAsItselfNotAsCorruption(t *testing.T) {
+	file := mustEncode(t, meta(9, 3), bytes.Repeat([]byte("s"), 3*MaxDataRecord))
+	for _, at := range []int{0, 10, MaxDataRecord + 17, len(file) - 3} {
+		var err error
+		rd, err := NewReader(&failAfter{r: bytes.NewReader(file), n: at, err: syscall.EIO}, int64(len(file)))
+		if err == nil {
+			err = rd.Verify()
+		}
+		if !errors.Is(err, syscall.EIO) || errors.Is(err, ErrCorrupt) {
+			t.Fatalf("a read failure after %d bytes: %v, want EIO and not ErrCorrupt", at, err)
+		}
+	}
+}
+
+// TestASendsVerificationStopsWhenItsContextIsDone: a node shutting down does not
+// wait for a transfer to finish proving a large file (S4 review).
+func TestASendsVerificationStopsWhenItsContextIsDone(t *testing.T) {
+	f := Files{FS: fault.NewMemFS(), Base: base}
+	if err := f.PublishFrom(meta(5, 1), BytesSource(bytes.Repeat([]byte("x"), 2*MaxDataRecord))); err != nil {
+		t.Fatal(err)
+	}
+	snd, err := f.OpenSend()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snd.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := snd.Verify(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("verifying under a cancelled context: %v", err)
+	}
+	if err := snd.Verify(context.Background()); err != nil {
+		t.Fatalf("the same handle verified afterwards: %v", err)
 	}
 }
