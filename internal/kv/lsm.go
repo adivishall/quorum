@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -70,8 +71,9 @@ const cycleFlushBytes = 32 << 20
 var ErrMachineClosed = errors.New("kv: the state machine is closed")
 
 var (
-	_ Machine                 = (*LSMMachine)(nil)
-	_ raftnode.DurableApplier = (*LSMMachine)(nil)
+	_ Machine                       = (*LSMMachine)(nil)
+	_ raftnode.DurableApplier       = (*LSMMachine)(nil)
+	_ raftnode.SnapshotStateMachine = (*LSMMachine)(nil)
 )
 
 // OpenLSMMachine opens the machine's engine in dir (creating it) under limits
@@ -403,6 +405,43 @@ func (m *LSMMachine) EncodeSnapshot() (uint64, []byte, error) {
 		return 0, nil, err
 	}
 	return m.engine.Index, encodeState(m.engine.Index, m.sessions.limits, user, m.sessions.sessions), nil
+}
+
+// OpenSnapshot returns the state at the engine's applied index as a snapshot
+// source (raftnode.SnapshotStateMachine).
+func (m *LSMMachine) OpenSnapshot() (raftnode.SnapshotSource, error) {
+	index, data, err := m.EncodeSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	return raftnode.BytesSource(index, data), nil
+}
+
+// ValidateSnapshotFrom reads a snapshot's whole state and validates it as
+// ValidateSnapshot does (raftnode.SnapshotStateMachine).
+func (m *LSMMachine) ValidateSnapshotFrom(index uint64, r io.Reader) error {
+	data, err := raftnode.ReadState(r)
+	if err != nil {
+		return err
+	}
+	return m.ValidateSnapshot(index, data)
+}
+
+// RestoreSnapshotFrom restores a snapshot's state as RestoreSnapshot does
+// (raftnode.SnapshotStateMachine). The no-op is decided before anything is
+// read.
+func (m *LSMMachine) RestoreSnapshotFrom(index, term uint64, r io.Reader) error {
+	m.mu.RLock()
+	noop := !m.closed && m.engine.Index >= index
+	m.mu.RUnlock()
+	if noop {
+		return nil
+	}
+	data, err := raftnode.ReadState(r)
+	if err != nil {
+		return err
+	}
+	return m.RestoreSnapshot(index, term, data)
 }
 
 // ValidateSnapshot reports whether RestoreSnapshot would accept data as the

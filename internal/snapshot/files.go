@@ -46,6 +46,34 @@ func (f Files) Publish(file []byte) error {
 	return f.promote(f.TmpPath())
 }
 
+// PublishFrom is Publish for a snapshot streamed from a Source (S4,
+// docs/STORAGE_INTEGRATION.md §10.4): the file is written into the temporary
+// (Write: a measuring pass, then the file), fsynced, renamed over the published
+// name, and the directory fsynced. The state is never held in memory whole. A
+// refused or failed write publishes nothing: the temporary is removed if it
+// can be, and is an orphan RemoveOrphans deletes if not.
+func (f Files) PublishFrom(m Meta, src Source) error {
+	file, err := f.fs().OpenFile(f.TmpPath(), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	fail := func(err error) error {
+		_ = file.Close()
+		_ = f.fs().Remove(f.TmpPath())
+		return err
+	}
+	if _, err := Write(file, m, src); err != nil {
+		return fail(err)
+	}
+	if err := file.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return f.promote(f.TmpPath())
+}
+
 // PublishReceived makes a received snapshot — already written to RecvPath and
 // fsynced by a Receiver — the published one: rename, then directory fsync.
 func (f Files) PublishReceived() error { return f.promote(f.RecvPath()) }
@@ -74,6 +102,65 @@ func (f Files) Load() (m Meta, data, file []byte, found bool, err error) {
 		return Meta{}, nil, nil, true, fmt.Errorf("%s: %w", f.Path(), err)
 	}
 	return m, data, file, true, nil
+}
+
+// Open opens the published snapshot for streaming (S4): its header is read and
+// checked, and the Reader then streams its state, validating the whole file as
+// it goes (Reader). found is false when there is none. The caller closes the
+// returned file once done with the Reader.
+func (f Files) Open() (rd *Reader, file io.Closer, found bool, err error) {
+	rd, file, err = openStream(f.fs(), f.Path())
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil, false, nil
+	}
+	if err != nil {
+		return nil, nil, true, err
+	}
+	return rd, file, true, nil
+}
+
+// OpenReceived opens the received snapshot staged at RecvPath for streaming.
+func (f Files) OpenReceived() (*Reader, io.Closer, error) { return openStream(f.fs(), f.RecvPath()) }
+
+// Verify validates the published snapshot by streaming it — every check Load
+// makes, holding one record at a time — and returns its metadata. found is
+// false when there is none; a published snapshot that does not validate is an
+// error, as for Load.
+func (f Files) Verify() (m Meta, found bool, err error) {
+	rd, file, found, err := f.Open()
+	if !found || err != nil {
+		return Meta{}, found, err
+	}
+	defer file.Close()
+	if err := rd.Verify(); err != nil {
+		return Meta{}, true, fmt.Errorf("%s: %w", f.Path(), err)
+	}
+	return rd.Meta(), true, nil
+}
+
+// openStream opens name and reads its header. A missing file is an error
+// satisfying fs.ErrNotExist; a malformed header, or a file larger than a
+// snapshot can be, is refused with the path named.
+func openStream(fsys vfs.FS, name string) (*Reader, vfs.File, error) {
+	file, err := fsys.OpenFile(name, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
+	if info.Size() > MaxFile {
+		_ = file.Close()
+		return nil, nil, fmt.Errorf("%w: %s is %d bytes", ErrTooLarge, name, info.Size())
+	}
+	rd, err := NewReader(file, info.Size())
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, fmt.Errorf("%s: %w", name, err)
+	}
+	return rd, file, nil
 }
 
 // RemoveOrphans deletes both temporaries if present, and makes the deletion

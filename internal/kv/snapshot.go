@@ -5,7 +5,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
+
+	"github.com/adivishall/quorum/internal/raftnode"
 )
 
 // The key-value store's snapshot state (Phase 14, docs/SNAPSHOTS.md §2–§3): the
@@ -38,6 +41,39 @@ func (s *Store) EncodeSnapshot() (index uint64, data []byte, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.applied, encodeState(s.applied, s.sessions.limits, s.m, s.sessions.sessions), nil
+}
+
+var _ raftnode.SnapshotStateMachine = (*Store)(nil)
+
+// OpenSnapshot returns the store's state at its applied index as a snapshot
+// source (raftnode.SnapshotStateMachine, S4): its encoding, in memory — the
+// in-memory store holds its state there anyway.
+func (s *Store) OpenSnapshot() (raftnode.SnapshotSource, error) {
+	index, data, err := s.EncodeSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	return raftnode.BytesSource(index, data), nil
+}
+
+// ValidateSnapshotFrom reads a snapshot's whole state and validates it as
+// ValidateSnapshot does (raftnode.SnapshotStateMachine).
+func (s *Store) ValidateSnapshotFrom(index uint64, r io.Reader) error {
+	data, err := raftnode.ReadState(r)
+	if err != nil {
+		return err
+	}
+	return s.ValidateSnapshot(index, data)
+}
+
+// RestoreSnapshotFrom reads a snapshot's whole state and restores it as
+// RestoreSnapshot does (raftnode.SnapshotStateMachine).
+func (s *Store) RestoreSnapshotFrom(index, term uint64, r io.Reader) error {
+	data, err := raftnode.ReadState(r)
+	if err != nil {
+		return err
+	}
+	return s.RestoreSnapshot(index, term, data)
 }
 
 // encodeState renders a state — the map, the session table, the applied index

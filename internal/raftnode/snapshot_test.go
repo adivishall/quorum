@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -47,6 +48,7 @@ func (s *snapSM) Apply(index uint64, command []byte) error {
 	return nil
 }
 
+// EncodeSnapshot returns the state, encoded (tests build snapshots from it).
 func (s *snapSM) EncodeSnapshot() (uint64, []byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -56,6 +58,14 @@ func (s *snapSM) EncodeSnapshot() (uint64, []byte, error) {
 		b = append(b, c...)
 	}
 	return s.index, b, nil
+}
+
+func (s *snapSM) OpenSnapshot() (SnapshotSource, error) {
+	index, b, err := s.EncodeSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	return BytesSource(index, b), nil
 }
 
 func decodeSnapSM(index uint64, data []byte) ([]string, error) {
@@ -79,12 +89,20 @@ func decodeSnapSM(index uint64, data []byte) ([]string, error) {
 	return cmds, nil
 }
 
-func (s *snapSM) ValidateSnapshot(index uint64, data []byte) error {
-	_, err := decodeSnapSM(index, data)
+func (s *snapSM) ValidateSnapshotFrom(index uint64, r io.Reader) error {
+	data, err := ReadState(r)
+	if err != nil {
+		return err
+	}
+	_, err = decodeSnapSM(index, data)
 	return err
 }
 
-func (s *snapSM) RestoreSnapshot(index, _ uint64, data []byte) error {
+func (s *snapSM) RestoreSnapshotFrom(index, _ uint64, r io.Reader) error {
+	data, err := ReadState(r)
+	if err != nil {
+		return err
+	}
 	cmds, err := decodeSnapSM(index, data)
 	if err != nil {
 		return err
@@ -924,7 +942,10 @@ func TestInstallOrderIsTermPublishBoundary(t *testing.T) {
 	for _, o := range inj.Ops()[before:] {
 		seq = append(seq, fmt.Sprintf("%s %s", o.Op, filepath.Base(o.Path)))
 	}
-	want := []string{"write raft.log", "fsync raft.log", "rename raft.log.snap", "syncdir node", "write raft.log", "fsync raft.log"}
+	// The term, the publication, the boundary — then (S4) the state machine's
+	// restore, which streams its state from the PUBLISHED file, never the
+	// staged one and never before the boundary.
+	want := []string{"write raft.log", "fsync raft.log", "rename raft.log.snap", "syncdir node", "write raft.log", "fsync raft.log", "open raft.log.snap"}
 	if strings.Join(seq, "; ") != strings.Join(want, "; ") {
 		t.Fatalf("install I/O:\n got %v\nwant %v", seq, want)
 	}

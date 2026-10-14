@@ -107,18 +107,7 @@ func Encode(m Meta, data []byte) ([]byte, error) {
 	if len(data) > MaxData {
 		return nil, fmt.Errorf("%w: %d bytes", ErrTooLarge, len(data))
 	}
-	sum := sha256.Sum256(data)
-	h := []byte(magic)
-	h = binary.AppendUvarint(h, Version)
-	h = binary.AppendUvarint(h, uint64(m.Group))
-	conf := replication.EncodeConfiguration(m.Conf)
-	h = binary.AppendUvarint(h, uint64(len(conf)))
-	h = append(h, conf...)
-	h = binary.AppendUvarint(h, m.Index)
-	h = binary.AppendUvarint(h, m.Term)
-	h = binary.AppendUvarint(h, uint64(len(data)))
-	h = append(h, sum[:]...)
-	out, err := record.Encode(nil, kindHeader, h)
+	out, err := record.Encode(nil, kindHeader, encodeHeader(m, uint64(len(data)), sha256.Sum256(data)))
 	if err != nil {
 		return nil, err
 	}
@@ -128,9 +117,7 @@ func Encode(m Meta, data []byte) ([]byte, error) {
 			return nil, err
 		}
 	}
-	f := binary.AppendUvarint(nil, m.Index)
-	f = binary.AppendUvarint(f, m.Term)
-	return record.Encode(out, kindFooter, f)
+	return record.Encode(out, kindFooter, encodeFooter(m))
 }
 
 // Decode validates a complete snapshot file and returns its metadata and state

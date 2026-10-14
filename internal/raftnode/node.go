@@ -303,7 +303,9 @@ func Recover(cfg Config) (*Recovered, error) {
 	if err := files.RemoveOrphans(); err != nil {
 		return nil, err
 	}
-	meta, data, _, found, err := files.Load()
+	// The published snapshot is validated whole, by streaming it (S4): bounded
+	// memory however large it is; its state is read again only to restore it.
+	meta, found, err := files.Verify()
 	if err != nil {
 		return nil, fmt.Errorf("%w: the published snapshot: %w", ErrSnapshot, err)
 	}
@@ -371,7 +373,7 @@ func Recover(cfg Config) (*Recovered, error) {
 	}
 	var restored *snapshot.Meta
 	if found {
-		if err := ssm.RestoreSnapshot(meta.Index, meta.Term, data); err != nil {
+		if err := restorePublished(files, ssm, meta.Index, meta.Term); err != nil {
 			return fail(fmt.Errorf("%w: restoring the published snapshot: %w", ErrSnapshot, err))
 		}
 		if err := mlog.Apply(meta.Index); err != nil {
@@ -1299,9 +1301,16 @@ func (n *Node) snapshotStatus() {
 // runs per peer; an offer while one runs is ignored. A failed send abandons
 // the transfer, and the core offers again when its offer goes unanswered.
 func (n *Node) startTransfer(m raft.Message) {
-	meta, file, err := n.dur.Snap.SendFile()
-	if err == nil && meta.Index < m.SnapshotIndex {
-		err = fmt.Errorf("%w: published snapshot %d is below the log's boundary %d", ErrSnapshot, meta.Index, m.SnapshotIndex)
+	n.mu.Lock()
+	busy := n.sending[m.To]
+	n.mu.Unlock()
+	if busy {
+		return
+	}
+	snd, err := n.dur.Snap.OpenSend()
+	if err == nil && snd.Meta().Index < m.SnapshotIndex {
+		err = fmt.Errorf("%w: published snapshot %d is below the log's boundary %d", ErrSnapshot, snd.Meta().Index, m.SnapshotIndex)
+		_ = snd.Close()
 	}
 	if err != nil {
 		n.m.snapFailed.Inc()
@@ -1309,34 +1318,41 @@ func (n *Node) startTransfer(m raft.Message) {
 		return
 	}
 	n.mu.Lock()
-	busy := n.sending[m.To]
 	n.sending[m.To] = true
 	n.mu.Unlock()
-	if busy {
-		return
-	}
 	n.wg.Add(1)
-	go n.transfer(m.To, m.Term, meta, file)
+	go n.transfer(m.To, m.Term, snd)
 }
 
-// transfer streams one snapshot to one peer.
-func (n *Node) transfer(peer NodeID, term uint64, meta snapshot.Meta, file []byte) {
+// transfer streams one snapshot to one peer (S4): it proves the whole file
+// first, off the actor, then sends it chunk by chunk as it reads it — never
+// the whole file in memory.
+func (n *Node) transfer(peer NodeID, term uint64, snd *snapshot.Sending) {
 	defer n.wg.Done()
+	defer snd.Close()
 	defer func() {
 		n.mu.Lock()
 		delete(n.sending, peer)
 		n.mu.Unlock()
 	}()
-	chunks := snapshot.Split(term, meta, file)
-	for _, c := range chunks {
-		if err := n.tr.Send(n.ctx, transport.NodeID(peer), transport.MsgInstallSnapshot, WrapGroup(n.cfg.Group, c.Marshal())); err != nil {
-			n.m.snapFailed.Inc()
-			n.logf("event=raft_snapshot_send_failed node=%s to=%s index=%d offset=%d group=%d err=%v", n.cfg.ID, peer, meta.Index, c.Offset, n.cfg.Group, err)
-			return
-		}
+	meta := snd.Meta()
+	if err := snd.Verify(); err != nil {
+		n.m.snapFailed.Inc()
+		n.logf("event=raft_snapshot_send_failed node=%s to=%s index=%d group=%d err=%v", n.cfg.ID, peer, meta.Index, n.cfg.Group, err)
+		return
+	}
+	var offset uint64
+	chunks, err := snd.Chunks(term, snapshot.MaxChunk, func(c snapshot.Chunk) error {
+		offset = c.Offset
+		return n.tr.Send(n.ctx, transport.NodeID(peer), transport.MsgInstallSnapshot, WrapGroup(n.cfg.Group, c.Marshal()))
+	})
+	if err != nil {
+		n.m.snapFailed.Inc()
+		n.logf("event=raft_snapshot_send_failed node=%s to=%s index=%d offset=%d group=%d err=%v", n.cfg.ID, peer, meta.Index, offset, n.cfg.Group, err)
+		return
 	}
 	n.m.snapSent.Inc()
-	n.logf("event=raft_snapshot_sent node=%s to=%s index=%d term=%d bytes=%d chunks=%d group=%d", n.cfg.ID, peer, meta.Index, meta.Term, len(file), len(chunks), n.cfg.Group)
+	n.logf("event=raft_snapshot_sent node=%s to=%s index=%d term=%d bytes=%d chunks=%d group=%d", n.cfg.ID, peer, meta.Index, meta.Term, snd.Size(), chunks, n.cfg.Group)
 }
 
 // receiveChunk takes one chunk of a snapshot a peer is sending. A complete,
