@@ -3345,15 +3345,12 @@ mutant "an-ingested-table-is-durable-before-the-commit" internal/storage/checkpo
   '		meta, err := tw.Finish()' \
   ./internal/storage '^TestIngestCrashMatrix$'
 
-# 385. S4: an ingest that cannot rename a staged table goes on and commits a
-#      table that is not there under its name.
-mutant "an-ingest-does-not-ignore-a-failed-rename" internal/storage/checkpoint.go \
-  '		if err := s.fs.Rename(tmp, final); err != nil {
-			_ = s.fs.Remove(tmp)
-			return classify(op, nil, fmt.Errorf("lsm: staging ingested %s: %w", sstName(num), err))
-		}' \
-  '		_ = s.fs.Rename(tmp, final)' \
-  ./internal/storage '^TestIngestCrashMatrix$'
+# 385. S4 (investigated, not a mutant): ignoring a failed rename of a staged
+#      table SURVIVES every test, and is equivalent: the reader open that follows
+#      the rename opens the table by its final name, so a rename that did not
+#      happen fails the ingest there; and no other file can hold that name —
+#      file numbers are never reused and open sweeps every unreferenced table.
+#      Recorded in docs/STORAGE_INTEGRATION.md §10, not kept as a mutant.
 
 # 386. S4: an ingest's commit keeps the old log number — the old contents' WAL
 #      records are replayed onto the new tables at the next open.
@@ -3435,7 +3432,8 @@ mutant "a-restored-state-is-at-the-snapshots-index" internal/kv/lsm.go \
 mutant "the-streamed-snapshot-carries-the-session-table" internal/kv/lsm.go \
   '			sessions++
 			b = appendSession(b, id, ss)' \
-  '			sessions++' \
+  '			sessions++
+			_ = ss' \
   ./internal/kv '^TestLSMMachineSnapshotIsTheStoresEncodingOnSeededScripts$'
 
 # 395. S4: the machine's snapshot does not check the engine's session records
