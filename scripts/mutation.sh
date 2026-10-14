@@ -3222,6 +3222,259 @@ mutant "failed-sync-stops-the-snapshot" internal/raftnode/snapshot.go \
   '			_ = err' \
   ./internal/raftnode '^TestAFailedEngineSyncStopsTheNodeBeforeAnythingIsPublished$'
 
+echo "== S4: engine checkpoints and streamed snapshot installation (docs/STORAGE_INTEGRATION.md §10) =="
+
+# 372. S4: a streamed publish renames a snapshot whose bytes were never
+#      fsynced — published before it is durable; a power loss after the
+#      rename and directory fsync leaves a published file that is empty or torn.
+mutant "a-streamed-snapshot-is-durable-before-it-is-published" internal/snapshot/files.go \
+  '	if _, err := Write(file, m, src); err != nil {
+		return fail(err)
+	}
+	if err := file.Sync(); err != nil {
+		return fail(err)
+	}' \
+  '	if _, err := Write(file, m, src); err != nil {
+		return fail(err)
+	}' \
+  ./internal/snapshot '^TestPublishFromIsByteIdenticalAndAtomicUnderEveryCrash$'
+
+# 373. S4: the streamed writer publishes what a source wrote although it
+#      differs from what it measured — a file whose header hash is not its state.
+mutant "a-source-must-reproduce-its-state" internal/snapshot/stream.go \
+  '	if out.data != meas.n || again != sum {' \
+  '	if false && (out.data != meas.n || again != sum) {' \
+  ./internal/snapshot '^TestWriteRefusesASourceThatDoesNotReproduceItself$'
+
+# 374. S4: the streaming reader does not check the state against the header's
+#      SHA-256 — the record CRCs alone pass a spliced or substituted state.
+mutant "the-streamed-snapshot-checksum-is-verified" internal/snapshot/stream.go \
+  '		if sum != r.sum {' \
+  '		if false && sum != r.sum {' \
+  ./internal/snapshot '^TestReaderReportsEndOnlyOnceTheFileIsProven$'
+
+# 375. S4: the streaming reader accepts a state shorter than its header says.
+mutant "the-streamed-snapshot-length-is-verified" internal/snapshot/stream.go \
+  '		if r.got != r.dataLen {' \
+  '		if false && r.got != r.dataLen {' \
+  ./internal/snapshot '^TestReaderAgreesWithDecodeOnTheCorpus$'
+
+# 376. S4: the streaming reader treats a file that ends before its footer — a
+#      truncated final record or chunk — as a clean end of the state.
+mutant "a-streamed-snapshot-must-reach-its-footer" internal/snapshot/stream.go \
+  '		return 0, nil, fmt.Errorf("%w: ends before its footer", ErrCorrupt)
+	}
+	if err != nil {
+		return 0, nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
+	return k, p, nil' \
+  '		return 0, nil, io.EOF
+	}
+	if err != nil {
+		return 0, nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
+	return k, p, nil' \
+  ./internal/snapshot '^TestReaderAgreesWithDecodeOnTheCorpus$'
+
+# 377. S4: the streaming reader accepts bytes after the footer.
+mutant "nothing-may-follow-a-streamed-footer" internal/snapshot/stream.go \
+  '		if r.rd.NextOffset() != r.size {' \
+  '		if false && r.rd.NextOffset() != r.size {' \
+  ./internal/snapshot '^TestReaderAgreesWithDecodeOnTheCorpus$'
+
+# 378. S4: the receiver reports a completed transfer without proving the file it
+#      staged — a corrupt snapshot reaches the state machine and the core.
+mutant "a-received-snapshot-is-proven-whole" internal/snapshot/transfer.go \
+  '	if err := rd.Verify(); err != nil {
+		return nil, err
+	}
+	m := rd.Meta()' \
+  '	m := rd.Meta()' \
+  ./internal/snapshot '^TestReceiverAcceptsOnlyAnInOrderCompleteSnapshot$'
+
+# 379. S4: a transfer that restarts at offset 0 reuses the partial staging file
+#      of an abandoned one instead of starting it empty.
+mutant "a-retried-transfer-starts-clean" internal/snapshot/transfer.go \
+  '		f, err := r.files.fs().OpenFile(r.files.RecvPath(), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)' \
+  '		f, err := r.files.fs().OpenFile(r.files.RecvPath(), os.O_RDWR|os.O_CREATE, 0o644)' \
+  ./internal/snapshot '^TestARetriedTransferStartsClean$'
+
+# 380. S4: the restore streams whatever file is published, without checking it
+#      is the snapshot the core installed (or recovery validated).
+mutant "a-restore-reads-only-the-named-snapshot" internal/raftnode/snapshot.go \
+  '	if m := rd.Meta(); m.Index != index || m.Term != term {' \
+  '	if m := rd.Meta(); false && (m.Index != index || m.Term != term) {' \
+  ./internal/raftnode '^TestARestoreReadsOnlyTheSnapshotItWasAskedFor$'
+
+# 381. S4: a checkpoint is pinned without flushing — its applied index is not the
+#      durable watermark, so a snapshot could name state the engine would lose.
+mutant "a-checkpoint-is-durable" internal/storage/checkpoint.go \
+  '		if err := s.flushLocked(); err != nil {
+			s.flushErr = err
+			return nil, false, classify("checkpoint", nil, err)
+		}
+		v := s.acquire()' \
+  '		v := s.acquire()' \
+  ./internal/storage '^TestACheckpointIsTheDurableStateAtItsAppliedIndex$'
+
+# 382. S4: a checkpoint does not keep its tables: a compaction that runs while it
+#      is read deletes them under it.
+mutant "a-checkpoint-pins-its-tables" internal/storage/checkpoint.go \
+  '		return &Checkpoint{s: s, v: v, applied: durable, seq: s.seq}, true, nil' \
+  '		s.release(v)
+		return &Checkpoint{s: s, v: v, applied: durable, seq: s.seq}, true, nil' \
+  ./internal/storage '^TestACheckpointIsTheDurableStateAtItsAppliedIndex$'
+
+# 383. S4: an ingest commits although its source ended with an error — the
+#      final checks of a snapshot stream (length, checksum, footer, nothing
+#      after the last session) are not waited for before the switch.
+mutant "an-ingest-waits-for-its-source-to-end-cleanly" internal/storage/checkpoint.go \
+  '	if err := src.Err(); err != nil {
+		abandon()' \
+  '	if err := src.Err(); false && err != nil {
+		abandon()' \
+  "./internal/storage ./internal/kv" '^(TestARefusedIngestLeavesTheEngineUnchangedAndUsable|TestLSMMachineARefusedRestoreChangesNothing)$'
+
+# 384. S4: an ingested table is renamed into place without its bytes fsynced —
+#      the commit names a table a power loss can empty.
+mutant "an-ingested-table-is-durable-before-the-commit" internal/storage/checkpoint.go \
+  '		meta, err := tw.Finish()
+		if err == nil {
+			err = file.Sync()
+		}' \
+  '		meta, err := tw.Finish()' \
+  ./internal/storage '^TestIngestCrashMatrix$'
+
+# 385. S4: an ingest that cannot rename a staged table goes on and commits a
+#      table that is not there under its name.
+mutant "an-ingest-does-not-ignore-a-failed-rename" internal/storage/checkpoint.go \
+  '		if err := s.fs.Rename(tmp, final); err != nil {
+			_ = s.fs.Remove(tmp)
+			return classify(op, nil, fmt.Errorf("lsm: staging ingested %s: %w", sstName(num), err))
+		}' \
+  '		_ = s.fs.Rename(tmp, final)' \
+  ./internal/storage '^TestIngestCrashMatrix$'
+
+# 386. S4: an ingest's commit keeps the old log number — the old contents' WAL
+#      records are replayed onto the new tables at the next open.
+mutant "an-ingest-starts-a-fresh-log" internal/storage/checkpoint.go \
+  '	edit.SetLogNumber(n)
+	edit.SetLogStartSeq(seq)
+	edit.SetApplied(manifest.Applied{Index: a.Index, Term: a.Term})' \
+  '	edit.SetLogStartSeq(seq)
+	edit.SetApplied(manifest.Applied{Index: a.Index, Term: a.Term})' \
+  ./internal/storage '^TestIngestReplacesTheWholeEngine$'
+
+# 387. S4: an ingest's commit adds the new tables but does not delete the old —
+#      a key the new state does not have survives from the old one (a mixture).
+mutant "an-ingest-replaces-every-old-table" internal/storage/checkpoint.go \
+  '	for _, f := range old {
+		edit.DeleteFile(f.meta.Level, f.meta.Num)
+	}' \
+  '	_ = old' \
+  ./internal/storage '^TestIngestReplacesTheWholeEngine$'
+
+# 388. S4: an ingest moves the applied index and the durable watermark before
+#      its commit — an ambiguous failure then reports as durable a state the
+#      next open may not find (R2 would compact against it).
+mutant "an-ingest-advances-the-watermark-only-after-its-commit" internal/storage/checkpoint.go \
+  '	if err := s.manifest.Append(&edit); err != nil {' \
+  '	s.mu.Lock()
+	s.applied, s.appliedSeq, s.flushedApplied = a, seq, a
+	s.mu.Unlock()
+	if err := s.manifest.Append(&edit); err != nil {' \
+  ./internal/storage '^TestAFailedIngestCommitLatchesAndReopensOldOrNew$'
+
+# 389. S4: a failed commit deletes the staged tables although its edit may be
+#      durable — the next open finds a MANIFEST naming tables that are gone.
+mutant "a-commit-in-doubt-keeps-its-tables" internal/storage/checkpoint.go \
+  '		for _, t := range staged {
+			_ = t.r.Close()
+		}
+		s.flushErr = fmt.Errorf("lsm: recording an ingest at %d in the manifest: %w", a.Index, err)' \
+  '		discard()
+		s.flushErr = fmt.Errorf("lsm: recording an ingest at %d in the manifest: %w", a.Index, err)' \
+  ./internal/storage '^TestAFailedIngestCommitLatchesAndReopensOldOrNew$'
+
+# 390. S4: an ingest retires the old log before its commit — a crash before the
+#      commit leaves the old contents without the WAL records they need.
+mutant "an-ingest-retires-the-old-log-after-its-commit" internal/storage/checkpoint.go \
+  '	// 5. The commit point.
+	var total int64' \
+  '	s.truncateWALBelow(n)
+	// 5. The commit point.
+	var total int64' \
+  ./internal/storage '^TestIngestCrashMatrix$'
+
+# 391. S4: an ingest records the wrong term with its applied index.
+mutant "an-ingest-records-its-term" internal/storage/checkpoint.go \
+  '	edit.SetApplied(manifest.Applied{Index: a.Index, Term: a.Term})
+	edit.SetAppliedSeq(seq)' \
+  '	edit.SetApplied(manifest.Applied{Index: a.Index, Term: a.Term - 1})
+	edit.SetAppliedSeq(seq)' \
+  ./internal/storage '^TestIngestReplacesTheWholeEngine$'
+
+# 392. S4: an ingest accepts keys out of order, or a key twice (the engine's own
+#      guard; the SSTable writer's would report the wrong error).
+mutant "an-ingest-requires-ascending-keys" internal/storage/checkpoint.go \
+  '		if have && bytes.Compare(prev, k) >= 0 {' \
+  '		if false && have && bytes.Compare(prev, k) >= 0 {' \
+  ./internal/storage '^TestARefusedIngestLeavesTheEngineUnchangedAndUsable$'
+
+# 393. S4: the LSM machine restores a state at another index than the snapshot's.
+mutant "a-restored-state-is-at-the-snapshots-index" internal/kv/lsm.go \
+  '	if sr.applied != index {
+		return fmt.Errorf("%w: state at index %d, snapshot at %d", ErrSnapshotState, sr.applied, index)
+	}
+	src := &restoreSource{' \
+  '	src := &restoreSource{' \
+  ./internal/kv '^TestLSMMachineARefusedRestoreChangesNothing$'
+
+# 394. S4: the LSM machine's snapshot drops the session table (the source writes
+#      no session's entry) — after an install, a retry executes twice.
+mutant "the-streamed-snapshot-carries-the-session-table" internal/kv/lsm.go \
+  '			sessions++
+			b = appendSession(b, id, ss)' \
+  '			sessions++' \
+  ./internal/kv '^TestLSMMachineSnapshotIsTheStoresEncodingOnSeededScripts$'
+
+# 395. S4: the machine's snapshot does not check the engine's session records
+#      against its session table — a checkpoint that is not the machine's state
+#      is published.
+mutant "the-snapshot-is-the-machines-state" internal/kv/lsm.go \
+  '			if !equalSession(ss, m.sessions.sessions[id]) {' \
+  '			if false && !equalSession(ss, m.sessions.sessions[id]) {' \
+  ./internal/kv '^TestLSMMachineSnapshotIsRefusedWhenTheEngineIsNotTheMachine$'
+
+# 396. S4: a restore that is refused before its commit fails the machine stop
+#      (or leaves it changed) — the stop belongs only to a commit in doubt.
+mutant "a-refused-restore-changes-nothing" internal/kv/lsm.go \
+  '		if m.db.Latched() != nil {
+			_ = m.db.Close()' \
+  '		if true {
+			_ = m.db.Close()' \
+  ./internal/kv '^TestLSMMachineARefusedRestoreChangesNothing$'
+
+# 397. S4: the state decoder accepts a state with bytes after its last session.
+mutant "a-streamed-state-has-nothing-after-it" internal/kv/snapstream.go \
+  '	case err == nil:
+		s.err = invalidState("%v: trailing bytes", ErrProtocol)' \
+  '	case err == nil:
+		return nil' \
+  ./internal/kv '^TestRestoreRefusesImpossibleState$'
+
+# 398. S4: the open loads the session table from the whole engine but stops at the
+#      first user key (a scan that does not reach the session records).
+mutant "the-session-scan-reads-the-whole-engine" internal/storage/checkpoint.go \
+  '		if err := fn(ikey.UserKey(m.Key()), m.Value()); err != nil {
+			return err
+		}' \
+  '		if err := fn(ikey.UserKey(m.Key()), m.Value()); err != nil {
+			return err
+		}
+		break' \
+  ./internal/kv '^TestLSMMachineMatchesTheStoreOnAScript$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then

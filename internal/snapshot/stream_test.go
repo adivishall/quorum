@@ -474,3 +474,33 @@ func (s sampleWriter) Write(p []byte) (int, error) {
 	s.sample()
 	return s.w.Write(p)
 }
+
+// TestARetriedTransferStartsClean: a transfer abandoned part-way — the leader
+// changed, or the follower's connection dropped — leaves a partial staging
+// file; the next transfer, of a smaller snapshot, starts at offset 0 and must
+// not inherit a byte of it.
+func TestARetriedTransferStartsClean(t *testing.T) {
+	mem := fault.NewMemFS()
+	r := NewReceiver(Files{FS: mem, Base: base})
+	big := mustEncode(t, meta(90, 3), bytes.Repeat([]byte("b"), 2*MaxChunk+5))
+	small := mustEncode(t, meta(95, 4), []byte("the newer, smaller state"))
+	for _, c := range Split(5, meta(90, 3), big)[:2] { // abandoned after two chunks
+		if got, err := r.Accept("n1", c); got != nil || err != nil {
+			t.Fatalf("partial transfer: %v %v", got, err)
+		}
+	}
+	var done *Received
+	for _, c := range Split(6, meta(95, 4), small) {
+		got, err := r.Accept("n2", c)
+		if err != nil {
+			t.Fatalf("the retried transfer: %v", err)
+		}
+		done = got
+	}
+	if done == nil || done.Meta.Index != 95 || done.Bytes != int64(len(small)) {
+		t.Fatalf("the retried transfer completed as %+v", done)
+	}
+	if b, _ := mem.Cached(base + ".snap.recv"); !bytes.Equal(b, small) {
+		t.Fatalf("the staged file is %d bytes, want exactly the %d of the retried snapshot", len(b), len(small))
+	}
+}
