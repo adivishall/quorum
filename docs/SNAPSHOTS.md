@@ -101,14 +101,17 @@ more entries — and the log then keeps growing (§16).
 
 `raftnode.Durable.Snapshot`, at applied index `S`:
 
-1. encode the state (memory only), and ask the core for the term and the **configuration** at `S`
+1. open the state (S4: `OpenSnapshot` — the in-memory store encodes it; the LSM machine flushes its
+   engine and pins a checkpoint, `docs/STORAGE_INTEGRATION.md` §10.3), and ask the core for the term and the **configuration** at `S`
    (`ConfAt`, Phase 15). If the core does not know the configuration there — only a joiner that has
    not yet applied its group's first configuration entry — nothing is written and the node tries
    again at the next applied entry; it never guesses (§19). A machine with a durable engine (the
    LSM machine, S3) is then made durable through `S` (`SyncApplied`), before anything is published,
    so a restart never finds the node's own snapshot above its engine
    (`docs/STORAGE_INTEGRATION.md` §9.6). Crash point `before-snapshot-publish` follows;
-2. write `<log>.snap.tmp`, fsync it;
+2. write `<log>.snap.tmp` — since S4 streamed from the source (`Files.PublishFrom`: a measuring
+   pass for the header's length and SHA-256, then the file, a record at a time; a source that does
+   not reproduce what it measured publishes nothing) — fsync it;
 3. rename it over `<log>.snap`, fsync the directory — **publication**: the snapshot is now the
    durable record of `[1, S]` — crash point `after-snapshot-publish`;
 4. rewrite the durable log without the prefix (keeping `SnapshotRetain` entries below `S`, so a
@@ -200,11 +203,18 @@ killed at `after-snapshot-publish` and `after-install-publish` (real tests 4 and
 - **Leader (driver):** the offer is realized as a transfer of the **published** snapshot `S ≥
   boundary` (compaction never passes publication), streamed on its own goroutine per peer — at most
   one at a time; an offer while one runs is ignored — so heartbeats keep flowing meanwhile (a chunk
-  does not reset a follower's election timer; a heartbeat does).
+  does not reset a follower's election timer; a heartbeat does). Since S4 the transfer opens the
+  published file, proves it whole by streaming it, and sends it chunk by chunk from that open
+  handle — never the whole file in memory; a later publish renames a new file over the name and
+  the handle still reads the snapshot the transfer started with.
 - **Follower (driver):** chunks are reassembled strictly in order into `<log>.snap.recv`; a
-  complete file is validated — its format, its group, **and its state** (`ValidateSnapshot`) —
+  complete file is validated — its format, its group, **and its state** (`ValidateSnapshotFrom`) —
   before the core ever sees it (a snapshot the state machine refuses would, once installed, be
-  durable and unstartable). Only then is `MsgSnapshot` stepped into the core.
+  durable and unstartable). Only then is `MsgSnapshot` stepped into the core. Since S4 both checks
+  stream the staged file, one record at a time, and the node's frame pump — off the actor — drops
+  the chunks of a snapshot no newer than the one it is proving or installing at that moment
+  (`Snapshots.Installing`, logged `event=raft_snapshot_chunk_dropped` once per dropped transfer): a
+  leader's repeated offer (below) can only repeat it. Outside that window nothing is dropped.
 - **Follower (core):** term rules as for AppendEntries; a snapshot at or below the commit index is
   already covered — answered success at the commit, nothing changed; otherwise the log is reset to
   the snapshot (keeping the entries after it only if the log holds its index with its term),
@@ -213,7 +223,9 @@ killed at `after-snapshot-publish` and `after-install-publish` (real tests 4 and
 - **Follower (driver, `Durable.InstallSnapshot`), in order:** a changed term and vote, alone,
   carrying the previous commit (the durable term must never be below the snapshot's); publication
   of the staged file; the log's boundary record (`raftlog.Log.Install`); the state machine's
-  restore; then the Ready's HardState and retained entries are saved and only then its response
+  restore, streamed from the **published** file (S4; for the LSM machine an ingest committed by one
+  MANIFEST edit, `docs/STORAGE_INTEGRATION.md` §10.6); then the Ready's HardState and retained
+  entries are saved and only then its response
   (`MsgSnapshotResponse`, transport kind 21) leaves. The order is pinned by
   `TestInstallOrderIsTermPublishBoundary` and two mutants.
 - **Waiters:** an install completes every waiter at or below its index — a read barrier
@@ -229,8 +241,10 @@ the current transfer exactly — same sender, term, snapshot, total and offset �
 duplicate, reordered, missing and stale chunks can never assemble a file; the completed file is
 fsynced and validated before anything uses it. A partial snapshot is never active state
 (`TestReceiverAcceptsOnlyAnInOrderCompleteSnapshot`; the simulator sends 64–256-byte chunks that its
-network drops, duplicates, delays, reorders and corrupts). The whole snapshot is held in memory
-while it is written, sent and received — which is why `MaxData` is 512 MiB and not "unbounded".
+network drops, duplicates, delays, reorders and corrupts). Until S4 the whole snapshot was held in
+memory while it was written, sent and received — which is why `MaxData` is 512 MiB and not
+"unbounded". Since S4 a node writes, sends, receives and validates it as a stream (the simulator
+still sends from memory); the bound stays the format's (`docs/STORAGE_INTEGRATION.md` §10.12).
 
 ## 10. Dedup / session preservation
 
@@ -343,20 +357,32 @@ most `every` replayed, independent of how long the node has run — are asserted
 
 ## 16. Limitations
 
-- **Size.** A snapshot is held in memory while it is created, sent and received; `MaxData` is 512
-  MiB of state. Beyond it the node does not snapshot (logged) and its log grows. No incremental,
-  streaming-from-disk or copy-on-write snapshots.
-- **Creation blocks the actor.** The state is encoded and published on the node's actor goroutine
-  (≈ 50 ms at 100k keys on the machine above); Raft processing pauses meanwhile.
-- **A transfer can be retried while running.** If a transfer outlasts `SnapshotRetryTicks`, the
-  leader re-offers; the second transfer waits for the first (one per peer) and then repeats it.
+- **Size.** `MaxData` is 512 MiB of state; beyond it the node does not snapshot (logged) and its
+  log grows. Since S4 (`docs/STORAGE_INTEGRATION.md` §10) a snapshot is streamed: created from a
+  source in passes, sent in chunks read from the published file, validated at receipt and at startup
+  by streaming, and — on the LSM machine — restored by streaming it into the engine (ingest), so
+  nothing on that machine's path holds the state in memory. The in-memory store still holds its
+  state in memory, as it always does, and reads a snapshot's state whole to restore it. No
+  incremental or copy-on-write snapshots.
+- **Creation blocks the actor.** The state is opened, measured and published on the node's actor
+  goroutine (≈ 50 ms at 100k keys on the machine above; the LSM machine's three passes over an
+  ~85 MiB checkpoint are seconds), and a follower validates and installs a received snapshot there
+  too; Raft processing pauses meanwhile. Taking it off the actor is S6.
+- **A transfer can be retried while running.** If a transfer — or the follower's proof and install
+  after it — outlasts `SnapshotRetryTicks`, the leader re-offers; the second transfer waits for the
+  first (one per peer) and then repeats it. At S4's sizes this is the common case (an ~85 MiB proof
+  and ingest take 1–2 s under `-race`; the retry is 1 s at the tests' 25 ms tick), and the repeat
+  used to arrive whole in the follower's transport queue while its actor was busy — a second copy
+  of the state in memory (66–149 MiB of heap measured during an install, against 10 MiB). Since
+  S4's closeout the follower drops it as it arrives (above); the leader still reads and sends it.
 - **Power loss is modeled, not tested** — as everywhere in this project (`docs/FAILURE_MODEL.md`).
 - **Membership (Phase 15).** A snapshot carries the configuration at its index and nothing about
   changes in flight beyond it; a change after the index is in the log's suffix (§19).
 - **Configuration consistency is not checked across nodes.** A follower refuses a snapshot built
   under other session limits (and cannot then catch up); nothing prevents the misconfiguration.
-- **No snapshot of the LSM engine.** The replicated state machine is the in-memory `kv.Store`; the
-  storage engine is not hosted by the Raft node yet.
+- ~~**No snapshot of the LSM engine.**~~ Since S2 the engine can host the replicated state
+  machine (`-state-machine lsm`), and since S4 its snapshots are engine checkpoints installed by
+  ingest (`docs/STORAGE_INTEGRATION.md` §10).
 - **A wiped node is not a safe replacement.** A node started on an empty data directory catches up
   by snapshot, but it has forgotten its term and vote; rejoining under the same id is not proven
   safe (`docs/FAILURE_MODEL.md`). The safe replacement is a new id: add it as a learner, promote it,
