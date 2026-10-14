@@ -3,7 +3,6 @@ package storage
 import (
 	"errors"
 	"fmt"
-	"os"
 	"sync/atomic"
 
 	"github.com/adivishall/quorum/internal/storage/compaction"
@@ -275,7 +274,7 @@ func (s *LSMStore) compactOnce() (bool, error) {
 			// The output was renamed into place but never referenced. Removing it
 			// here is tidiness, not correctness: it is already an orphan and the
 			// next startup would sweep it.
-			_ = os.Remove(s.sstPath(num))
+			_ = s.fs.Remove(s.sstPath(num))
 		}
 		// After a failed manifest append the edit naming the output may be on
 		// disk — written, its fsync failed — and the next open would then
@@ -309,9 +308,9 @@ func (s *LSMStore) runMerge(job compactionJob, num uint64) (sstable.Metadata, bo
 	m := compaction.New(streams, compaction.Options{BottomMost: job.bottomMost})
 
 	tmpPath := s.tmpPath(num)
-	meta, err := sstable.WriteFile(tmpPath, m, s.writerOptions())
+	meta, err := sstable.WriteFileFS(s.fs, tmpPath, m, s.writerOptions())
 	if err != nil {
-		_ = os.Remove(tmpPath)
+		_ = s.fs.Remove(tmpPath)
 		return sstable.Metadata{}, false, fmt.Errorf("lsm: compacting level %d into %s: %w",
 			job.level, sstName(num), err)
 	}
@@ -324,7 +323,7 @@ func (s *LSMStore) runMerge(job compactionJob, num uint64) (sstable.Metadata, bo
 	s.compactStats.tombstonesKept.Add(st.TombstonesKept)
 
 	if meta.NumEntries == 0 {
-		_ = os.Remove(tmpPath)
+		_ = s.fs.Remove(tmpPath)
 		s.compactStats.emptyOutputs.Add(1)
 		return sstable.Metadata{}, false, nil
 	}
@@ -332,11 +331,11 @@ func (s *LSMStore) runMerge(job compactionJob, num uint64) (sstable.Metadata, bo
 	// Same publication order as a flush, for the same reasons (docs/LSM.md §7):
 	// the file is complete and fsynced before any name refers to it, the rename
 	// is atomic, and the directory fsync makes the rename itself durable.
-	if err := os.Rename(tmpPath, s.sstPath(num)); err != nil {
-		_ = os.Remove(tmpPath)
+	if err := s.fs.Rename(tmpPath, s.sstPath(num)); err != nil {
+		_ = s.fs.Remove(tmpPath)
 		return sstable.Metadata{}, false, fmt.Errorf("lsm: publishing %s: %w", sstName(num), err)
 	}
-	if err := sstable.SyncDir(s.dir); err != nil {
+	if err := s.fs.SyncDir(s.dir); err != nil {
 		return sstable.Metadata{}, false, fmt.Errorf("lsm: syncing %s after publishing %s: %w",
 			s.dir, sstName(num), err)
 	}
@@ -365,7 +364,7 @@ func (s *LSMStore) publishCompaction(job compactionJob, num uint64, meta sstable
 	if produced {
 		// Opened before the manifest append, so a file that cannot be opened is
 		// found before it is declared live rather than after.
-		r, err = sstable.Open(s.sstPath(num))
+		r, err = sstable.OpenFS(s.fs, s.sstPath(num))
 		if err != nil {
 			return err
 		}

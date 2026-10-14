@@ -495,6 +495,30 @@ func (f *memFile) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// ReadAt reads len(p) bytes at off without moving the handle's offset
+// (io.ReaderAt): fewer only at the end of the file, with io.EOF.
+func (f *memFile) ReadAt(p []byte, off int64) (int, error) {
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+	if err := f.check("read"); err != nil {
+		return 0, err
+	}
+	if !f.readable {
+		return 0, &fs.PathError{Op: "read", Path: f.name, Err: fs.ErrPermission}
+	}
+	if off < 0 {
+		return 0, &fs.PathError{Op: "read", Path: f.name, Err: fs.ErrInvalid}
+	}
+	if off >= int64(len(f.node.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, f.node.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
 func (f *memFile) Write(p []byte) (int, error) {
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()

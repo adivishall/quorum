@@ -17,6 +17,7 @@ import (
 	"github.com/adivishall/quorum/internal/storage/memtable"
 	"github.com/adivishall/quorum/internal/storage/sstable"
 	"github.com/adivishall/quorum/internal/storage/wal"
+	"github.com/adivishall/quorum/internal/vfs"
 )
 
 // SSTable file naming. Numbers ascend with creation order, so a higher number is
@@ -78,6 +79,8 @@ func sstTempName(n uint64) string { return fmt.Sprintf("%0*d%s", sstDigits, n, s
 type LSMStore struct {
 	opts Options
 	dir  string
+	fs   vfs.FS // the tables and the directory (Options.FS, or the OS)
+	mfs  vfs.FS // the MANIFEST: Options.FS when set, else manifest.FS
 
 	closeMu sync.RWMutex
 	closed  bool
@@ -173,7 +176,7 @@ type LSMRecovery struct {
 }
 
 // syncDir fsyncs a directory; a test replaces it to observe the sync.
-var syncDir = sstable.SyncDir
+var syncDir = func(fsys vfs.FS, dir string) error { return fsys.SyncDir(dir) }
 
 // OpenLSMStore opens or creates a durable LSM store in dir.
 //
@@ -212,8 +215,16 @@ func OpenLSMStore(dir string, opts Options) (*LSMStore, error) {
 	if dir == "" {
 		return nil, opErr("open", nil, fmt.Errorf("%w: data directory is empty", ErrInvalidOptions))
 	}
-	_, statErr := os.Stat(dir)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	fsys := vfs.Or(opts.FS)
+	mfs := opts.FS
+	if mfs == nil {
+		mfs = manifest.FS
+	}
+	if opts.WAL.FS == nil {
+		opts.WAL.FS = opts.FS // the engine's files share one filesystem unless the WAL names its own
+	}
+	_, statErr := fsys.Stat(dir)
+	if err := fsys.MkdirAll(dir, 0o755); err != nil {
 		return nil, classify("open", nil, err)
 	}
 	if errors.Is(statErr, os.ErrNotExist) {
@@ -221,7 +232,7 @@ func OpenLSMStore(dir string, opts Options) (*LSMStore, error) {
 		// directory's creation is, inside it): a power loss would take the
 		// directory's own entry, and with it every table and MANIFEST record the
 		// engine fsynced — the durable applied index R2 compacts against (S3).
-		if err := syncDir(filepath.Dir(filepath.Clean(dir))); err != nil {
+		if err := syncDir(fsys, filepath.Dir(filepath.Clean(dir))); err != nil {
 			return nil, classify("open", nil, fmt.Errorf("lsm: syncing the parent of new directory %s: %w", dir, err))
 		}
 	}
@@ -229,6 +240,8 @@ func OpenLSMStore(dir string, opts Options) (*LSMStore, error) {
 	s := &LSMStore{
 		opts:           opts,
 		dir:            dir,
+		fs:             fsys,
+		mfs:            mfs,
 		compactWake:    make(chan struct{}, 1),
 		compactQuit:    make(chan struct{}),
 		compactStopped: make(chan struct{}),
@@ -319,7 +332,7 @@ func OpenLSMStore(dir string, opts Options) (*LSMStore, error) {
 
 // recoverManifest reads the MANIFEST, or bootstraps one.
 func (s *LSMStore) recoverManifest() (manifest.State, error) {
-	state, rec, err := manifest.Recover(s.dir)
+	state, rec, err := manifest.RecoverFS(s.mfs, s.dir)
 	switch {
 	case err == nil:
 		s.recovery.ManifestNum = rec.Num
@@ -368,7 +381,7 @@ func (s *LSMStore) bootstrapState() (manifest.State, error) {
 	// sequence range that had nowhere on disk to live before the MANIFEST.
 	state := manifest.State{NextFileNum: 1}
 	for _, n := range nums {
-		r, err := sstable.Open(s.sstPath(n))
+		r, err := sstable.OpenFS(s.fs, s.sstPath(n))
 		if err != nil {
 			return manifest.State{}, err
 		}
@@ -405,7 +418,7 @@ func (s *LSMStore) bootstrapState() (manifest.State, error) {
 
 // listSSTables returns the SSTable numbers present in the directory, ascending.
 func (s *LSMStore) listSSTables() ([]uint64, error) {
-	entries, err := os.ReadDir(s.dir)
+	entries, err := s.fs.ReadDir(s.dir)
 	if err != nil {
 		return nil, fmt.Errorf("lsm: reading %s: %w", s.dir, err)
 	}
@@ -454,7 +467,7 @@ func (s *LSMStore) openFiles(metas []manifest.FileMeta) ([]*sstFile, error) {
 	files := make([]*sstFile, 0, len(sorted))
 	for _, m := range sorted {
 		path := s.sstPath(m.Num)
-		r, err := sstable.Open(path)
+		r, err := sstable.OpenFS(s.fs, path)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return files, fmt.Errorf(
@@ -556,7 +569,7 @@ func (s *LSMStore) sweepOrphans(live []*sstFile) error {
 		referenced[f.meta.Num] = true
 	}
 
-	entries, err := os.ReadDir(s.dir)
+	entries, err := s.fs.ReadDir(s.dir)
 	if err != nil {
 		return fmt.Errorf("lsm: reading %s: %w", s.dir, err)
 	}
@@ -567,7 +580,7 @@ func (s *LSMStore) sweepOrphans(live []*sstFile) error {
 		name := e.Name()
 		switch {
 		case strings.HasSuffix(name, sstTempSuffix):
-			if err := os.Remove(filepath.Join(s.dir, name)); err != nil {
+			if err := s.fs.Remove(filepath.Join(s.dir, name)); err != nil {
 				return fmt.Errorf("lsm: removing partial output %s: %w", name, err)
 			}
 			s.recovery.TempFilesRemoved++
@@ -576,7 +589,7 @@ func (s *LSMStore) sweepOrphans(live []*sstFile) error {
 			if !ok || referenced[n] {
 				continue
 			}
-			if err := os.Remove(filepath.Join(s.dir, name)); err != nil {
+			if err := s.fs.Remove(filepath.Join(s.dir, name)); err != nil {
 				return fmt.Errorf("lsm: removing orphan %s: %w", name, err)
 			}
 			s.recovery.OrphansRemoved++
@@ -603,7 +616,7 @@ func (s *LSMStore) installManifest(state manifest.State) error {
 	// Reusing the number fails on the O_EXCL create — Install refuses to overwrite
 	// a manifest, which is the right instinct — and the store would not open at
 	// all, so the number has to be chosen against the directory.
-	existing, err := manifest.List(s.dir)
+	existing, err := manifest.ListFS(s.mfs, s.dir)
 	if err != nil {
 		return err
 	}
@@ -617,13 +630,13 @@ func (s *LSMStore) installManifest(state manifest.State) error {
 		num = 1
 	}
 
-	w, err := manifest.Install(s.dir, num, state)
+	w, err := manifest.InstallFS(s.mfs, s.dir, num, state)
 	if err != nil {
 		return err
 	}
 	s.manifest = w
 
-	removed, err := manifest.RemoveObsolete(s.dir, num)
+	removed, err := manifest.RemoveObsoleteFS(s.mfs, s.dir, num)
 	if err != nil {
 		return err
 	}
@@ -937,19 +950,19 @@ func (s *LSMStore) flushLocked() error {
 	tmpPath := s.tmpPath(num)
 	finalPath := s.sstPath(num)
 
-	meta, err := sstable.WriteFile(tmpPath, old.NewIterator(), s.writerOptions())
+	meta, err := sstable.WriteFileFS(s.fs, tmpPath, old.NewIterator(), s.writerOptions())
 	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmpPath, finalPath); err != nil {
-		_ = os.Remove(tmpPath)
+	if err := s.fs.Rename(tmpPath, finalPath); err != nil {
+		_ = s.fs.Remove(tmpPath)
 		return fmt.Errorf("lsm: publishing %s: %w", sstName(num), err)
 	}
-	if err := sstable.SyncDir(s.dir); err != nil {
+	if err := s.fs.SyncDir(s.dir); err != nil {
 		return fmt.Errorf("lsm: syncing %s after publishing %s: %w", s.dir, sstName(num), err)
 	}
 
-	r, err := sstable.Open(finalPath)
+	r, err := sstable.OpenFS(s.fs, finalPath)
 	if err != nil {
 		return err
 	}

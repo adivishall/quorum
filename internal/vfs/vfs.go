@@ -1,6 +1,7 @@
 // Package vfs is the filesystem seam of Quorum's durable Raft log (Phase 10,
-// docs/FAULTS.md, ADR-017) and, since S1, of the storage engine's write-ahead
-// log (docs/STORAGE_INTEGRATION.md §7.6).
+// docs/FAULTS.md, ADR-017), since S1 of the storage engine's write-ahead log
+// (docs/STORAGE_INTEGRATION.md §7.6), and since S4 of the engine's SSTables and
+// MANIFEST reads (§10.11).
 //
 // internal/raftlog and internal/storage/wal read and write their logs through the
 // two small interfaces here instead of calling package os directly. Production code uses OS, which is
@@ -27,6 +28,9 @@ type File interface {
 	io.Reader
 	io.Writer
 	io.Seeker
+	// ReaderAt reads at an offset without moving the file's offset; an SSTable
+	// reader serves concurrent block reads through it (S4).
+	io.ReaderAt
 	// Stat reports the file's current size (other fields are not relied on).
 	Stat() (fs.FileInfo, error)
 	// Truncate changes the file's size.

@@ -1,7 +1,8 @@
 package storage
 
 import (
-	"os"
+	"errors"
+	"io/fs"
 	"path/filepath"
 	"sort"
 	"sync/atomic"
@@ -167,7 +168,7 @@ func (s *LSMStore) reap(v *version) {
 
 	for _, f := range dead {
 		_ = f.r.Close()
-		if err := os.Remove(f.path); err != nil && !os.IsNotExist(err) {
+		if err := s.fs.Remove(f.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			// Nothing to do but record it. The file is already invisible to the
 			// database; the next startup's orphan sweep will try again.
 			s.noteObsoleteRemovalFailure(f.meta.Num, err)
