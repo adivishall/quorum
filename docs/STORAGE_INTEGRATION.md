@@ -1,6 +1,6 @@
 # STORAGE INTEGRATION — the LSM engine as the replicated state machine
 
-Status: **S1, S2 and S3 are implemented (§7, §8, §9); S4–S6 are design.** The design was audited against the code at
+Status: **S1, S2 and S3 are implemented (§7, §8, §9); S4 is in progress (§10); S5–S6 are design.** The design was audited against the code at
 PR #10's head (`a8eb9e1`, 2026-10-07), and S1's audit against `main` after it. This document fixes
 who owns each invariant, so that no code moves before that is clear. `docs/ENGINEERING_ROADMAP.md`
 §0 states the project's thesis, and this is its layer-2 plan.
@@ -1483,3 +1483,275 @@ micro-benchmarks; the cluster-level cost of S3 is not measured here (the S2 stea
   compaction outputs also use, run out sooner; then every flush fails and the node fail-stops (no
   loss; a restart does not help). A wider name format is the fix; it is a
   format change of its own, and should precede any long-running deployment.
+
+## 10. S4 — engine checkpoints and streamed snapshot installation
+
+S4 replaces "the whole state, encoded in memory, installed as one WAL record" with a consistent
+engine checkpoint streamed into the snapshot file, and an installation that streams the file into
+new SSTables and switches the engine to them with one MANIFEST edit. Its exit criterion: a follower
+installs, and restarts on, a snapshot larger than the ~63 MiB S3 left, with every S1–S3
+guarantee intact. R1 and R2 are unchanged and must stay intact.
+
+The design below was written against `main` at `a3c886f` (S3 merged) before any S4 code; §10.15
+onward record what was built, what building it found, and what it proves.
+
+### 10.1 Audit: the snapshot path at S3, traced
+
+| Step | Code | What it holds in memory | What bounds it |
+|---|---|---|---|
+| Create (leader, on the actor) | `Durable.Snapshot` → `LSMMachine.EncodeSnapshot` (`db.Snapshot()`: every key into a map; `encodeState`: the bytes) → `snapshot.Encode` (the file) → `SyncApplied` → `Files.Publish` | the state ~3–4 times | `snapshot.MaxData` = 512 MiB |
+| Send | `Snapshots.SendFile` loads, validates and **caches** the whole file for the node's life; `snapshot.Split` into 1 MiB chunks; `transfer` sends them on its own goroutine | the file | `MaxFile` |
+| Receive | `Receiver.Accept` appends each in-order chunk to `.snap.recv`; when complete: fsync, `readFile` (all of it), `Decode`, `ValidateSnapshot` → `decodeState` (a map) and, for the LSM machine, `restoreBatchBytes ≤ maxRestoreBytes` | the file, then the state ~2 times | **`maxRestoreBytes` = `record.MaxRecordSize` − 1 MiB ≈ 63 MiB** — the effective install limit |
+| Install | `Durable.InstallSnapshot`: term/vote, `PublishReceived` (rename, dir fsync), `Log.Install` (boundary), `RestoreSnapshot(data)`: close the engine, rename it aside, fsync the parent, delete it, open a fresh engine, **one `Apply` batch** holding every key and session record, fsync the parent | the state ~2 times | one WAL record (64 MiB) |
+| Restart | `Recover`: `Files.Load` (the whole file), reconcile, `RestoreSnapshot` (a no-op when the engine is at or above the snapshot, decided first since S3) | the file | — |
+| Open the machine | `loadSessions` reads `db.Snapshot()` — **every key** — to find the session records | the state | — |
+
+So the ~63 MiB limit is one constant, but behind it every stage holds the whole state at least
+once. Lifting the constant alone (or raising the WAL record limit) would leave a 500 MiB snapshot
+needing gigabytes of memory at both ends; S4 removes the whole-state buffers on the LSM path.
+
+### 10.2 The decision: what a snapshot is, and what is streamed
+
+**A logical, key-ordered stream in the existing snapshot format.** The snapshot file stays exactly
+what it is today — QSNP v2 around the key-value state encoding v1 (`docs/SNAPSHOTS.md` §3): a
+header binding group, configuration, index, term, the state's length and its SHA-256; data
+records of at most 1 MiB, each with its own CRC-32C; a footer repeating index and term. The kv
+state encoding is already key-ordered: every user key ascending, then every session ascending by
+id — and that is exactly the engine's key order under the machine's tags (`0x01` user keys sort
+before `0x02` session records, and a session key is its id big-endian). So the stream the leader
+produces from its engine, and the stream the follower builds SSTables from, are the same ordered
+sequence the format already defines. **No on-disk or wire format changes in S4.**
+
+Why this representation is safe: every byte is covered by a record CRC; the whole state by the
+SHA-256 in a header that also names the group, index and term, with the footer repeating index and
+term; the state encoding is canonical, so a duplicated, reordered or missing key or session is
+undecodable, and the session rules (`docs/SNAPSHOTS.md` §3) reject any session table no sequence
+of commands could produce; the chunk rules (`docs/SNAPSHOTS.md` §9) never assemble a file from
+duplicated, reordered, stale or missing chunks. The receiver builds its own SSTables from
+validated logical content; it never adopts a file a peer produced.
+
+**Rejected: a physical checkpoint** — the engine's live SSTables hard-linked into a checkpoint
+directory with their own MANIFEST, streamed as a file set. It would add a second durable artifact
+beside the published snapshot (two records of "the snapshot at `i`", two commit protocols to
+prove); couple the snapshot to the SSTable format and to the sender's sequence numbering, so the
+receiver would have to trust and renumber a peer's tables; and the in-memory reference machine,
+the simulator and the Phase 14 snapshot crash matrix could no longer install or exercise it.
+`fault.MemFS` does not model hard links either.
+
+### 10.3 The engine checkpoint
+
+**What it is.** `LSMStore.Checkpoint()` makes the engine durable through its applied index and pins
+it: under the write lock it flushes (S3's protocol; an empty memtable records the applied index
+alone) and acquires the current **version** — the immutable set of tables the MANIFEST names, with
+an empty memtable. The checkpoint is that pinned version: the engine's state at applied index
+`(i, t)`, exactly the MANIFEST's durable `Applied`. It is read in key order through the
+compaction merge (`internal/storage/compaction`, `BottomMost`: the version holds the whole
+database, so a tombstone hides nothing), which yields each live key's newest value once.
+
+**Consistency model.** The version's reference count keeps every table it names open and on disk
+until the checkpoint is closed, as it does for any read (INV-S5): a compaction that runs meanwhile
+publishes a new version and its inputs are deleted only when the checkpoint releases them. Writes
+after the pin go to the new memtable and are not in the checkpoint. So the checkpoint is one point
+in the apply order — never a mixture — whatever the engine does meanwhile. Iterating it any
+number of times yields the same bytes.
+
+**Index and term.** The checkpoint carries the `Applied` it was pinned at. It is never above the
+durable watermark: it *is* the durable watermark (`DurableApplied()` at the pin, checked). The
+machine requires it to equal its own applied index (no cycle staged) and raftnode requires that to
+equal the core's applied index, whose term and configuration (`core.TermAt`, `core.ConfAt`) go in
+the snapshot's `Meta`, as today.
+
+**Durable form and publication.** The checkpoint's durable, transferable form is the published
+snapshot file: the checkpoint streamed into `.snap.tmp` (fsync), renamed over `.snap`, the
+directory fsynced (`Files.Publish`'s protocol, unchanged). That rename-and-directory-fsync is the
+publication commit point; at restart the snapshot is discovered by its name, and a `.snap.tmp` is
+an orphan that `Recover` removes — an abandoned checkpoint is never mistaken for a published one.
+A failed creation leaves the engine untouched (the checkpoint only reads) and the previous snapshot
+published; the pin is released either way.
+
+### 10.4 Creation
+
+`Durable.Snapshot`, at applied index `i`, on the actor (moving it off is S6):
+1. `OpenSnapshot` — the checkpoint (flush + pin) — and the existing guards: the machine's index must
+   equal the core's applied index, be above the published snapshot, and have a known configuration.
+2. `SyncApplied` (S3; a no-op now, the checkpoint having flushed), before anything is published.
+3. Stream into `.snap.tmp`. The format's header needs the state's length and SHA-256 before the
+   data, and the state's header needs the key count, so the file is written in passes over the same
+   pinned checkpoint: count (the machine's source, first), measure and hash (`snapshot` package),
+   write. The writer hashes what it writes and refuses to publish if it differs from the measured
+   pass — a source that does not reproduce its bytes is a bug, never a published snapshot. A state
+   over `MaxData` is refused at the measuring pass, before anything is written (unchanged
+   behaviour: skipped until `Every` more entries).
+4. fsync, rename, directory fsync — publication; release the checkpoint; compact (R2's clamp,
+   unchanged).
+
+The in-memory store's source is its encoded bytes, so its snapshot is byte-for-byte what it was.
+The LSM machine's source must produce **the same bytes the reference encoder produces for the same
+state** — tested differentially, and the reason no format changes.
+
+### 10.5 Transfer and receipt
+
+- **Sender.** The leader opens the published file and reads its header (the snapshot it names must
+  be the published one); the transfer goroutine then verifies the whole file (a streaming pass:
+  every record, the length, the hash, the footer) and sends it in 1 MiB chunks read from that open
+  handle — never the whole file in memory, and nothing cached. A later publish renames a new file
+  over the name; the open handle still reads the snapshot the transfer started with.
+- **Receiver.** The chunk rules are unchanged (offset 0 starts a transfer and abandons any other;
+  every other chunk must continue it exactly, or is ignored). `Total ≤ MaxFile` bounds the disk a
+  transfer can take; memory is one chunk. When the last chunk arrives: fsync `.snap.recv`, then
+  validate **by streaming it**: the framing (each record's CRC, kinds, sizes, the length, the hash,
+  the footer, nothing after) and the announced index and term; then the state machine validates the
+  state by streaming it — every rule `decodeState` applies, without building the state. Only then is
+  `MsgSnapshot` stepped into the core. A failed validation abandons the transfer; the leader offers
+  again; the partial or rejected file is never active state and is truncated by the next transfer
+  or removed at startup. A retry starts from offset 0 (no resume): simple, and correct by the rules
+  above.
+
+### 10.6 Installation by ingest — the engine's commit point
+
+`LSMStore.Ingest(src, (i, t))` replaces the engine's entire contents with a key-ordered stream,
+atomically, at applied index `(i, t)`. The LSM machine's restore feeds it the published snapshot's
+state as engine entries: each user key under its tag, then each session record re-encoded, building
+the new session mirror as they pass. Steps, holding the close, compaction and write locks (no
+writer and no compaction runs during an ingest):
+
+1. **Stage.** Write SSTables from the stream: entries strictly ascending (checked), each within the
+   engine's key and value limits, numbered with fresh sequence numbers above every one the engine
+   has used, cut at a target size; each table is written to `N.sst.tmp`, fsynced, renamed to
+   `N.sst`. A staged table is named by no MANIFEST edit, so by INV-S6 it is not part of the
+   engine: a crash leaves it an orphan, swept at the next open.
+2. **End of stream.** The source must end cleanly: for a snapshot this means the reader reached the
+   footer with the length and the SHA-256 verified, and the state decoder found nothing after the
+   last session. Any failure here — or in step 1 — deletes the staged tables and returns with the
+   engine **unchanged and usable**.
+3. **Make the staged names durable:** fsync the engine directory.
+4. **Rotate the WAL** to a new, empty, durable segment `n` (S3's rotation: sync and close the old
+   segment, create `n`, fsync the WAL directory).
+5. **Commit:** append ONE MANIFEST edit, fsynced — `DeleteFile` every live table, `AddFile` every
+   staged table, `SetNextFileNum`, `SetLastSequence(S)`, `SetLogNumber(n)`, `SetLogStartSeq(S)`,
+   `SetApplied(i, t)`, `SetAppliedSeq(S)`, where `S` is the last staged sequence. **This is the
+   commit point.** Before it the MANIFEST names the old tables and the old log; after it, only the
+   new tables and an empty log that starts at `S + 1`, at applied index `(i, t)`. The old WAL
+   records are below the new log number, so nothing of the old state is ever replayed onto the new.
+6. **Switch:** install a version with a fresh memtable and only the new tables; the applied index,
+   the durable watermark (R2's `DurableApplied`) and both sequences become the edit's.
+7. **Retire:** the old tables are deleted once no reader holds them (the existing reference
+   counting); the WAL segments below `n` are deleted. A failure here costs space only: the next open
+   sweeps unreferenced tables and segments below the log number.
+
+A failure in step 4 or 5 is **ambiguous** (the edit may be on disk): the engine latches it, as a
+failed flush does, refuses every later write, and the machine fails stop; the next open reads
+whichever edit is durable — old or new, never both. Nothing advances the durable watermark before
+the append has returned success.
+
+Ingested tables are placed at the shallowest level ≥ 1 whose size budget holds them, so the level-0
+file-count trigger does not immediately rewrite them; they have disjoint key ranges and disjoint,
+ascending sequence ranges, the property the read path and the open-time coherence check rely on.
+
+### 10.7 The installation state machine (follower)
+
+| # | State | Durable on disk | Restart selects |
+|---|---|---|---|
+| 0 | no installation | the old engine; the old published snapshot (if any) | the old engine |
+| 1 | partial transfer | `.snap.recv` partly written | removed by `Recover`; the old engine |
+| 2 | complete, validated, staged (in memory) | `.snap.recv` fsynced | removed; the old engine — the leader offers again |
+| 3 | **published** — the Raft-level commit point | `.snap` = the new snapshot (rename + dir fsync); the log's boundary may or may not be recorded | `Recover` completes the boundary if missing (Phase 14), then restores: the engine (old, index `< i`) is replaced by ingest from `.snap` |
+| 4 | ingest staging | new `.sst` files no MANIFEST edit names | open sweeps them; the engine is the old one; `Recover` ingests again |
+| 5 | **ingest committed** — the engine's commit point | the MANIFEST names only the new tables at `(i, t)`; old tables and segments may remain | open sweeps the old files; the engine is the new one; `Recover`'s restore is a no-op (`e ≥ i`) |
+| 6 | old engine retired | the new engine only | the new engine |
+
+Two commit points, ordered: the snapshot file is published before the engine's ingest commits, so
+whenever the engine holds the new state the published snapshot covers it, and whenever the engine
+still holds the old state the published snapshot is there to install it again. "Old or new, never
+a mixture" is the MANIFEST's: it names one table set. "Never silently stale" is `Recover`'s: an
+engine below the published snapshot is restored before anything is applied, exactly as at S3.
+
+### 10.8 Recovery
+
+At open the engine recovers the MANIFEST, refuses a referenced table that is missing, sweeps
+unreferenced tables (staged or retired), and replays the WAL from the log number — after a
+committed ingest, from the empty segment the ingest rotated to. Then `raftnode.Recover` verifies
+the published snapshot by streaming it (bounded memory, the same checks as at receipt) and calls
+the machine's restore with a stream over it; the machine decides the no-op first, before reading
+anything (S3). A crash at any point of a restore leaves state 3, 4, 5 or 6 above, each of which
+`Recover` handles; a second crash right after recovery finds one of the same states, so recovery
+is idempotent. Every ambiguity found at open — a referenced table missing, a corrupt published
+snapshot, a MANIFEST that does not decode — is refused (the node does not start), never guessed.
+
+### 10.9 R2 and consistency with Raft
+
+- **Creation:** unchanged — `SyncApplied` before publication, the checkpoint's index is the durable
+  index, and compaction stays clamped to `min(snapshot − Retain, DurableAppliedIndex)`.
+- **Installation:** the log's boundary moves to `i` at step 3 of `InstallSnapshot`, covered by the
+  published file (S3's statement: R2 bounds compaction; an install is covered by its snapshot file).
+  The engine's durable index jumps to `i` at the ingest commit, so after it the node's own later
+  compactions are clamped at or above `i`. A failed or ambiguous ingest never advances it.
+- **Sessions and the applied index:** the session records travel inside the snapshot and are
+  ingested with the data in the same commit; the machine's mirror is rebuilt from them; the applied
+  index and term are the snapshot's. A retry of a request the snapshot covers is answered
+  `Duplicate`, as after any restore.
+
+### 10.10 Compatibility
+
+- **Formats:** none change. A snapshot published before S4 loads, sends and installs; a snapshot an
+  S4 leader publishes is byte-identical to what the S3 encoder produced for the same state, so an
+  S3 follower can install it (within its own 63 MiB limit) and an S4 follower can install an S3
+  leader's.
+- **Engine directories:** an S3 directory opens unchanged; ingest uses only existing MANIFEST tags.
+  S3's restore set the old engine aside as `<dir>.restore-aside`; open still removes one.
+- **The in-memory machine and the simulator** keep their byte-slice encodings behind the streaming
+  interface; the Phase 14 matrices exercise the new plumbing unchanged.
+
+### 10.11 The `vfs` seam reaches the SSTables and the MANIFEST's reads
+
+The ingest's genuine new persistence operations are SSTable writes, fsyncs, renames, directory
+fsyncs and deletions. Testing them under the power-loss model needs them on the model, so
+`storage.Options.FS` (nil: the OS) now carries every SSTable and engine-directory operation —
+creation, write, fsync, rename, removal, listing, reads — and the MANIFEST's reads join its writes
+on `manifest.FS`. `vfs.File` gains `ReadAt`, which an SSTable reader needs (`*os.File` has it;
+`fault.MemFS` implements it). Production behaviour is unchanged: everything is the OS.
+
+### 10.12 Residual limits (by design, stated)
+
+- `snapshot.MaxData` stays 512 MiB: S4 lifts the ~63 MiB install limit to the format's bound. On the
+  LSM path nothing holds the state in memory any more, so the bound is a policy constant; raising
+  it is a separate change (an S3 node would refuse such a snapshot with `ErrTooLarge`, safely).
+- Disk during an install: the received file, the staged tables and the old engine coexist until the
+  commit — about three times the state.
+- Creation is three passes over the checkpoint, on the actor. Taking it off the actor is S6.
+- A transfer interrupted part-way restarts from offset 0.
+
+### 10.13 Test plan
+
+- **Checkpoint:** empty and large engines; writes after the pin invisible; a compaction during the
+  read does not disturb it; its index is the durable index; repeated creation releases every pin.
+- **Ingest:** replace, reopen, empty, larger than the old limit; unordered or over-limit input
+  refused with the engine unchanged; a failure at every step; the crash matrix below.
+- **Crash matrix (`TestIngestCrashMatrix`):** every filesystem operation of an ingest — table
+  writes (whole and torn), fsyncs, renames, directory fsyncs, the rotation, the MANIFEST append, the
+  deletions — under a process crash and a power loss (with and without a torn tail); each cell
+  records the operation and the fault, and checks that the engine opens as exactly the old state or
+  exactly the new, matching a reference model, that nothing committed was lost and nothing
+  uncommitted is visible, and that a second crash right after recovery changes nothing.
+- **Snapshot stream:** the streaming writer is byte-identical to `Encode`; the streaming reader
+  agrees with `Decode` on every input (a differential fuzz target); the receiver validates by
+  streaming; a transfer reads the snapshot it started with across a later publish.
+- **kv:** the LSM source is byte-identical to the reference encoding of the same state; the
+  streaming validator agrees with `decodeState` on the known-good and known-bad corpus and under
+  fuzzing; a restore above the old limit; sessions and deduplication across a restore; a failed
+  restore fails stop.
+- **raftnode:** the existing snapshot, install and crash-point tests on the streaming interface;
+  the Phase 14 snapshot crash matrix and the simulator unchanged.
+- **Real processes:** a follower installs a snapshot larger than 63 MiB from an LSM leader,
+  restarts, converges, serves reads and writes, and answers a retried request as a duplicate; a
+  follower crashed during installation recovers.
+- **Mutants** for every faulty variant listed in the S4 brief that applies to this design.
+
+### 10.14 Deliberately deferred
+
+- S5 (the two-log measurement) and S6 (group commit, pipelining, taking snapshot creation and the
+  snapshot flush off the actor).
+- Raising `snapshot.MaxData`; resuming an interrupted transfer; real-device power loss.
+- The separately tracked follow-ups, each its own issue and not part of S4: file-number exhaustion
+  (#20), the S2-era intermittent read rejection (#21), the snapshot flush's election churn (#22, S6),
+  and `SyncOff`'s power-loss refusal (#23).
