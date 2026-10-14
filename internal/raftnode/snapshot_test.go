@@ -35,6 +35,10 @@ type snapSM struct {
 	index    uint64
 	cmds     []string
 	restores int
+	// slow, when set, is how long each validation of a received snapshot
+	// takes (a large state's proof); proofs counts them.
+	slow   time.Duration
+	proofs int
 }
 
 func (s *snapSM) Apply(index uint64, command []byte) error {
@@ -90,6 +94,11 @@ func decodeSnapSM(index uint64, data []byte) ([]string, error) {
 }
 
 func (s *snapSM) ValidateSnapshotFrom(index uint64, r io.Reader) error {
+	s.mu.Lock()
+	s.proofs++
+	slow := s.slow
+	s.mu.Unlock()
+	time.Sleep(slow)
 	data, err := ReadState(r)
 	if err != nil {
 		return err
@@ -482,6 +491,9 @@ type snapCluster struct {
 	// each, as in production), kept across restarts.
 	regs map[NodeID]*metrics.Registry
 	mets map[NodeID]*Metrics
+	// slow, when set, gives a node started from now on a state machine whose
+	// proof of a received snapshot takes that long (snapSM.slow).
+	slow map[NodeID]time.Duration
 }
 
 // withMetrics gives every node started from now on a registry of its own.
@@ -536,7 +548,7 @@ func (c *snapCluster) start(id NodeID, hook Hook) {
 		}
 		c.trs[id] = tr
 	}
-	sm := &snapSM{}
+	sm := &snapSM{slow: c.slow[id]}
 	var peers []NodeID
 	switch {
 	case c.joiners[id], c.genesisless:

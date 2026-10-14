@@ -1245,6 +1245,9 @@ func (n *Node) receiveLoop() {
 				env.Payload = payload
 			}
 			if env.Kind == transport.MsgInstallSnapshot {
+				if n.coveredChunk(env) {
+					continue
+				}
 				select {
 				case n.chunkCh <- inChunk{from: NodeID(env.Peer), payload: env.Payload}:
 				case <-n.ctx.Done():
@@ -1358,6 +1361,33 @@ func (n *Node) transfer(peer NodeID, term uint64, snd *snapshot.Sending) {
 	}
 	n.m.snapSent.Inc()
 	n.logf("event=raft_snapshot_sent node=%s to=%s index=%d term=%d bytes=%d chunks=%d group=%d", n.cfg.ID, peer, meta.Index, meta.Term, snd.Size(), chunks, n.cfg.Group)
+}
+
+// coveredChunk reports, off the actor, whether a frame is a chunk of a
+// snapshot no newer than the one this node is proving or installing right now
+// (Snapshots.Installing): such a transfer — a leader's re-offer the node could
+// not answer while busy with the first copy — can only repeat what the node is
+// about to have, so it is dropped here, chunk by chunk as it arrives, instead
+// of waiting in memory behind the busy actor and then being written, proven
+// and ignored. The first chunk of each dropped transfer is logged. Outside an
+// install nothing is dropped, and a chunk that does not decode is passed on:
+// the receiver refuses it and says why.
+func (n *Node) coveredChunk(env transport.Envelope) bool {
+	if n.dur == nil || n.dur.Snap == nil {
+		return false
+	}
+	installing := n.dur.Snap.Installing()
+	if installing == 0 {
+		return false
+	}
+	c, err := snapshot.UnmarshalChunk(env.Payload)
+	if err != nil || c.Index > installing {
+		return false
+	}
+	if c.Offset == 0 {
+		n.logf("event=raft_snapshot_chunk_dropped node=%s from=%s index=%d installing=%d group=%d", n.cfg.ID, env.Peer, c.Index, installing, n.cfg.Group)
+	}
+	return true
 }
 
 // receiveChunk takes one chunk of a snapshot a peer is sending. A complete,

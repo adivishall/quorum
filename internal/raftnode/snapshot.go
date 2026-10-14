@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync/atomic"
 
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftlog"
@@ -158,10 +159,37 @@ type Snapshots struct {
 	skip   uint64        // no new snapshot below this applied index (a state too large)
 	recv   *snapshot.Receiver
 	staged *snapshot.Received // complete and validated, awaiting the core
+
+	// installing is the snapshot this node is proving or installing at this
+	// moment (0: none) — read off the actor (Installing).
+	installing atomic.Uint64
 }
 
 // Published returns the published snapshot's metadata (Index 0: none).
 func (s *Snapshots) Published() snapshot.Meta { return s.meta }
+
+// Installing is the index of the snapshot this node is proving or installing
+// at this moment (0: none) — from the chunk that completes its transfer until
+// it is installed, refused, or found already covered. A transfer of a snapshot
+// at or below it can only repeat what the node is about to have. Safe from any
+// goroutine: the node's frame pump drops such chunks rather than queue them
+// behind the busy actor (S4: a leader re-offers a snapshot its follower has not
+// answered within SnapshotRetryTicks; a large proof and install outlast that,
+// and the whole repeat used to wait in the follower's memory). Outside that
+// window nothing is dropped.
+func (s *Snapshots) Installing() uint64 { return s.installing.Load() }
+
+// setInstalling recomputes Installing: the snapshot being proven (0: none) or
+// the staged one, awaiting or in its install. A proof that fails, an install
+// that completes and a staged snapshot the core ignores all clear it, so a
+// refused snapshot is never kept from the leader's next offer of it.
+func (s *Snapshots) setInstalling(proving uint64) {
+	i := proving
+	if s.staged != nil {
+		i = max(i, s.staged.Meta.Index)
+	}
+	s.installing.Store(i)
+}
 
 // SendFile returns the published snapshot and its file, for a transfer to a
 // follower. It loads (and validates) the file on first use. The deterministic
@@ -221,6 +249,15 @@ func (s *Snapshots) Receive(from NodeID, payload []byte) (*raft.Message, error) 
 	if s.recv == nil {
 		s.recv = snapshot.NewReceiver(s.Files)
 	}
+	// The chunk that completes the transfer in progress starts its proof (a
+	// streaming pass over the file, then over the state): the snapshot is being
+	// installed from here, and after the proof only if it was staged.
+	if c.Offset+uint64(len(c.Data)) == c.Total {
+		if f, idx, got, ok := s.recv.Active(); c.Offset == 0 || ok && f == string(from) && idx == c.Index && got == c.Offset {
+			s.setInstalling(c.Index)
+		}
+	}
+	defer s.setInstalling(0)
 	got, err := s.recv.Accept(string(from), c)
 	if err != nil || got == nil {
 		return nil, err
@@ -272,7 +309,10 @@ func restorePublished(files snapshot.Files, sm SnapshotStateMachine, index, term
 // Unstage drops a staged snapshot the core did not install (it already had
 // the state). Its staging file is overwritten by the next transfer or removed
 // at startup; it is never published.
-func (s *Snapshots) Unstage() { s.staged = nil }
+func (s *Snapshots) Unstage() {
+	s.staged = nil
+	s.setInstalling(0)
+}
 
 // Durable is a node's durable state as the Ready cycle drives it: the Raft log
 // and the snapshots. It is the Storage the node and the simulator drain Readies
@@ -338,6 +378,7 @@ func (d *Durable) InstallSnapshot(meta raft.SnapshotMeta, hs *raftlog.HardState,
 		return fmt.Errorf("%w: restoring a validated snapshot: %w", ErrSnapshot, err)
 	}
 	s.staged = nil
+	s.setInstalling(0)
 	if s.Installed != nil {
 		s.Installed(meta.Index)
 	}
