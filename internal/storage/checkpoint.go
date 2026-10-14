@@ -148,6 +148,59 @@ func (it *CheckpointIterator) Err() error {
 	return it.m.Err()
 }
 
+// memStream adapts a memtable iterator to a merge input (it cannot fail).
+type memStream struct{ *memtable.Iterator }
+
+func (memStream) Err() error { return nil }
+
+// Scan calls fn with each live entry of the current state in key order — the
+// memtables included — one entry at a time, never the state in memory: the
+// LSM machine loads its session records this way at open (S4). It reads one
+// version, pinned for the scan, so it sees one coherent state. fn's arguments
+// are valid only during the call; an error from fn stops the scan and is
+// returned.
+func (s *LSMStore) Scan(fn func(key, value []byte) error) error {
+	s.closeMu.RLock()
+	defer s.closeMu.RUnlock()
+	if s.closed {
+		return opErr("scan", nil, ErrClosed)
+	}
+	v := s.acquire()
+	if v == nil {
+		return opErr("scan", nil, ErrClosed)
+	}
+	defer s.release(v)
+	inputs := make([]compaction.Stream, 0, 1+len(v.imm)+len(v.files))
+	for _, m := range append([]*memtable.MemTable{v.mem}, v.imm...) {
+		inputs = append(inputs, memStream{m.NewIterator()})
+	}
+	for _, f := range v.files {
+		inputs = append(inputs, f.r.NewIterator())
+	}
+	m := compaction.New(inputs, compaction.Options{BottomMost: true})
+	for m.Next() {
+		if ikey.KindOf(m.Key()) != ikey.KindValue {
+			return opErr("scan", nil, fmt.Errorf("lsm: a scan produced a tombstone for %s: %w", SafeKey(ikey.UserKey(m.Key())), ErrCorrupt))
+		}
+		if err := fn(ikey.UserKey(m.Key()), m.Value()); err != nil {
+			return err
+		}
+	}
+	if err := m.Err(); err != nil {
+		return classify("scan", nil, err)
+	}
+	return nil
+}
+
+// Latched reports the failure that latched the store — a flush, or an ingest
+// whose commit is in doubt — after which it refuses every write and must be
+// reopened; nil when it has none.
+func (s *LSMStore) Latched() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.flushErr
+}
+
 // ---------------------------------------------------------------- ingest
 
 // IngestSource is the content an Ingest replaces the store's with: entries in
