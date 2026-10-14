@@ -342,10 +342,31 @@ func TestIngestCrashMatrix(t *testing.T) {
 		}
 	}
 	dist := map[string]int{}
+	byOp := map[string]map[string]bool{} // the operation a fault hit -> the states recovered
+	var opOrder []string
 	for _, cell := range cells {
 		got := runIngestCell(t, cell, models)
 		dist[cell.kind.name+" -> "+got]++
+		if cell.at > 0 {
+			key := fmt.Sprintf("op %3d %s", cell.at, opClass(cell.what))
+			if byOp[key] == nil {
+				byOp[key] = map[string]bool{}
+				opOrder = append(opOrder, key)
+			}
+			byOp[key][got] = true
+		}
 	}
+	sort.Strings(opOrder)
+	var ops []string
+	for _, k := range opOrder {
+		var outs []string
+		for o := range byOp[k] {
+			outs = append(outs, o)
+		}
+		sort.Strings(outs)
+		ops = append(ops, fmt.Sprintf("%s -> %s", k, strings.Join(outs, "|")))
+	}
+	t.Logf("a crash before each operation (any kind) recovers:\n  %s", strings.Join(ops, "\n  "))
 	var lines []string
 	for k, v := range dist {
 		lines = append(lines, fmt.Sprintf("%s: %d", k, v))
@@ -354,4 +375,13 @@ func TestIngestCrashMatrix(t *testing.T) {
 	t.Logf("%d cells (%d filesystem operations of the ingest and after it, %d ingest operations with an injected error), "+
 		"each recovering exactly one whole state, durably, and going on:\n  %s",
 		len(cells), nOps-start, len(ingestOps), strings.Join(lines, "\n  "))
+}
+
+// opClass names an operation without its byte count, for the summary.
+func opClass(what string) string {
+	f := strings.Fields(what)
+	if len(f) >= 2 {
+		return f[0] + " " + f[1]
+	}
+	return what
 }

@@ -478,3 +478,35 @@ func TestAFailedIngestCommitLatchesAndReopensOldOrNew(t *testing.T) {
 		})
 	}
 }
+
+// TestAFailedCheckpointFlushLatchesAndPinsNothing: a checkpoint whose flush
+// fails — here its MANIFEST append — returns no checkpoint, latches the engine
+// as any failed flush does (every later write is refused until a reopen), and
+// leaves the durable watermark where it was; the reopen recovers every batch.
+func TestAFailedCheckpointFlushLatchesAndPinsNothing(t *testing.T) {
+	dir := t.TempDir()
+	inj := injectManifest(t) // before the open: the MANIFEST's writer is made there
+	s := openLSM(t, dir, lsmOpts(1<<20))
+	model := ingestBase(t, s)
+	durable := s.DurableApplied()
+	mustApply(t, s, applyStep{[]storage.Mutation{mput("tail", "1")}, ai(13, 1)})
+	model = model.after(applyStep{[]storage.Mutation{mput("tail", "1")}, ai(13, 1)})
+	inj.Arm(fault.Injection{Op: fault.OpWrite})
+	if c, err := s.Checkpoint(); err == nil {
+		_ = c.Close()
+		t.Fatal("a checkpoint whose flush failed was returned")
+	}
+	inj.Disarm()
+	if got := s.DurableApplied(); got != durable {
+		t.Fatalf("a failed checkpoint flush moved the durable index from %+v to %+v", durable, got)
+	}
+	if err := s.Apply(context.Background(), nil, ai(14, 1)); err == nil {
+		t.Fatal("a store whose checkpoint flush failed took another batch")
+	}
+	_ = s.Close()
+	s = openLSM(t, dir, lsmOpts(1<<20))
+	defer s.Close()
+	if d := diff(s, model, append(keysOfModel(model), "tail")); d != "" {
+		t.Fatalf("reopened after the failed checkpoint: %s", d)
+	}
+}
