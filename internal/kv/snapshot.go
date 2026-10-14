@@ -167,17 +167,3 @@ type state struct {
 func decodeState(data []byte, l Limits) (*state, error) {
 	return readState(bytes.NewReader(data), uint64(len(data)), l)
 }
-
-// fixed reads exactly n bytes.
-func (d *decoder) fixed(n int) []byte {
-	if d.err != nil {
-		return nil
-	}
-	if len(d.b)-d.i < n {
-		d.err = fmt.Errorf("%w: truncated", ErrProtocol)
-		return nil
-	}
-	out := d.b[d.i : d.i+n]
-	d.i += n
-	return out
-}

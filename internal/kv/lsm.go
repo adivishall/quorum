@@ -585,11 +585,34 @@ func (m *LSMMachine) ValidateSnapshotFrom(index uint64, r io.Reader) error {
 		}
 	}
 	for {
-		if _, _, ok := sr.nextSession(); !ok {
+		id, ss, ok := sr.nextSession()
+		if !ok {
 			break
+		}
+		if err := m.fitsTheEngine(id, ss); err != nil {
+			return err
 		}
 	}
 	return sr.end()
+}
+
+// fitsTheEngine refuses a session whose record would not fit one engine value.
+// The decoder's rules bound a session by the limits, but a group run with a
+// very large MaxUnacked (above ~21,800 at a 1 MiB value limit) can hold a
+// session the engine cannot store: validating it, then failing to restore it at
+// every start, would leave a node that cannot start (S4 review). The in-memory
+// store has no such bound.
+func (m *LSMMachine) fitsTheEngine(id uint64, ss *session) error {
+	if n := sessionRecordLen(ss); n > m.opts.MaxValueSize {
+		return fmt.Errorf("%w: session %d's record is %d bytes, over the engine's %d-byte value limit (MaxUnacked %d is too large for the LSM machine)",
+			ErrSnapshotState, id, n, m.opts.MaxValueSize, m.sessions.limits.MaxUnacked)
+	}
+	return nil
+}
+
+// sessionRecordLen is len(encodeSession(ss)), without encoding it.
+func sessionRecordLen(ss *session) int {
+	return 1 + 16 + uvarintLen(uint64(len(ss.results))) + len(ss.results)*sessionResultLen
 }
 
 // RestoreSnapshot restores data as the state at (index, term): the stream
@@ -638,7 +661,7 @@ func (m *LSMMachine) RestoreSnapshotFrom(index, term uint64, r io.Reader) (err e
 	if sr.applied != index {
 		return fmt.Errorf("%w: state at index %d, snapshot at %d", ErrSnapshotState, sr.applied, index)
 	}
-	src := &restoreSource{sr: sr, sessions: map[uint64]*session{}}
+	src := &restoreSource{sr: sr, sessions: map[uint64]*session{}, fits: m.fitsTheEngine}
 	applied := storage.AppliedIndex{Index: index, Term: term}
 	if _, err := m.db.Ingest(src, applied); err != nil {
 		if m.db.Latched() != nil {
@@ -658,6 +681,7 @@ func (m *LSMMachine) RestoreSnapshotFrom(index, term uint64, r io.Reader) (err e
 // sessions it passes — the machine's new session table.
 type restoreSource struct {
 	sr       *stateReader
+	fits     func(uint64, *session) error
 	sessions map[uint64]*session
 	key, val []byte
 	inUsers  bool
@@ -685,6 +709,10 @@ func (s *restoreSource) Next() bool {
 		s.inUsers = false
 	}
 	if id, ss, ok := s.sr.nextSession(); ok {
+		if err := s.fits(id, ss); err != nil {
+			s.err = err
+			return false
+		}
 		s.sessions[id] = ss
 		s.key = sessionKey(id)
 		s.val = encodeSession(ss)

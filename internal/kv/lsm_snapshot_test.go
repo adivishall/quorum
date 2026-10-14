@@ -385,3 +385,44 @@ func TestLSMMachineOpenRemovesAnS3SetAsideEngine(t *testing.T) {
 		t.Fatalf("the engine an S3 restore set aside is still there: %v", err)
 	}
 }
+
+// TestLSMMachineRefusesASessionItsEngineCannotStore: under a very large
+// MaxUnacked a session can remember more results than one engine value holds.
+// The in-memory store keeps such a session; the LSM machine refuses the
+// snapshot at validation — before the core could install it and leave a node
+// that fails to restore it at every start — and a restore of it changes
+// nothing (S4 review).
+func TestLSMMachineRefusesASessionItsEngineCannotStore(t *testing.T) {
+	limits := Limits{MaxSessions: 2, MaxUnacked: 30000}
+	ref := NewStoreWithLimits(limits)
+	if _, err := ref.ApplyResult(1, register()); err != nil {
+		t.Fatal(err)
+	}
+	n := (MaxValueLen-17-3)/sessionResultLen + 1 // results whose record exceeds one value
+	for i := 0; i < n; i++ {
+		if _, err := ref.ApplyResult(uint64(i+2), idPut(1, uint64(i+1), 1, "k", "v")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	idx, data, err := ref.EncodeSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ref.ValidateSnapshot(idx, data); err != nil {
+		t.Fatalf("premise: the in-memory store accepts the state: %v", err)
+	}
+	m, err := OpenLSMMachine(filepath.Join(t.TempDir(), "lsm"), limits, engineOpts(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.ValidateSnapshot(idx, data); !errors.Is(err, ErrSnapshotState) || !strings.Contains(err.Error(), "value limit") {
+		t.Fatalf("validating a session the engine cannot store: %v", err)
+	}
+	if err := m.RestoreSnapshot(idx, 1, data); !errors.Is(err, ErrSnapshotState) {
+		t.Fatalf("restoring it: %v", err)
+	}
+	if m.Applied() != 0 {
+		t.Fatalf("a refused restore moved the machine to %d", m.Applied())
+	}
+}

@@ -14,8 +14,13 @@ import (
 // The snapshot state, streamed (S4, docs/STORAGE_INTEGRATION.md §10.2): the
 // encoding of snapshot.go read one key or session at a time. It is THE
 // decoder — decodeState is built on it — so the in-memory store and the LSM
-// machine refuse exactly the same states, by the same rules, in the same
-// order, whether a state arrives as bytes or as a stream too large to hold.
+// machine refuse exactly the same states, by the same rules (each in the
+// order this decoder meets them), whether a state arrives as bytes or as a
+// stream too large to hold; it is held to the S3 decoder by
+// TestTheStreamDecoderIsTheS3Decoder and FuzzStreamDecoderMatchesS3. Checks
+// that are not the decoder's — the state's index against the snapshot's — may
+// come earlier on one machine than the other, so a state that is wrong twice
+// over can be refused with a different reason.
 
 // stateReader decodes a snapshot state from a stream: the header at
 // construction, then the keys (nextKey), then the sessions (nextSession), then
