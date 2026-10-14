@@ -2216,9 +2216,9 @@ mutant "compact-refuses-a-failed-log" internal/raftlog/raftlog.go \
 # 256. Install never deletes a manifest CURRENT may name (audit M11).
 mutant "install-keeps-a-manifest-current-may-name" internal/storage/manifest/manifest.go \
   '		if !errors.Is(err, ErrFailed) {
-			_ = FS.Remove(path) // CURRENT was never touched
+			_ = fsys.Remove(path) // CURRENT was never touched
 		}' \
-  '		_ = FS.Remove(path)' \
+  '		_ = fsys.Remove(path)' \
   ./internal/storage/manifest '^TestInstallUnderEveryFault$'
 
 # 257. A failed manifest Writer refuses every later edit.
