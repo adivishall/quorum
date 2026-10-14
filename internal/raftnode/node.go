@@ -623,7 +623,12 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		n.dur.Log = timedLog{LogStore: n.dur.Log, m: n.m}
 		n.store = timedStorage{Durable: n.dur, m: n.m}
 	}
-	n.dur.Snap.Installed = n.waiters.Installed
+	n.dur.Snap.Installed = func(index uint64) {
+		n.waiters.Installed(index)
+		// The snapshot is published, the log's boundary recorded and the state
+		// machine restored (S4: for an engine, ingested and committed).
+		n.logf("event=raft_snapshot_installed node=%s index=%d group=%d", cfg.ID, index, cfg.Group)
+	}
 	n.wasMember = rc.Identity.Genesis.IsMember(cfg.ID)
 	n.noteConf()
 	n.snapshotStatus()
