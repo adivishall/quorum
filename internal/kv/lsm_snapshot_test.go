@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -360,3 +361,27 @@ var errRead = errors.New("the stream failed")
 type errReader struct{}
 
 func (errReader) Read([]byte) (int, error) { return 0, errRead }
+
+// TestLSMMachineOpenRemovesAnS3SetAsideEngine: S3's restore set the old engine
+// aside as <dir>.restore-aside before deleting it, and a crash between the two
+// could leave it there. S4's restore — an ingest — sets nothing aside, but a
+// directory an S3 binary wrote may still hold one: open removes it (nothing
+// ever reads it) and the engine opens.
+func TestLSMMachineOpenRemovesAnS3SetAsideEngine(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "lsm")
+	aside := asidePath(dir)
+	if err := os.MkdirAll(filepath.Join(aside, "wal"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(aside, "CURRENT"), []byte("MANIFEST-000009\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := OpenLSMMachine(dir, DefaultLimits, engineOpts(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if _, err := os.Stat(aside); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the engine an S3 restore set aside is still there: %v", err)
+	}
+}

@@ -958,7 +958,7 @@ mutant "the-snapshot-is-durable-before-the-log-is-compacted" internal/raftnode/s
   '	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
 		return err
 	}
-	if err := s.Files.Publish(file); err != nil {' \
+	if err := s.Files.PublishFrom(meta, src); err != nil {' \
   '	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
 		return err
 	}
@@ -966,7 +966,7 @@ mutant "the-snapshot-is-durable-before-the-log-is-compacted" internal/raftnode/s
 	if err := d.compact(core, at); err != nil {
 		return err
 	}
-	if err := s.Files.Publish(file); err != nil {' \
+	if err := s.Files.PublishFrom(meta, src); err != nil {' \
   "./internal/raftnode ./internal/raftsim" 'TestSnapshotCrashPointsRecover|TestSnapshotCrashMatrix'
 
 # 94. Compact beyond the applied index, in memory.
@@ -1078,8 +1078,8 @@ mutant "replay-keeps-a-matching-suffix" internal/raftlog/raftlog.go \
 # 109. A restart forgets its snapshot: the state machine is validated against
 #      it but not restored, while the applied index says it was.
 mutant "restart-restores-the-published-snapshot" internal/raftnode/node.go \
-  '		if err := ssm.RestoreSnapshot(meta.Index, meta.Term, data); err != nil {' \
-  '		if err := ssm.ValidateSnapshot(meta.Index, data); err != nil {' \
+  '		if err := restorePublished(files, ssm, meta.Index, meta.Term); err != nil {' \
+  '		if _, _, err := files.Verify(); err != nil {' \
   "./internal/raftnode ./internal/raftsim" 'TestRecoverFromSnapshotAndSuffix|TestSimRestartFromSnapshotAfterPowerLoss'
 
 # 110. A restart with a compacted log and no snapshot starts anyway — from an
@@ -1178,7 +1178,7 @@ mutant "an-installed-snapshot-is-made-durable-before-the-response" internal/raft
 
 # 116. A transfer's state is not validated before the core sees it.
 mutant "a-transfer-is-validated-before-the-core-sees-it" internal/raftnode/snapshot.go \
-  '	if err := s.SM.ValidateSnapshot(got.Meta.Index, got.Data); err != nil {' \
+  '	if err := s.validateReceived(got.Meta.Index); err != nil {' \
   '	if err := error(nil); err != nil {' \
   ./internal/raftnode 'TestReceiveRefusesWhatCannotBeInstalled'
 
@@ -2838,8 +2838,12 @@ mutant "lsm-restore-below-engine-is-noop" internal/kv/lsm.go \
 
 # 334. S2: a restore leaves the session table out of the engine.
 mutant "lsm-restore-carries-session-records" internal/kv/lsm.go \
-  '		muts = append(muts, storage.Mutation{Kind: storage.MutationPut, Key: sessionKey(id), Value: encodeSession(st.sessions[id])})' \
-  '		_ = id' \
+  '		s.sessions[id] = ss
+		s.key = sessionKey(id)
+		s.val = encodeSession(ss)
+		return true' \
+  '		s.sessions[id] = ss
+		return s.Next()' \
   ./internal/kv '^TestLSMMachineRestoresASnapshot$'
 
 # 335. S2: the machine's record of what its engine holds does not follow the cycle —
@@ -2897,10 +2901,14 @@ mutant "user-keys-are-tagged" internal/kv/namespace.go \
 # 342. S2: the session records are not loaded at open — a restart forgets every
 #      session.
 mutant "session-records-load-at-open" internal/kv/lsm.go \
-  '		id, ok := parseSessionKey([]byte(k))
-		if !ok {' \
-  '		id, ok := parseSessionKey([]byte(k))
-		if !ok || true {' \
+  '		id, ok := parseSessionKey(k)
+		if !ok {
+			return nil
+		}' \
+  '		id, ok := parseSessionKey(k)
+		if !ok || true {
+			return nil
+		}' \
   ./internal/kv '^TestLSMMachineMatchesTheStoreOnAScript$'
 
 # 343. S2: a group whose state machine cannot be made leaves its directory behind,
@@ -3112,20 +3120,26 @@ mutant "engine-synced-before-the-snapshot-is-published" internal/raftnode/snapsh
 	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
 		return err
 	}
-	if err := s.Files.Publish(file); err != nil {
+	if err := s.Files.PublishFrom(meta, src); err != nil {
+		if errors.Is(err, snapshot.ErrTooLarge) {
+			s.skip = idx + max(s.Every, 1)
+		}
 		return err
 	}
-	s.meta, s.file = meta, file
+	s.meta, s.file = meta, nil
 	if err := at.hit(AfterSnapshotPublish, idx); err != nil {
 		return err
 	}' \
   '	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
 		return err
 	}
-	if err := s.Files.Publish(file); err != nil {
+	if err := s.Files.PublishFrom(meta, src); err != nil {
+		if errors.Is(err, snapshot.ErrTooLarge) {
+			s.skip = idx + max(s.Every, 1)
+		}
 		return err
 	}
-	s.meta, s.file = meta, file
+	s.meta, s.file = meta, nil
 	if err := at.hit(AfterSnapshotPublish, idx); err != nil {
 		return err
 	}
@@ -3136,47 +3150,63 @@ mutant "engine-synced-before-the-snapshot-is-published" internal/raftnode/snapsh
 	}' \
   ./internal/raftnode '^TestSnapshotSyncsTheEngineFirstAndCompactsOnlyToItsDurableIndex$'
 
-# 366. S3 (final review): the restore measures the state before deciding it has
-#      nothing to do — a node whose state is too large for one restore batch can
-#      never restart on its own snapshot.
+# 366. S3 (final review): the restore reads the state before deciding it has
+#      nothing to do — at S3 a node whose state was too large for one restore
+#      batch could never restart on its own snapshot; since S4 a restart would
+#      read (and could refuse) a snapshot its engine already holds.
 mutant "restore-decides-the-noop-first" internal/kv/lsm.go \
   '	if m.engine.Index >= index {
 		return nil
 	}
-	st, err := m.checkSnapshot(index, data)
+	if m.last.Index != 0 {
+		return fmt.Errorf("kv: a restore inside a cycle (entries through %d staged)", m.last.Index)
+	}
+	sr, err := newStateReader(r, stateSize(r), m.sessions.limits)
 	if err != nil {
 		return err
 	}' \
-  '	st, err := m.checkSnapshot(index, data)
+  '	if m.last.Index != 0 {
+		return fmt.Errorf("kv: a restore inside a cycle (entries through %d staged)", m.last.Index)
+	}
+	sr, err := newStateReader(r, stateSize(r), m.sessions.limits)
 	if err != nil {
 		return err
 	}
 	if m.engine.Index >= index {
 		return nil
 	}' \
-  ./internal/kv '^TestLSMMachineRestartsOnItsOwnSnapshotBeyondOneRestoreBatch$'
+  ./internal/kv '^TestLSMMachineRestartsOnItsOwnSnapshotWithoutReadingIt$'
 
-# 367. S3 (final review): the restore deletes the old engine in place — a crash
-#      part-way leaves an engine the next open refuses.
-mutant "restore-sets-the-old-engine-aside" internal/kv/lsm.go \
-  '	if err := os.Rename(m.dir, aside); err != nil {' \
-  '	if err := removeAll(m.dir); err != nil {' \
-  ./internal/kv '^TestLSMMachineACrashWhileReplacingTheEngineLeavesOneThatOpens$'
+# 367. S3 (final review) guarded "the restore deletes the old engine in place —
+#      a crash part-way leaves an engine the next open refuses" by setting the
+#      old engine aside. S4's restore is an ingest and deletes nothing in place,
+#      so the same property — a crash during a restore leaves an engine that
+#      opens, old or new — now rests on the ingest's commit protocol: here, the
+#      staged tables' names made durable before the MANIFEST edit names them
+#      (else a power loss after the commit leaves a MANIFEST naming tables that
+#      are gone, an engine that never opens).
+mutant "restore-sets-the-old-engine-aside" internal/storage/checkpoint.go \
+  '	if err := s.fs.SyncDir(s.dir); err != nil {
+		discard()' \
+  '	if err := error(nil); err != nil {
+		discard()' \
+  ./internal/storage '^TestIngestCrashMatrix$'
 
 # 368. S3 (final review): an engine a crashed restore set aside is never removed.
 mutant "open-removes-the-engine-set-aside" internal/kv/lsm.go \
   '	if err := removeAll(asidePath(dir)); err != nil {' \
   '	if err := error(nil); err != nil {' \
-  ./internal/kv '^TestLSMMachineACrashWhileReplacingTheEngineLeavesOneThatOpens$'
+  ./internal/kv '^TestLSMMachineOpenRemovesAnS3SetAsideEngine$'
 
 # 369. S3 (review of the fixes): a restore that fails after the engine is closed
 #      leaves the machine open over an empty or partial engine, which then
-#      reports a key that exists as absent.
+#      reports a key that exists as absent. Since S4: a restore whose commit is
+#      in doubt leaves the machine open over an engine it cannot vouch for.
 mutant "failed-restore-fails-stop" internal/kv/lsm.go \
   '			_ = m.db.Close()
 			m.closed = true' \
   '			_ = m.db.Close()' \
-  ./internal/kv '^TestLSMMachineAFailedRestoreFailsStop$'
+  ./internal/kv '^TestLSMMachineARestoreWhoseCommitIsInDoubtFailsStop$'
 
 # 370. S3 (review of the fixes): a newly created engine directory is not synced
 #      into its parent, so a power loss can take the whole engine.
