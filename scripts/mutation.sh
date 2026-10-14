@@ -2947,10 +2947,17 @@ mutant "flush-records-the-log-start-sequence" internal/storage/lsmstore.go \
 # 344c. S3 (R2): creating a snapshot does not make the engine durable, so a node
 #       whose engine has not flushed never advances its durable index and its log
 #       never compacts — a lagging follower is never sent a snapshot.
+#       S4: the LSM machine's OpenSnapshot takes an engine checkpoint, which
+#       flushes, so on that machine this call is a second flush that finds
+#       nothing to do, and the kv cluster test no longer sees the mutant (the
+#       first full run after S4 found it surviving there). The rule is the
+#       driver's, for any DurableApplier — whose contract does not require
+#       OpenSnapshot to flush — so it is killed where the driver is tested: by
+#       an engine that becomes durable only through SyncApplied.
 mutant "snapshot-makes-the-engine-durable" internal/raftnode/snapshot.go \
   '		if err := da.SyncApplied(); err != nil {' \
   '		if err := error(nil); da == nil || err != nil {' \
-  ./internal/kv '^TestR2CompactionStaysWithinADurableCopy$'
+  ./internal/raftnode '^(TestSnapshotSyncsTheEngineFirstAndCompactsOnlyToItsDurableIndex|TestAFailedEngineSyncStopsTheNodeBeforeAnythingIsPublished)$'
 
 # 345. S3: a flush does not record the log number — the reopen cannot tell where
 #      the truncated log begins and mis-numbers or mis-reads the surviving records.
@@ -3532,6 +3539,58 @@ mutant "a-session-must-fit-the-engine" internal/kv/lsm.go \
   '	if n := sessionRecordLen(ss); n > m.opts.MaxValueSize {' \
   '	if n := sessionRecordLen(ss); false && n > m.opts.MaxValueSize {' \
   ./internal/kv '^TestLSMMachineRefusesASessionItsEngineCannotStore$'
+
+# 406. S4 (closeout): the engine-fit check sizes a session one byte short — a
+#      session within a byte of the value limit validates, then cannot be
+#      restored. The boundary test above is 4 bytes over the limit and does
+#      not see it; the exact-length test does.
+mutant "a-session-record-is-sized-exactly" internal/kv/lsm.go \
+  '	return 1 + 16 + uvarintLen(uint64(len(ss.results))) + len(ss.results)*sessionResultLen' \
+  '	return 16 + uvarintLen(uint64(len(ss.results))) + len(ss.results)*sessionResultLen' \
+  ./internal/kv '^TestSessionRecordLenIsTheEncodedLength$'
+
+# 407. S4 (closeout): a leader's repeated offer, sent while its follower is
+#      still proving or installing the first copy, is not dropped where it
+#      arrives — the whole repeat waits in the follower's memory behind its
+#      busy actor, and is then written, proven and ignored.
+mutant "a-repeated-offer-is-dropped-while-installing" internal/raftnode/node.go \
+  '	if installing == 0 {' \
+  '	if true || installing == 0 {' \
+  ./internal/raftnode '^TestARepeatedOfferIsDroppedWhileTheFirstIsProven$'
+
+# 408. S4 (closeout): the proof of a completed transfer does not mark its
+#      snapshot as installing — repeats arriving during the proof, the longest
+#      part of an install, are queued again.
+mutant "the-proof-marks-the-snapshot-installing" internal/raftnode/snapshot.go \
+  '			s.setInstalling(c.Index)' \
+  '			_ = c.Index' \
+  ./internal/raftnode '^(TestInstallingCoversExactlyTheProofAndTheInstall|TestARepeatedOfferIsDroppedWhileTheFirstIsProven)$'
+
+# 409. S4 (closeout): a refused proof leaves its snapshot marked as installing,
+#      so every later offer of it is dropped and the follower cannot catch up.
+mutant "a-refused-proof-clears-installing" internal/raftnode/snapshot.go \
+  '	defer s.setInstalling(0)' \
+  '	defer func() {}()' \
+  ./internal/raftnode '^TestInstallingCoversExactlyTheProofAndTheInstall$'
+
+# 410. S4 (closeout): a staged snapshot the core does not install stays marked
+#      as installing after it is unstaged.
+mutant "unstage-clears-installing" internal/raftnode/snapshot.go \
+  'func (s *Snapshots) Unstage() {
+	s.staged = nil
+	s.setInstalling(0)
+}' \
+  'func (s *Snapshots) Unstage() {
+	s.staged = nil
+}' \
+  ./internal/raftnode '^TestInstallingCoversExactlyTheProofAndTheInstall$'
+
+# 411. S4 (closeout): a transfer completed by its first chunk — a snapshot of
+#      one chunk — is not marked as installing during its proof.
+mutant "a-one-chunk-transfer-is-marked-installing" internal/raftnode/snapshot.go \
+  'c.Offset == 0 || ok && f == string(from)' \
+  'false || ok && f == string(from)' \
+  ./internal/raftnode '^(TestInstallingCoversExactlyTheProofAndTheInstall|TestARepeatedOfferIsDroppedWhileTheFirstIsProven)$'
 
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
