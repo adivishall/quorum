@@ -958,7 +958,7 @@ mutant "the-snapshot-is-durable-before-the-log-is-compacted" internal/raftnode/s
   '	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
 		return err
 	}
-	if err := s.Files.PublishFrom(meta, src); err != nil {' \
+	if err := s.Files.PublishMeasured(meta, src, meas); err != nil {' \
   '	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
 		return err
 	}
@@ -966,7 +966,7 @@ mutant "the-snapshot-is-durable-before-the-log-is-compacted" internal/raftnode/s
 	if err := d.compact(core, at); err != nil {
 		return err
 	}
-	if err := s.Files.PublishFrom(meta, src); err != nil {' \
+	if err := s.Files.PublishMeasured(meta, src, meas); err != nil {' \
   "./internal/raftnode ./internal/raftsim" 'TestSnapshotCrashPointsRecover|TestSnapshotCrashMatrix'
 
 # 94. Compact beyond the applied index, in memory.
@@ -3120,10 +3120,7 @@ mutant "engine-synced-before-the-snapshot-is-published" internal/raftnode/snapsh
 	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
 		return err
 	}
-	if err := s.Files.PublishFrom(meta, src); err != nil {
-		if errors.Is(err, snapshot.ErrTooLarge) {
-			s.skip = idx + max(s.Every, 1)
-		}
+	if err := s.Files.PublishMeasured(meta, src, meas); err != nil {
 		return err
 	}
 	s.meta, s.file = meta, nil
@@ -3133,10 +3130,7 @@ mutant "engine-synced-before-the-snapshot-is-published" internal/raftnode/snapsh
   '	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
 		return err
 	}
-	if err := s.Files.PublishFrom(meta, src); err != nil {
-		if errors.Is(err, snapshot.ErrTooLarge) {
-			s.skip = idx + max(s.Every, 1)
-		}
+	if err := s.Files.PublishMeasured(meta, src, meas); err != nil {
 		return err
 	}
 	s.meta, s.file = meta, nil
@@ -3228,13 +3222,13 @@ echo "== S4: engine checkpoints and streamed snapshot installation (docs/STORAGE
 #      fsynced — published before it is durable; a power loss after the
 #      rename and directory fsync leaves a published file that is empty or torn.
 mutant "a-streamed-snapshot-is-durable-before-it-is-published" internal/snapshot/files.go \
-  '	if _, err := Write(file, m, src); err != nil {
+  '	if _, err := WriteMeasured(file, m, src, meas); err != nil {
 		return fail(err)
 	}
 	if err := file.Sync(); err != nil {
 		return fail(err)
 	}' \
-  '	if _, err := Write(file, m, src); err != nil {
+  '	if _, err := WriteMeasured(file, m, src, meas); err != nil {
 		return fail(err)
 	}' \
   ./internal/snapshot '^TestPublishFromIsByteIdenticalAndAtomicUnderEveryCrash$'
@@ -3242,8 +3236,8 @@ mutant "a-streamed-snapshot-is-durable-before-it-is-published" internal/snapshot
 # 373. S4: the streamed writer publishes what a source wrote although it
 #      differs from what it measured — a file whose header hash is not its state.
 mutant "a-source-must-reproduce-its-state" internal/snapshot/stream.go \
-  '	if out.data != meas.n || again != sum {' \
-  '	if false && (out.data != meas.n || again != sum) {' \
+  '	if out.data != meas.Len || again != meas.Sum {' \
+  '	if false && (out.data != meas.Len || again != meas.Sum) {' \
   ./internal/snapshot '^TestWriteRefusesASourceThatDoesNotReproduceItself$'
 
 # 374. S4: the streaming reader does not check the state against the header's
@@ -3472,6 +3466,72 @@ mutant "the-session-scan-reads-the-whole-engine" internal/storage/checkpoint.go 
 		}
 		break' \
   ./internal/kv '^TestLSMMachineMatchesTheStoreOnAScript$'
+
+# 399. S4 (review): a state too large to snapshot is not skipped for Every
+#      entries — the node opens, flushes and measures it at every applied entry.
+mutant "an-oversized-state-is-skipped" internal/raftnode/snapshot.go \
+  '	if errors.Is(err, snapshot.ErrTooLarge) {
+		s.skip = idx + max(s.Every, 1)
+		return err
+	}' \
+  '	if errors.Is(err, snapshot.ErrTooLarge) {
+		return err
+	}' \
+  ./internal/raftnode '^TestAStateTooLargeToSnapshotIsSkippedBeforeAnySideEffect$'
+
+# 400. S4 (review): an oversized state is found only after the engine sync — as
+#      the first S4 cut had it, which synced, crossed the publish crash point
+#      and created the temporary file first.
+mutant "an-oversized-state-is-refused-before-any-side-effect" internal/raftnode/snapshot.go \
+  '	meas, err := snapshot.Measure(src)
+	if errors.Is(err, snapshot.ErrTooLarge) {' \
+  '	if da, ok := s.SM.(DurableApplier); ok {
+		_ = da.SyncApplied()
+	}
+	meas, err := snapshot.Measure(src)
+	if errors.Is(err, snapshot.ErrTooLarge) {' \
+  ./internal/raftnode '^TestAStateTooLargeToSnapshotIsSkippedBeforeAnySideEffect$'
+
+# 401. S4 (review): a disk that fails while a snapshot is streamed is reported as
+#      a corrupt snapshot.
+mutant "a-read-failure-is-not-corruption" internal/snapshot/stream.go \
+  '	if r.src.err != nil {' \
+  '	if false && r.src.err != nil {' \
+  ./internal/snapshot '^TestAReadFailureIsReportedAsItselfNotAsCorruption$'
+
+# 402. S4 (review): a transfer's verification ignores the node shutting down.
+mutant "a-sends-verification-stops-with-its-context" internal/snapshot/transfer.go \
+  '	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}' \
+  '	if err := c.ctx.Err(); false && err != nil {
+		return 0, err
+	}' \
+  ./internal/snapshot '^TestASendsVerificationStopsWhenItsContextIsDone$'
+
+# 403. S4 (review): a checkpoint closed twice releases its version twice, deleting
+#      tables the MANIFEST still names.
+mutant "a-checkpoint-releases-once" internal/storage/checkpoint.go \
+  '	if c.closed.CompareAndSwap(false, true) {' \
+  '	if c.closed.CompareAndSwap(false, true) || true {' \
+  ./internal/storage '^TestACheckpointClosedFromManyGoroutinesReleasesOnce$'
+
+# 404. S4 (review): a latched store still records an applied index.
+mutant "a-latched-store-refuses-set-applied-index" internal/storage/lsmstore.go \
+  '	if s.flushErr != nil {
+		return classify("set-applied-index", nil, s.flushErr)
+	}' \
+  '	if false && s.flushErr != nil {
+		return classify("set-applied-index", nil, s.flushErr)
+	}' \
+  ./internal/storage '^TestALatchedStoreRefusesSetAppliedIndex$'
+
+# 405. S4 (review): the LSM machine validates a session its engine cannot store,
+#      then fails to restore it at every start.
+mutant "a-session-must-fit-the-engine" internal/kv/lsm.go \
+  '	if n := sessionRecordLen(ss); n > m.opts.MaxValueSize {' \
+  '	if n := sessionRecordLen(ss); false && n > m.opts.MaxValueSize {' \
+  ./internal/kv '^TestLSMMachineRefusesASessionItsEngineCannotStore$'
 
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
