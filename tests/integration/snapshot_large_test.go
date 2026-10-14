@@ -208,16 +208,34 @@ func sentBytes(t *testing.T, c *rcluster, from, to string, index uint64) int64 {
 // TestRealFollowerInstallsASnapshotAboveTheS3Limit: the S4 exit criterion on
 // real processes. A follower returns behind a boundary every other node has
 // compacted past, and the leader of the moment streams it a snapshot above
-// the S3 limit; the follower installs it, publishes it, restarts on it — its
+// the S3 limit; the follower installs it — on the LSM machine without its heap
+// ever reaching half the snapshot's size — publishes it, restarts on it — its
 // own snapshot, which its engine already holds — converges with the group,
 // serves writes after it, and a retry of a request the snapshot covers is a
 // duplicate of its original index.
 func TestRealFollowerInstallsASnapshotAboveTheS3Limit(t *testing.T) {
 	c, w, lag, clientID, rIndex := lagForLargeSnapshot(t)
-	c.start(lag)
+	// The follower serves /metrics: its live heap is sampled while it installs,
+	// and its peak resident set read once it has (getrusage's maximum over the
+	// process, which starts behind the snapshot).
+	metricsAt := freeTCPAddr(t)
+	c.startWith(lag, "-metrics-listen", metricsAt)
+	out := c.procs[lag].out
+	heap := sampleHeap(t, metricsAt, func() string {
+		if strings.Contains(out.String(), "event=raft_snapshot_received node="+lag) {
+			return "install"
+		}
+		return "receive"
+	})
 	start := time.Now()
 	from, index := waitInstalled(t, c, lag)
 	installedIn := time.Since(start)
+	mostHeap := heap.stop()
+	ss, err := scrapeHTTP(t, metricsAt)
+	if err != nil {
+		t.Fatalf("%s's metrics: %v", lag, err)
+	}
+	peakRSS, _ := ss.Get("process_max_rss_bytes")
 	size := sentBytes(t, c, from, lag, index)
 	if size <= s3InstallLimit || c.snapSize(lag) <= s3InstallLimit {
 		t.Fatalf("premise: the snapshot %s installed is %d bytes (sent %d), not above the S3 limit %d",
@@ -226,7 +244,26 @@ func TestRealFollowerInstallsASnapshotAboveTheS3Limit(t *testing.T) {
 	if m, _, ok := c.published(lag); !ok || m.Index != index {
 		t.Fatalf("%s installed %d but publishes %+v", lag, index, m)
 	}
-	t.Logf("%s installed snapshot %d (%d MiB) from %s, %.1fs after it started", lag, index, size>>20, from, installedIn.Seconds())
+	sent, failed := c.transfersTo(lag)
+	t.Logf("%s installed snapshot %d (%d MiB) from %s, %.1fs after it started; its heap at most %d MiB receiving and proving it, %d MiB installing it (sampled); its peak resident set %d MiB; transfers to it by then: %d sent, %d failed",
+		lag, index, size>>20, from, installedIn.Seconds(), int64(mostHeap["receive"])>>20, int64(mostHeap["install"])>>20, int64(peakRSS)>>20, sent, failed)
+	if mostHeap["receive"] == 0 || mostHeap["install"] == 0 || peakRSS == 0 {
+		t.Fatalf("premise: %s's metrics were not sampled in both phases (%v) or report no resident set (%v)", lag, mostHeap, peakRSS)
+	}
+	// On the LSM machine nothing holds the state: it streams through the
+	// receiver, the proofs and the ingest a record at a time, and a leader's
+	// repeated offer, sent while the follower is still busy, is dropped as it
+	// arrives. Half the snapshot is far above what that costs (8–18 MiB of
+	// heap for ~85 MiB, measured under CPU contention) and far below one copy
+	// of the state — which a repeated offer queued whole used to add. The
+	// in-memory machine holds the state by design; its figures are logged.
+	if stateMachineKind() == "lsm" {
+		for _, phase := range []string{"receive", "install"} {
+			if most := int64(mostHeap[phase]); most >= size/2 {
+				t.Fatalf("%s's heap reached %d MiB in the %s phase of a %d MiB snapshot: half a copy of the state or more", lag, most>>20, phase, size>>20)
+			}
+		}
+	}
 
 	// The restart: the node's own snapshot, which its engine already holds.
 	c.kill(lag)
@@ -292,6 +329,120 @@ func TestRealFollowerKilledDuringALargeInstallRecovers(t *testing.T) {
 	w.putN("after", 5)
 	c.waitCommit([]string{lag}, w.last, 60*time.Second)
 	c.finishLarge(w)
+}
+
+// TestRealFollowerKilledMidTransferOfALargeSnapshotRecovers: the follower is
+// SIGKILLed while a snapshot above the S3 limit is still streaming into it —
+// part of it in its .snap.recv, none of it proven. The partial transfer never
+// becomes state: nothing new is published, and the engine is still the
+// follower's own old state; its restart discards the partial file, a leader
+// streams the snapshot again from its start, and the follower installs it and
+// converges.
+func TestRealFollowerKilledMidTransferOfALargeSnapshotRecovers(t *testing.T) {
+	withPremise(t, func() {
+		c, w, lag, _, _ := lagForLargeSnapshot(t)
+		behind := c.liveLog(lag).LastIndex()
+		before, _, had := c.published(lag)
+		c.start(lag)
+		out, recv := c.procs[lag].out, c.snapFiles(lag).RecvPath()
+		var partial int64
+		for deadline := time.Now().Add(120 * time.Second); partial == 0 && time.Now().Before(deadline); {
+			if info, err := os.Stat(recv); err == nil && info.Size() >= 4<<20 {
+				partial = info.Size()
+			} else {
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+		c.kill(lag)
+		if partial == 0 {
+			t.Fatalf("%s never received 4 MiB of a snapshot within 120s\n%s", lag, c.outputs())
+		}
+		if strings.Contains(out.String(), "event=raft_snapshot_received node="+lag) {
+			c.killAll()
+			panic(premiseFailed{"the transfer was proven before the kill landed"})
+		}
+		info, err := os.Stat(recv)
+		if err != nil {
+			t.Fatalf("premise: the partial transfer is on disk: %v", err)
+		}
+		if after, _, has := c.published(lag); has != had || after.Index != before.Index {
+			t.Fatalf("a partial transfer changed what %s publishes: %+v (had %v) -> %+v (has %v)", lag, before, had, after, has)
+		}
+		if dir := filepath.Join(c.dirs[lag], "lsm"); stateMachineKind() == "lsm" {
+			m, err := kv.OpenLSMMachine(dir, kv.DefaultLimits, storage.DefaultOptions())
+			if err != nil {
+				t.Fatalf("%s's engine does not open after a kill mid-transfer: %v", lag, err)
+			}
+			applied, durable := m.Applied(), m.DurableAppliedIndex()
+			_ = m.Close()
+			if applied > behind || durable > behind {
+				t.Fatalf("%s's engine is at %d (durable %d) after a partial transfer; it went down at %d", lag, applied, durable, behind)
+			}
+		}
+		t.Logf("%s killed with %d MiB of a snapshot unproven in its %s: nothing published, its state still its own at ≤ %d",
+			lag, info.Size()>>20, filepath.Base(recv), behind)
+		c.start(lag)
+		from, index := waitInstalled(t, c, lag)
+		size := sentBytes(t, c, from, lag, index)
+		if size <= s3InstallLimit {
+			t.Fatalf("premise: the snapshot sent again is %d bytes, not above the S3 limit", size)
+		}
+		t.Logf("restarted, %s installed snapshot %d (%d MiB) from %s", lag, index, size>>20, from)
+		w.putN("after", 5)
+		c.waitCommit([]string{lag}, w.last, 60*time.Second)
+		c.finishLarge(w)
+	})
+}
+
+// transfersTo counts the snapshot transfers to id that the other running
+// nodes have finished — streamed whole, or failed — from their own logs.
+func (c *rcluster) transfersTo(id string) (sent, failed int) {
+	for _, other := range others(c.ids, id) {
+		if p := c.procs[other]; p != nil {
+			out := p.out.String()
+			sent += strings.Count(out, "event=raft_snapshot_sent node="+other+" to="+id+" ")
+			failed += strings.Count(out, "event=raft_snapshot_send_failed node="+other+" to="+id+" ")
+		}
+	}
+	return sent, failed
+}
+
+// heapSampler polls a node's /metrics while it runs and keeps, for each phase
+// the phase function names at the sample, the most heap it reported
+// (go_heap_objects_bytes: live objects and dead ones not yet swept): a sampled
+// maximum, not the true peak, and unlike the resident set it excludes the
+// race detector's shadow memory, so it measures what the code holds.
+type heapSampler struct {
+	stopc chan struct{}
+	done  chan map[string]float64
+}
+
+func sampleHeap(t *testing.T, addr string, phase func() string) *heapSampler {
+	h := &heapSampler{stopc: make(chan struct{}), done: make(chan map[string]float64, 1)}
+	go func() {
+		most := map[string]float64{}
+		for {
+			p := phase()
+			if ss, err := scrapeHTTP(t, addr); err == nil {
+				if v, ok := ss.Get("go_heap_objects_bytes"); ok && v > most[p] {
+					most[p] = v
+				}
+			}
+			select {
+			case <-h.stopc:
+				h.done <- most
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}()
+	return h
+}
+
+// stop ends the sampling and returns the most heap seen in each phase.
+func (h *heapSampler) stop() map[string]float64 {
+	close(h.stopc)
+	return <-h.done
 }
 
 // waitInstalledOrRestored waits until a restarted node holds a large snapshot:

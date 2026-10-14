@@ -426,3 +426,20 @@ func TestLSMMachineRefusesASessionItsEngineCannotStore(t *testing.T) {
 		t.Fatalf("a refused restore moved the machine to %d", m.Applied())
 	}
 }
+
+// TestSessionRecordLenIsTheEncodedLength: the engine-fit check sizes a
+// session without encoding it, so the size must be encodeSession's exactly —
+// at every width of the result count — or a session within a few bytes of the
+// engine's value limit is judged on the wrong side of it. The test above sits
+// 4 bytes over the limit and cannot see a smaller error.
+func TestSessionRecordLenIsTheEncodedLength(t *testing.T) {
+	for _, n := range []int{0, 1, 127, 128, 16383, 16384, 21845} {
+		ss := &session{last: uint64(n) + 2, ackedBelow: 1, results: map[uint64]execution{}}
+		for i := 0; i < n; i++ {
+			ss.results[uint64(i+1)] = execution{index: uint64(i + 2)}
+		}
+		if got, want := sessionRecordLen(ss), len(encodeSession(ss)); got != want {
+			t.Fatalf("%d results: sessionRecordLen says %d bytes, encodeSession writes %d", n, got, want)
+		}
+	}
+}
