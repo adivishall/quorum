@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/adivishall/quorum/internal/fault"
@@ -508,5 +509,59 @@ func TestAFailedCheckpointFlushLatchesAndPinsNothing(t *testing.T) {
 	defer s.Close()
 	if d := diff(s, model, append(keysOfModel(model), "tail")); d != "" {
 		t.Fatalf("reopened after the failed checkpoint: %s", d)
+	}
+}
+
+// TestACheckpointClosedFromManyGoroutinesReleasesOnce: Close is idempotent
+// under concurrency — the pinned version is released exactly once. A second
+// release of a checkpoint that pins the CURRENT version would drop its count
+// to zero and delete tables the MANIFEST still names (S4 review).
+func TestACheckpointClosedFromManyGoroutinesReleasesOnce(t *testing.T) {
+	dir := t.TempDir()
+	s := openLSM(t, dir, lsmOpts(256))
+	ingestBase(t, s)
+	c, err := s.Checkpoint() // pins the current version: nothing changes after it
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = c.Close()
+		}()
+	}
+	wg.Wait()
+	for _, info := range s.SSTables() {
+		if _, err := os.Stat(filepath.Join(dir, fmt.Sprintf("%06d.sst", info.Number))); err != nil {
+			t.Fatalf("closing a checkpoint concurrently deleted the live table %d: %v", info.Number, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = openLSM(t, dir, lsmOpts(256))
+	_ = s.Close()
+}
+
+// TestALatchedStoreRefusesSetAppliedIndex: once a flush (or an ingest's
+// commit) has failed and latched the store, SetAppliedIndex is refused like
+// every other write — after an ingest in doubt the WAL has rotated to the
+// segment the edit may name, and a record there would be replayed onto
+// whichever state the next open finds (S4 review).
+func TestALatchedStoreRefusesSetAppliedIndex(t *testing.T) {
+	dir := t.TempDir()
+	inj := injectManifest(t) // before the open: the MANIFEST's writer is made there
+	s := openLSM(t, dir, lsmOpts(1<<20))
+	defer s.Close()
+	mustApply(t, s, applyStep{[]storage.Mutation{mput("a", "1")}, ai(1, 1)})
+	inj.Arm(fault.Injection{Op: fault.OpWrite})
+	if err := s.Flush(); err == nil {
+		t.Fatal("premise: the flush succeeded although its MANIFEST append failed")
+	}
+	inj.Disarm()
+	if err := s.SetAppliedIndex(context.Background(), ai(2, 1)); err == nil {
+		t.Fatal("a latched store recorded an applied index")
 	}
 }

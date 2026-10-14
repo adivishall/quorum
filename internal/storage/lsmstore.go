@@ -1206,6 +1206,13 @@ func (s *LSMStore) SetAppliedIndex(ctx context.Context, a AppliedIndex) error {
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	// A latched store refuses this record as it refuses every write: after an
+	// ingest whose commit is in doubt the WAL has rotated to the segment that
+	// edit may name, and a record there would be replayed onto whichever state
+	// the next open finds (S4 review).
+	if s.flushErr != nil {
+		return classify("set-applied-index", nil, s.flushErr)
+	}
 	if err := s.w.AppendAppliedIndex(wal.AppliedIndex{Index: a.Index, Term: a.Term}); err != nil {
 		return classify("set-applied-index", nil, err)
 	}

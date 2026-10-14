@@ -83,26 +83,28 @@ func ingestPostBatch() applyStep {
 	return applyStep{[]storage.Mutation{mput("post", "1"), mdel("n03")}, ai(101, 3)}
 }
 
-func ingestMatrixOpts(fsys *fault.InjectFS) storage.Options {
+func ingestMatrixOpts(mode wal.SyncMode, fsys *fault.InjectFS) storage.Options {
 	o := lsmOpts(256) // several tables per ingest
 	o.FS = fsys       // the whole engine on the model
-	o.WAL.SyncMode = wal.SyncAlways
-	o.WAL.SyncInterval = time.Duration(1 << 62)
+	o.WAL.SyncMode = mode
+	o.WAL.SyncInterval = time.Duration(1 << 62) // batch mode: no timer fsync — every one is the script's
+	o.WAL.SyncBytes = 1 << 40
 	o.WAL.SegmentSize = 96
 	return o
 }
 
 // ingestOutcome is how far a run got before it died.
 type ingestOutcome struct {
-	baseDone  bool // every old batch acknowledged (SyncAlways: durable)
-	ingested  bool // Ingest returned nil
-	attempted bool // Ingest was called
-	postDone  bool // the batch after it was acknowledged
+	baseDone    bool // every old batch acknowledged and synced: durable
+	ingested    bool // Ingest returned nil
+	attempted   bool // Ingest was called
+	postDone    bool // the batch after it was acknowledged (written)
+	postDurable bool // ... and durable: sync mode, or the flush after it succeeded
 }
 
 // runIngestScript runs the script until the process dies (or to its end),
 // arming armAt just before the ingest.
-func runIngestScript(t *testing.T, s *storage.LSMStore, cfs *crashFS, inj *fault.InjectFS, armAt *fault.Injection, afterIngest bool) (o ingestOutcome) {
+func runIngestScript(t *testing.T, s *storage.LSMStore, cfs *crashFS, inj *fault.InjectFS, armAt *fault.Injection, afterIngest bool, mode wal.SyncMode) (o ingestOutcome) {
 	ctx := context.Background()
 	for i, st := range ingestBaseScript() {
 		if err := s.Apply(ctx, st.muts, st.applied); err != nil {
@@ -113,6 +115,9 @@ func runIngestScript(t *testing.T, s *storage.LSMStore, cfs *crashFS, inj *fault
 				t.Fatalf("premise: the old state's flush: %v", err)
 			}
 		}
+	}
+	if err := s.Sync(); err != nil { // the old state durable, whatever the mode
+		t.Fatalf("premise: syncing the old state: %v", err)
 	}
 	o.baseDone = true
 	if armAt != nil {
@@ -127,9 +132,12 @@ func runIngestScript(t *testing.T, s *storage.LSMStore, cfs *crashFS, inj *fault
 	post := ingestPostBatch()
 	if err := s.Apply(ctx, post.muts, post.applied); err == nil {
 		o.postDone = true
+		o.postDurable = mode == wal.SyncAlways
 	}
 	if !cfs.isDead() {
-		_ = s.Flush()
+		if err := s.Flush(); err == nil && o.postDone {
+			o.postDurable = true
+		}
 	}
 	return o
 }
@@ -137,14 +145,14 @@ func runIngestScript(t *testing.T, s *storage.LSMStore, cfs *crashFS, inj *fault
 // ingestDryRun runs the script with no crash: the number of crashFS
 // operations, their names, and where the ingest's begin; and the InjectFS
 // records of the ingest's own operations.
-func ingestDryRun(t *testing.T) (nOps int, names []string, ingestStart int, ingestOps []fault.OpRecord) {
+func ingestDryRun(t *testing.T, mode wal.SyncMode) (nOps int, names []string, ingestStart int, ingestOps []fault.OpRecord) {
 	t.Helper()
 	dir := t.TempDir()
 	mem := fault.NewMemFS()
 	durableStoreRoot(t, mem, dir)
 	cfs := &crashFS{mem: mem}
 	inj := fault.NewInjectFS(cfs)
-	s := openLSM(t, dir, ingestMatrixOpts(inj))
+	s := openLSM(t, dir, ingestMatrixOpts(mode, inj))
 	defer s.Close()
 	ctx := context.Background()
 	for i, st := range ingestBaseScript() {
@@ -152,6 +160,9 @@ func ingestDryRun(t *testing.T) (nOps int, names []string, ingestStart int, inge
 		if i == 5 {
 			mustFlush(t, s)
 		}
+	}
+	if err := s.Sync(); err != nil {
+		t.Fatal(err)
 	}
 	ingestStart = cfs.n
 	before := len(inj.Ops())
@@ -173,6 +184,7 @@ func ingestDryRun(t *testing.T) (nOps int, names []string, ingestStart int, inge
 
 // ingestCell is one run of the script under a fault.
 type ingestCell struct {
+	mode  wal.SyncMode
 	at    int  // crash at this crashFS operation (0: none)
 	torn  bool // a crashing write is torn halfway
 	after bool // or crash right after Ingest returns
@@ -185,15 +197,15 @@ type ingestCell struct {
 func (c ingestCell) String() string {
 	switch {
 	case c.inj != nil:
-		return fmt.Sprintf("error at %s (%s)/%s", c.what, c.phase, c.kind.name)
+		return fmt.Sprintf("%s/error at %s (%s)/%s", c.mode, c.what, c.phase, c.kind.name)
 	case c.after:
-		return fmt.Sprintf("after the ingest returned/%s", c.kind.name)
+		return fmt.Sprintf("%s/after the ingest returned/%s", c.mode, c.kind.name)
 	}
 	torn := ""
 	if c.torn {
 		torn = " torn"
 	}
-	return fmt.Sprintf("crash at op %d [%s]%s/%s", c.at, c.what, torn, c.kind.name)
+	return fmt.Sprintf("%s/crash at op %d [%s]%s/%s", c.mode, c.at, c.what, torn, c.kind.name)
 }
 
 // classify reports which model s holds, or why it holds none.
@@ -242,11 +254,11 @@ func runIngestCell(t *testing.T, cell ingestCell, models ingestModels) string {
 	durableStoreRoot(t, mem, dir)
 	cfs := &crashFS{mem: mem, at: cell.at, torn: cell.torn}
 	inj := fault.NewInjectFS(cfs)
-	s, err := storage.OpenLSMStore(dir, ingestMatrixOpts(inj))
+	s, err := storage.OpenLSMStore(dir, ingestMatrixOpts(cell.mode, inj))
 	if err != nil {
 		t.Fatalf("%s: premise: the first open: %v", cell, err)
 	}
-	o := runIngestScript(t, s, cfs, inj, cell.inj, cell.after)
+	o := runIngestScript(t, s, cfs, inj, cell.inj, cell.after, cell.mode)
 	inj.Disarm()
 	cfs.kill()
 	if cell.kind.power {
@@ -256,7 +268,7 @@ func runIngestCell(t *testing.T, cell ingestCell, models ingestModels) string {
 
 	// 1. The engine opens on what the crash left.
 	cfs.revive(0)
-	s, err = storage.OpenLSMStore(dir, ingestMatrixOpts(inj))
+	s, err = storage.OpenLSMStore(dir, ingestMatrixOpts(cell.mode, inj))
 	if err != nil {
 		t.Fatalf("%s: the store does not open after the crash: %v", cell, err)
 	}
@@ -268,7 +280,7 @@ func runIngestCell(t *testing.T, cell ingestCell, models ingestModels) string {
 	// 3. At least what was acknowledged; nothing never attempted.
 	allowed := map[string]bool{"old": true, "new": true}
 	switch {
-	case o.postDone:
+	case o.postDurable, o.postDone && !cell.kind.power: // a process crash keeps what was written
 		allowed = map[string]bool{"post": true}
 	case o.ingested:
 		allowed = map[string]bool{"new": true, "post": true}
@@ -284,7 +296,7 @@ func runIngestCell(t *testing.T, cell ingestCell, models ingestModels) string {
 	mem.CrashPowerLoss(0)
 	_ = s.Close()
 	cfs.revive(0)
-	s, err = storage.OpenLSMStore(dir, ingestMatrixOpts(inj))
+	s, err = storage.OpenLSMStore(dir, ingestMatrixOpts(cell.mode, inj))
 	if err != nil {
 		t.Fatalf("%s: after a second, immediate power loss the store does not open: %v", cell, err)
 	}
@@ -310,35 +322,40 @@ func runIngestCell(t *testing.T, cell ingestCell, models ingestModels) string {
 // TestIngestCrashMatrix runs every cell.
 func TestIngestCrashMatrix(t *testing.T) {
 	models := newIngestModels()
-	nOps, names, start, ingestOps := ingestDryRun(t)
 	var cells []ingestCell
-	for _, kind := range crashKinds {
-		for at := start + 1; at <= nOps; at++ {
-			cells = append(cells, ingestCell{at: at, kind: kind, what: names[at-1]})
-			if strings.HasPrefix(names[at-1], "write") {
-				cells = append(cells, ingestCell{at: at, torn: true, kind: kind, what: names[at-1]})
+	totalOps, totalInj := 0, 0
+	for _, mode := range []wal.SyncMode{wal.SyncAlways, wal.SyncBatch} {
+		nOps, names, start, ingestOps := ingestDryRun(t, mode)
+		totalOps += nOps - start
+		totalInj += len(ingestOps)
+		for _, kind := range crashKinds {
+			for at := start + 1; at <= nOps; at++ {
+				cells = append(cells, ingestCell{mode: mode, at: at, kind: kind, what: names[at-1]})
+				if strings.HasPrefix(names[at-1], "write") {
+					cells = append(cells, ingestCell{mode: mode, at: at, torn: true, kind: kind, what: names[at-1]})
+				}
 			}
-		}
-		cells = append(cells, ingestCell{after: true, kind: kind})
-		// An injected error at every operation of the ingest itself, then a crash.
-		phase := "before-commit"
-		seen := map[string]int{}
-		for _, r := range ingestOps {
-			key := fmt.Sprintf("%s %s", r.Op, r.Path)
-			seen[key]++
-			isManifest := strings.HasPrefix(filepath.Base(r.Path), "MANIFEST-")
-			p := phase
-			switch {
-			case isManifest && r.Op == fault.OpWrite && phase == "before-commit":
-				p = "commit-write"
-			case isManifest && r.Op == fault.OpSync && phase == "before-commit":
-				p, phase = "commit-sync", "after-commit"
+			cells = append(cells, ingestCell{mode: mode, after: true, kind: kind})
+			// An injected error at every operation of the ingest itself, then a crash.
+			phase := "before-commit"
+			seen := map[string]int{}
+			for _, r := range ingestOps {
+				key := fmt.Sprintf("%s %s", r.Op, r.Path)
+				seen[key]++
+				isManifest := strings.HasPrefix(filepath.Base(r.Path), "MANIFEST-")
+				p := phase
+				switch {
+				case isManifest && r.Op == fault.OpWrite && phase == "before-commit":
+					p = "commit-write"
+				case isManifest && r.Op == fault.OpSync && phase == "before-commit":
+					p, phase = "commit-sync", "after-commit"
+				}
+				if r.Op == fault.OpOpen && !strings.HasSuffix(r.Path, ".tmp") && !strings.HasSuffix(r.Path, ".log") {
+					continue // a read-only open of a table; its failure is a read error, covered elsewhere
+				}
+				inj := fault.Injection{Op: r.Op, Path: r.Path, Nth: seen[key]}
+				cells = append(cells, ingestCell{mode: mode, inj: &inj, kind: kind, phase: p, what: fmt.Sprintf("%s %s #%d", r.Op, filepath.Base(r.Path), seen[key])})
 			}
-			if r.Op == fault.OpOpen && !strings.HasSuffix(r.Path, ".tmp") && !strings.HasSuffix(r.Path, ".log") {
-				continue // a read-only open of a table; its failure is a read error, covered elsewhere
-			}
-			inj := fault.Injection{Op: r.Op, Path: r.Path, Nth: seen[key]}
-			cells = append(cells, ingestCell{inj: &inj, kind: kind, phase: p, what: fmt.Sprintf("%s %s #%d", r.Op, filepath.Base(r.Path), seen[key])})
 		}
 	}
 	dist := map[string]int{}
@@ -346,9 +363,9 @@ func TestIngestCrashMatrix(t *testing.T) {
 	var opOrder []string
 	for _, cell := range cells {
 		got := runIngestCell(t, cell, models)
-		dist[cell.kind.name+" -> "+got]++
+		dist[cell.mode.String()+"/"+cell.kind.name+" -> "+got]++
 		if cell.at > 0 {
-			key := fmt.Sprintf("op %3d %s", cell.at, opClass(cell.what))
+			key := fmt.Sprintf("%s op %3d %s", cell.mode, cell.at, opClass(cell.what))
 			if byOp[key] == nil {
 				byOp[key] = map[string]bool{}
 				opOrder = append(opOrder, key)
@@ -372,9 +389,9 @@ func TestIngestCrashMatrix(t *testing.T) {
 		lines = append(lines, fmt.Sprintf("%s: %d", k, v))
 	}
 	sort.Strings(lines)
-	t.Logf("%d cells (%d filesystem operations of the ingest and after it, %d ingest operations with an injected error), "+
+	t.Logf("%d cells (sync and batch modes: %d filesystem operations of the ingest and after it, %d ingest operations with an injected error), "+
 		"each recovering exactly one whole state, durably, and going on:\n  %s",
-		len(cells), nOps-start, len(ingestOps), strings.Join(lines, "\n  "))
+		len(cells), totalOps, totalInj, strings.Join(lines, "\n  "))
 }
 
 // opClass names an operation without its byte count, for the summary.

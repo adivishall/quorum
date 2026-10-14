@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 
 	"github.com/adivishall/quorum/internal/storage/compaction"
 	"github.com/adivishall/quorum/internal/storage/ikey"
@@ -32,7 +33,7 @@ type Checkpoint struct {
 	v       *version
 	applied AppliedIndex
 	seq     uint64
-	closed  bool
+	closed  atomic.Bool
 }
 
 // ErrNotDurable means a checkpoint could not be pinned at a durable applied
@@ -104,10 +105,15 @@ func (c *Checkpoint) Iterator() *CheckpointIterator {
 	return &CheckpointIterator{m: compaction.New(inputs, compaction.Options{BottomMost: true})}
 }
 
-// Close releases the checkpoint's tables. It is idempotent.
+// Close releases the checkpoint's tables. It is idempotent, from any number
+// of goroutines: the version is released exactly once (a second release could
+// drop a live version's count to zero and delete tables the MANIFEST names).
+//
+// Close the checkpoint before the store. A store closed first closes its
+// current version's readers, and a checkpoint still reading that version then
+// fails with a read error — never a wrong answer.
 func (c *Checkpoint) Close() error {
-	if !c.closed {
-		c.closed = true
+	if c.closed.CompareAndSwap(false, true) {
 		c.s.release(c.v)
 	}
 	return nil
@@ -155,10 +161,12 @@ func (memStream) Err() error { return nil }
 
 // Scan calls fn with each live entry of the current state in key order — the
 // memtables included — one entry at a time, never the state in memory: the
-// LSM machine loads its session records this way at open (S4). It reads one
-// version, pinned for the scan, so it sees one coherent state. fn's arguments
-// are valid only during the call; an error from fn stops the scan and is
-// returned.
+// LSM machine loads its session records this way at open (S4). It pins one
+// version for the scan, so its tables cannot change under it; but its
+// memtable is the live one, so a write concurrent with the scan may or may
+// not be seen, and a batch may be seen in part. Scan when nothing writes (the
+// machine does, at open), or take a Checkpoint. fn's arguments are valid only
+// during the call; an error from fn stops the scan and is returned.
 func (s *LSMStore) Scan(fn func(key, value []byte) error) error {
 	s.closeMu.RLock()
 	defer s.closeMu.RUnlock()
