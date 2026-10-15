@@ -248,16 +248,13 @@ mutant "actor-never-blocks-on-a-peer" internal/raftnode/node.go \
   ./internal/raftnode 'TestWedgedPeerDoesNotStallTheLeader'
 
 # 14. Propose ignores the caller's deadline while the node is busy persisting.
+#     Re-anchored to answer, which every client request now waits in (#27).
 mutant "propose-honours-deadline" internal/raftnode/node.go \
-  '	case <-n.ctx.Done():
-		return raft.ErrStopped
-	case <-ctx.Done():
-		return ctx.Err()
+  '	case <-ctx.Done():
+		return a, ctx.Err()
 	}
 }' \
-  '	case <-n.ctx.Done():
-		return raft.ErrStopped
-	}
+  '	}
 }' \
   ./internal/raftnode 'TestProposeHonoursContextDuringSlowFsync'
 
