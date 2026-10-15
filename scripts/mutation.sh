@@ -3592,6 +3592,23 @@ mutant "a-one-chunk-transfer-is-marked-installing" internal/raftnode/snapshot.go
   'false || ok && f == string(from)' \
   ./internal/raftnode '^(TestInstallingCoversExactlyTheProofAndTheInstall|TestARepeatedOfferIsDroppedWhileTheFirstIsProven)$'
 
+# 412. Found by CI on the S4 branch (#27): a node that stops right after
+#      answering a request hides the answer — with the answer and the stop both
+#      ready, select chose at random, and the write whose entry the state
+#      machine refused learnt ErrStopped instead of ErrApply half the time.
+#      The node-level test sees it only when the runner schedules against the
+#      caller; the helper's test sees it every time.
+mutant "a-stop-does-not-hide-an-answer" internal/raftnode/node.go \
+  '		// Stopped. An answer given before the stop is the outcome.
+		select {
+		case a = <-ch:
+			return a, nil
+		default:
+			return a, raft.ErrStopped
+		}' \
+  '		return a, raft.ErrStopped' \
+  ./internal/raftnode '^TestAnAnswerGivenBeforeTheStopIsTheOutcome$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then

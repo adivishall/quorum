@@ -673,13 +673,38 @@ func (n *Node) Propose(ctx context.Context, data []byte) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	err, stopped := answer(ctx, p.result, n.ctx.Done())
+	if stopped != nil {
+		return stopped
+	}
+	return err
+}
+
+// answer waits for the actor's answer to a request it has taken — or for the
+// node to stop, or the caller's ctx to end (context.Background: wait for the
+// node), whichever comes first. A node that stops right after answering does
+// not hide its answer: the actor answers every request it takes within the same
+// cycle, and fail completes every waiter before it cancels, so an answer
+// already in the channel when the stop is seen IS the request's outcome — the
+// write whose entry the state machine refused learns ErrApply through its
+// waiter, as the contract says — and raft.ErrStopped is the outcome only when
+// the actor never answered. Before, with the answer and the stop both ready,
+// select chose at random, and the write learnt ErrStopped half the time
+// (found by CI on the S4 branch, #27).
+func answer[T any](ctx context.Context, ch <-chan T, stop <-chan struct{}) (a T, err error) {
 	select {
-	case err := <-p.result:
-		return err
-	case <-n.ctx.Done():
-		return raft.ErrStopped
+	case a = <-ch:
+		return a, nil
+	case <-stop:
+		// Stopped. An answer given before the stop is the outcome.
+		select {
+		case a = <-ch:
+			return a, nil
+		default:
+			return a, raft.ErrStopped
+		}
 	case <-ctx.Done():
-		return ctx.Err()
+		return a, ctx.Err()
 	}
 }
 
@@ -704,7 +729,10 @@ func (n *Node) Propose(ctx context.Context, data []byte) error {
 //     A client must treat it exactly as a timeout (docs/CONSISTENCY.md C4).
 //   - raft.ErrStopped, or a persistence or state-machine failure (ErrApply):
 //     the node stopped. If the proposal had been accepted the outcome is
-//     likewise unknown.
+//     likewise unknown — except that the write whose own entry the state
+//     machine refused learns ErrApply (its entry is applied nowhere, ever), and
+//     every answer the node gave before it stopped is returned over
+//     ErrStopped.
 func (n *Node) Write(ctx context.Context, data []byte) (index, term uint64, result any, err error) {
 	req := writeReq{data: append([]byte(nil), data...), result: make(chan writeAccepted, 1)}
 	select {
@@ -714,14 +742,12 @@ func (n *Node) Write(ctx context.Context, data []byte) (index, term uint64, resu
 	case <-ctx.Done():
 		return 0, 0, nil, ctx.Err()
 	}
-	var acc writeAccepted
-	select {
-	case acc = <-req.result:
-	case <-n.ctx.Done():
-		return 0, 0, nil, raft.ErrStopped
-	case <-ctx.Done():
-		n.abandon(abandoned{write: req.result})
-		return 0, 0, nil, ctx.Err()
+	acc, err := answer(ctx, req.result, n.ctx.Done())
+	if err != nil {
+		if !errors.Is(err, raft.ErrStopped) {
+			n.abandon(abandoned{write: req.result}) // the caller gave up: forget it
+		}
+		return 0, 0, nil, err
 	}
 	if acc.err != nil {
 		return 0, 0, nil, acc.err
@@ -811,14 +837,12 @@ func (n *Node) ReadIndex(ctx context.Context) (uint64, error) {
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	}
-	var acc readAccepted
-	select {
-	case acc = <-req.result:
-	case <-n.ctx.Done():
-		return 0, raft.ErrStopped
-	case <-ctx.Done():
-		n.abandon(abandoned{read: req.result})
-		return 0, ctx.Err()
+	acc, err := answer(ctx, req.result, n.ctx.Done())
+	if err != nil {
+		if !errors.Is(err, raft.ErrStopped) {
+			n.abandon(abandoned{read: req.result}) // the caller gave up: forget it
+		}
+		return 0, err
 	}
 	if acc.err != nil {
 		return 0, acc.err
@@ -846,12 +870,11 @@ func (n *Node) Snapshot(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	select {
-	case err := <-r:
-		return err
-	case <-n.ctx.Done():
-		return raft.ErrStopped
+	err, stopped := answer(context.Background(), r, n.ctx.Done())
+	if stopped != nil {
+		return stopped
 	}
+	return err
 }
 
 // Status returns one consistent snapshot of the node's state. Use it (not the
