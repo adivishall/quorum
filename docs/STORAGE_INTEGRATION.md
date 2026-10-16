@@ -1900,6 +1900,22 @@ it, and what the real-process tests had not measured, measured. It found:
   contract did not change: an accepted request's outcome is unknown on a stop, except that an
   answer the node gave is the outcome. `TestAnAnswerGivenBeforeTheStopIsTheOutcome` reproduces the
   exact state a thousand times (a plain `select` fails the first trial); mutant 412 reverts it.
+- *What CI found on the fix* (run 38757466436, the `integration` job; five jobs passed, the S4
+  large-snapshot tests among them): `TestRealOneGroupBrokenTheOtherContinues` (Phase 15: group 0
+  stopped on two of its three nodes; group 1 goes on) reported "group 0 committed without its
+  quorum: 1 -> 2". The test sampled n1's commit index as what group 0 had committed, then required
+  it unchanged. But n1 is a *follower* of group 0 in two runs of three, and a follower's commit
+  index trails the leader's by a heartbeat (`commitTo` does not broadcast; the next AppendEntries
+  carries `LeaderCommit`): measured on a real cluster, after each of 40 completed writes n1's
+  commit index was behind the leader's 40 times. Entry 2 is the `"a"` write, completed with quorum
+  before the break; "1 -> 2" is n1 learning that, late, on the ~3× slower runner. The test, the
+  Raft core, `multiraft` and the harness are byte-identical to `main`; S4 is not on this path
+  (its only change to the frame pump concerns `InstallSnapshot` frames). A test premise, not a
+  defect: fixed by taking the baseline where it is defined — the group-0 leader's commit index
+  before the stop, which a completed write is at or below — and requiring n1 never to pass it. The
+  invariant the test is for is intact and still asserted; a lone replica committing a *new*
+  entry would still fail it. Not reproduced on the M4 under full CPU load (8/8 pass with the old
+  premise); the failing run's exact scheduling is inferred from the value, not observed.
 
 ### 10.16 Tests, mutants, fuzzing
 
@@ -1966,27 +1982,29 @@ and `FuzzStreamDecoderMatchesS3` (the state decoder against the frozen S3 decode
 
 ### 10.17 Evidence
 
-Every gate below ran sequentially on `2509012` (Apple M4, macOS, **go1.27.2**, the machine kept
+Every gate below ran sequentially on `16bdb2f` (Apple M4, macOS, **go1.27.2**, the machine kept
 awake, no other test running), the last commit that changes code or tests: the S4 code, the
-closeout's fixes, and the fix for the race CI found (§10.15). The commit after it is this evidence
-— documentation only (`git diff 2509012 HEAD` names only files under `docs/`). CI runs every
-gate again on the final commit. Earlier runs are not reported as evidence: the same gates passed
-on `ecf046d`, the revision CI then found the race on, and one earlier run is history worth stating
-— see *An unrelated failure* below.
+closeout's fixes, the fix for the race CI found, and the membership test's premise (§10.15). The
+commit after it is this evidence — documentation only (`git diff 16bdb2f HEAD` names only
+files under `docs/`). CI runs every gate again on the final commit. Earlier runs are not reported
+as evidence: the same gates passed on `ecf046d` and on `2509012`, the revisions CI then found the
+race and the premise on; one earlier run is history worth stating — see *An unrelated failure*
+below.
 
 | Gate | What it covers | Result |
 |---|---|---|
-| `make check` (fmt, ignore, vet, every unit package under `-race`) | storage — including the ingest crash matrix in both WAL modes — WAL, MANIFEST, snapshot, kv on the in-memory machine, raftnode, raftsim, multiraft; 37 packages | pass, 209 s |
-| `make race-lsm` | every `internal/kv` test again with the group's machine in the engine | pass, 76 s |
+| `make check` (fmt, ignore, vet, every unit package under `-race`) | storage — including the ingest crash matrix in both WAL modes — WAL, MANIFEST, snapshot, kv on the in-memory machine, raftnode, raftsim, multiraft; 37 packages | pass, 334 s |
+| `make race-lsm` | every `internal/kv` test again with the group's machine in the engine | pass, 80 s |
 | staticcheck (`SA*`, the CI pin, #25) and govulncheck v1.8.0 | correctness checks; known vulnerabilities in the code's call graph and imports | pass (no findings); **"No vulnerabilities found."** |
-| `make integration` | 93 real-process tests on the in-memory machine: linearizability, dedup/retry, snapshots — the four large-snapshot tests included — membership, chaos, the engine crash tests | 93 pass, 439 s |
-| `make integration-lsm` | the same 93 tests with every `dkvd` on the LSM machine | 93 pass, 463 s |
-| `make faults FAULT_SEEDS=200` | the deterministic simulator: 200-seed fault schedules, the crash, snapshot and membership matrices, seeded KV histories checked for linearizability, multi-group isolation, the bounded membership model at depth 4, the pinned trace hash | pass, 158 s |
-| `make fuzz` | 37 of 37 fuzz targets, 10 s each — `FuzzReaderAgreesWithDecode` and `FuzzStreamDecoderMatchesS3` (S4) among them | pass, 421 s |
-| `make mutation` | all 413 mutants — the thirty-nine S4 mutants (372–411), 412 for the race CI found, and 344c and 14 retargeted (§10.15, §10.16) among them; each killed by its intended test, none by an unrelated failure | **413 / 413 killed**, 1059 s |
+| `make integration` | 93 real-process tests on the in-memory machine: linearizability, dedup/retry, snapshots — the four large-snapshot tests included — membership, chaos, the engine crash tests | 93 pass, 463 s |
+| `make integration-lsm` | the same 93 tests with every `dkvd` on the LSM machine | 93 pass, 459 s |
+| `make faults FAULT_SEEDS=200` | the deterministic simulator: 200-seed fault schedules, the crash, snapshot and membership matrices, seeded KV histories checked for linearizability, multi-group isolation, the bounded membership model at depth 4, the pinned trace hash | pass, 154 s |
+| `make fuzz` | 37 of 37 fuzz targets, 10 s each — `FuzzReaderAgreesWithDecode` and `FuzzStreamDecoderMatchesS3` (S4) among them | pass, 413 s |
+| `make mutation` | all 413 mutants — the thirty-nine S4 mutants (372–411), 412 for the race CI found, and 344c and 14 retargeted (§10.15, §10.16) among them; each killed by its intended test, none by an unrelated failure | **413 / 413 killed**, 1012 s |
 | `TestIngestCrashMatrix -v` (under `-race`; it also runs inside `make check`) | the ingest's crash matrix, verbose, for the per-mode record below | **1192 / 1192 cells** recover exactly one whole state |
 | `TestRealFollowerInstallsASnapshotAboveTheS3Limit`, alone, on each machine | the S4 exit criterion once more, outside the suites (below) | pass on both |
 | `TestApplyFailureStopsTheNode` and `TestAnAnswerGivenBeforeTheStopIsTheOutcome`, `-count=50 -cpu=1,2` under `-race` | the race CI found (§10.15), 100 runs of each | pass |
+| `TestRealOneGroupBrokenTheOtherContinues`, `-count=5` under `-race`, each machine | the premise CI found (§10.15) | pass on both |
 
 **The S4 exit criterion, on real processes.** Real `dkvd` processes
 (`tests/integration/snapshot_large_test.go`), in both suites above, each test ending with every
@@ -1995,15 +2013,17 @@ with it:
 
 | Test | In-memory machine | LSM machine |
 |---|---|---|
-| `TestRealFollowerInstallsASnapshotAboveTheS3Limit` | 84 MiB installed from n2, 1.3 s; one transfer streamed (two earlier attempts had failed); restart, writes, duplicate retry: pass | 84 MiB installed from n2, 1.1 s; heap ≤ 7 MiB receiving and proving, ≤ 9 MiB installing (sampled), 92 MiB peak resident; one transfer streamed (two earlier attempts had failed); restart, writes, duplicate retry: pass; every engine at the durable state's index, durable at or above its snapshot |
+| `TestRealFollowerInstallsASnapshotAboveTheS3Limit` | 84 MiB installed from n3, 1.2 s; one transfer streamed (two earlier attempts had failed); restart, writes, duplicate retry: pass | 85 MiB installed from n2, 0.9 s; heap ≤ 8 MiB receiving and proving, ≤ 11 MiB installing (sampled), 89 MiB peak resident; one transfer streamed (two earlier attempts had failed); restart, writes, duplicate retry: pass; every engine at the durable state's index, durable at or above its snapshot |
 | `TestRealFollowerDiesBetweenALargeInstallsBoundaryAndItsRestore` | pass | pass; the restart ingests the published snapshot; engines at 102 |
-| `TestRealFollowerKilledDuringALargeInstallRecovers` | killed with snapshot 97 published, install incomplete: pass | killed with snapshot 96 published, install incomplete: pass; engines at 104 |
-| `TestRealFollowerKilledMidTransferOfALargeSnapshotRecovers` | killed with 4 MiB of an 85 MiB snapshot received; restart installs 84 MiB: pass | killed 4 MiB in; nothing published, engine ≤ 7 (offline); restart installs 84 MiB from n3: pass; engines at 103 |
+| `TestRealFollowerKilledDuringALargeInstallRecovers` | killed with snapshot 97 published, install incomplete: pass | killed with snapshot 97 published, install incomplete: pass; engines at 104 |
+| `TestRealFollowerKilledMidTransferOfALargeSnapshotRecovers` | killed with 4 MiB of an 87 MiB snapshot received; restart installs 86 MiB: pass | n2 killed 4 MiB in; nothing published, engine ≤ 7 (offline); restart installs 84 MiB from n1: pass; engines at 103 |
 
-The in-memory machine's follower held 393 MiB of heap (1067 MiB resident) installing
-84 MiB: it decodes and holds the state by design; nothing is asserted there.
-On the LSM machine the heap bound is asserted; the closeout's repeated measurements, with and
-without CPU contention and with and without a repeated offer, are in §10.15.
+The in-memory machine's follower held 352 MiB of heap (1071 MiB resident) installing
+84 MiB: it decodes and holds the state by design; nothing is asserted there. (CI's run of the same
+suite on `ef0a6a4`, on a runner about three times slower, installed 83 MiB in 5.5 s with one
+repeated offer — "2 sent, 1 failed" — and a 348–352 MiB heap on that machine; its figures are not
+comparable with these.) On the LSM machine the heap bound is asserted; the closeout's repeated
+measurements, with and without CPU contention and with and without a repeated offer, are in §10.15.
 
 **The ingest crash matrix.** 1192 cells, 596 per WAL mode (`sync` and the production default
 `batch`): a crash before each filesystem operation of the ingest and of the writes after it (132
@@ -2031,7 +2051,7 @@ and SSTables — is on the model. Modeled power loss is not device certification
 
 ### 10.18 What S4 proves, and what it does not
 
-**PROVEN WITHIN THE TEST MODEL** (the tests and mutants of §10.16, passing on `2509012`, §10.17):
+**PROVEN WITHIN THE TEST MODEL** (the tests and mutants of §10.16, passing on `16bdb2f`, §10.17):
 - **A follower installs, and restarts on, a snapshot larger than the S3 limit.** Real `dkvd`
   processes on both machines: a follower behind every other node's compaction boundary is sent an
   83–86 MiB snapshot (above the ~63 MiB one-WAL-record limit S3 left) by whichever node leads,
