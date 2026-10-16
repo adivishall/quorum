@@ -364,12 +364,18 @@ func TestRealRemoveAPartitionedMember(t *testing.T) {
 // TestRealOneGroupBrokenTheOtherContinues is the isolation test: group 0 is
 // stopped on two of its three nodes — no quorum — while group 1, on the very
 // same processes and connections, keeps committing by its own quorum; group 0
-// commits nothing meanwhile; restarted from its files, group 0 serves again.
+// commits nothing new meanwhile (its one replica may still learn what its
+// quorum committed before the break, never more); restarted from its files,
+// group 0 serves again.
 func TestRealOneGroupBrokenTheOtherContinues(t *testing.T) {
 	c := newMCluster(t, 3, 0, 2)
 	cl := c.sharded()
 	c.write(cl, c.keyIn(0, 0), "a")
 	c.write(cl, c.keyIn(1, 0), "b")
+	// What group 0 had committed with its quorum, read at its leader (a write
+	// completes once the leader applied it): the bound n1 can never pass alone.
+	l0, _ := c.waitLeaderOf(0)
+	committed0 := c.status(l0)[0].Commit
 	for _, id := range []string{"n2", "n3"} {
 		if resp, err := c.adminCall(id, multiraft.AdminRequest{Op: "stop-group", Group: 0}); err != nil || !resp.OK {
 			t.Fatalf("stop group 0 on %s: %v %+v", id, err, resp)
@@ -380,7 +386,6 @@ func TestRealOneGroupBrokenTheOtherContinues(t *testing.T) {
 		return c.status(l)[1].Commit
 	}
 	before1 := commit1()
-	before0 := c.status("n1")[0].Commit
 	for i := 0; i < 10; i++ {
 		c.write(cl, c.keyIn(1, 1+i), "more")
 	}
@@ -393,8 +398,12 @@ func TestRealOneGroupBrokenTheOtherContinues(t *testing.T) {
 	if out.Err == nil {
 		t.Fatal("group 0 accepted a write with one of its three replicas")
 	}
-	if after := c.status("n1")[0].Commit; after != before0 {
-		t.Fatalf("group 0 committed without its quorum: %d -> %d", before0, after)
+	// n1 — the one replica of group 0 left — may still LEARN of the entries its
+	// quorum committed before the break (a follower's commit index trails the
+	// leader's by a heartbeat: on CI, 1 -> 2 here was n1 learning that "a" had
+	// committed), but it can never commit past them.
+	if after := c.status("n1")[0].Commit; after > committed0 {
+		t.Fatalf("group 0 committed without its quorum: %d, past the %d its quorum had committed before the break\n%s", after, committed0, c.statusDump())
 	}
 	for _, id := range []string{"n2", "n3"} {
 		resp, err := c.adminCall(id, multiraft.AdminRequest{Op: "start-group", Group: 0})
