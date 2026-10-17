@@ -3606,6 +3606,21 @@ mutant "a-stop-does-not-hide-an-answer" internal/raftnode/node.go \
   '		return a, raft.ErrStopped' \
   ./internal/raftnode '^TestAnAnswerGivenBeforeTheStopIsTheOutcome$'
 
+# 413. Found by CI on the S4 branch (#27): a chaos fault aimed at "the leader"
+#      looks once — a group between leaders at the fault's instant has none —
+#      and the planned fault is dropped by its timing.
+mutant "a-leader-fault-waits-for-a-leader" internal/lab/chaos.go \
+  '		if since := time.Since(start); since >= bound {' \
+  '		if since := time.Since(start); true || since >= bound {' \
+  ./internal/lab '^TestALeaderFaultWaitsOutAnElection$'
+
+# 414. Found by CI on the S4 branch (#27): a planned fault with no target is a
+#      skip, and the run passes as if it had been carried out.
+mutant "a-leaderless-fault-is-an-error" internal/lab/chaos.go \
+  '		r.event(i, "error", f.Node, "%s: no target: %v", f, err)' \
+  '		r.event(i, "skip", f.Node, "%s: no target: %v", f, err)' \
+  ./internal/lab '^TestALeaderFaultWithoutALeaderFailsTheRun$'
+
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"
 if [ "$TOTAL" -eq 0 ]; then

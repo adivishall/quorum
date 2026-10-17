@@ -45,7 +45,7 @@ killed node is a `SIGKILL`ed process, and a partition is a TCP link whose connec
 
 A run **passes** if:
 - the schedule was carried out with no error event (a fault the runner could not inject or undo,
-  such as a restart that failed);
+  such as a restart that failed, or a "leader" fault whose group had no leader within its hold);
 - the history is linearizable and was checked, not left over the checker's budget;
 - the cluster converged;
 - clients completed operations.
@@ -66,7 +66,13 @@ Anything else fails the run, and its evidence is written to disk (§5).
 | `add-member` | a spare joins the group: started with `-join`, added as a learner, caught up, promoted | — |
 
 A node fault targets a node drawn from the seed or, half the time, the leader of the fault's group at
-the moment the fault starts. The node it actually hit is recorded.
+the moment the fault starts. The node it actually hit is recorded. A group has no leader while it
+elects one, and a fault's instant can fall inside that interval, so a "leader" fault **waits** for a
+leader — polling every 10 ms, for up to the fault's hold (the schedule's default hold for a fault
+without one: several election timeouts, where a group that can elect at all does) — and its event
+records how long it waited. A group still leaderless then is an **error** event: the fault was
+planned and not carried out, and the run does not pass as if it had been. (Before, one look decided:
+CI on the S4 branch saw a fault scheduled 250 ms into an election skipped, and the run pass.)
 
 **One impairment at a time.** No fault starts before the previous one has been undone, and none
 touches more than one node or link. In a group of three or more voters an impairment always leaves
