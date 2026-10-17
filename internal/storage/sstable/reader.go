@@ -10,6 +10,7 @@ import (
 
 	"github.com/adivishall/quorum/internal/storage/bloom"
 	"github.com/adivishall/quorum/internal/storage/ikey"
+	"github.com/adivishall/quorum/internal/vfs"
 )
 
 // indexEntry locates one data block. LastKey is the greatest internal key in
@@ -32,7 +33,7 @@ type indexEntry struct {
 // must not race with in-flight reads; storage.LSMStore guarantees that by
 // draining its operations before it closes anything.
 type Reader struct {
-	f    *os.File
+	f    vfs.File
 	name string
 	size int64
 
@@ -66,8 +67,12 @@ type Reader struct {
 // which costs a full read of the file. The split is deliberate: Open is on the
 // read path for every file at startup, Verify is a decision the engine makes
 // about how much it wants to pay to trust a file before serving from it.
-func Open(path string) (*Reader, error) {
-	f, err := os.Open(path)
+func Open(path string) (*Reader, error) { return OpenFS(vfs.OS{}, path) }
+
+// OpenFS is Open on a filesystem (S4: the engine's tables go through its vfs
+// seam, so the crash model covers them).
+func OpenFS(fsys vfs.FS, path string) (*Reader, error) {
+	f, err := fsys.OpenFile(path, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, fmt.Errorf("sstable: opening %s: %w", path, err)
 	}
@@ -79,7 +84,7 @@ func Open(path string) (*Reader, error) {
 	return r, nil
 }
 
-func newReader(f *os.File, path string) (*Reader, error) {
+func newReader(f vfs.File, path string) (*Reader, error) {
 	info, err := f.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("sstable: stat %s: %w", path, err)

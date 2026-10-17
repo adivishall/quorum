@@ -9,6 +9,7 @@ import (
 
 	"github.com/adivishall/quorum/internal/storage/bloom"
 	"github.com/adivishall/quorum/internal/storage/ikey"
+	"github.com/adivishall/quorum/internal/vfs"
 )
 
 // Metadata describes a finished SSTable.
@@ -307,14 +308,20 @@ type FailableSource interface {
 // On any failure the partial file is removed, so a failed flush does not leave
 // something that a later startup has to classify.
 func WriteFile(path string, src Source, opts WriterOptions) (Metadata, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	return WriteFileFS(vfs.OS{}, path, src, opts)
+}
+
+// WriteFileFS is WriteFile on a filesystem (S4: the engine's tables go through
+// its vfs seam, so the crash model covers them).
+func WriteFileFS(fsys vfs.FS, path string, src Source, opts WriterOptions) (Metadata, error) {
+	f, err := fsys.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
 		return Metadata{}, fmt.Errorf("sstable: creating %s: %w", path, err)
 	}
 
 	cleanup := func(cause error) (Metadata, error) {
 		_ = f.Close()
-		_ = os.Remove(path)
+		_ = fsys.Remove(path)
 		return Metadata{}, cause
 	}
 
@@ -340,7 +347,7 @@ func WriteFile(path string, src Source, opts WriterOptions) (Metadata, error) {
 		return cleanup(fmt.Errorf("sstable: syncing %s: %w", path, err))
 	}
 	if err := f.Close(); err != nil {
-		_ = os.Remove(path)
+		_ = fsys.Remove(path)
 		return Metadata{}, fmt.Errorf("sstable: closing %s: %w", path, err)
 	}
 	return meta, nil

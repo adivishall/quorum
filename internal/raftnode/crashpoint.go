@@ -45,8 +45,9 @@ const (
 
 	// Phase 14 — creating a snapshot (docs/SNAPSHOTS.md §5; Arg = its index).
 
-	// BeforeSnapshotPublish: the state is encoded; nothing of the snapshot is
-	// on disk.
+	// BeforeSnapshotPublish: the state is opened and measured (S4: its length
+	// and hash known, an oversized one already refused) and an engine-backed
+	// machine is durable through the index; nothing of the snapshot is on disk.
 	BeforeSnapshotPublish
 	// AfterSnapshotPublish: the snapshot is published (renamed, directory
 	// fsynced); the log still holds the prefix it covers.

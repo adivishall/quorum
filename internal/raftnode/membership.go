@@ -68,14 +68,11 @@ func (n *Node) ChangeMembership(ctx context.Context, cc raft.ConfChange) (replic
 	case <-ctx.Done():
 		return replication.Configuration{}, 0, ctx.Err()
 	}
-	select {
-	case out := <-req.result:
-		return out.conf, out.index, out.err
-	case <-n.ctx.Done():
-		return replication.Configuration{}, 0, raft.ErrStopped
-	case <-ctx.Done():
-		return replication.Configuration{}, 0, ctx.Err()
+	out, err := answer(ctx, req.result, n.ctx.Done())
+	if err != nil {
+		return replication.Configuration{}, 0, err
 	}
+	return out.conf, out.index, out.err
 }
 
 // settleChanges completes the accepted membership changes that have finished

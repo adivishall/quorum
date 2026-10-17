@@ -497,8 +497,10 @@ entry is truncated from this node's log: another leader that holds the entry may
 **Apply failures (audit M4).** A state machine that returns an error from `Apply` for a committed
 entry refuses it on every replica and on every retry — a committed entry is the same everywhere.
 The node now fail-stops on it exactly as on a persistence failure: `event=raft_apply_failed`,
-`Node.Err()` wraps `ErrApply`, every waiting client learns the error, and `dkvd` exits 1 (`-raft`)
-or stops that group alone (`-cluster`). Before, the error was logged and retried every cycle,
+`Node.Err()` wraps `ErrApply`, every waiting client learns the error — including the client whose
+own write it was, even when the stop lands before that client has read the actor's answer (the
+answer wins over `ErrStopped`; a plain `select` chose at random, found by CI on the S4 branch) —
+and `dkvd` exits 1 (`-raft`) or stops that group alone (`-cluster`). Before, the error was logged and retried every cycle,
 forever: the group stalled behind the entry while its leader went on accepting writes it could
 never apply. `appliedIndex` never passes the refused entry, so a restart refuses it again; the
 entries applied before it in the failing cycle complete, and the published `Status` covers them

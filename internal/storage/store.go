@@ -17,6 +17,7 @@ import (
 	"github.com/adivishall/quorum/internal/storage/bloom"
 	"github.com/adivishall/quorum/internal/storage/sstable"
 	"github.com/adivishall/quorum/internal/storage/wal"
+	"github.com/adivishall/quorum/internal/vfs"
 )
 
 // Default limits. These match docs/DESIGN.md §1 so that the in-memory store and
@@ -48,6 +49,15 @@ type Options struct {
 	// WAL configures durability. It is ignored by MemStore, which has none.
 	// Its zero value is the documented default (batch sync, 16 MiB segments).
 	WAL wal.Options
+
+	// FS is the filesystem LSMStore keeps its files on: the SSTables, the
+	// data directory, the MANIFEST, and the WAL unless WAL.FS names another
+	// (S4, docs/STORAGE_INTEGRATION.md §10.11). Nil means the real OS — and
+	// then the MANIFEST goes through manifest.FS, so tests that inject faults
+	// there keep working. Tests set it to a fault.MemFS (or a wrapper) to put
+	// the whole engine under the crash and power-loss model. Ignored by
+	// MemStore and WALStore.
+	FS vfs.FS
 
 	// MemTableSize is the byte threshold at which LSMStore flushes its
 	// memtable to an SSTable. Zero selects DefaultMemTableSize. Ignored by

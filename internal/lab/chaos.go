@@ -209,7 +209,7 @@ type ChaosEvent struct {
 	At     time.Duration `json:"at"`
 	Pos    int64         `json:"pos"`
 	Fault  int           `json:"fault"` // the schedule index, or -1
-	Kind   string        `json:"kind"`  // inject, recover, skip, error, leader (a change), first-leader, converged
+	Kind   string        `json:"kind"`  // inject, recover, skip (the load had ended), error, leader (a change), first-leader, converged
 	Node   string        `json:"node,omitempty"`
 	Detail string        `json:"detail,omitempty"`
 }
@@ -293,6 +293,9 @@ type chaosRun struct {
 	cc    ChaosConfig
 	rec   *lincheck.Recorder
 	start time.Time
+	// leader finds a group's current leader (the cluster's Leader; a test's
+	// stand-in).
+	leader func(ctx context.Context, g multiraft.GroupID) (string, uint64, error)
 
 	mu      sync.Mutex
 	events  []ChaosEvent
@@ -354,7 +357,7 @@ func RunChaos(ctx context.Context, cc ChaosConfig) (*ChaosResult, error) {
 	}
 	cc.Schedule = schedule
 
-	r := &chaosRun{c: c, cc: cc, rec: lincheck.NewRecorder(), leaders: map[multiraft.GroupID][2]string{}, paused: map[string]bool{}}
+	r := &chaosRun{c: c, cc: cc, rec: lincheck.NewRecorder(), leader: c.Leader, leaders: map[multiraft.GroupID][2]string{}, paused: map[string]bool{}}
 	lc := cc.Load
 	lc.Endpoints = c.Endpoints()
 	if rt := c.Route(); rt != nil {
@@ -499,26 +502,65 @@ func check(h lincheck.History) CheckResult {
 	return out
 }
 
-// resolve turns a fault's target into a node id: TargetLeader is the node
-// leading the fault's group now.
-func (r *chaosRun) resolve(ctx context.Context, f Fault) (string, error) {
-	if f.Node != TargetLeader {
-		return f.Node, nil
+// leaderWait is how long a fault aimed at "the leader" waits for its group to
+// have one: the fault's hold, or the schedule's default hold for a fault
+// without one. A group has no leader while it elects one — half a second or
+// so here after a leader dies — and a fault's planned instant may fall inside
+// such an interval, so a single look is not enough; several election timeouts
+// are, in a group that can elect at all.
+func (r *chaosRun) leaderWait(f Fault) time.Duration {
+	if f.Hold > 0 {
+		return f.Hold
 	}
-	actx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	id, _, err := r.c.Leader(actx, f.Group)
-	return id, err
+	return r.cc.Hold
+}
+
+// resolve turns a fault's target into a node id: TargetLeader is the node
+// leading the fault's group, waited for up to leaderWait (polled every 10 ms)
+// when the group is between leaders at the fault's instant; waited is how
+// long that took (0: a leader at once), so the fault's event records it. A
+// group still leaderless at the bound is an error: the fault was planned and
+// not carried out, and the run must not pass as if it had been (CI on the S4
+// branch found a fault skipped 250 ms into an election, and the run passing).
+func (r *chaosRun) resolve(ctx context.Context, f Fault) (node string, waited time.Duration, err error) {
+	if f.Node != TargetLeader {
+		return f.Node, 0, nil
+	}
+	bound := r.leaderWait(f)
+	start := time.Now()
+	for polls := 1; ; polls++ {
+		actx, cancel := context.WithTimeout(ctx, time.Second)
+		id, _, err := r.leader(actx, f.Group)
+		cancel()
+		if err == nil {
+			if polls > 1 {
+				waited = time.Since(start)
+			}
+			return id, waited, nil
+		}
+		if since := time.Since(start); since >= bound {
+			return "", since, fmt.Errorf("%w within %s", err, bound)
+		}
+		select {
+		case <-ctx.Done():
+			return "", time.Since(start), ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 // inject starts fault i and returns how to recover from it (nil for a fault
 // with nothing to undo, or one that could not be injected).
 func (r *chaosRun) inject(ctx context.Context, i int, f Fault) func() {
 	c := r.c
-	node, err := r.resolve(ctx, f)
+	node, waited, err := r.resolve(ctx, f)
 	if err != nil {
-		r.event(i, "skip", f.Node, "%s: no target: %v", f, err)
+		r.event(i, "error", f.Node, "%s: no target: %v", f, err)
 		return nil
+	}
+	desc := f.String()
+	if waited > 0 {
+		desc += fmt.Sprintf(", after %s without a leader", waited.Round(time.Millisecond))
 	}
 	fail := func(err error) func() {
 		r.event(i, "error", node, "%s: %v", f, err)
@@ -535,13 +577,13 @@ func (r *chaosRun) inject(ctx context.Context, i int, f Fault) func() {
 		if err != nil {
 			return fail(err)
 		}
-		r.event(i, "inject", node, "%s (%s)", f.Kind, f)
+		r.event(i, "inject", node, "%s (%s)", f.Kind, desc)
 		return func() { r.restart(ctx, i, node) }
 	case FaultCrash:
 		if err := c.send(node, syscall.SIGUSR1); err != nil {
 			return fail(err)
 		}
-		r.event(i, "inject", node, "crash armed at %s (%s)", r.cc.CrashPoint, f)
+		r.event(i, "inject", node, "crash armed at %s (%s)", r.cc.CrashPoint, desc)
 		return func() {
 			if c.Node(node).Alive() {
 				// The point was not reached during the hold (an idle node):
@@ -560,7 +602,7 @@ func (r *chaosRun) inject(ctx context.Context, i int, f Fault) func() {
 		r.mu.Lock()
 		r.paused[node] = true
 		r.mu.Unlock()
-		r.event(i, "inject", node, "paused (%s)", f)
+		r.event(i, "inject", node, "paused (%s)", desc)
 		return func() {
 			if err := c.Resume(node); err != nil {
 				r.event(i, "error", node, "resume: %v", err)
@@ -575,7 +617,7 @@ func (r *chaosRun) inject(ctx context.Context, i int, f Fault) func() {
 		if err := c.Isolate(node); err != nil {
 			return fail(err)
 		}
-		r.event(i, "inject", node, "isolated (%s)", f)
+		r.event(i, "inject", node, "isolated (%s)", desc)
 		return func() {
 			for _, o := range c.Nodes() {
 				if !o.Spare && o.ID != node {
@@ -588,7 +630,7 @@ func (r *chaosRun) inject(ctx context.Context, i int, f Fault) func() {
 		if err := c.Cut(node, f.Peer); err != nil {
 			return fail(err)
 		}
-		r.event(i, "inject", node, "link to %s cut (%s)", f.Peer, f)
+		r.event(i, "inject", node, "link to %s cut (%s)", f.Peer, desc)
 		return func() {
 			_ = c.Heal(node, f.Peer)
 			r.event(i, "recover", node, "link to %s healed", f.Peer)
@@ -603,7 +645,7 @@ func (r *chaosRun) inject(ctx context.Context, i int, f Fault) func() {
 		case !resp.OK:
 			return fail(errors.New(resp.Error))
 		}
-		r.event(i, "inject", node, "snapshot at index %d (%s)", resp.Index, f)
+		r.event(i, "inject", node, "snapshot at index %d (%s)", resp.Index, desc)
 		return nil
 	case FaultAddMember:
 		ar := c.act(ctx, Action{Kind: "add-member", Group: f.Group}, time.Since(r.start), map[string]bool{})

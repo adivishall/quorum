@@ -1,8 +1,10 @@
 package snapshot
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/adivishall/quorum/internal/vfs"
@@ -77,10 +79,13 @@ func SplitSize(term uint64, m Meta, file []byte, size int) []Chunk {
 // (abandoning any other); any other chunk must continue the current transfer
 // exactly where it left off — same sender, term and snapshot — or it is ignored
 // (a duplicate, a delayed chunk from an earlier attempt, a stale leader's). When
-// the last chunk arrives, the file is fsynced, read back and decoded in full;
+// the last chunk arrives, the file is fsynced and read back in full by
+// streaming it (S4: one record at a time, never the whole file in memory);
 // only a snapshot that validates, and whose metadata matches what the chunks
 // announced, is reported complete. Until then — and if it does not validate —
 // nothing of it is active state: it is a temporary file (docs/SNAPSHOTS.md §8).
+// The state inside is the state machine's to validate (raftnode does, from
+// OpenReceived) before anything installs it.
 //
 // A Receiver is used by one goroutine (the node's actor, or the simulator).
 type Receiver struct {
@@ -98,13 +103,13 @@ type transfer struct {
 // NewReceiver returns a receiver that stages into files.RecvPath.
 func NewReceiver(files Files) *Receiver { return &Receiver{files: files} }
 
-// Received is a complete, validated snapshot a leader sent, staged at RecvPath.
+// Received is a complete, validated snapshot a leader sent, staged at RecvPath
+// (its state is read from there: Files.OpenReceived).
 type Received struct {
 	From  string // the sender (the leader)
 	Term  uint64 // the leader's term when it sent it
 	Meta  Meta
-	Data  []byte // the state bytes
-	Bytes int    // the file's size
+	Bytes int64 // the file's size
 }
 
 // Accept takes one chunk from a peer. It returns a Received when the chunk
@@ -140,18 +145,19 @@ func (r *Receiver) Accept(from string, c Chunk) (*Received, error) {
 	}
 	_ = t.f.Close()
 	r.cur = nil
-	file, err := readFile(r.files.fs(), r.files.RecvPath())
+	rd, file, err := r.files.OpenReceived()
 	if err != nil {
 		return nil, err
 	}
-	m, data, err := Decode(file)
-	if err != nil {
+	defer file.Close()
+	if err := rd.Verify(); err != nil {
 		return nil, err
 	}
+	m := rd.Meta()
 	if m.Index != t.index || m.Term != t.snapTerm {
 		return nil, fmt.Errorf("%w: received snapshot (%d,%d) announced as (%d,%d)", ErrCorrupt, m.Index, m.Term, t.index, t.snapTerm)
 	}
-	return &Received{From: t.from, Term: t.term, Meta: m, Data: data, Bytes: len(file)}, nil
+	return &Received{From: t.from, Term: t.term, Meta: m, Bytes: int64(t.total)}, nil
 }
 
 // Active reports the transfer in progress, if any: its sender, snapshot index and
@@ -173,3 +179,91 @@ func (r *Receiver) abandon() {
 		r.cur = nil
 	}
 }
+
+// Sending is a published snapshot opened to be sent to a follower (S4,
+// docs/STORAGE_INTEGRATION.md §10.5). The transfer reads its chunks from this
+// handle, never from the whole file in memory: a later publish renames a new
+// file over the published name, and this handle still reads the snapshot the
+// transfer started with.
+type Sending struct {
+	f    vfs.File
+	meta Meta
+	size int64
+}
+
+// OpenSend opens the published snapshot to send it, reading its header.
+func (f Files) OpenSend() (*Sending, error) {
+	rd, file, err := openStream(f.fs(), f.Path())
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return &Sending{f: file, meta: rd.Meta(), size: info.Size()}, nil
+}
+
+// Meta returns the snapshot's metadata, from its header.
+func (s *Sending) Meta() Meta { return s.meta }
+
+// Size returns the file's size.
+func (s *Sending) Size() int64 { return s.size }
+
+// Verify validates the whole file by streaming it, so a leader never streams a
+// snapshot it has not proven whole. It stops early, with ctx's error, once
+// ctx is done (a node shutting down does not wait for a large file's read).
+func (s *Sending) Verify(ctx context.Context) error {
+	if _, err := s.f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	rd, err := NewReader(ctxReader{ctx: ctx, r: s.f}, s.size)
+	if err != nil {
+		return err
+	}
+	return rd.Verify()
+}
+
+// ctxReader fails its reads once ctx is done.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
+}
+
+// Chunks reads the file from its start and hands send each chunk, in order, of
+// at most size bytes (clamped to [1, MaxChunk]) — Split's chunks, read from
+// disk one at a time — and returns how many it sent. A chunk's Data is reused
+// for the next chunk: send must not keep it (Marshal copies it). It stops at
+// the first error send returns.
+func (s *Sending) Chunks(term uint64, size int, send func(Chunk) error) (int, error) {
+	size = max(1, min(size, MaxChunk))
+	if _, err := s.f.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
+	buf := make([]byte, size)
+	n := 0
+	for off := int64(0); off < s.size; {
+		want := min(int64(size), s.size-off)
+		if _, err := io.ReadFull(s.f, buf[:want]); err != nil {
+			return n, fmt.Errorf("snapshot: reading the published file at %d: %w", off, err)
+		}
+		c := Chunk{Term: term, Index: s.meta.Index, SnapTerm: s.meta.Term, Total: uint64(s.size), Offset: uint64(off), Data: buf[:want]}
+		if err := send(c); err != nil {
+			return n, err
+		}
+		off += want
+		n++
+	}
+	return n, nil
+}
+
+// Close releases the handle.
+func (s *Sending) Close() error { return s.f.Close() }

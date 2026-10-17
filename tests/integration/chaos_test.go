@@ -25,9 +25,28 @@ func chaosConfig(t *testing.T, bin string, seed int64) lab.ChaosConfig {
 	}
 }
 
-// requireChaosOK fails the test with the run's evidence unless it passed:
-// the artifacts are written where the integration tests keep theirs, and the
-// failure names how to re-check the history and replay the schedule.
+// chaosEvidence writes a run's artifacts where the integration tests keep
+// theirs — node logs, link logs, samples, the history and the schedule — and
+// returns the run's events with how to re-check the history and replay the
+// schedule, for the message of any failure about the run. A premise that
+// failed is diagnosed from this record, never from a rerun (docs/CHAOS.md §3).
+func chaosEvidence(t *testing.T, res *lab.ChaosResult) string {
+	t.Helper()
+	dir, derr := artifactDir("dkv-chaos-", t.Name())
+	if derr == nil {
+		derr = lab.WriteArtifacts(dir, res)
+	}
+	var b strings.Builder
+	b.WriteString("events:\n")
+	for _, e := range res.Events {
+		fmt.Fprintf(&b, "  %7s pos=%-6d %-9s %-3s %s\n", e.At.Round(time.Millisecond), e.Pos, e.Kind, e.Node, e.Detail)
+	}
+	fmt.Fprintf(&b, "--- artifacts: %s (%v); re-check: go run ./cmd/lincheck %s; replay: dkvlab -scenario chaos -schedule %s ---",
+		dir, derr, filepath.Join(dir, "history.txt"), filepath.Join(dir, "schedule.json"))
+	return b.String()
+}
+
+// requireChaosOK fails the test with the run's evidence unless it passed.
 func requireChaosOK(t *testing.T, res *lab.ChaosResult, err error) {
 	t.Helper()
 	if res == nil {
@@ -36,18 +55,9 @@ func requireChaosOK(t *testing.T, res *lab.ChaosResult, err error) {
 	if err == nil && res.OK() {
 		return
 	}
-	dir, derr := artifactDir("dkv-chaos-", t.Name())
-	if derr == nil {
-		derr = lab.WriteArtifacts(dir, res)
-	}
-	var b strings.Builder
-	for _, e := range res.Events {
-		fmt.Fprintf(&b, "  %7s pos=%-6d %-9s %-3s %s\n", e.At.Round(time.Millisecond), e.Pos, e.Kind, e.Node, e.Detail)
-	}
-	t.Fatalf("chaos run failed (err %v): errors=%d linearizable=%v unchecked=%v converged=%v (%s)\n%s\n%s\nevents:\n%s"+
-		"--- artifacts: %s (%v); re-check: go run ./cmd/lincheck %s; replay: dkvlab -scenario chaos -schedule %s ---",
-		err, res.Errors(), res.Check.Linearizable, res.Check.Unchecked, res.Converged, res.ConvergeErr, res.Check.Reason, res.Check.Counterexample, b.String(),
-		dir, derr, filepath.Join(dir, "history.txt"), filepath.Join(dir, "schedule.json"))
+	t.Fatalf("chaos run failed (err %v): errors=%d linearizable=%v unchecked=%v converged=%v (%s)\n%s\n%s\n%s",
+		err, res.Errors(), res.Check.Linearizable, res.Check.Unchecked, res.Converged, res.ConvergeErr, res.Check.Reason, res.Check.Counterexample,
+		chaosEvidence(t, res))
 }
 
 // TestChaosLeaderLossUnderLoadIsLinearizable: clients write, read and delete
@@ -74,7 +84,7 @@ func TestChaosLeaderLossUnderLoadIsLinearizable(t *testing.T) {
 		}
 	}
 	if len(injected) != 2 {
-		t.Fatalf("injected %d faults, want 2: %+v", len(injected), res.Events)
+		t.Fatalf("injected %d faults, want 2\n%s", len(injected), chaosEvidence(t, res))
 	}
 	for _, inj := range injected {
 		deposed := false
@@ -85,7 +95,7 @@ func TestChaosLeaderLossUnderLoadIsLinearizable(t *testing.T) {
 			}
 		}
 		if !deposed {
-			t.Fatalf("premise: no other node led after %s's fault (%s)", inj.Node, inj.Detail)
+			t.Fatalf("premise: no other node led after %s's fault (%s)\n%s", inj.Node, inj.Detail, chaosEvidence(t, res))
 		}
 	}
 	// Premise: the clients kept going after the last recovery.
@@ -102,7 +112,7 @@ func TestChaosLeaderLossUnderLoadIsLinearizable(t *testing.T) {
 		}
 	}
 	if after == 0 {
-		t.Fatal("premise: no operation succeeded after the last recovery")
+		t.Fatalf("premise: no operation succeeded after the last recovery\n%s", chaosEvidence(t, res))
 	}
 	// Unknown outcomes are kept in the history, never dropped.
 	if inc := res.Check.Counts.Incomplete; int64(inc) < res.Load.Classes[load.ClassUnknown] {

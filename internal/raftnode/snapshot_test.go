@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -34,6 +35,10 @@ type snapSM struct {
 	index    uint64
 	cmds     []string
 	restores int
+	// slow, when set, is how long each validation of a received snapshot
+	// takes (a large state's proof); proofs counts them.
+	slow   time.Duration
+	proofs int
 }
 
 func (s *snapSM) Apply(index uint64, command []byte) error {
@@ -47,6 +52,7 @@ func (s *snapSM) Apply(index uint64, command []byte) error {
 	return nil
 }
 
+// EncodeSnapshot returns the state, encoded (tests build snapshots from it).
 func (s *snapSM) EncodeSnapshot() (uint64, []byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -56,6 +62,14 @@ func (s *snapSM) EncodeSnapshot() (uint64, []byte, error) {
 		b = append(b, c...)
 	}
 	return s.index, b, nil
+}
+
+func (s *snapSM) OpenSnapshot() (SnapshotSource, error) {
+	index, b, err := s.EncodeSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	return BytesSource(index, b), nil
 }
 
 func decodeSnapSM(index uint64, data []byte) ([]string, error) {
@@ -79,12 +93,25 @@ func decodeSnapSM(index uint64, data []byte) ([]string, error) {
 	return cmds, nil
 }
 
-func (s *snapSM) ValidateSnapshot(index uint64, data []byte) error {
-	_, err := decodeSnapSM(index, data)
+func (s *snapSM) ValidateSnapshotFrom(index uint64, r io.Reader) error {
+	s.mu.Lock()
+	s.proofs++
+	slow := s.slow
+	s.mu.Unlock()
+	time.Sleep(slow)
+	data, err := ReadState(r)
+	if err != nil {
+		return err
+	}
+	_, err = decodeSnapSM(index, data)
 	return err
 }
 
-func (s *snapSM) RestoreSnapshot(index, _ uint64, data []byte) error {
+func (s *snapSM) RestoreSnapshotFrom(index, _ uint64, r io.Reader) error {
+	data, err := ReadState(r)
+	if err != nil {
+		return err
+	}
 	cmds, err := decodeSnapSM(index, data)
 	if err != nil {
 		return err
@@ -464,6 +491,9 @@ type snapCluster struct {
 	// each, as in production), kept across restarts.
 	regs map[NodeID]*metrics.Registry
 	mets map[NodeID]*Metrics
+	// slow, when set, gives a node started from now on a state machine whose
+	// proof of a received snapshot takes that long (snapSM.slow).
+	slow map[NodeID]time.Duration
 }
 
 // withMetrics gives every node started from now on a registry of its own.
@@ -518,7 +548,7 @@ func (c *snapCluster) start(id NodeID, hook Hook) {
 		}
 		c.trs[id] = tr
 	}
-	sm := &snapSM{}
+	sm := &snapSM{slow: c.slow[id]}
 	var peers []NodeID
 	switch {
 	case c.joiners[id], c.genesisless:
@@ -924,7 +954,10 @@ func TestInstallOrderIsTermPublishBoundary(t *testing.T) {
 	for _, o := range inj.Ops()[before:] {
 		seq = append(seq, fmt.Sprintf("%s %s", o.Op, filepath.Base(o.Path)))
 	}
-	want := []string{"write raft.log", "fsync raft.log", "rename raft.log.snap", "syncdir node", "write raft.log", "fsync raft.log"}
+	// The term, the publication, the boundary — then (S4) the state machine's
+	// restore, which streams its state from the PUBLISHED file, never the
+	// staged one and never before the boundary.
+	want := []string{"write raft.log", "fsync raft.log", "rename raft.log.snap", "syncdir node", "write raft.log", "fsync raft.log", "open raft.log.snap"}
 	if strings.Join(seq, "; ") != strings.Join(want, "; ") {
 		t.Fatalf("install I/O:\n got %v\nwant %v", seq, want)
 	}

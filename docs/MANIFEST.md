@@ -139,6 +139,15 @@ The whole point of the MANIFEST is the transition between file sets. For a compa
 
 A flush is the same protocol with no deletions.
 
+**Ingest (S4, `docs/STORAGE_INTEGRATION.md` §10.6)** is the same protocol with *every* live table
+deleted: it writes the new contents into tables 1–4 (several, each `.sst.tmp` → fsync → rename),
+fsyncs the directory once, rotates the WAL to an empty durable segment, and appends ONE record —
+`DeleteFile` for every live table, `AddFile` for every new one, `SetNextFileNum`,
+`SetLastSequence`, `SetLogNumber`, `SetLogStartSeq`, `SetApplied`, `SetAppliedSeq` — fsynced: the
+whole contents of the engine change HERE, at a new applied index, with a log that begins empty.
+No new tag; an S3 binary reads such a MANIFEST. Before the record the new tables are orphans, swept
+at open; after it the old ones are, and the segments below the new log number are deleted.
+
 Every crash leaves a state that the MANIFEST alone explains:
 
 | Crash point | On disk | Recovery |

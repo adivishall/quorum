@@ -170,7 +170,7 @@ func TestReceiverAcceptsOnlyAnInOrderCompleteSnapshot(t *testing.T) {
 	}
 	feed("n1", chunks[2])
 	done := feed("n1", chunks[3])
-	if done == nil || done.Meta.Index != 50 || done.From != "n1" || done.Term != 6 || done.Bytes != len(file) {
+	if done == nil || done.Meta.Index != 50 || done.From != "n1" || done.Term != 6 || done.Bytes != int64(len(file)) {
 		t.Fatalf("completion: %+v", done)
 	}
 	if b, _ := mem.Cached(base + ".snap.recv"); !bytes.Equal(b, file) {
@@ -282,7 +282,7 @@ func TestSplitSizeReassembles(t *testing.T) {
 			}
 			done = got
 		}
-		if done == nil || done.Meta.Index != 9 || done.Bytes != len(file) {
+		if done == nil || done.Meta.Index != 9 || done.Bytes != int64(len(file)) {
 			t.Fatalf("size %d: %+v", size, done)
 		}
 	}
