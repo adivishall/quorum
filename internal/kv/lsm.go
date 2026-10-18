@@ -76,17 +76,31 @@ var (
 	_ raftnode.SnapshotStateMachine = (*LSMMachine)(nil)
 )
 
+// ErrLimits is a session limit the LSM machine cannot run under: a MaxUnacked
+// whose fullest session record would not fit one engine value.
+var ErrLimits = errors.New("kv: session limits the engine cannot store")
+
 // OpenLSMMachine opens the machine's engine in dir (creating it) under limits
 // — the same limits every replica of the group uses — and engine options opts,
 // whose key and value limits are set here: a user key is stored one tag byte
 // longer. It loads the session table from the engine's records and refuses a
-// record it did not write (ErrSessionRecord).
+// record it did not write (ErrSessionRecord), or a key under no tag it writes.
+//
+// It refuses a MaxUnacked whose fullest session record would not fit one
+// engine value (ErrLimits): the machine could run until a session filled up,
+// then fail every cycle that flushes it — and every restart, replaying the
+// same entry (S4 closeout review; the in-memory store has no such bound). At
+// the 1 MiB value limit, 21,844 results fit.
 func OpenLSMMachine(dir string, limits Limits, opts storage.Options) (*LSMMachine, error) {
 	if limits.MaxSessions < 1 || limits.MaxUnacked < 1 {
 		return nil, errors.New("kv: session limits must be at least 1")
 	}
 	opts.MaxKeySize = MaxKeyLen + 1
 	opts.MaxValueSize = MaxValueLen
+	if n := maxSessionRecordLen(limits); n > opts.MaxValueSize {
+		return nil, fmt.Errorf("%w: a session may hold %d results, a record of %d bytes; the engine stores values of at most %d bytes (%d results fit)",
+			ErrLimits, limits.MaxUnacked, n, opts.MaxValueSize, maxUnackedFor(opts.MaxValueSize))
+	}
 	// A restore that a crash interrupted may have left the old engine renamed
 	// aside (RestoreSnapshot); it is never read again.
 	if err := removeAll(asidePath(dir)); err != nil {
@@ -109,12 +123,17 @@ func OpenLSMMachine(dir string, limits Limits, opts storage.Options) (*LSMMachin
 
 // loadSessions rebuilds the session mirror from the engine's session records,
 // scanning the engine one entry at a time (S4: never its whole state in a
-// map); the records themselves are few and small.
+// map); the records themselves are few and small. A key under no tag the
+// machine writes is refused here, as the snapshot source refuses it — not at
+// the first snapshot, where it would fail the node at every start.
 func (m *LSMMachine) loadSessions() error {
 	err := m.db.Scan(func(k, v []byte) error {
+		if len(k) > 0 && k[0] == tagUser {
+			return nil
+		}
 		id, ok := parseSessionKey(k)
 		if !ok {
-			return nil
+			return fmt.Errorf("%w: an engine key %q under no tag the machine writes", ErrSessionRecord, k)
 		}
 		ss, err := decodeSession(id, v, m.sessions.limits)
 		if err != nil {
@@ -612,7 +631,25 @@ func (m *LSMMachine) fitsTheEngine(id uint64, ss *session) error {
 
 // sessionRecordLen is len(encodeSession(ss)), without encoding it.
 func sessionRecordLen(ss *session) int {
-	return 1 + 16 + uvarintLen(uint64(len(ss.results))) + len(ss.results)*sessionResultLen
+	return sessionRecordLenOf(len(ss.results))
+}
+
+// sessionRecordLenOf is the length of a session record holding n results.
+func sessionRecordLenOf(n int) int {
+	return 1 + 16 + uvarintLen(uint64(n)) + n*sessionResultLen
+}
+
+// maxSessionRecordLen is the length of the fullest session record limits allow.
+func maxSessionRecordLen(l Limits) int { return sessionRecordLenOf(l.MaxUnacked) }
+
+// maxUnackedFor is the largest MaxUnacked whose fullest session record fits a
+// value of valueLimit bytes.
+func maxUnackedFor(valueLimit int) int {
+	n := (valueLimit - 1 - 16 - binary.MaxVarintLen64) / sessionResultLen
+	for sessionRecordLenOf(n+1) <= valueLimit {
+		n++
+	}
+	return n
 }
 
 // RestoreSnapshot restores data as the state at (index, term): the stream

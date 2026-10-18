@@ -457,6 +457,24 @@ func TestAFailedIngestCommitLatchesAndReopensOldOrNew(t *testing.T) {
 			if got := s.DurableApplied(); got != durable {
 				t.Fatalf("a failed ingest commit moved the durable applied index from %+v to %+v", durable, got)
 			}
+			// Nor is anything served: memory holds the old contents, the disk
+			// may hold the new, and only a reopen can tell (independent review
+			// of S4: the latch fenced writes, and reads served the old state).
+			if err := s.Latched(); !errors.Is(err, storage.ErrInDoubt) {
+				t.Fatalf("latched with %v, want ErrInDoubt", err)
+			}
+			if _, err := s.Get(context.Background(), []byte("o01")); !errors.Is(err, storage.ErrInDoubt) {
+				t.Fatalf("a read from a store whose commit is in doubt: %v, want ErrInDoubt", err)
+			}
+			if err := s.Scan(func(k, v []byte) error { return nil }); !errors.Is(err, storage.ErrInDoubt) {
+				t.Fatalf("a scan of a store whose commit is in doubt: %v, want ErrInDoubt", err)
+			}
+			if _, err := s.Snapshot(); !errors.Is(err, storage.ErrInDoubt) {
+				t.Fatalf("a snapshot of a store whose commit is in doubt: %v, want ErrInDoubt", err)
+			}
+			if _, err := s.Checkpoint(); !errors.Is(err, storage.ErrInDoubt) {
+				t.Fatalf("a checkpoint of a store whose commit is in doubt: %v, want ErrInDoubt", err)
+			}
 			if err := s.Apply(context.Background(), nil, ai(101, 3)); err == nil {
 				t.Fatal("a store whose ingest commit failed took another batch")
 			}

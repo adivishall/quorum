@@ -212,9 +212,11 @@ killed at `after-snapshot-publish` and `after-install-publish` (real tests 4 and
   before the core ever sees it (a snapshot the state machine refuses would, once installed, be
   durable and unstartable). Only then is `MsgSnapshot` stepped into the core. Since S4 both checks
   stream the staged file, one record at a time, and the node's frame pump — off the actor — drops
-  the chunks of a snapshot no newer than the one it is proving or installing at that moment
-  (`Snapshots.Installing`, logged `event=raft_snapshot_chunk_dropped` once per dropped transfer): a
-  leader's repeated offer (below) can only repeat it. Outside that window nothing is dropped.
+  the chunks of a snapshot no newer than the one it is proving or installing at that moment **from
+  the same sender** (`Snapshots.Installing`, logged `event=raft_snapshot_chunk_dropped` once per
+  dropped transfer): that sender's repeated offer (below) can only repeat it. Another sender's
+  transfer is never dropped — it may be a newer leader's, needed if the one being proven is a stale
+  leader's that the core then refuses. Outside that window nothing is dropped.
 - **Follower (core):** term rules as for AppendEntries; a snapshot at or below the commit index is
   already covered — answered success at the commit, nothing changed; otherwise the log is reset to
   the snapshot (keeping the entries after it only if the log holds its index with its term),

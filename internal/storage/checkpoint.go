@@ -36,6 +36,11 @@ type Checkpoint struct {
 	closed  atomic.Bool
 }
 
+// ErrInDoubt means an ingest's commit — its one MANIFEST edit — may or may not
+// be durable: the engine refuses every read and write until it is reopened,
+// when the MANIFEST decides (docs/STORAGE_INTEGRATION.md §10.6).
+var ErrInDoubt = errors.New("lsm: the engine's contents are in doubt until it is reopened")
+
 // ErrNotDurable means a checkpoint could not be pinned at a durable applied
 // index: after the flush the engine still held unflushed data, or its durable
 // watermark was not its applied index. It is an engine bug, never expected.
@@ -53,6 +58,9 @@ func (s *LSMStore) Checkpoint() (*Checkpoint, error) {
 	defer s.closeMu.RUnlock()
 	if s.closed {
 		return nil, opErr("checkpoint", nil, ErrClosed)
+	}
+	if s.inDoubt.Load() {
+		return nil, opErr("checkpoint", nil, ErrInDoubt)
 	}
 	c, flushed, err := func() (*Checkpoint, bool, error) {
 		s.writeMu.Lock()
@@ -172,6 +180,9 @@ func (s *LSMStore) Scan(fn func(key, value []byte) error) error {
 	defer s.closeMu.RUnlock()
 	if s.closed {
 		return opErr("scan", nil, ErrClosed)
+	}
+	if s.inDoubt.Load() {
+		return opErr("scan", nil, ErrInDoubt)
 	}
 	v := s.acquire()
 	if v == nil {
@@ -360,11 +371,14 @@ func (s *LSMStore) Ingest(src IngestSource, a AppliedIndex) (IngestStats, error)
 	edit.SetAppliedSeq(seq)
 	if err := s.manifest.Append(&edit); err != nil {
 		// Ambiguous: the edit may be durable, naming the staged tables, so they
-		// are kept for the next open to decide. The watermark does not move.
+		// are kept for the next open to decide. The watermark does not move,
+		// and nothing is served — the disk may now hold the new contents while
+		// memory holds the old (inDoubt).
 		for _, t := range staged {
 			_ = t.r.Close()
 		}
-		s.flushErr = fmt.Errorf("lsm: recording an ingest at %d in the manifest: %w", a.Index, err)
+		s.flushErr = fmt.Errorf("%w: recording an ingest at %d in the manifest: %w", ErrInDoubt, a.Index, err)
+		s.inDoubt.Store(true)
 		return stats, classify(op, nil, s.flushErr)
 	}
 	// 6. Switch.

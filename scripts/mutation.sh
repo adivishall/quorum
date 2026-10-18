@@ -3559,14 +3559,14 @@ mutant "a-repeated-offer-is-dropped-while-installing" internal/raftnode/node.go 
 #      snapshot as installing — repeats arriving during the proof, the longest
 #      part of an install, are queued again.
 mutant "the-proof-marks-the-snapshot-installing" internal/raftnode/snapshot.go \
-  '			s.setInstalling(c.Index)' \
-  '			_ = c.Index' \
+  '			s.setInstalling(string(from), c.Index)' \
+  '			_, _ = from, c.Index' \
   ./internal/raftnode '^(TestInstallingCoversExactlyTheProofAndTheInstall|TestARepeatedOfferIsDroppedWhileTheFirstIsProven)$'
 
 # 409. S4 (closeout): a refused proof leaves its snapshot marked as installing,
 #      so every later offer of it is dropped and the follower cannot catch up.
 mutant "a-refused-proof-clears-installing" internal/raftnode/snapshot.go \
-  '	defer s.setInstalling(0)' \
+  '	defer s.setInstalling("", 0)' \
   '	defer func() {}()' \
   ./internal/raftnode '^TestInstallingCoversExactlyTheProofAndTheInstall$'
 
@@ -3575,7 +3575,7 @@ mutant "a-refused-proof-clears-installing" internal/raftnode/snapshot.go \
 mutant "unstage-clears-installing" internal/raftnode/snapshot.go \
   'func (s *Snapshots) Unstage() {
 	s.staged = nil
-	s.setInstalling(0)
+	s.setInstalling("", 0)
 }' \
   'func (s *Snapshots) Unstage() {
 	s.staged = nil
@@ -3620,6 +3620,44 @@ mutant "a-leaderless-fault-is-an-error" internal/lab/chaos.go \
   '		r.event(i, "error", f.Node, "%s: no target: %v", f, err)' \
   '		r.event(i, "skip", f.Node, "%s: no target: %v", f, err)' \
   ./internal/lab '^TestALeaderFaultWithoutALeaderFailsTheRun$'
+
+echo "== S4 independent review: the LSM machine's limits, the engine in doubt, the pump's drop rule =="
+
+# 415. S4 (independent review): the LSM machine opens under a MaxUnacked whose
+#      fullest session record cannot be stored — it runs until a session fills
+#      up, then fails the cycle that flushes it, and every restart.
+mutant "the-lsm-machine-refuses-a-limit-it-cannot-store" internal/kv/lsm.go \
+  '	if n := maxSessionRecordLen(limits); n > opts.MaxValueSize {' \
+  '	if n := maxSessionRecordLen(limits); false && n > opts.MaxValueSize {' \
+  ./internal/kv '^TestLSMMachineRefusesALimitItsEngineCannotStore$'
+
+# 416. S4 (independent review): a key under no tag the machine writes passes the
+#      open and fails the node at its first snapshot, at every start.
+mutant "a-foreign-key-is-refused-at-open" internal/kv/lsm.go \
+  '		id, ok := parseSessionKey(k)
+		if !ok {
+			return fmt.Errorf("%w: an engine key %q under no tag the machine writes", ErrSessionRecord, k)
+		}' \
+  '		id, ok := parseSessionKey(k)
+		if !ok {
+			return nil
+		}' \
+  ./internal/kv '^TestLSMMachineRefusesAKeyUnderNoTagItWritesAtOpen$'
+
+# 417. S4 (independent review): an ingest whose commit is in doubt latches
+#      writes but serves reads from memory, which may be behind the disk.
+mutant "an-engine-in-doubt-serves-nothing" internal/storage/checkpoint.go \
+  '		s.inDoubt.Store(true)' \
+  '		_ = true' \
+  ./internal/storage '^TestAFailedIngestCommitLatchesAndReopensOldOrNew$'
+
+# 418. S4 (independent review): the pump drops any sender's chunks at or below
+#      the snapshot being proven — a newer leader's transfer among them, when
+#      the one being proven is a stale leader's the core will refuse.
+mutant "only-the-senders-own-repeat-is-dropped" internal/raftnode/node.go \
+  '	return installing != 0 && peer == from && index <= installing' \
+  '	return installing != 0 && index <= installing' \
+  ./internal/raftnode '^TestOnlyTheSendersOwnRepeatIsDropped$'
 
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"

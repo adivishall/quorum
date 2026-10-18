@@ -35,6 +35,17 @@ type ingestModels struct {
 	keys           []string
 }
 
+// applied is the applied index of the named state.
+func (m ingestModels) applied(state string) storage.AppliedIndex {
+	switch state {
+	case "old":
+		return m.old.applied
+	case "new":
+		return m.new.applied
+	}
+	return m.post.applied
+}
+
 func newIngestModels() ingestModels {
 	var m ingestModels
 	m.old = newApplyModel()
@@ -277,18 +288,29 @@ func runIngestCell(t *testing.T, cell ingestCell, models ingestModels) string {
 	if got == "" {
 		t.Fatalf("%s: the recovered state is neither the old, the new, nor the new plus the next batch: %s", cell, why)
 	}
-	// 3. At least what was acknowledged; nothing never attempted.
+	// 3. At least what was acknowledged; nothing never attempted; and the
+	// commit point is the MANIFEST record's fsync: before the record is
+	// written, the old state; after the fsync, the new.
 	allowed := map[string]bool{"old": true, "new": true}
 	switch {
 	case o.postDurable, o.postDone && !cell.kind.power: // a process crash keeps what was written
 		allowed = map[string]bool{"post": true}
 	case o.ingested:
 		allowed = map[string]bool{"new": true, "post": true}
-	case cell.inj != nil && (cell.phase == "before-commit" || cell.phase == "commit-write"):
+	case cell.phase == "before-commit" || cell.phase == "commit-write":
 		allowed = map[string]bool{"old": true} // the edit never reached the file whole
+	case cell.inj == nil && cell.phase == "after-commit":
+		allowed = map[string]bool{"new": true, "post": true} // the edit was fsynced before the crash
 	}
 	if !allowed[got] {
 		t.Fatalf("%s: recovered %q; the run acknowledged %+v", cell, got, o)
+	}
+	// The applied index recovered with the state is the state's (R1).
+	if want := models.applied(got); s.AppliedIndex() != want {
+		t.Fatalf("%s: recovered the %s state at applied index %+v, want %+v", cell, got, s.AppliedIndex(), want)
+	}
+	if d := s.DurableApplied(); d.Index > s.AppliedIndex().Index {
+		t.Fatalf("%s: durable applied %+v above the recovered applied %+v", cell, d, s.AppliedIndex())
 	}
 	noUnreferencedFiles(t, mem, dir, s, cell)
 	// 4. Recovered implies durable: a power loss right after the open changes nothing.
@@ -328,11 +350,38 @@ func TestIngestCrashMatrix(t *testing.T) {
 		nOps, names, start, ingestOps := ingestDryRun(t, mode)
 		totalOps += nOps - start
 		totalInj += len(ingestOps)
+		// The commit point in this mode's operations: the ingest's MANIFEST
+		// write (the first after it started; staging never touches the
+		// MANIFEST) and the fsync after it. A crash before the write recovers
+		// the old state; before the fsync, either (the record is written, not
+		// durable); after it, the new — the oracle holds each cell to that,
+		// not only the injected-error cells (independent review of S4).
+		commitWrite, commitSync := 0, 0
+		for at := start + 1; at <= nOps; at++ {
+			switch {
+			case commitWrite == 0 && strings.HasPrefix(names[at-1], "write MANIFEST"):
+				commitWrite = at
+			case commitWrite != 0 && commitSync == 0 && strings.HasPrefix(names[at-1], "fsync MANIFEST"):
+				commitSync = at
+			}
+		}
+		if commitWrite == 0 || commitSync == 0 {
+			t.Fatalf("premise: no MANIFEST write and fsync among the ingest's operations %v", names[start:])
+		}
+		crashPhase := func(at int) string {
+			switch {
+			case at <= commitWrite:
+				return "before-commit" // the crash comes before the write (or tears it)
+			case at <= commitSync:
+				return "commit-sync" // written, not yet fsynced
+			}
+			return "after-commit"
+		}
 		for _, kind := range crashKinds {
 			for at := start + 1; at <= nOps; at++ {
-				cells = append(cells, ingestCell{mode: mode, at: at, kind: kind, what: names[at-1]})
+				cells = append(cells, ingestCell{mode: mode, at: at, kind: kind, what: names[at-1], phase: crashPhase(at)})
 				if strings.HasPrefix(names[at-1], "write") {
-					cells = append(cells, ingestCell{mode: mode, at: at, torn: true, kind: kind, what: names[at-1]})
+					cells = append(cells, ingestCell{mode: mode, at: at, torn: true, kind: kind, what: names[at-1], phase: crashPhase(at)})
 				}
 			}
 			cells = append(cells, ingestCell{mode: mode, after: true, kind: kind})

@@ -94,6 +94,13 @@ type LSMStore struct {
 	// would report a write that happened as one that did not. The next mutation
 	// reports it instead, which also stops the memtable growing without bound.
 	flushErr error
+	// inDoubt is set with flushErr when an ingest's MANIFEST edit may or may
+	// not be durable (S4): memory still holds the old contents while the disk
+	// may hold the new, so until the engine is reopened nothing it serves can be
+	// vouched for — reads are refused too, not only writes (a failed flush is
+	// the other way round: memory is ahead of the disk and the WAL holds it, so
+	// reads stay right). Read off writeMu by the read paths.
+	inDoubt atomic.Bool
 
 	// compactErr latches a failed background compaction. It does not fail reads
 	// or writes: nothing is wrong with the data, only with the file count.
@@ -1133,6 +1140,9 @@ func (s *LSMStore) Get(ctx context.Context, key []byte) ([]byte, error) {
 	if s.closed {
 		return nil, opErr("get", key, ErrClosed)
 	}
+	if s.inDoubt.Load() {
+		return nil, opErr("get", key, ErrInDoubt)
+	}
 
 	v := s.acquire()
 	if v == nil {
@@ -1490,6 +1500,9 @@ func (s *LSMStore) Snapshot() (map[string][]byte, error) {
 	defer s.closeMu.RUnlock()
 	if s.closed {
 		return nil, opErr("snapshot", nil, ErrClosed)
+	}
+	if s.inDoubt.Load() {
+		return nil, opErr("snapshot", nil, ErrInDoubt)
 	}
 	v := s.acquire()
 	if v == nil {

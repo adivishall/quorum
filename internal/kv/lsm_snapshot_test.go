@@ -2,6 +2,7 @@ package kv
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/adivishall/quorum/internal/replication"
 	"github.com/adivishall/quorum/internal/snapshot"
+	"github.com/adivishall/quorum/internal/storage"
 )
 
 // S4 (docs/STORAGE_INTEGRATION.md §10.2–§10.6): the LSM machine's snapshots
@@ -386,44 +388,80 @@ func TestLSMMachineOpenRemovesAnS3SetAsideEngine(t *testing.T) {
 	}
 }
 
-// TestLSMMachineRefusesASessionItsEngineCannotStore: under a very large
-// MaxUnacked a session can remember more results than one engine value holds.
-// The in-memory store keeps such a session; the LSM machine refuses the
-// snapshot at validation — before the core could install it and leave a node
-// that fails to restore it at every start — and a restore of it changes
-// nothing (S4 review).
-func TestLSMMachineRefusesASessionItsEngineCannotStore(t *testing.T) {
-	limits := Limits{MaxSessions: 2, MaxUnacked: 30000}
-	ref := NewStoreWithLimits(limits)
-	if _, err := ref.ApplyResult(1, register()); err != nil {
-		t.Fatal(err)
+// TestLSMMachineRefusesALimitItsEngineCannotStore: under a MaxUnacked above
+// what one engine value holds, a session could remember more results than
+// its record can carry — and the machine would run until a session filled
+// up, then fail the cycle that flushes it, and every restart (ErrApply,
+// replayed; found by the independent review of S4: the first S4 review had
+// guarded only the restore, so a replica could still be configured into that
+// state). The machine refuses to OPEN under such a limit; the largest that
+// fits opens. The in-memory store has no such bound. The restore-side guard
+// stays, defensive, and is held to the exact record length.
+func TestLSMMachineRefusesALimitItsEngineCannotStore(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "lsm")
+	most := maxUnackedFor(MaxValueLen)
+	if sessionRecordLenOf(most) > MaxValueLen || sessionRecordLenOf(most+1) <= MaxValueLen {
+		t.Fatalf("maxUnackedFor(%d) = %d: records of %d and %d bytes", MaxValueLen, most, sessionRecordLenOf(most), sessionRecordLenOf(most+1))
 	}
-	n := (MaxValueLen-17-3)/sessionResultLen + 1 // results whose record exceeds one value
-	for i := 0; i < n; i++ {
-		if _, err := ref.ApplyResult(uint64(i+2), idPut(1, uint64(i+1), 1, "k", "v")); err != nil {
-			t.Fatal(err)
+	for _, n := range []int{most + 1, 30000} {
+		_, err := OpenLSMMachine(dir, Limits{MaxSessions: 2, MaxUnacked: n}, engineOpts(nil))
+		if !errors.Is(err, ErrLimits) || !strings.Contains(err.Error(), fmt.Sprint(most)) {
+			t.Fatalf("MaxUnacked %d: %v, want ErrLimits naming the %d that fit", n, err, most)
 		}
 	}
-	idx, data, err := ref.EncodeSnapshot()
+	m, err := OpenLSMMachine(dir, Limits{MaxSessions: 2, MaxUnacked: most}, engineOpts(nil))
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := ref.ValidateSnapshot(idx, data); err != nil {
-		t.Fatalf("premise: the in-memory store accepts the state: %v", err)
-	}
-	m, err := OpenLSMMachine(filepath.Join(t.TempDir(), "lsm"), limits, engineOpts(nil))
-	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("MaxUnacked %d, the largest that fits: %v", most, err)
 	}
 	defer m.Close()
-	if err := m.ValidateSnapshot(idx, data); !errors.Is(err, ErrSnapshotState) || !strings.Contains(err.Error(), "value limit") {
-		t.Fatalf("validating a session the engine cannot store: %v", err)
+	// The restore-side guard, directly: a record one result over the limit.
+	full := &session{last: 1, ackedBelow: 1, results: map[uint64]execution{}}
+	for i := 0; i < most; i++ {
+		full.results[uint64(i+1)] = execution{index: 1}
 	}
-	if err := m.RestoreSnapshot(idx, 1, data); !errors.Is(err, ErrSnapshotState) {
-		t.Fatalf("restoring it: %v", err)
+	if err := m.fitsTheEngine(1, full); err != nil {
+		t.Fatalf("the fullest session that fits: %v", err)
 	}
-	if m.Applied() != 0 {
-		t.Fatalf("a refused restore moved the machine to %d", m.Applied())
+	full.results[uint64(most+1)] = execution{index: 1}
+	if err := m.fitsTheEngine(1, full); !errors.Is(err, ErrSnapshotState) || !strings.Contains(err.Error(), "value limit") {
+		t.Fatalf("one result over: %v", err)
+	}
+}
+
+// TestLSMMachineRefusesAKeyUnderNoTagItWritesAtOpen: an engine key under
+// neither tag the machine writes — corruption, or another writer — is refused
+// when the machine opens, where the operator sees it, not at the node's first
+// snapshot, where it would fail the node at every start (independent review
+// of S4: the open skipped such a key and the snapshot source refused it).
+func TestLSMMachineRefusesAKeyUnderNoTagItWritesAtOpen(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "lsm")
+	m, err := OpenLSMMachine(dir, DefaultLimits, engineOpts(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.ApplyEntry(1, 1, register()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.EndCycle(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opts := engineOpts(nil)
+	opts.MaxKeySize, opts.MaxValueSize = MaxKeyLen+1, MaxValueLen
+	db, err := storage.OpenLSMStore(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put(context.Background(), []byte{0x03, 'x'}, []byte("foreign")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenLSMMachine(dir, DefaultLimits, engineOpts(nil)); !errors.Is(err, ErrSessionRecord) || !strings.Contains(err.Error(), "no tag") {
+		t.Fatalf("opening on a key under no tag the machine writes: %v, want ErrSessionRecord", err)
 	}
 }
 

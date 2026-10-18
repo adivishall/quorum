@@ -1617,8 +1617,11 @@ state** — tested differentially, and the reason no format changes.
   during its install. The node's frame pump, off the actor, now drops a chunk of a snapshot no
   newer than the one being proven or installed (`Snapshots.Installing`: from the chunk that
   completes a transfer until it is installed, refused or unstaged; outside that window nothing is
-  dropped, and a refused proof clears it, so the next offer is received). A transfer of a *newer*
-  snapshot arriving during an install still queues, bounded by those 272 frames.
+  dropped, and a refused proof clears it, so the next offer is received). Only the *same sender's*
+  repeat is dropped: another sender's transfer may be a newer leader's, needed if the snapshot being
+  proven is a stale leader's that the core then refuses (the independent review, §10.15). A transfer
+  of a *newer* snapshot, or from another sender, arriving during an install still queues, bounded by
+  those 272 frames.
 
 ### 10.6 Installation by ingest — the engine's commit point
 
@@ -1655,7 +1658,10 @@ writer and no compaction runs during an ingest):
 A failure in step 4 or 5 is **ambiguous** (the edit may be on disk): the engine latches it, as a
 failed flush does, refuses every later write, and the machine fails stop; the next open reads
 whichever edit is durable — old or new, never both. Nothing advances the durable watermark before
-the append has returned success.
+the append has returned success. After a failure in step 5 the engine refuses its **reads** too
+(`ErrInDoubt`): memory still holds the old contents while the disk may hold the new, so nothing it
+could serve can be vouched for — unlike a failed flush, where memory is ahead of the disk and the
+WAL holds it (the independent review, §10.15).
 
 Ingested tables are placed at the shallowest level ≥ 1 whose size budget holds them, so the level-0
 file-count trigger does not immediately rewrite them; they have disjoint key ranges and disjoint,

@@ -28,10 +28,13 @@ type probeSM struct {
 	*snapSM
 	snaps *Snapshots
 	seen  []uint64
+	from  []string
 }
 
 func (p *probeSM) ValidateSnapshotFrom(index uint64, r io.Reader) error {
-	p.seen = append(p.seen, p.snaps.Installing())
+	from, idx := p.snaps.Installing()
+	p.seen = append(p.seen, idx)
+	p.from = append(p.from, from)
 	return p.snapSM.ValidateSnapshotFrom(index, r)
 }
 
@@ -62,13 +65,13 @@ func TestInstallingCoversExactlyTheProofAndTheInstall(t *testing.T) {
 			if m, err := snaps.Receive("n1", c.Marshal()); m != nil || err != nil {
 				t.Fatalf("chunk %d of %d: %v %v", i+1, len(chunks), m, err)
 			}
-			if got := snaps.Installing(); got != 0 {
+			if _, got := snaps.Installing(); got != 0 {
 				t.Fatalf("chunk %d of %d: installing %d while the transfer is still arriving", i+1, len(chunks), got)
 			}
 		}
 		return snaps.Receive("n1", chunks[len(chunks)-1].Marshal())
 	}
-	if got := snaps.Installing(); got != 0 {
+	if _, got := snaps.Installing(); got != 0 {
 		t.Fatalf("installing %d before any transfer", got)
 	}
 
@@ -76,11 +79,11 @@ func TestInstallingCoversExactlyTheProofAndTheInstall(t *testing.T) {
 	if m, err := send(snapshot.Meta{Group: 3, Conf: conf, Index: 4, Term: 1}, 16); m != nil || err == nil {
 		t.Fatalf("a state the machine refuses: %v %v", m, err)
 	}
-	if want := []uint64{4}; !slices.Equal(sm.seen, want) {
-		t.Fatalf("installing during the proof: %v, want %v", sm.seen, want)
+	if want := []uint64{4}; !slices.Equal(sm.seen, want) || !slices.Equal(sm.from, []string{"n1"}) {
+		t.Fatalf("installing during the proof: %v from %v, want %v from [n1]", sm.seen, sm.from, want)
 	}
-	if got := snaps.Installing(); got != 0 {
-		t.Fatalf("installing %d after its proof was refused: every later offer of it would be dropped", got)
+	if from, got := snaps.Installing(); got != 0 || from != "" {
+		t.Fatalf("installing %d from %q after its proof was refused: every later offer of it would be dropped", got, from)
 	}
 
 	// A valid one, in many chunks and then in one.
@@ -93,12 +96,40 @@ func TestInstallingCoversExactlyTheProofAndTheInstall(t *testing.T) {
 		if want := []uint64{3}; !slices.Equal(sm.seen, want) {
 			t.Fatalf("chunks of %d bytes: installing during the proof: %v, want %v", size, sm.seen, want)
 		}
-		if got := snaps.Installing(); got != 3 {
-			t.Fatalf("chunks of %d bytes: installing %d once staged, want 3", size, got)
+		if from, got := snaps.Installing(); got != 3 || from != "n1" {
+			t.Fatalf("chunks of %d bytes: installing %d from %q once staged, want 3 from n1", size, got, from)
 		}
 		snaps.Unstage()
-		if got := snaps.Installing(); got != 0 {
+		if _, got := snaps.Installing(); got != 0 {
 			t.Fatalf("chunks of %d bytes: installing %d after the core unstaged it", size, got)
+		}
+	}
+}
+
+// TestOnlyTheSendersOwnRepeatIsDropped: the pump's rule. While n1's snapshot
+// at 100 is being proven or installed, n1's chunks at or below 100 are its
+// repeated offer and are dropped; n1's chunks above 100 are a newer snapshot
+// and pass; another sender's chunks pass at any index — it may be a newer
+// leader whose snapshot the node needs if the one from n1 is a stale leader's
+// (independent review of S4); and with no install under way nothing is dropped.
+func TestOnlyTheSendersOwnRepeatIsDropped(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		peer       string
+		index      uint64
+		from       string
+		installing uint64
+		want       bool
+	}{
+		{"the sender's repeat at the same index", "n1", 100, "n1", 100, true},
+		{"the sender's repeat of an older snapshot", "n1", 90, "n1", 100, true},
+		{"the sender's newer snapshot", "n1", 101, "n1", 100, false},
+		{"another sender at the same index", "n2", 100, "n1", 100, false},
+		{"another sender at a lower index", "n2", 90, "n1", 100, false},
+		{"no install under way", "n1", 100, "", 0, false},
+	} {
+		if got := dropsRepeat(tc.peer, tc.index, tc.from, tc.installing); got != tc.want {
+			t.Errorf("%s: dropsRepeat(%q, %d, %q, %d) = %v, want %v", tc.name, tc.peer, tc.index, tc.from, tc.installing, got, tc.want)
 		}
 	}
 }
@@ -145,7 +176,7 @@ func TestARepeatedOfferIsDroppedWhileTheFirstIsProven(t *testing.T) {
 	if proofs > 2 {
 		t.Fatalf("the follower proved %d snapshots: the repeats were proven too:\n%s", proofs, log)
 	}
-	if got := c.nodes[lag].dur.Snap.Installing(); got != 0 {
+	if _, got := c.nodes[lag].dur.Snap.Installing(); got != 0 {
 		t.Fatalf("installing %d after the follower caught up", got)
 	}
 }
