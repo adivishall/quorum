@@ -248,16 +248,13 @@ mutant "actor-never-blocks-on-a-peer" internal/raftnode/node.go \
   ./internal/raftnode 'TestWedgedPeerDoesNotStallTheLeader'
 
 # 14. Propose ignores the caller's deadline while the node is busy persisting.
+#     Re-anchored to answer, which every client request now waits in (#27).
 mutant "propose-honours-deadline" internal/raftnode/node.go \
-  '	case <-n.ctx.Done():
-		return raft.ErrStopped
-	case <-ctx.Done():
-		return ctx.Err()
+  '	case <-ctx.Done():
+		return a, ctx.Err()
 	}
 }' \
-  '	case <-n.ctx.Done():
-		return raft.ErrStopped
-	}
+  '	}
 }' \
   ./internal/raftnode 'TestProposeHonoursContextDuringSlowFsync'
 
@@ -958,7 +955,7 @@ mutant "the-snapshot-is-durable-before-the-log-is-compacted" internal/raftnode/s
   '	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
 		return err
 	}
-	if err := s.Files.Publish(file); err != nil {' \
+	if err := s.Files.PublishMeasured(meta, src, meas); err != nil {' \
   '	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
 		return err
 	}
@@ -966,7 +963,7 @@ mutant "the-snapshot-is-durable-before-the-log-is-compacted" internal/raftnode/s
 	if err := d.compact(core, at); err != nil {
 		return err
 	}
-	if err := s.Files.Publish(file); err != nil {' \
+	if err := s.Files.PublishMeasured(meta, src, meas); err != nil {' \
   "./internal/raftnode ./internal/raftsim" 'TestSnapshotCrashPointsRecover|TestSnapshotCrashMatrix'
 
 # 94. Compact beyond the applied index, in memory.
@@ -1078,8 +1075,8 @@ mutant "replay-keeps-a-matching-suffix" internal/raftlog/raftlog.go \
 # 109. A restart forgets its snapshot: the state machine is validated against
 #      it but not restored, while the applied index says it was.
 mutant "restart-restores-the-published-snapshot" internal/raftnode/node.go \
-  '		if err := ssm.RestoreSnapshot(meta.Index, meta.Term, data); err != nil {' \
-  '		if err := ssm.ValidateSnapshot(meta.Index, data); err != nil {' \
+  '		if err := restorePublished(files, ssm, meta.Index, meta.Term); err != nil {' \
+  '		if _, _, err := files.Verify(); err != nil {' \
   "./internal/raftnode ./internal/raftsim" 'TestRecoverFromSnapshotAndSuffix|TestSimRestartFromSnapshotAfterPowerLoss'
 
 # 110. A restart with a compacted log and no snapshot starts anyway — from an
@@ -1178,7 +1175,7 @@ mutant "an-installed-snapshot-is-made-durable-before-the-response" internal/raft
 
 # 116. A transfer's state is not validated before the core sees it.
 mutant "a-transfer-is-validated-before-the-core-sees-it" internal/raftnode/snapshot.go \
-  '	if err := s.SM.ValidateSnapshot(got.Meta.Index, got.Data); err != nil {' \
+  '	if err := s.validateReceived(got.Meta.Index); err != nil {' \
   '	if err := error(nil); err != nil {' \
   ./internal/raftnode 'TestReceiveRefusesWhatCannotBeInstalled'
 
@@ -2216,9 +2213,9 @@ mutant "compact-refuses-a-failed-log" internal/raftlog/raftlog.go \
 # 256. Install never deletes a manifest CURRENT may name (audit M11).
 mutant "install-keeps-a-manifest-current-may-name" internal/storage/manifest/manifest.go \
   '		if !errors.Is(err, ErrFailed) {
-			_ = FS.Remove(path) // CURRENT was never touched
+			_ = fsys.Remove(path) // CURRENT was never touched
 		}' \
-  '		_ = FS.Remove(path)' \
+  '		_ = fsys.Remove(path)' \
   ./internal/storage/manifest '^TestInstallUnderEveryFault$'
 
 # 257. A failed manifest Writer refuses every later edit.
@@ -2838,8 +2835,12 @@ mutant "lsm-restore-below-engine-is-noop" internal/kv/lsm.go \
 
 # 334. S2: a restore leaves the session table out of the engine.
 mutant "lsm-restore-carries-session-records" internal/kv/lsm.go \
-  '		muts = append(muts, storage.Mutation{Kind: storage.MutationPut, Key: sessionKey(id), Value: encodeSession(st.sessions[id])})' \
-  '		_ = id' \
+  '		s.sessions[id] = ss
+		s.key = sessionKey(id)
+		s.val = encodeSession(ss)
+		return true' \
+  '		s.sessions[id] = ss
+		return s.Next()' \
   ./internal/kv '^TestLSMMachineRestoresASnapshot$'
 
 # 335. S2: the machine's record of what its engine holds does not follow the cycle —
@@ -2897,10 +2898,18 @@ mutant "user-keys-are-tagged" internal/kv/namespace.go \
 # 342. S2: the session records are not loaded at open — a restart forgets every
 #      session.
 mutant "session-records-load-at-open" internal/kv/lsm.go \
-  '		id, ok := parseSessionKey([]byte(k))
-		if !ok {' \
-  '		id, ok := parseSessionKey([]byte(k))
-		if !ok || true {' \
+  '		ss, err := decodeSession(id, v, m.sessions.limits)
+		if err != nil {
+			return err
+		}
+		m.sessions.sessions[id] = ss
+		return nil' \
+  '		ss, err := decodeSession(id, v, m.sessions.limits)
+		if err != nil {
+			return err
+		}
+		_ = ss
+		return nil' \
   ./internal/kv '^TestLSMMachineMatchesTheStoreOnAScript$'
 
 # 343. S2: a group whose state machine cannot be made leaves its directory behind,
@@ -2939,10 +2948,17 @@ mutant "flush-records-the-log-start-sequence" internal/storage/lsmstore.go \
 # 344c. S3 (R2): creating a snapshot does not make the engine durable, so a node
 #       whose engine has not flushed never advances its durable index and its log
 #       never compacts — a lagging follower is never sent a snapshot.
+#       S4: the LSM machine's OpenSnapshot takes an engine checkpoint, which
+#       flushes, so on that machine this call is a second flush that finds
+#       nothing to do, and the kv cluster test no longer sees the mutant (the
+#       first full run after S4 found it surviving there). The rule is the
+#       driver's, for any DurableApplier — whose contract does not require
+#       OpenSnapshot to flush — so it is killed where the driver is tested: by
+#       an engine that becomes durable only through SyncApplied.
 mutant "snapshot-makes-the-engine-durable" internal/raftnode/snapshot.go \
   '		if err := da.SyncApplied(); err != nil {' \
   '		if err := error(nil); da == nil || err != nil {' \
-  ./internal/kv '^TestR2CompactionStaysWithinADurableCopy$'
+  ./internal/raftnode '^(TestSnapshotSyncsTheEngineFirstAndCompactsOnlyToItsDurableIndex|TestAFailedEngineSyncStopsTheNodeBeforeAnythingIsPublished)$'
 
 # 345. S3: a flush does not record the log number — the reopen cannot tell where
 #      the truncated log begins and mis-numbers or mis-reads the surviving records.
@@ -3112,20 +3128,20 @@ mutant "engine-synced-before-the-snapshot-is-published" internal/raftnode/snapsh
 	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
 		return err
 	}
-	if err := s.Files.Publish(file); err != nil {
+	if err := s.Files.PublishMeasured(meta, src, meas); err != nil {
 		return err
 	}
-	s.meta, s.file = meta, file
+	s.meta, s.file = meta, nil
 	if err := at.hit(AfterSnapshotPublish, idx); err != nil {
 		return err
 	}' \
   '	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
 		return err
 	}
-	if err := s.Files.Publish(file); err != nil {
+	if err := s.Files.PublishMeasured(meta, src, meas); err != nil {
 		return err
 	}
-	s.meta, s.file = meta, file
+	s.meta, s.file = meta, nil
 	if err := at.hit(AfterSnapshotPublish, idx); err != nil {
 		return err
 	}
@@ -3136,47 +3152,63 @@ mutant "engine-synced-before-the-snapshot-is-published" internal/raftnode/snapsh
 	}' \
   ./internal/raftnode '^TestSnapshotSyncsTheEngineFirstAndCompactsOnlyToItsDurableIndex$'
 
-# 366. S3 (final review): the restore measures the state before deciding it has
-#      nothing to do — a node whose state is too large for one restore batch can
-#      never restart on its own snapshot.
+# 366. S3 (final review): the restore reads the state before deciding it has
+#      nothing to do — at S3 a node whose state was too large for one restore
+#      batch could never restart on its own snapshot; since S4 a restart would
+#      read (and could refuse) a snapshot its engine already holds.
 mutant "restore-decides-the-noop-first" internal/kv/lsm.go \
   '	if m.engine.Index >= index {
 		return nil
 	}
-	st, err := m.checkSnapshot(index, data)
+	if m.last.Index != 0 {
+		return fmt.Errorf("kv: a restore inside a cycle (entries through %d staged)", m.last.Index)
+	}
+	sr, err := newStateReader(r, stateSize(r), m.sessions.limits)
 	if err != nil {
 		return err
 	}' \
-  '	st, err := m.checkSnapshot(index, data)
+  '	if m.last.Index != 0 {
+		return fmt.Errorf("kv: a restore inside a cycle (entries through %d staged)", m.last.Index)
+	}
+	sr, err := newStateReader(r, stateSize(r), m.sessions.limits)
 	if err != nil {
 		return err
 	}
 	if m.engine.Index >= index {
 		return nil
 	}' \
-  ./internal/kv '^TestLSMMachineRestartsOnItsOwnSnapshotBeyondOneRestoreBatch$'
+  ./internal/kv '^TestLSMMachineRestartsOnItsOwnSnapshotWithoutReadingIt$'
 
-# 367. S3 (final review): the restore deletes the old engine in place — a crash
-#      part-way leaves an engine the next open refuses.
-mutant "restore-sets-the-old-engine-aside" internal/kv/lsm.go \
-  '	if err := os.Rename(m.dir, aside); err != nil {' \
-  '	if err := removeAll(m.dir); err != nil {' \
-  ./internal/kv '^TestLSMMachineACrashWhileReplacingTheEngineLeavesOneThatOpens$'
+# 367. S3 (final review) guarded "the restore deletes the old engine in place —
+#      a crash part-way leaves an engine the next open refuses" by setting the
+#      old engine aside. S4's restore is an ingest and deletes nothing in place,
+#      so the same property — a crash during a restore leaves an engine that
+#      opens, old or new — now rests on the ingest's commit protocol: here, the
+#      staged tables' names made durable before the MANIFEST edit names them
+#      (else a power loss after the commit leaves a MANIFEST naming tables that
+#      are gone, an engine that never opens).
+mutant "restore-sets-the-old-engine-aside" internal/storage/checkpoint.go \
+  '	if err := s.fs.SyncDir(s.dir); err != nil {
+		discard()' \
+  '	if err := error(nil); err != nil {
+		discard()' \
+  ./internal/storage '^TestIngestCrashMatrix$'
 
 # 368. S3 (final review): an engine a crashed restore set aside is never removed.
 mutant "open-removes-the-engine-set-aside" internal/kv/lsm.go \
   '	if err := removeAll(asidePath(dir)); err != nil {' \
   '	if err := error(nil); err != nil {' \
-  ./internal/kv '^TestLSMMachineACrashWhileReplacingTheEngineLeavesOneThatOpens$'
+  ./internal/kv '^TestLSMMachineOpenRemovesAnS3SetAsideEngine$'
 
 # 369. S3 (review of the fixes): a restore that fails after the engine is closed
 #      leaves the machine open over an empty or partial engine, which then
-#      reports a key that exists as absent.
+#      reports a key that exists as absent. Since S4: a restore whose commit is
+#      in doubt leaves the machine open over an engine it cannot vouch for.
 mutant "failed-restore-fails-stop" internal/kv/lsm.go \
   '			_ = m.db.Close()
 			m.closed = true' \
   '			_ = m.db.Close()' \
-  ./internal/kv '^TestLSMMachineAFailedRestoreFailsStop$'
+  ./internal/kv '^TestLSMMachineARestoreWhoseCommitIsInDoubtFailsStop$'
 
 # 370. S3 (review of the fixes): a newly created engine directory is not synced
 #      into its parent, so a power loss can take the whole engine.
@@ -3191,6 +3223,447 @@ mutant "failed-sync-stops-the-snapshot" internal/raftnode/snapshot.go \
   '			return fmt.Errorf("%w: making the engine durable through %d for compaction: %w", ErrSnapshot, idx, err)' \
   '			_ = err' \
   ./internal/raftnode '^TestAFailedEngineSyncStopsTheNodeBeforeAnythingIsPublished$'
+
+echo "== S4: engine checkpoints and streamed snapshot installation (docs/STORAGE_INTEGRATION.md §10) =="
+
+# 372. S4: a streamed publish renames a snapshot whose bytes were never
+#      fsynced — published before it is durable; a power loss after the
+#      rename and directory fsync leaves a published file that is empty or torn.
+mutant "a-streamed-snapshot-is-durable-before-it-is-published" internal/snapshot/files.go \
+  '	if _, err := WriteMeasured(file, m, src, meas); err != nil {
+		return fail(err)
+	}
+	if err := file.Sync(); err != nil {
+		return fail(err)
+	}' \
+  '	if _, err := WriteMeasured(file, m, src, meas); err != nil {
+		return fail(err)
+	}' \
+  ./internal/snapshot '^TestPublishFromIsByteIdenticalAndAtomicUnderEveryCrash$'
+
+# 373. S4: the streamed writer publishes what a source wrote although it
+#      differs from what it measured — a file whose header hash is not its state.
+mutant "a-source-must-reproduce-its-state" internal/snapshot/stream.go \
+  '	if out.data != meas.Len || again != meas.Sum {' \
+  '	if false && (out.data != meas.Len || again != meas.Sum) {' \
+  ./internal/snapshot '^TestWriteRefusesASourceThatDoesNotReproduceItself$'
+
+# 374. S4: the streaming reader does not check the state against the header's
+#      SHA-256 — the record CRCs alone pass a spliced or substituted state.
+mutant "the-streamed-snapshot-checksum-is-verified" internal/snapshot/stream.go \
+  '		if sum != r.sum {' \
+  '		if false && sum != r.sum {' \
+  ./internal/snapshot '^TestReaderReportsEndOnlyOnceTheFileIsProven$'
+
+# 375. S4: the streaming reader accepts a state shorter than its header says.
+mutant "the-streamed-snapshot-length-is-verified" internal/snapshot/stream.go \
+  '		if r.got != r.dataLen {' \
+  '		if false && r.got != r.dataLen {' \
+  ./internal/snapshot '^TestReaderAgreesWithDecodeOnTheCorpus$'
+
+# 376. S4: the streaming reader treats a file that ends before its footer — a
+#      truncated final record or chunk — as a clean end of the state.
+mutant "a-streamed-snapshot-must-reach-its-footer" internal/snapshot/stream.go \
+  '		return 0, nil, fmt.Errorf("%w: ends before its footer", ErrCorrupt)
+	}
+	if err != nil {
+		return 0, nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
+	return k, p, nil' \
+  '		return 0, nil, io.EOF
+	}
+	if err != nil {
+		return 0, nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
+	return k, p, nil' \
+  ./internal/snapshot '^TestReaderAgreesWithDecodeOnTheCorpus$'
+
+# 377. S4: the streaming reader accepts bytes after the footer.
+mutant "nothing-may-follow-a-streamed-footer" internal/snapshot/stream.go \
+  '		if r.rd.NextOffset() != r.size {' \
+  '		if false && r.rd.NextOffset() != r.size {' \
+  ./internal/snapshot '^TestReaderAgreesWithDecodeOnTheCorpus$'
+
+# 378. S4: the receiver reports a completed transfer without proving the file it
+#      staged — a corrupt snapshot reaches the state machine and the core.
+mutant "a-received-snapshot-is-proven-whole" internal/snapshot/transfer.go \
+  '	if err := rd.Verify(); err != nil {
+		return nil, err
+	}
+	m := rd.Meta()' \
+  '	m := rd.Meta()' \
+  ./internal/snapshot '^TestReceiverAcceptsOnlyAnInOrderCompleteSnapshot$'
+
+# 379. S4: a transfer that restarts at offset 0 reuses the partial staging file
+#      of an abandoned one instead of starting it empty.
+mutant "a-retried-transfer-starts-clean" internal/snapshot/transfer.go \
+  '		f, err := r.files.fs().OpenFile(r.files.RecvPath(), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)' \
+  '		f, err := r.files.fs().OpenFile(r.files.RecvPath(), os.O_RDWR|os.O_CREATE, 0o644)' \
+  ./internal/snapshot '^TestARetriedTransferStartsClean$'
+
+# 380. S4: the restore streams whatever file is published, without checking it
+#      is the snapshot the core installed (or recovery validated).
+mutant "a-restore-reads-only-the-named-snapshot" internal/raftnode/snapshot.go \
+  '	if m := rd.Meta(); m.Index != index || m.Term != term {' \
+  '	if m := rd.Meta(); false && (m.Index != index || m.Term != term) {' \
+  ./internal/raftnode '^TestARestoreReadsOnlyTheSnapshotItWasAskedFor$'
+
+# 381. S4: a checkpoint is pinned without flushing — its applied index is not the
+#      durable watermark, so a snapshot could name state the engine would lose.
+mutant "a-checkpoint-is-durable" internal/storage/checkpoint.go \
+  '		if err := s.flushLocked(); err != nil {
+			s.flushErr = err
+			return nil, false, classify("checkpoint", nil, err)
+		}
+		v := s.acquire()' \
+  '		v := s.acquire()' \
+  ./internal/storage '^TestACheckpointIsTheDurableStateAtItsAppliedIndex$'
+
+# 382. S4: a checkpoint does not keep its tables: a compaction that runs while it
+#      is read deletes them under it.
+mutant "a-checkpoint-pins-its-tables" internal/storage/checkpoint.go \
+  '		return &Checkpoint{s: s, v: v, applied: durable, seq: s.seq}, true, nil' \
+  '		s.release(v)
+		return &Checkpoint{s: s, v: v, applied: durable, seq: s.seq}, true, nil' \
+  ./internal/storage '^TestACheckpointIsTheDurableStateAtItsAppliedIndex$'
+
+# 383. S4: an ingest commits although its source ended with an error — the
+#      final checks of a snapshot stream (length, checksum, footer, nothing
+#      after the last session) are not waited for before the switch.
+mutant "an-ingest-waits-for-its-source-to-end-cleanly" internal/storage/checkpoint.go \
+  '	if err := src.Err(); err != nil {
+		abandon()' \
+  '	if err := src.Err(); false && err != nil {
+		abandon()' \
+  "./internal/storage ./internal/kv" '^(TestARefusedIngestLeavesTheEngineUnchangedAndUsable|TestLSMMachineARefusedRestoreChangesNothing)$'
+
+# 384. S4: an ingested table is renamed into place without its bytes fsynced —
+#      the commit names a table a power loss can empty.
+mutant "an-ingested-table-is-durable-before-the-commit" internal/storage/checkpoint.go \
+  '		meta, err := tw.Finish()
+		if err == nil {
+			err = file.Sync()
+		}' \
+  '		meta, err := tw.Finish()' \
+  ./internal/storage '^TestIngestCrashMatrix$'
+
+# 385. S4 (investigated, not a mutant): ignoring a failed rename of a staged
+#      table SURVIVES every test, and is equivalent: the reader open that follows
+#      the rename opens the table by its final name, so a rename that did not
+#      happen fails the ingest there; and no other file can hold that name —
+#      file numbers are never reused and open sweeps every unreferenced table.
+#      Recorded in docs/STORAGE_INTEGRATION.md §10, not kept as a mutant.
+
+# 386. S4: an ingest's commit keeps the old log number — the old contents' WAL
+#      records are replayed onto the new tables at the next open.
+mutant "an-ingest-starts-a-fresh-log" internal/storage/checkpoint.go \
+  '	edit.SetLogNumber(n)
+	edit.SetLogStartSeq(seq)
+	edit.SetApplied(manifest.Applied{Index: a.Index, Term: a.Term})' \
+  '	edit.SetLogStartSeq(seq)
+	edit.SetApplied(manifest.Applied{Index: a.Index, Term: a.Term})' \
+  ./internal/storage '^TestIngestReplacesTheWholeEngine$'
+
+# 387. S4: an ingest's commit adds the new tables but does not delete the old —
+#      a key the new state does not have survives from the old one (a mixture).
+mutant "an-ingest-replaces-every-old-table" internal/storage/checkpoint.go \
+  '	for _, f := range old {
+		edit.DeleteFile(f.meta.Level, f.meta.Num)
+	}' \
+  '	_ = old' \
+  ./internal/storage '^TestIngestReplacesTheWholeEngine$'
+
+# 388. S4: an ingest moves the applied index and the durable watermark before
+#      its commit — an ambiguous failure then reports as durable a state the
+#      next open may not find (R2 would compact against it).
+mutant "an-ingest-advances-the-watermark-only-after-its-commit" internal/storage/checkpoint.go \
+  '	if err := s.manifest.Append(&edit); err != nil {' \
+  '	s.mu.Lock()
+	s.applied, s.appliedSeq, s.flushedApplied = a, seq, a
+	s.mu.Unlock()
+	if err := s.manifest.Append(&edit); err != nil {' \
+  ./internal/storage '^TestAFailedIngestCommitLatchesAndReopensOldOrNew$'
+
+# 389. S4: a failed commit deletes the staged tables although its edit may be
+#      durable — the next open finds a MANIFEST naming tables that are gone.
+mutant "a-commit-in-doubt-keeps-its-tables" internal/storage/checkpoint.go \
+  '		for _, t := range staged {
+			_ = t.r.Close()
+		}
+		s.flushErr = fmt.Errorf("%w: recording an ingest at %d in the manifest: %w", ErrInDoubt, a.Index, err)' \
+  '		discard()
+		s.flushErr = fmt.Errorf("%w: recording an ingest at %d in the manifest: %w", ErrInDoubt, a.Index, err)' \
+  ./internal/storage '^TestAFailedIngestCommitLatchesAndReopensOldOrNew$'
+
+# 390. S4: an ingest retires the old log before its commit — a crash before the
+#      commit leaves the old contents without the WAL records they need.
+mutant "an-ingest-retires-the-old-log-after-its-commit" internal/storage/checkpoint.go \
+  '	// 5. The commit point.
+	var total int64' \
+  '	s.truncateWALBelow(n)
+	// 5. The commit point.
+	var total int64' \
+  ./internal/storage '^TestIngestCrashMatrix$'
+
+# 391. S4: an ingest records the wrong term with its applied index.
+mutant "an-ingest-records-its-term" internal/storage/checkpoint.go \
+  '	edit.SetApplied(manifest.Applied{Index: a.Index, Term: a.Term})
+	edit.SetAppliedSeq(seq)' \
+  '	edit.SetApplied(manifest.Applied{Index: a.Index, Term: a.Term - 1})
+	edit.SetAppliedSeq(seq)' \
+  ./internal/storage '^TestIngestReplacesTheWholeEngine$'
+
+# 392. S4: an ingest accepts keys out of order, or a key twice (the engine's own
+#      guard; the SSTable writer's would report the wrong error).
+mutant "an-ingest-requires-ascending-keys" internal/storage/checkpoint.go \
+  '		if have && bytes.Compare(prev, k) >= 0 {' \
+  '		if false && have && bytes.Compare(prev, k) >= 0 {' \
+  ./internal/storage '^TestARefusedIngestLeavesTheEngineUnchangedAndUsable$'
+
+# 393. S4: the LSM machine restores a state at another index than the snapshot's.
+mutant "a-restored-state-is-at-the-snapshots-index" internal/kv/lsm.go \
+  '	if sr.applied != index {
+		return fmt.Errorf("%w: state at index %d, snapshot at %d", ErrSnapshotState, sr.applied, index)
+	}
+	src := &restoreSource{' \
+  '	src := &restoreSource{' \
+  ./internal/kv '^TestLSMMachineARefusedRestoreChangesNothing$'
+
+# 394. S4: the LSM machine's snapshot drops the session table (the source writes
+#      no session's entry) — after an install, a retry executes twice.
+mutant "the-streamed-snapshot-carries-the-session-table" internal/kv/lsm.go \
+  '			sessions++
+			b = appendSession(b, id, ss)' \
+  '			sessions++
+			_ = ss' \
+  ./internal/kv '^TestLSMMachineSnapshotIsTheStoresEncodingOnSeededScripts$'
+
+# 395. S4: the machine's snapshot does not check the engine's session records
+#      against its session table — a checkpoint that is not the machine's state
+#      is published.
+mutant "the-snapshot-is-the-machines-state" internal/kv/lsm.go \
+  '			if !equalSession(ss, m.sessions.sessions[id]) {' \
+  '			if false && !equalSession(ss, m.sessions.sessions[id]) {' \
+  ./internal/kv '^TestLSMMachineSnapshotIsRefusedWhenTheEngineIsNotTheMachine$'
+
+# 396. S4: a restore that is refused before its commit fails the machine stop
+#      (or leaves it changed) — the stop belongs only to a commit in doubt.
+mutant "a-refused-restore-changes-nothing" internal/kv/lsm.go \
+  '		if m.db.Latched() != nil {
+			_ = m.db.Close()' \
+  '		if true {
+			_ = m.db.Close()' \
+  ./internal/kv '^TestLSMMachineARefusedRestoreChangesNothing$'
+
+# 397. S4: the state decoder accepts a state with bytes after its last session.
+mutant "a-streamed-state-has-nothing-after-it" internal/kv/snapstream.go \
+  '	case err == nil:
+		s.err = invalidState("%v: trailing bytes", ErrProtocol)' \
+  '	case err == nil:
+		return nil' \
+  ./internal/kv '^TestRestoreRefusesImpossibleState$'
+
+# 398. S4: the open loads the session table from the whole engine but stops at the
+#      first user key (a scan that does not reach the session records).
+mutant "the-session-scan-reads-the-whole-engine" internal/storage/checkpoint.go \
+  '		if err := fn(ikey.UserKey(m.Key()), m.Value()); err != nil {
+			return err
+		}' \
+  '		if err := fn(ikey.UserKey(m.Key()), m.Value()); err != nil {
+			return err
+		}
+		break' \
+  ./internal/kv '^TestLSMMachineMatchesTheStoreOnAScript$'
+
+# 399. S4 (review): a state too large to snapshot is not skipped for Every
+#      entries — the node opens, flushes and measures it at every applied entry.
+mutant "an-oversized-state-is-skipped" internal/raftnode/snapshot.go \
+  '	if errors.Is(err, snapshot.ErrTooLarge) {
+		s.skip = idx + max(s.Every, 1)
+		return err
+	}' \
+  '	if errors.Is(err, snapshot.ErrTooLarge) {
+		return err
+	}' \
+  ./internal/raftnode '^TestAStateTooLargeToSnapshotIsSkippedBeforeAnySideEffect$'
+
+# 400. S4 (review): an oversized state is found only after the engine sync — as
+#      the first S4 cut had it, which synced, crossed the publish crash point
+#      and created the temporary file first.
+mutant "an-oversized-state-is-refused-before-any-side-effect" internal/raftnode/snapshot.go \
+  '	meas, err := snapshot.Measure(src)
+	if errors.Is(err, snapshot.ErrTooLarge) {' \
+  '	if da, ok := s.SM.(DurableApplier); ok {
+		_ = da.SyncApplied()
+	}
+	meas, err := snapshot.Measure(src)
+	if errors.Is(err, snapshot.ErrTooLarge) {' \
+  ./internal/raftnode '^TestAStateTooLargeToSnapshotIsSkippedBeforeAnySideEffect$'
+
+# 401. S4 (review): a disk that fails while a snapshot is streamed is reported as
+#      a corrupt snapshot.
+mutant "a-read-failure-is-not-corruption" internal/snapshot/stream.go \
+  '	if r.src.err != nil {' \
+  '	if false && r.src.err != nil {' \
+  ./internal/snapshot '^TestAReadFailureIsReportedAsItselfNotAsCorruption$'
+
+# 402. S4 (review): a transfer's verification ignores the node shutting down.
+mutant "a-sends-verification-stops-with-its-context" internal/snapshot/transfer.go \
+  '	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}' \
+  '	if err := c.ctx.Err(); false && err != nil {
+		return 0, err
+	}' \
+  ./internal/snapshot '^TestASendsVerificationStopsWhenItsContextIsDone$'
+
+# 403. S4 (review): a checkpoint closed twice releases its version twice, deleting
+#      tables the MANIFEST still names.
+mutant "a-checkpoint-releases-once" internal/storage/checkpoint.go \
+  '	if c.closed.CompareAndSwap(false, true) {' \
+  '	if c.closed.CompareAndSwap(false, true) || true {' \
+  ./internal/storage '^TestACheckpointClosedFromManyGoroutinesReleasesOnce$'
+
+# 404. S4 (review): a latched store still records an applied index.
+mutant "a-latched-store-refuses-set-applied-index" internal/storage/lsmstore.go \
+  '	if s.flushErr != nil {
+		return classify("set-applied-index", nil, s.flushErr)
+	}' \
+  '	if false && s.flushErr != nil {
+		return classify("set-applied-index", nil, s.flushErr)
+	}' \
+  ./internal/storage '^TestALatchedStoreRefusesSetAppliedIndex$'
+
+# 405. S4 (review): the LSM machine validates a session its engine cannot store,
+#      then fails to restore it at every start. Since the independent review
+#      the limit is refused at open (415) and this guard is the second one,
+#      held directly.
+mutant "a-session-must-fit-the-engine" internal/kv/lsm.go \
+  '	if n := sessionRecordLen(ss); n > m.opts.MaxValueSize {' \
+  '	if n := sessionRecordLen(ss); false && n > m.opts.MaxValueSize {' \
+  ./internal/kv '^TestLSMMachineRefusesALimitItsEngineCannotStore$'
+
+# 406. S4 (closeout): the engine-fit check sizes a session one byte short — a
+#      session within a byte of the value limit validates, then cannot be
+#      restored. The boundary test above is 4 bytes over the limit and does
+#      not see it; the exact-length test does.
+mutant "a-session-record-is-sized-exactly" internal/kv/lsm.go \
+  '	return 1 + 16 + uvarintLen(uint64(n)) + n*sessionResultLen' \
+  '	return 16 + uvarintLen(uint64(n)) + n*sessionResultLen' \
+  ./internal/kv '^TestSessionRecordLenIsTheEncodedLength$'
+
+# 407. S4 (closeout): a leader's repeated offer, sent while its follower is
+#      still proving or installing the first copy, is not dropped where it
+#      arrives — the whole repeat waits in the follower's memory behind its
+#      busy actor, and is then written, proven and ignored.
+mutant "a-repeated-offer-is-dropped-while-installing" internal/raftnode/node.go \
+  '	if installing == 0 {' \
+  '	if true || installing == 0 {' \
+  ./internal/raftnode '^TestARepeatedOfferIsDroppedWhileTheFirstIsProven$'
+
+# 408. S4 (closeout): the proof of a completed transfer does not mark its
+#      snapshot as installing — repeats arriving during the proof, the longest
+#      part of an install, are queued again.
+mutant "the-proof-marks-the-snapshot-installing" internal/raftnode/snapshot.go \
+  '			s.setInstalling(string(from), c.Index)' \
+  '			_, _ = from, c.Index' \
+  ./internal/raftnode '^(TestInstallingCoversExactlyTheProofAndTheInstall|TestARepeatedOfferIsDroppedWhileTheFirstIsProven)$'
+
+# 409. S4 (closeout): a refused proof leaves its snapshot marked as installing,
+#      so every later offer of it is dropped and the follower cannot catch up.
+mutant "a-refused-proof-clears-installing" internal/raftnode/snapshot.go \
+  '	defer s.setInstalling("", 0)' \
+  '	defer func() {}()' \
+  ./internal/raftnode '^TestInstallingCoversExactlyTheProofAndTheInstall$'
+
+# 410. S4 (closeout): a staged snapshot the core does not install stays marked
+#      as installing after it is unstaged.
+mutant "unstage-clears-installing" internal/raftnode/snapshot.go \
+  'func (s *Snapshots) Unstage() {
+	s.staged = nil
+	s.setInstalling("", 0)
+}' \
+  'func (s *Snapshots) Unstage() {
+	s.staged = nil
+}' \
+  ./internal/raftnode '^TestInstallingCoversExactlyTheProofAndTheInstall$'
+
+# 411. S4 (closeout): a transfer completed by its first chunk — a snapshot of
+#      one chunk — is not marked as installing during its proof.
+mutant "a-one-chunk-transfer-is-marked-installing" internal/raftnode/snapshot.go \
+  'c.Offset == 0 || ok && f == string(from)' \
+  'false || ok && f == string(from)' \
+  ./internal/raftnode '^(TestInstallingCoversExactlyTheProofAndTheInstall|TestARepeatedOfferIsDroppedWhileTheFirstIsProven)$'
+
+# 412. Found by CI on the S4 branch (#27): a node that stops right after
+#      answering a request hides the answer — with the answer and the stop both
+#      ready, select chose at random, and the write whose entry the state
+#      machine refused learnt ErrStopped instead of ErrApply half the time.
+#      The node-level test sees it only when the runner schedules against the
+#      caller; the helper's test sees it every time.
+mutant "a-stop-does-not-hide-an-answer" internal/raftnode/node.go \
+  '		// Stopped. An answer given before the stop is the outcome.
+		select {
+		case a = <-ch:
+			return a, nil
+		default:
+			return a, raft.ErrStopped
+		}' \
+  '		return a, raft.ErrStopped' \
+  ./internal/raftnode '^TestAnAnswerGivenBeforeTheStopIsTheOutcome$'
+
+# 413. Found by CI on the S4 branch (#27): a chaos fault aimed at "the leader"
+#      looks once — a group between leaders at the fault's instant has none —
+#      and the planned fault is dropped by its timing.
+mutant "a-leader-fault-waits-for-a-leader" internal/lab/chaos.go \
+  '		if since := time.Since(start); since >= bound {' \
+  '		if since := time.Since(start); true || since >= bound {' \
+  ./internal/lab '^TestALeaderFaultWaitsOutAnElection$'
+
+# 414. Found by CI on the S4 branch (#27): a planned fault with no target is a
+#      skip, and the run passes as if it had been carried out.
+mutant "a-leaderless-fault-is-an-error" internal/lab/chaos.go \
+  '		r.event(i, "error", f.Node, "%s: no target: %v", f, err)' \
+  '		r.event(i, "skip", f.Node, "%s: no target: %v", f, err)' \
+  ./internal/lab '^TestALeaderFaultWithoutALeaderFailsTheRun$'
+
+echo "== S4 independent review: the LSM machine's limits, the engine in doubt, the pump's drop rule =="
+
+# 415. S4 (independent review): the LSM machine opens under a MaxUnacked whose
+#      fullest session record cannot be stored — it runs until a session fills
+#      up, then fails the cycle that flushes it, and every restart.
+mutant "the-lsm-machine-refuses-a-limit-it-cannot-store" internal/kv/lsm.go \
+  '	if n := maxSessionRecordLen(limits); n > opts.MaxValueSize {' \
+  '	if n := maxSessionRecordLen(limits); false && n > opts.MaxValueSize {' \
+  ./internal/kv '^TestLSMMachineRefusesALimitItsEngineCannotStore$'
+
+# 416. S4 (independent review): a key under no tag the machine writes passes the
+#      open and fails the node at its first snapshot, at every start.
+mutant "a-foreign-key-is-refused-at-open" internal/kv/lsm.go \
+  '		id, ok := parseSessionKey(k)
+		if !ok {
+			return fmt.Errorf("%w: an engine key %q under no tag the machine writes", ErrSessionRecord, k)
+		}' \
+  '		id, ok := parseSessionKey(k)
+		if !ok {
+			return nil
+		}' \
+  ./internal/kv '^TestLSMMachineRefusesAKeyUnderNoTagItWritesAtOpen$'
+
+# 417. S4 (independent review): an ingest whose commit is in doubt latches
+#      writes but serves reads from memory, which may be behind the disk.
+mutant "an-engine-in-doubt-serves-nothing" internal/storage/checkpoint.go \
+  '		s.inDoubt.Store(true)' \
+  '		_ = true' \
+  ./internal/storage '^TestAFailedIngestCommitLatchesAndReopensOldOrNew$'
+
+# 418. S4 (independent review): the pump drops any sender's chunks at or below
+#      the snapshot being proven — a newer leader's transfer among them, when
+#      the one being proven is a stale leader's the core will refuse.
+mutant "only-the-senders-own-repeat-is-dropped" internal/raftnode/node.go \
+  '	return installing != 0 && peer == from && index <= installing' \
+  '	return installing != 0 && index <= installing' \
+  ./internal/raftnode '^TestOnlyTheSendersOwnRepeatIsDropped$'
 
 echo "== $KILLED/$TOTAL mutants killed =="
 rm -f "$LOG" "$LOG.clean"

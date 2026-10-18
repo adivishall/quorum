@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 
@@ -35,19 +36,28 @@ func (s *snapSM) Apply(uint64, []byte) error {
 	return errors.New("raftsim: entries are applied through simSM")
 }
 
-func (s *snapSM) EncodeSnapshot() (uint64, []byte, error) {
+func (s *snapSM) OpenSnapshot() (raftnode.SnapshotSource, error) {
 	idx, data, err := s.n.store.EncodeSnapshot()
-	if err == nil {
-		s.c.checkSnapshotState(s.n, "created", idx, data)
+	if err != nil {
+		return nil, err
 	}
-	return idx, data, err
+	s.c.checkSnapshotState(s.n, "created", idx, data)
+	return raftnode.BytesSource(idx, data), nil
 }
 
-func (s *snapSM) ValidateSnapshot(index uint64, data []byte) error {
+func (s *snapSM) ValidateSnapshotFrom(index uint64, r io.Reader) error {
+	data, err := raftnode.ReadState(r)
+	if err != nil {
+		return err
+	}
 	return s.n.store.ValidateSnapshot(index, data)
 }
 
-func (s *snapSM) RestoreSnapshot(index, term uint64, data []byte) error {
+func (s *snapSM) RestoreSnapshotFrom(index, term uint64, r io.Reader) error {
+	data, err := raftnode.ReadState(r)
+	if err != nil {
+		return err
+	}
 	if err := s.n.store.RestoreSnapshot(index, term, data); err != nil {
 		return err
 	}

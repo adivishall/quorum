@@ -3,6 +3,8 @@ package raftnode
 import (
 	"errors"
 	"fmt"
+	"io"
+	"sync/atomic"
 
 	"github.com/adivishall/quorum/internal/raft"
 	"github.com/adivishall/quorum/internal/raftlog"
@@ -28,18 +30,66 @@ var ErrSnapshot = errors.New("raftnode: snapshot")
 var ErrSuperseded = errors.New("raftnode: outcome unknown: a snapshot replaced the log at the proposal's index")
 
 // SnapshotStateMachine is a state machine whose whole state a snapshot can
-// capture and restore (kv.Store). The encoding is the state machine's own; the
-// driver treats it as opaque bytes.
+// capture and restore (kv.Store, kv.LSMMachine). The encoding is the state
+// machine's own; the driver treats it as opaque bytes. Since S4 the state is
+// streamed (docs/STORAGE_INTEGRATION.md §10): written from a source, validated
+// and restored by reading it, so neither the driver nor a machine that keeps
+// its state on disk ever holds it in memory whole. A machine that does hold it
+// in memory (the in-memory store) reads it whole with ReadState.
 type SnapshotStateMachine interface {
 	StateMachine
-	// EncodeSnapshot returns the state at the applied index, encoded.
-	EncodeSnapshot() (index uint64, data []byte, err error)
-	// ValidateSnapshot reports whether RestoreSnapshot would accept the state.
-	ValidateSnapshot(index uint64, data []byte) error
-	// RestoreSnapshot replaces the whole state with the snapshot's, taken at
-	// (index, term), or changes nothing on error. The in-memory store has no
-	// use for the term; a durable engine records it beside the index (S2).
-	RestoreSnapshot(index, term uint64, data []byte) error
+	// OpenSnapshot returns the state at the applied index as a source. Its
+	// WriteTo writes the same bytes every time until Close: the driver writes
+	// it twice, once to measure and hash it for the file's header.
+	OpenSnapshot() (SnapshotSource, error)
+	// ValidateSnapshotFrom reads a snapshot's whole state from r and reports
+	// whether RestoreSnapshotFrom would accept it as the state at index. It
+	// changes nothing.
+	ValidateSnapshotFrom(index uint64, r io.Reader) error
+	// RestoreSnapshotFrom replaces the whole state with the one read from r,
+	// taken at (index, term). On error the state is unchanged, or — for a
+	// machine whose replacement is not undoable in memory — the machine has
+	// failed stop; the node stops either way. The in-memory store has no use
+	// for the term; a durable engine records it beside the index (S2).
+	RestoreSnapshotFrom(index, term uint64, r io.Reader) error
+}
+
+// SnapshotSource is a state machine's state at one applied index, ready to be
+// written into a snapshot file (snapshot.Source) as many times as asked.
+type SnapshotSource interface {
+	snapshot.Source
+	// Index is the applied index the state is at.
+	Index() uint64
+	// Close releases what the source holds (an engine's pinned checkpoint).
+	Close() error
+}
+
+// BytesSource is a SnapshotSource over a state already encoded in memory.
+func BytesSource(index uint64, data []byte) SnapshotSource { return bytesSource{index, data} }
+
+type bytesSource struct {
+	index uint64
+	data  []byte
+}
+
+func (b bytesSource) Index() uint64 { return b.index }
+func (b bytesSource) WriteTo(w io.Writer) (int64, error) {
+	return snapshot.BytesSource(b.data).WriteTo(w)
+}
+func (b bytesSource) Close() error { return nil }
+
+// ReadState reads a snapshot's whole state from r, for a state machine that
+// holds its state in memory: at most snapshot.MaxData bytes, and to the end,
+// so a snapshot.Reader proves the whole file before the state is returned.
+func ReadState(r io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, snapshot.MaxData+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > snapshot.MaxData {
+		return nil, fmt.Errorf("%w: more than %d state bytes", snapshot.ErrTooLarge, snapshot.MaxData)
+	}
+	return data, nil
 }
 
 // DurableApplier is a state machine whose durable applied index bounds how far
@@ -105,17 +155,61 @@ type Snapshots struct {
 	Installed func(index uint64)
 
 	meta   snapshot.Meta // the published snapshot; Index 0 means none
-	file   []byte        // its bytes, loaded when first sent
+	file   []byte        // its bytes, loaded when first sent by SendFile (the simulator)
 	skip   uint64        // no new snapshot below this applied index (a state too large)
 	recv   *snapshot.Receiver
 	staged *snapshot.Received // complete and validated, awaiting the core
+
+	// installing is the snapshot this node is proving or installing at this
+	// moment, and its sender (installingState; none: the zero value) — read off
+	// the actor (Installing).
+	installing atomic.Value
+}
+
+// installingState is what Installing reports: the sender and index of the
+// snapshot being proven or installed (index 0: none).
+type installingState struct {
+	from  string
+	index uint64
 }
 
 // Published returns the published snapshot's metadata (Index 0: none).
 func (s *Snapshots) Published() snapshot.Meta { return s.meta }
 
+// Installing is the sender and index of the snapshot this node is proving or
+// installing at this moment (index 0: none) — from the chunk that completes
+// its transfer until it is installed, refused, or found already covered. A
+// transfer from THAT sender of a snapshot at or below it is the sender's
+// repeated offer, which can only repeat what the node is about to have. Safe
+// from any goroutine: the node's frame pump drops such chunks rather than
+// queue them behind the busy actor (S4: a leader re-offers a snapshot its
+// follower has not answered within SnapshotRetryTicks; a large proof and
+// install outlast that, and the whole repeat used to wait in the follower's
+// memory). Another sender's transfer is never dropped: it may be a newer
+// leader's, whose snapshot the node needs if the one being proven is a stale
+// leader's and the core refuses it (independent review of S4). Outside that
+// window nothing is dropped.
+func (s *Snapshots) Installing() (from string, index uint64) {
+	st, _ := s.installing.Load().(installingState)
+	return st.from, st.index
+}
+
+// setInstalling recomputes Installing: the snapshot being proven (index 0:
+// none), from its sender, or the staged one, awaiting or in its install. A
+// proof that fails, an install that completes and a staged snapshot the core
+// ignores all clear it, so a refused snapshot is never kept from the leader's
+// next offer of it.
+func (s *Snapshots) setInstalling(from string, proving uint64) {
+	st := installingState{from: from, index: proving}
+	if s.staged != nil && s.staged.Meta.Index >= proving {
+		st = installingState{from: s.staged.From, index: s.staged.Meta.Index}
+	}
+	s.installing.Store(st)
+}
+
 // SendFile returns the published snapshot and its file, for a transfer to a
-// follower. It loads (and validates) the file on first use.
+// follower. It loads (and validates) the file on first use. The deterministic
+// simulator sends this way; a node streams the file instead (OpenSend).
 func (s *Snapshots) SendFile() (snapshot.Meta, []byte, error) {
 	if s.meta.Index == 0 {
 		return snapshot.Meta{}, nil, fmt.Errorf("%w: no published snapshot to send", ErrSnapshot)
@@ -131,6 +225,24 @@ func (s *Snapshots) SendFile() (snapshot.Meta, []byte, error) {
 		s.file = file
 	}
 	return s.meta, s.file, nil
+}
+
+// OpenSend opens the published snapshot to stream it to a follower (S4): the
+// file the handle reads is the one published now, whatever is published
+// later. The caller closes it.
+func (s *Snapshots) OpenSend() (*snapshot.Sending, error) {
+	if s.meta.Index == 0 {
+		return nil, fmt.Errorf("%w: no published snapshot to send", ErrSnapshot)
+	}
+	snd, err := s.Files.OpenSend()
+	if err != nil {
+		return nil, err
+	}
+	if m := snd.Meta(); m.Index != s.meta.Index || m.Term != s.meta.Term {
+		_ = snd.Close()
+		return nil, fmt.Errorf("%w: the published file is not snapshot (%d,%d)", ErrSnapshot, s.meta.Index, s.meta.Term)
+	}
+	return snd, nil
 }
 
 // Receive takes one chunk of a snapshot a peer is sending (transport kind
@@ -153,6 +265,15 @@ func (s *Snapshots) Receive(from NodeID, payload []byte) (*raft.Message, error) 
 	if s.recv == nil {
 		s.recv = snapshot.NewReceiver(s.Files)
 	}
+	// The chunk that completes the transfer in progress starts its proof (a
+	// streaming pass over the file, then over the state): the snapshot is being
+	// installed from here, and after the proof only if it was staged.
+	if c.Offset+uint64(len(c.Data)) == c.Total {
+		if f, idx, got, ok := s.recv.Active(); c.Offset == 0 || ok && f == string(from) && idx == c.Index && got == c.Offset {
+			s.setInstalling(string(from), c.Index)
+		}
+	}
+	defer s.setInstalling("", 0)
 	got, err := s.recv.Accept(string(from), c)
 	if err != nil || got == nil {
 		return nil, err
@@ -160,7 +281,7 @@ func (s *Snapshots) Receive(from NodeID, payload []byte) (*raft.Message, error) 
 	if got.Meta.Group != s.Group {
 		return nil, fmt.Errorf("%w: a snapshot of group %d, this node is of group %d", snapshot.ErrWrongGroup, got.Meta.Group, s.Group)
 	}
-	if err := s.SM.ValidateSnapshot(got.Meta.Index, got.Data); err != nil {
+	if err := s.validateReceived(got.Meta.Index); err != nil {
 		return nil, err
 	}
 	s.staged = got
@@ -169,10 +290,45 @@ func (s *Snapshots) Receive(from NodeID, payload []byte) (*raft.Message, error) 
 		SnapshotIndex: got.Meta.Index, SnapshotTerm: got.Meta.Term, Conf: &conf}, nil
 }
 
+// validateReceived has the state machine validate the state of the snapshot
+// staged at RecvPath, streaming it, and then proves the rest of the file — so
+// even a machine that stopped reading early validates nothing unproven.
+func (s *Snapshots) validateReceived(index uint64) error {
+	rd, file, err := s.Files.OpenReceived()
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if err := s.SM.ValidateSnapshotFrom(index, rd); err != nil {
+		return err
+	}
+	return rd.Verify()
+}
+
+// restorePublished restores the state machine from the published snapshot,
+// which must be (index, term), streaming it.
+func restorePublished(files snapshot.Files, sm SnapshotStateMachine, index, term uint64) error {
+	rd, file, found, err := files.Open()
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("%w: no published snapshot to restore (%d,%d) from", ErrSnapshot, index, term)
+	}
+	defer file.Close()
+	if m := rd.Meta(); m.Index != index || m.Term != term {
+		return fmt.Errorf("%w: the published snapshot is (%d,%d), not (%d,%d)", ErrSnapshot, m.Index, m.Term, index, term)
+	}
+	return sm.RestoreSnapshotFrom(index, term, rd)
+}
+
 // Unstage drops a staged snapshot the core did not install (it already had
 // the state). Its staging file is overwritten by the next transfer or removed
 // at startup; it is never published.
-func (s *Snapshots) Unstage() { s.staged = nil }
+func (s *Snapshots) Unstage() {
+	s.staged = nil
+	s.setInstalling("", 0)
+}
 
 // Durable is a node's durable state as the Ready cycle drives it: the Raft log
 // and the snapshots. It is the Storage the node and the simulator drain Readies
@@ -198,7 +354,8 @@ func (d *Durable) Save(hs *raftlog.HardState, entries []raftlog.Entry) error {
 //  2. publication of the staged file: from here the snapshot is the durable
 //     record of the log through its index;
 //  3. the log's boundary record: the durable log is reset to the snapshot;
-//  4. the state machine's restore (validated when the transfer completed).
+//  4. the state machine's restore (validated when the transfer completed),
+//     streamed from the published file.
 //
 // The Ready's own HardState (the new commit) and entries are saved after this,
 // and its messages — the response to the leader — leave only after that. A
@@ -233,10 +390,11 @@ func (d *Durable) InstallSnapshot(meta raft.SnapshotMeta, hs *raftlog.HardState,
 	if err := at.hit(AfterInstallBoundary, meta.Index); err != nil {
 		return err
 	}
-	if err := s.SM.RestoreSnapshot(meta.Index, meta.Term, st.Data); err != nil {
+	if err := restorePublished(s.Files, s.SM, meta.Index, meta.Term); err != nil {
 		return fmt.Errorf("%w: restoring a validated snapshot: %w", ErrSnapshot, err)
 	}
 	s.staged = nil
+	s.setInstalling("", 0)
 	if s.Installed != nil {
 		s.Installed(meta.Index)
 	}
@@ -260,10 +418,15 @@ func (d *Durable) MaybeSnapshot(core *raft.Raft, at Hook) error {
 
 // Snapshot creates a snapshot of the state machine at the applied index,
 // publishes it, and compacts the log behind it, in this order
-// (docs/SNAPSHOTS.md §5): encode (memory); make an engine-backed machine
-// durable through the index (SyncApplied, S3); publish (temporary file, fsync,
-// rename, directory fsync); rewrite the durable log without the prefix; discard
-// the prefix in the core. The log is never compacted before the snapshot that
+// (docs/SNAPSHOTS.md §5, docs/STORAGE_INTEGRATION.md §10.4): the cheap checks
+// first — something applied since the published snapshot, the term and the
+// configuration at the applied index; then open the state (an engine pins a
+// checkpoint; memory encodes it) and check it is at that index; measure it
+// (its length and hash, refusing an oversized state before any side effect);
+// make an engine-backed machine durable through the index (SyncApplied, S3);
+// publish — the state streamed into the temporary file, fsync, rename,
+// directory fsync; rewrite the durable log without the prefix; discard the
+// prefix in the core. The log is never compacted before the snapshot that
 // covers it is durable, so a crash anywhere leaves a state recovery accepts.
 //
 // A state larger than snapshot.MaxData is not snapshotted: the error wraps
@@ -272,19 +435,38 @@ func (d *Durable) MaybeSnapshot(core *raft.Raft, at Hook) error {
 // hidden). Nor is a state whose configuration the node does not know (Phase 15:
 // a joiner that has not yet applied its group's first configuration entry it
 // received; raft.ErrConfUnknown): the snapshot must carry the configuration, so
-// it waits for the next applied entry. Any other failure is a durability
-// failure: the node stops.
+// it waits for the next applied entry — without opening the state, which for
+// an engine is a flush and a pass over it (S4 review). Any other failure is a
+// durability failure: the node stops.
 func (d *Durable) Snapshot(core *raft.Raft, at Hook) error {
 	s := d.Snap
 	if s.SM == nil {
 		return fmt.Errorf("%w: this node's state machine cannot snapshot", ErrSnapshot)
 	}
-	idx, data, err := s.SM.EncodeSnapshot()
-	if err != nil {
-		return fmt.Errorf("%w: encoding the state: %w", ErrSnapshot, err)
+	applied := core.AppliedIndex()
+	if applied <= s.meta.Index {
+		return nil // nothing applied since the published snapshot
 	}
+	term, err := core.TermAt(applied)
+	if err != nil {
+		return fmt.Errorf("%w: the term of applied entry %d: %w", ErrSnapshot, applied, err)
+	}
+	conf, err := core.ConfAt(applied)
+	if errors.Is(err, raft.ErrConfUnknown) {
+		s.skip = applied + 1
+		return fmt.Errorf("%w: at %d: %w", ErrSnapshot, applied, err)
+	}
+	if err != nil {
+		return fmt.Errorf("%w: the configuration at %d: %w", ErrSnapshot, applied, err)
+	}
+	src, err := s.SM.OpenSnapshot()
+	if err != nil {
+		return fmt.Errorf("%w: opening the state: %w", ErrSnapshot, err)
+	}
+	defer src.Close()
+	idx := src.Index()
 	switch {
-	case idx > core.AppliedIndex():
+	case idx > applied:
 		// A machine whose durable state holds more than the core has applied
 		// (S2, docs/STORAGE_INTEGRATION.md §8.6): after a restart the core
 		// catches up through entries the machine already holds and skips. In
@@ -294,32 +476,17 @@ func (d *Durable) Snapshot(core *raft.Raft, at Hook) error {
 		// ever being taken at an index the core has not reached, which would
 		// compact a log the core still reads. None is taken until they agree.
 		return nil
-	case idx < core.AppliedIndex():
-		return fmt.Errorf("%w: the state machine is at %d, the core applied %d", ErrSnapshot, idx, core.AppliedIndex())
-	}
-	if idx <= s.meta.Index {
-		return nil // nothing applied since the published snapshot
-	}
-	term, err := core.TermAt(idx)
-	if err != nil {
-		return fmt.Errorf("%w: the term of applied entry %d: %w", ErrSnapshot, idx, err)
-	}
-	conf, err := core.ConfAt(idx)
-	if errors.Is(err, raft.ErrConfUnknown) {
-		s.skip = idx + 1
-		return fmt.Errorf("%w: at %d: %w", ErrSnapshot, idx, err)
-	}
-	if err != nil {
-		return fmt.Errorf("%w: the configuration at %d: %w", ErrSnapshot, idx, err)
+	case idx < applied:
+		return fmt.Errorf("%w: the state machine is at %d, the core applied %d", ErrSnapshot, idx, applied)
 	}
 	meta := snapshot.Meta{Group: s.Group, Conf: conf, Index: idx, Term: term}
-	file, err := snapshot.Encode(meta, data)
+	meas, err := snapshot.Measure(src)
 	if errors.Is(err, snapshot.ErrTooLarge) {
 		s.skip = idx + max(s.Every, 1)
 		return err
 	}
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: measuring the state at %d: %w", ErrSnapshot, idx, err)
 	}
 	// R2: make the engine durable through the snapshot's index before compacting
 	// the log behind it, so the compaction boundary does not pass the engine's
@@ -328,8 +495,7 @@ func (d *Durable) Snapshot(core *raft.Raft, at Hook) error {
 	// a lagging follower a snapshot. It comes BEFORE the publish: a power loss
 	// between the two would otherwise leave a published snapshot above an engine
 	// that lost its unsynced tail, and the restart would replace the whole
-	// engine from the file — refused outright for a state too large for one
-	// restore batch — when the engine itself could have been made durable
+	// engine from the file when the engine itself could have been made durable
 	// first. The in-memory store needs nothing: its durable copy of the prefix
 	// is the snapshot file.
 	if da, ok := s.SM.(DurableApplier); ok {
@@ -340,10 +506,10 @@ func (d *Durable) Snapshot(core *raft.Raft, at Hook) error {
 	if err := at.hit(BeforeSnapshotPublish, idx); err != nil {
 		return err
 	}
-	if err := s.Files.Publish(file); err != nil {
+	if err := s.Files.PublishMeasured(meta, src, meas); err != nil {
 		return err
 	}
-	s.meta, s.file = meta, file
+	s.meta, s.file = meta, nil
 	if err := at.hit(AfterSnapshotPublish, idx); err != nil {
 		return err
 	}

@@ -5,13 +5,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/adivishall/quorum/internal/fault"
+	"github.com/adivishall/quorum/internal/record"
 	"github.com/adivishall/quorum/internal/storage"
 	"github.com/adivishall/quorum/internal/storage/wal"
 )
@@ -494,8 +497,8 @@ func TestLSMMachineAFailedCyclePublishesNothingDurable(t *testing.T) {
 // TestLSMMachineRestoresASnapshot: a snapshot the store encoded restores into
 // the machine — the state, the sessions, the index and the term — and the
 // machine goes on from it; a snapshot at or below the engine's index changes
-// nothing; a restore whose batch fails leaves an empty engine at index 0,
-// which the next restore replaces.
+// nothing; a restore whose commit fails leaves the old engine — here empty,
+// at index 0 — which the next restore replaces.
 func TestLSMMachineRestoresASnapshot(t *testing.T) {
 	limits := Limits{MaxSessions: 4, MaxUnacked: 4}
 	ref := NewStoreWithLimits(limits)
@@ -517,10 +520,12 @@ func TestLSMMachineRestoresASnapshot(t *testing.T) {
 	if err := p.lsm.ValidateSnapshot(idx, data); err != nil {
 		t.Fatal(err)
 	}
-	// The restore's batch fails: the engine is empty at 0.
-	inj.Arm(fault.Injection{Op: fault.OpWrite})
+	// The restore's commit fails — here the WAL rotation before it (S4: a
+	// restore is an ingest, whose only WAL operation is that rotation): the
+	// engine is the old one, empty at 0.
+	inj.Arm(fault.Injection{Op: fault.OpOpen})
 	if err := p.lsm.RestoreSnapshot(idx, 3, data); err == nil {
-		t.Fatal("a restore whose batch failed succeeded")
+		t.Fatal("a restore whose commit failed succeeded")
 	}
 	mem.CrashProcess()
 	_ = p.lsm.Close()
@@ -555,47 +560,44 @@ func TestLSMMachineRestoresASnapshot(t *testing.T) {
 	if err != nil || gi != ri || !bytes.Equal(gd, rd) {
 		t.Fatalf("the machine's snapshot at %d differs from the store's at %d (%v)", gi, ri, err)
 	}
-	// Too large for one batch: refused before the core could install it.
+	// Since S4 a state too large for one WAL record — S2/S3 refused it here —
+	// validates: a restore is an ingest, not one batch (the install itself is
+	// TestLSMMachineInstallsAStateAboveTheS3Limit).
 	big := NewStoreWithLimits(limits)
 	v := bytes.Repeat([]byte("v"), MaxValueLen/2) // a value that fits one command with room for its key
-	for i, total := 0, 0; total <= maxRestoreBytes; i, total = i+1, total+len(v) {
+	for i, total := 0, 0; total <= s3RestoreLimit; i, total = i+1, total+len(v) {
 		if _, err := big.ApplyResult(uint64(i+1), anonPut(fmt.Sprintf("k%03d", i), string(v))); err != nil {
 			t.Fatal(err)
 		}
 	}
 	bi, bd, _ := big.EncodeSnapshot()
-	if err := p.lsm.ValidateSnapshot(bi, bd); !errors.Is(err, ErrSnapshotState) {
-		t.Fatalf("a state too large for one batch: %v, want ErrSnapshotState", err)
+	if err := p.lsm.ValidateSnapshot(bi, bd); err != nil {
+		t.Fatalf("a state above the S3 limit of one batch: %v, want it valid", err)
 	}
 }
 
-// TestLSMMachineRestartsOnItsOwnSnapshotBeyondOneRestoreBatch: at every
-// restart raftnode restores the node's published snapshot. For the node's own
+// s3RestoreLimit is the most an S2/S3 restore could install: one WAL record,
+// less room for its framing — about 63 MiB (docs/STORAGE_INTEGRATION.md §10.1).
+const s3RestoreLimit = record.MaxRecordSize - 1<<20
+
+// TestLSMMachineRestartsOnItsOwnSnapshotWithoutReadingIt: at every restart
+// raftnode restores the node's published snapshot. For the node's own
 // snapshot the engine already holds that index — SyncApplied made it durable
-// before the publish — so the restore changes nothing. A state too large to
-// install as one engine batch must not stop the node from starting: the restore
-// decides it has nothing to do before it decodes or measures the state. Found by
-// the final S3 review; the size check used to run first and refuse every restart.
-func TestLSMMachineRestartsOnItsOwnSnapshotBeyondOneRestoreBatch(t *testing.T) {
+// before the publish — so the restore changes nothing, and it decides so
+// before it reads a byte: however large the snapshot, the restart never
+// streams or validates it again. Found by the final S3 review (then, the size
+// check ran first and refused every restart of a large state); since S4 the
+// no-op is decided before the stream is touched.
+func TestLSMMachineRestartsOnItsOwnSnapshotWithoutReadingIt(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "lsm")
 	m, err := OpenLSMMachine(dir, DefaultLimits, engineOpts(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	v := string(bytes.Repeat([]byte("v"), MaxValueLen/2))
-	var idx uint64
-	for total := 0; total <= maxRestoreBytes; total += len(v) {
-		idx++
-		if err := m.Apply(idx, anonPut(fmt.Sprintf("k%04d", idx), v)); err != nil {
+	for i := uint64(1); i <= 20; i++ {
+		if err := m.Apply(i, anonPut(fmt.Sprintf("k%04d", i), "v")); err != nil {
 			t.Fatal(err)
 		}
-	}
-	si, data, err := m.EncodeSnapshot()
-	if err != nil || si != idx {
-		t.Fatalf("premise: snapshot at %d (%v), want %d", si, err, idx)
-	}
-	if err := m.ValidateSnapshot(si, data); !errors.Is(err, ErrSnapshotState) {
-		t.Fatalf("premise: the state must be too large for one restore batch, ValidateSnapshot = %v", err)
 	}
 	if err := m.SyncApplied(); err != nil {
 		t.Fatal(err)
@@ -610,44 +612,83 @@ func TestLSMMachineRestartsOnItsOwnSnapshotBeyondOneRestoreBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
-	if err := r.RestoreSnapshot(si, 1, data); err != nil {
+	var unread untouchable
+	if err := r.RestoreSnapshotFrom(20, 1, &unread); err != nil {
 		t.Fatalf("restoring the node's own snapshot at a restart: %v", err)
 	}
-	if got := r.Applied(); got != si {
-		t.Fatalf("applied %d after the restart, want %d", got, si)
+	if unread.reads != 0 {
+		t.Fatalf("the restart read the snapshot %d times to decide it had nothing to do", unread.reads)
 	}
-	if val, ok, err := r.Lookup([]byte(fmt.Sprintf("k%04d", idx))); err != nil || !ok || string(val) != v {
+	if got := r.Applied(); got != 20 {
+		t.Fatalf("applied %d after the restart, want 20", got)
+	}
+	if val, ok, err := r.Lookup([]byte("k0020")); err != nil || !ok || string(val) != "v" {
 		t.Fatalf("the last key after the restart: present %v, %v", ok, err)
 	}
 }
 
-// TestLSMMachineACrashWhileReplacingTheEngineLeavesOneThatOpens: a restore
-// replaces the engine, and deleting a directory is not atomic. A crash part of
-// the way through used to leave an engine the next open refused — here its WAL
-// gone under a MANIFEST that names a log number — so the node could not start
-// to restore the published snapshot that would replace it. The old engine is
-// now set aside by a durable rename before it is deleted: whatever the crash
-// leaves, the engine opens, and the restore then completes. Found by the final
-// S3 review.
-func TestLSMMachineACrashWhileReplacingTheEngineLeavesOneThatOpens(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "lsm")
-	m, err := OpenLSMMachine(dir, DefaultLimits, engineOpts(nil))
-	if err != nil {
+// durableParent makes dir's parent, and every directory above it, durable
+// directories of mem — as a data directory's parent is on a real disk — so a
+// modeled power loss is about the engine's own files.
+func durableParent(t *testing.T, mem *fault.MemFS, dir string) {
+	t.Helper()
+	parent := filepath.Dir(dir)
+	if err := mem.MkdirAll(parent, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for i := uint64(1); i <= 3; i++ {
-		if err := m.Apply(i, anonPut(fmt.Sprintf("old%d", i), "v")); err != nil {
+	for d := parent; filepath.Dir(d) != d; d = filepath.Dir(d) {
+		if err := mem.SyncDir(filepath.Dir(d)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := m.SyncApplied(); err != nil { // a flushed engine: its MANIFEST names a log number
-		t.Fatal(err)
-	}
+}
 
-	// The snapshot to restore, newer than the engine.
+// untouchable is a snapshot stream that must not be read.
+type untouchable struct{ reads int }
+
+func (u *untouchable) Read([]byte) (int, error) {
+	u.reads++
+	return 0, errors.New("read")
+}
+
+// armCrash makes the n'th operation op on path (any path: "") kill the
+// process: the dead process's handles fail from then on, and it panics with
+// errDiedHere, so nothing after the point runs.
+func armCrash(inj *fault.InjectFS, mem *fault.MemFS, op fault.Op, path string, n int) {
+	inj.Arm(fault.Injection{Op: op, Path: path, Nth: n, At: func() {
+		mem.CrashProcess()
+		panic(errDiedHere)
+	}})
+}
+
+var errDiedHere = errors.New("the process died here")
+
+// restoreUntilDeath runs a restore that is expected to die part-way.
+func restoreUntilDeath(t *testing.T, m *LSMMachine, index, term uint64, data []byte) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != errDiedHere {
+			if r != nil {
+				panic(r)
+			}
+			t.Fatal("premise: the restore never reached the crash point")
+		}
+	}()
+	_ = m.RestoreSnapshot(index, term, data)
+}
+
+// TestLSMMachineACrashDuringARestoreLeavesTheOldStateOrTheNew: a restore is an
+// ingest (S4); a process that dies while the new tables are being staged
+// leaves the old engine — the staged tables are orphans the open sweeps — and
+// one that dies after the commit, while the old engine is being retired,
+// leaves the new one. Either way the machine opens, and the restart's restore
+// completes or is a no-op. (S3's restore deleted the old engine in place and
+// set it aside to survive this; ingest needs neither. The exhaustive version
+// is internal/storage's TestIngestCrashMatrix.)
+func TestLSMMachineACrashDuringARestoreLeavesTheOldStateOrTheNew(t *testing.T) {
 	src := NewStoreWithLimits(DefaultLimits)
-	for i := uint64(1); i <= 6; i++ {
-		if _, err := src.ApplyResult(i, anonPut(fmt.Sprintf("new%d", i), "w")); err != nil {
+	for i := uint64(1); i <= 60; i++ {
+		if _, err := src.ApplyResult(i, anonPut(fmt.Sprintf("new%02d", i), strings.Repeat("w", 200))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -655,59 +696,79 @@ func TestLSMMachineACrashWhileReplacingTheEngineLeavesOneThatOpens(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	for _, tc := range []struct {
+		name string
+		op   fault.Op
+		path string // matched against the operation's path; "" is any
+		want string
+	}{
+		{"while staging the new tables", fault.OpSync, "", "old"}, // the first fsync of the restore is a staged table's
+		{"after the commit, retiring the old log", fault.OpRemove, "", "new"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mem := fault.NewMemFS()
+			dir := filepath.Join(t.TempDir(), "lsm")
+			opts := engineOpts(nil)
+			opts.FS = mem
+			opts.MemTableSize = 4 << 10 // several staged tables
+			m, err := OpenLSMMachine(dir, DefaultLimits, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := uint64(1); i <= 3; i++ {
+				if err := m.Apply(i, anonPut(fmt.Sprintf("old%d", i), "v")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := m.SyncApplied(); err != nil {
+				t.Fatal(err)
+			}
+			_ = m.Close()
+			inj := fault.NewInjectFS(mem)
+			copts := opts
+			copts.FS = inj
+			m, err = OpenLSMMachine(dir, DefaultLimits, copts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			armCrash(inj, mem, tc.op, tc.path, 1) // after the open: the restore's own operations
+			restoreUntilDeath(t, m, si, 2, data)
 
-	// The process dies part of the way through deleting a directory that exists:
-	// the WAL is gone, the rest is not.
-	errCrash := errors.New("simulated crash")
-	removeAll = func(path string) error {
-		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		if err := os.RemoveAll(filepath.Join(path, "wal")); err != nil {
-			return err
-		}
-		return errCrash
-	}
-	t.Cleanup(func() { removeAll = os.RemoveAll })
-	if err := m.RestoreSnapshot(si, 2, data); !errors.Is(err, errCrash) {
-		t.Fatalf("premise: the restore = %v, want the simulated crash", err)
-	}
-	removeAll = os.RemoveAll
-
-	// The restart: the engine opens, and the published snapshot is restored.
-	r, err := OpenLSMMachine(dir, DefaultLimits, engineOpts(nil))
-	if err != nil {
-		t.Fatalf("the engine does not open after a crash while it was being replaced: %v", err)
-	}
-	defer r.Close()
-	if _, err := os.Stat(asidePath(dir)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("the engine set aside was not removed at open: %v", err)
-	}
-	if err := r.RestoreSnapshot(si, 2, data); err != nil {
-		t.Fatal(err)
-	}
-	if got := r.Applied(); got != si {
-		t.Fatalf("applied %d after the restore, want %d", got, si)
-	}
-	got, err := r.Contents()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 6 || string(got["new6"]) != "w" {
-		t.Fatalf("restored contents %v, want new1..new6 and nothing of the old engine", got)
+			r, err := OpenLSMMachine(dir, DefaultLimits, opts)
+			if err != nil {
+				t.Fatalf("the engine does not open after a crash during a restore: %v", err)
+			}
+			defer r.Close()
+			got := "old"
+			if r.Applied() == si {
+				got = "new"
+			}
+			if got != tc.want {
+				t.Fatalf("after the crash the engine is at %d (%s), want the %s state", r.Applied(), got, tc.want)
+			}
+			if err := r.RestoreSnapshot(si, 2, data); err != nil {
+				t.Fatal(err)
+			}
+			contents, err := r.Contents()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(contents) != 60 || string(contents["new60"]) != strings.Repeat("w", 200) || contents["old1"] != nil {
+				t.Fatalf("restored contents: %d keys, want new01..new60 and nothing of the old engine", len(contents))
+			}
+		})
 	}
 }
 
-// TestLSMMachineAFailedRestoreFailsStop: once a restore has closed the engine
-// that held the state, a later failure leaves no engine holding it — the new
-// one is empty or partial. The machine must then fail stop: refuse every read
-// and write, never report a key that exists as absent from an empty engine
-// (INV-L7). Found by the review of the S3 fixes; a failed restore used to leave
-// the machine open over the new, empty engine. The next start reopens the
-// engine and restores the snapshot again.
-func TestLSMMachineAFailedRestoreFailsStop(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "lsm")
-	m, err := OpenLSMMachine(dir, DefaultLimits, engineOpts(nil))
+// TestLSMMachineARefusedRestoreChangesNothing: a restore refused before its
+// commit — a state that does not validate, at the wrong index, or a term the
+// engine cannot record — leaves the old engine whole: the machine keeps
+// answering from it, at its index, and goes on applying. (Before S4 the old
+// engine was closed and set aside before the new state was written, so any
+// failure had to fail the machine stop; an ingest keeps the old engine until
+// its commit.)
+func TestLSMMachineARefusedRestoreChangesNothing(t *testing.T) {
+	m, err := OpenLSMMachine(filepath.Join(t.TempDir(), "lsm"), DefaultLimits, engineOpts(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -727,28 +788,113 @@ func TestLSMMachineAFailedRestoreFailsStop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	trailing := append(append([]byte(nil), data...), 0)
+	for name, try := range map[string]func() error{
+		"a zero term":       func() error { return m.RestoreSnapshot(si, 0, data) },
+		"the wrong index":   func() error { return m.RestoreSnapshot(si+1, 2, data) },
+		"a trailing byte":   func() error { return m.RestoreSnapshot(si, 2, trailing) },
+		"a truncated state": func() error { return m.RestoreSnapshot(si, 2, data[:len(data)-3]) },
+		"a stream that fails": func() error {
+			return m.RestoreSnapshotFrom(si, 2, io.MultiReader(bytes.NewReader(data[:20]), failingReader{}))
+		},
+	} {
+		if err := try(); err == nil {
+			t.Fatalf("%s: the restore succeeded", name)
+		}
+		if v, ok, err := m.Lookup([]byte("old3")); err != nil || !ok || string(v) != "v" {
+			t.Fatalf("%s: after the refused restore old3 is present %v (%v)", name, ok, err)
+		}
+		if _, ok, err := m.Lookup([]byte("new1")); err != nil || ok {
+			t.Fatalf("%s: after the refused restore new1 is present %v (%v)", name, ok, err)
+		}
+		if m.Applied() != 3 || m.EngineApplied().Index != 3 {
+			t.Fatalf("%s: applied %d, engine %+v after a refused restore, want 3", name, m.Applied(), m.EngineApplied())
+		}
+	}
+	if err := m.Apply(4, anonPut("x", "y")); err != nil {
+		t.Fatalf("applying after refused restores: %v", err)
+	}
+}
 
-	// A zero term: the new engine refuses the restore's batch, after the old
-	// engine is gone and the new one is open.
-	if err := m.RestoreSnapshot(si, 0, data); err == nil {
-		t.Fatal("premise: a restore at term 0 succeeded")
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) { return 0, errors.New("the stream failed") }
+
+// TestLSMMachineARestoreWhoseCommitIsInDoubtFailsStop: when the ingest's
+// MANIFEST commit fails, the edit may or may not be durable and the engine
+// latches; the machine must then fail stop — refuse every read and write,
+// never answer from an engine it cannot vouch for (INV-L7) — and the next
+// start reads whichever state is durable and restores the snapshot again if it
+// is the old one. (Found by the review of the S3 fixes for the S3 restore; the
+// same rule, for the commit that can now be in doubt.)
+func TestLSMMachineARestoreWhoseCommitIsInDoubtFailsStop(t *testing.T) {
+	mem := fault.NewMemFS()
+	dir := filepath.Join(t.TempDir(), "lsm")
+	durableParent(t, mem, dir)
+	inj := fault.NewInjectFS(mem)
+	opts := engineOpts(nil)
+	opts.FS = inj
+	m, err := OpenLSMMachine(dir, DefaultLimits, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	for i := uint64(1); i <= 3; i++ {
+		if err := m.Apply(i, anonPut(fmt.Sprintf("old%d", i), "v")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.SyncApplied(); err != nil { // the old state durable
+		t.Fatal(err)
+	}
+	src := NewStoreWithLimits(DefaultLimits)
+	for i := uint64(1); i <= 6; i++ {
+		if _, err := src.ApplyResult(i, anonPut(fmt.Sprintf("new%d", i), "w")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	si, data, err := src.EncodeSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifestPath string
+	entries, err := mem.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "MANIFEST-") {
+			manifestPath = filepath.Join(dir, e.Name())
+		}
+	}
+	inj.Arm(fault.Injection{Op: fault.OpSync, Path: manifestPath})
+	if err := m.RestoreSnapshot(si, 2, data); err == nil {
+		t.Fatal("premise: the restore succeeded although its commit's fsync failed")
 	}
 	if _, ok, err := m.Lookup([]byte("new1")); !errors.Is(err, ErrMachineClosed) {
-		t.Fatalf("Lookup after a failed restore: present %v, err %v; want ErrMachineClosed, not an answer from an empty engine", ok, err)
+		t.Fatalf("Lookup after a restore in doubt: present %v, err %v; want ErrMachineClosed", ok, err)
 	}
 	if _, ok, err := m.Lookup([]byte("old1")); !errors.Is(err, ErrMachineClosed) {
-		t.Fatalf("Lookup of a key the machine held, after a failed restore: present %v, err %v; want ErrMachineClosed", ok, err)
+		t.Fatalf("Lookup of a key the machine held, after a restore in doubt: present %v, err %v; want ErrMachineClosed", ok, err)
 	}
 	if _, err := m.ApplyEntry(4, 1, anonPut("x", "y")); !errors.Is(err, ErrMachineClosed) {
-		t.Fatalf("ApplyEntry after a failed restore: %v, want ErrMachineClosed", err)
+		t.Fatalf("ApplyEntry after a restore in doubt: %v, want ErrMachineClosed", err)
+	}
+	if m.DurableAppliedIndex() != 0 {
+		t.Fatalf("a closed machine vouches for durable index %d", m.DurableAppliedIndex())
 	}
 
-	// The next start reopens the engine, and the restore completes.
-	r, err := OpenLSMMachine(dir, DefaultLimits, engineOpts(nil))
+	// A power loss: the unsynced edit is gone, the old state is durable; the next
+	// start restores the snapshot again.
+	mem.CrashPowerLoss(0)
+	r, err := OpenLSMMachine(dir, DefaultLimits, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer r.Close()
+	if r.Applied() != 3 {
+		t.Fatalf("after the power loss the engine is at %d, want the old 3", r.Applied())
+	}
 	if err := r.RestoreSnapshot(si, 2, data); err != nil {
 		t.Fatal(err)
 	}

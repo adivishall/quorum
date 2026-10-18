@@ -303,7 +303,9 @@ func Recover(cfg Config) (*Recovered, error) {
 	if err := files.RemoveOrphans(); err != nil {
 		return nil, err
 	}
-	meta, data, _, found, err := files.Load()
+	// The published snapshot is validated whole, by streaming it (S4): bounded
+	// memory however large it is; its state is read again only to restore it.
+	meta, found, err := files.Verify()
 	if err != nil {
 		return nil, fmt.Errorf("%w: the published snapshot: %w", ErrSnapshot, err)
 	}
@@ -371,7 +373,7 @@ func Recover(cfg Config) (*Recovered, error) {
 	}
 	var restored *snapshot.Meta
 	if found {
-		if err := ssm.RestoreSnapshot(meta.Index, meta.Term, data); err != nil {
+		if err := restorePublished(files, ssm, meta.Index, meta.Term); err != nil {
 			return fail(fmt.Errorf("%w: restoring the published snapshot: %w", ErrSnapshot, err))
 		}
 		if err := mlog.Apply(meta.Index); err != nil {
@@ -621,7 +623,12 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		n.dur.Log = timedLog{LogStore: n.dur.Log, m: n.m}
 		n.store = timedStorage{Durable: n.dur, m: n.m}
 	}
-	n.dur.Snap.Installed = n.waiters.Installed
+	n.dur.Snap.Installed = func(index uint64) {
+		n.waiters.Installed(index)
+		// The snapshot is published, the log's boundary recorded and the state
+		// machine restored (S4: for an engine, ingested and committed).
+		n.logf("event=raft_snapshot_installed node=%s index=%d group=%d", cfg.ID, index, cfg.Group)
+	}
 	n.wasMember = rc.Identity.Genesis.IsMember(cfg.ID)
 	n.noteConf()
 	n.snapshotStatus()
@@ -666,13 +673,38 @@ func (n *Node) Propose(ctx context.Context, data []byte) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	err, stopped := answer(ctx, p.result, n.ctx.Done())
+	if stopped != nil {
+		return stopped
+	}
+	return err
+}
+
+// answer waits for the actor's answer to a request it has taken — or for the
+// node to stop, or the caller's ctx to end (context.Background: wait for the
+// node), whichever comes first. A node that stops right after answering does
+// not hide its answer: the actor answers every request it takes within the same
+// cycle, and fail completes every waiter before it cancels, so an answer
+// already in the channel when the stop is seen IS the request's outcome — the
+// write whose entry the state machine refused learns ErrApply through its
+// waiter, as the contract says — and raft.ErrStopped is the outcome only when
+// the actor never answered. Before, with the answer and the stop both ready,
+// select chose at random, and the write learnt ErrStopped half the time
+// (found by CI on the S4 branch, #27).
+func answer[T any](ctx context.Context, ch <-chan T, stop <-chan struct{}) (a T, err error) {
 	select {
-	case err := <-p.result:
-		return err
-	case <-n.ctx.Done():
-		return raft.ErrStopped
+	case a = <-ch:
+		return a, nil
+	case <-stop:
+		// Stopped. An answer given before the stop is the outcome.
+		select {
+		case a = <-ch:
+			return a, nil
+		default:
+			return a, raft.ErrStopped
+		}
 	case <-ctx.Done():
-		return ctx.Err()
+		return a, ctx.Err()
 	}
 }
 
@@ -697,7 +729,10 @@ func (n *Node) Propose(ctx context.Context, data []byte) error {
 //     A client must treat it exactly as a timeout (docs/CONSISTENCY.md C4).
 //   - raft.ErrStopped, or a persistence or state-machine failure (ErrApply):
 //     the node stopped. If the proposal had been accepted the outcome is
-//     likewise unknown.
+//     likewise unknown — except that the write whose own entry the state
+//     machine refused learns ErrApply (its entry is applied nowhere, ever), and
+//     every answer the node gave before it stopped is returned over
+//     ErrStopped.
 func (n *Node) Write(ctx context.Context, data []byte) (index, term uint64, result any, err error) {
 	req := writeReq{data: append([]byte(nil), data...), result: make(chan writeAccepted, 1)}
 	select {
@@ -707,14 +742,12 @@ func (n *Node) Write(ctx context.Context, data []byte) (index, term uint64, resu
 	case <-ctx.Done():
 		return 0, 0, nil, ctx.Err()
 	}
-	var acc writeAccepted
-	select {
-	case acc = <-req.result:
-	case <-n.ctx.Done():
-		return 0, 0, nil, raft.ErrStopped
-	case <-ctx.Done():
-		n.abandon(abandoned{write: req.result})
-		return 0, 0, nil, ctx.Err()
+	acc, err := answer(ctx, req.result, n.ctx.Done())
+	if err != nil {
+		if !errors.Is(err, raft.ErrStopped) {
+			n.abandon(abandoned{write: req.result}) // the caller gave up: forget it
+		}
+		return 0, 0, nil, err
 	}
 	if acc.err != nil {
 		return 0, 0, nil, acc.err
@@ -804,14 +837,12 @@ func (n *Node) ReadIndex(ctx context.Context) (uint64, error) {
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	}
-	var acc readAccepted
-	select {
-	case acc = <-req.result:
-	case <-n.ctx.Done():
-		return 0, raft.ErrStopped
-	case <-ctx.Done():
-		n.abandon(abandoned{read: req.result})
-		return 0, ctx.Err()
+	acc, err := answer(ctx, req.result, n.ctx.Done())
+	if err != nil {
+		if !errors.Is(err, raft.ErrStopped) {
+			n.abandon(abandoned{read: req.result}) // the caller gave up: forget it
+		}
+		return 0, err
 	}
 	if acc.err != nil {
 		return 0, acc.err
@@ -839,12 +870,11 @@ func (n *Node) Snapshot(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	select {
-	case err := <-r:
-		return err
-	case <-n.ctx.Done():
-		return raft.ErrStopped
+	err, stopped := answer(context.Background(), r, n.ctx.Done())
+	if stopped != nil {
+		return stopped
 	}
+	return err
 }
 
 // Status returns one consistent snapshot of the node's state. Use it (not the
@@ -1238,6 +1268,9 @@ func (n *Node) receiveLoop() {
 				env.Payload = payload
 			}
 			if env.Kind == transport.MsgInstallSnapshot {
+				if n.coveredChunk(env) {
+					continue
+				}
 				select {
 				case n.chunkCh <- inChunk{from: NodeID(env.Peer), payload: env.Payload}:
 				case <-n.ctx.Done():
@@ -1299,9 +1332,16 @@ func (n *Node) snapshotStatus() {
 // runs per peer; an offer while one runs is ignored. A failed send abandons
 // the transfer, and the core offers again when its offer goes unanswered.
 func (n *Node) startTransfer(m raft.Message) {
-	meta, file, err := n.dur.Snap.SendFile()
-	if err == nil && meta.Index < m.SnapshotIndex {
-		err = fmt.Errorf("%w: published snapshot %d is below the log's boundary %d", ErrSnapshot, meta.Index, m.SnapshotIndex)
+	n.mu.Lock()
+	busy := n.sending[m.To]
+	n.mu.Unlock()
+	if busy {
+		return
+	}
+	snd, err := n.dur.Snap.OpenSend()
+	if err == nil && snd.Meta().Index < m.SnapshotIndex {
+		err = fmt.Errorf("%w: published snapshot %d is below the log's boundary %d", ErrSnapshot, snd.Meta().Index, m.SnapshotIndex)
+		_ = snd.Close()
 	}
 	if err != nil {
 		n.m.snapFailed.Inc()
@@ -1309,34 +1349,78 @@ func (n *Node) startTransfer(m raft.Message) {
 		return
 	}
 	n.mu.Lock()
-	busy := n.sending[m.To]
 	n.sending[m.To] = true
 	n.mu.Unlock()
-	if busy {
-		return
-	}
 	n.wg.Add(1)
-	go n.transfer(m.To, m.Term, meta, file)
+	go n.transfer(m.To, m.Term, snd)
 }
 
-// transfer streams one snapshot to one peer.
-func (n *Node) transfer(peer NodeID, term uint64, meta snapshot.Meta, file []byte) {
+// transfer streams one snapshot to one peer (S4): it proves the whole file
+// first, off the actor, then sends it chunk by chunk as it reads it — never
+// the whole file in memory.
+func (n *Node) transfer(peer NodeID, term uint64, snd *snapshot.Sending) {
 	defer n.wg.Done()
+	defer snd.Close()
 	defer func() {
 		n.mu.Lock()
 		delete(n.sending, peer)
 		n.mu.Unlock()
 	}()
-	chunks := snapshot.Split(term, meta, file)
-	for _, c := range chunks {
-		if err := n.tr.Send(n.ctx, transport.NodeID(peer), transport.MsgInstallSnapshot, WrapGroup(n.cfg.Group, c.Marshal())); err != nil {
-			n.m.snapFailed.Inc()
-			n.logf("event=raft_snapshot_send_failed node=%s to=%s index=%d offset=%d group=%d err=%v", n.cfg.ID, peer, meta.Index, c.Offset, n.cfg.Group, err)
-			return
-		}
+	meta := snd.Meta()
+	if err := snd.Verify(n.ctx); err != nil {
+		n.m.snapFailed.Inc()
+		n.logf("event=raft_snapshot_send_failed node=%s to=%s index=%d group=%d err=%v", n.cfg.ID, peer, meta.Index, n.cfg.Group, err)
+		return
+	}
+	var offset uint64
+	chunks, err := snd.Chunks(term, snapshot.MaxChunk, func(c snapshot.Chunk) error {
+		offset = c.Offset
+		return n.tr.Send(n.ctx, transport.NodeID(peer), transport.MsgInstallSnapshot, WrapGroup(n.cfg.Group, c.Marshal()))
+	})
+	if err != nil {
+		n.m.snapFailed.Inc()
+		n.logf("event=raft_snapshot_send_failed node=%s to=%s index=%d offset=%d group=%d err=%v", n.cfg.ID, peer, meta.Index, offset, n.cfg.Group, err)
+		return
 	}
 	n.m.snapSent.Inc()
-	n.logf("event=raft_snapshot_sent node=%s to=%s index=%d term=%d bytes=%d chunks=%d group=%d", n.cfg.ID, peer, meta.Index, meta.Term, len(file), len(chunks), n.cfg.Group)
+	n.logf("event=raft_snapshot_sent node=%s to=%s index=%d term=%d bytes=%d chunks=%d group=%d", n.cfg.ID, peer, meta.Index, meta.Term, snd.Size(), chunks, n.cfg.Group)
+}
+
+// coveredChunk reports, off the actor, whether a frame is a chunk of the
+// sender's repeated offer of the snapshot this node is proving or installing
+// right now (Snapshots.Installing, dropsRepeat): a leader's re-offer the node
+// could not answer while busy with the first copy can only repeat what the
+// node is about to have, so it is dropped here, chunk by chunk as it arrives,
+// instead of waiting in memory behind the busy actor and then being written,
+// proven and ignored. The first chunk of each dropped transfer is logged.
+// Outside an install nothing is dropped; another sender's transfer is never
+// dropped; and a chunk that does not decode is passed on: the receiver refuses
+// it and says why.
+func (n *Node) coveredChunk(env transport.Envelope) bool {
+	if n.dur == nil || n.dur.Snap == nil {
+		return false
+	}
+	from, installing := n.dur.Snap.Installing()
+	if installing == 0 {
+		return false
+	}
+	c, err := snapshot.UnmarshalChunk(env.Payload)
+	if err != nil || !dropsRepeat(string(env.Peer), c.Index, from, installing) {
+		return false
+	}
+	if c.Offset == 0 {
+		n.logf("event=raft_snapshot_chunk_dropped node=%s from=%s index=%d installing=%d group=%d", n.cfg.ID, env.Peer, c.Index, installing, n.cfg.Group)
+	}
+	return true
+}
+
+// dropsRepeat is the pump's rule: a chunk from peer of a snapshot at index is
+// dropped only while the node is proving or installing a snapshot at or above
+// that index FROM THE SAME PEER — the peer's repeated offer. Nothing else is:
+// not another sender's transfer at any index, and nothing when no install is
+// under way.
+func dropsRepeat(peer string, index uint64, from string, installing uint64) bool {
+	return installing != 0 && peer == from && index <= installing
 }
 
 // receiveChunk takes one chunk of a snapshot a peer is sending. A complete,

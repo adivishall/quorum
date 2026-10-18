@@ -222,3 +222,35 @@ func TestMemFSIsDeterministic(t *testing.T) {
 		t.Fatalf("non-deterministic: %q vs %q", a, b)
 	}
 }
+
+// TestReadAtReadsWithoutMovingTheOffset: ReadAt (S4, the SSTable reader's
+// access) reads at an offset, reports io.EOF only for a short read at the end,
+// and leaves the handle's own offset where Read left it.
+func TestReadAtReadsWithoutMovingTheOffset(t *testing.T) {
+	m := NewMemFS()
+	f := mustOpen(t, m, "/f", os.O_RDWR|os.O_CREATE)
+	mustWrite(t, f, "0123456789")
+	if _, err := f.Seek(2, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4)
+	if n, err := f.ReadAt(buf, 5); n != 4 || err != nil || string(buf) != "5678" {
+		t.Fatalf("ReadAt(5): %d %v %q", n, err, buf)
+	}
+	if n, err := f.ReadAt(buf, 8); n != 2 || !errors.Is(err, io.EOF) || string(buf[:n]) != "89" {
+		t.Fatalf("ReadAt(8): %d %v %q, want 2 bytes and io.EOF", n, err, buf[:n])
+	}
+	if n, err := f.ReadAt(buf, 10); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("ReadAt(10): %d %v, want io.EOF", n, err)
+	}
+	if _, err := f.ReadAt(buf, -1); err == nil {
+		t.Fatal("ReadAt at a negative offset succeeded")
+	}
+	if n, err := f.Read(buf); n != 4 || err != nil || string(buf) != "2345" {
+		t.Fatalf("Read after ReadAt: %d %v %q — ReadAt moved the offset", n, err, buf)
+	}
+	m.CrashProcess()
+	if _, err := f.ReadAt(buf, 0); !errors.Is(err, ErrCrashed) {
+		t.Fatalf("ReadAt on a crashed process's handle: %v", err)
+	}
+}

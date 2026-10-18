@@ -69,11 +69,13 @@ import (
 	"github.com/adivishall/quorum/internal/vfs"
 )
 
-// FS is the filesystem the manifest WRITES through — its files, CURRENT, the
-// renames and directory fsyncs (reads use package os). It is the OS; tests
-// substitute a fault injector (internal/fault) to fail a write, a sync, a
-// rename or a directory sync at an exact point. Never change it while a store
-// is open.
+// FS is the filesystem the package-level functions use — the manifest files,
+// CURRENT, the renames and directory fsyncs, and since S4 the reads as well
+// (docs/STORAGE_INTEGRATION.md §10.11). It is the OS; tests substitute a fault
+// injector (internal/fault) to fail a write, a sync, a rename or a directory
+// sync at an exact point. Never change it while a store is open. The *FS
+// variants (InstallFS, RecoverFS, ...) take the filesystem explicitly: a store
+// opened on its own filesystem keeps its MANIFEST there too.
 var FS vfs.FS = vfs.OS{}
 
 // File names.
@@ -604,8 +606,11 @@ func ParseName(name string) (uint64, bool) {
 }
 
 // List returns the manifest numbers present in dir, ascending.
-func List(dir string) ([]uint64, error) {
-	entries, err := os.ReadDir(dir)
+func List(dir string) ([]uint64, error) { return ListFS(FS, dir) }
+
+// ListFS is List on a filesystem.
+func ListFS(fsys vfs.FS, dir string) ([]uint64, error) {
+	entries, err := fsys.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("manifest: reading %s: %w", dir, err)
 	}
@@ -623,8 +628,15 @@ func List(dir string) ([]uint64, error) {
 }
 
 // ReadCurrent returns the manifest number CURRENT names.
-func ReadCurrent(dir string) (uint64, error) {
-	raw, err := os.ReadFile(filepath.Join(dir, CurrentName))
+func ReadCurrent(dir string) (uint64, error) { return ReadCurrentFS(FS, dir) }
+
+// maxCurrentSize bounds what is read of CURRENT: one manifest name and a
+// newline. Anything longer is damage, refused by ParseName below.
+const maxCurrentSize = 1 << 10
+
+// ReadCurrentFS is ReadCurrent on a filesystem.
+func ReadCurrentFS(fsys vfs.FS, dir string) (uint64, error) {
+	raw, err := readSmall(fsys, filepath.Join(dir, CurrentName), maxCurrentSize)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return 0, ErrNoManifest
@@ -643,6 +655,16 @@ func ReadCurrent(dir string) (uint64, error) {
 	return n, nil
 }
 
+// readSmall reads at most max bytes of a file.
+func readSmall(fsys vfs.FS, path string, max int64) ([]byte, error) {
+	f, err := fsys.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	return io.ReadAll(io.LimitReader(f, max))
+}
+
 // writeCurrent points CURRENT at a manifest, atomically and durably.
 //
 // The sequence is docs/DESIGN.md §6's: write the temporary file, fsync it so its
@@ -653,30 +675,30 @@ func ReadCurrent(dir string) (uint64, error) {
 // rename itself or after it — the directory fsync — is ambiguous: CURRENT may
 // already name num, or may name it only until a power loss. Such an error
 // wraps ErrFailed, and the caller must keep both manifests.
-func writeCurrent(dir string, num uint64) error {
+func writeCurrent(fsys vfs.FS, dir string, num uint64) error {
 	tmp := filepath.Join(dir, currentTempName)
-	f, err := FS.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	f, err := fsys.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("manifest: creating %s: %w", currentTempName, err)
 	}
 	if _, err := f.Write([]byte(Name(num) + "\n")); err != nil {
 		_ = f.Close()
-		_ = FS.Remove(tmp)
+		_ = fsys.Remove(tmp)
 		return fmt.Errorf("manifest: writing %s: %w", currentTempName, err)
 	}
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
-		_ = FS.Remove(tmp)
+		_ = fsys.Remove(tmp)
 		return fmt.Errorf("manifest: syncing %s: %w", currentTempName, err)
 	}
 	if err := f.Close(); err != nil {
-		_ = FS.Remove(tmp)
+		_ = fsys.Remove(tmp)
 		return fmt.Errorf("manifest: closing %s: %w", currentTempName, err)
 	}
-	if err := FS.Rename(tmp, filepath.Join(dir, CurrentName)); err != nil {
+	if err := fsys.Rename(tmp, filepath.Join(dir, CurrentName)); err != nil {
 		return fmt.Errorf("%w: installing %s: %w", ErrFailed, CurrentName, err)
 	}
-	if err := SyncDir(dir); err != nil {
+	if err := fsys.SyncDir(filepath.Clean(dir)); err != nil {
 		return fmt.Errorf("%w: syncing %s after installing %s: %w", ErrFailed, dir, CurrentName, err)
 	}
 	return nil
@@ -720,11 +742,16 @@ type Writer struct {
 // CURRENT and previous manifest untouched and the new manifest unreferenced, so
 // the old version stays authoritative and the new file is an orphan.
 func Install(dir string, num uint64, state State) (*Writer, error) {
+	return InstallFS(FS, dir, num, state)
+}
+
+// InstallFS is Install on a filesystem.
+func InstallFS(fsys vfs.FS, dir string, num uint64, state State) (*Writer, error) {
 	if num == 0 || num > maxManifestNumber {
 		return nil, fmt.Errorf("manifest: number %d is outside [1,%d]", num, maxManifestNumber)
 	}
 	path := filepath.Join(dir, Name(num))
-	f, err := FS.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	f, err := fsys.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("manifest: creating %s: %w", Name(num), err)
 	}
@@ -734,13 +761,13 @@ func Install(dir string, num uint64, state State) (*Writer, error) {
 	if err := w.Append(&snap); err != nil {
 		// CURRENT does not name it yet: the new manifest is an orphan.
 		_ = f.Close()
-		_ = FS.Remove(path)
+		_ = fsys.Remove(path)
 		return nil, err
 	}
-	if err := writeCurrent(dir, num); err != nil {
+	if err := writeCurrent(fsys, dir, num); err != nil {
 		_ = f.Close()
 		if !errors.Is(err, ErrFailed) {
-			_ = FS.Remove(path) // CURRENT was never touched
+			_ = fsys.Remove(path) // CURRENT was never touched
 		}
 		// Otherwise CURRENT may name the new manifest — removing it here
 		// used to leave CURRENT naming a file that did not exist, a store
@@ -753,8 +780,13 @@ func Install(dir string, num uint64, state State) (*Writer, error) {
 // Reopen returns a Writer appending to an existing manifest at the given offset,
 // which must be the end of the last good record.
 func Reopen(dir string, num uint64, offset int64) (*Writer, error) {
+	return ReopenFS(FS, dir, num, offset)
+}
+
+// ReopenFS is Reopen on a filesystem.
+func ReopenFS(fsys vfs.FS, dir string, num uint64, offset int64) (*Writer, error) {
 	path := filepath.Join(dir, Name(num))
-	f, err := FS.OpenFile(path, os.O_WRONLY, 0o644)
+	f, err := fsys.OpenFile(path, os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("manifest: opening %s: %w", Name(num), err)
 	}
@@ -834,15 +866,18 @@ type Recovery struct {
 //
 // A torn final record is repaired by truncating the file, so the next append
 // does not follow garbage. Damage anywhere else is refused.
-func Recover(dir string) (State, Recovery, error) {
-	num, err := ReadCurrent(dir)
+func Recover(dir string) (State, Recovery, error) { return RecoverFS(FS, dir) }
+
+// RecoverFS is Recover on a filesystem.
+func RecoverFS(fsys vfs.FS, dir string) (State, Recovery, error) {
+	num, err := ReadCurrentFS(fsys, dir)
 	if err != nil {
 		return State{}, Recovery{}, err
 	}
 	rec := Recovery{Num: num}
 
 	path := filepath.Join(dir, Name(num))
-	f, err := os.Open(path)
+	f, err := fsys.OpenFile(path, os.O_RDONLY, 0)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			// CURRENT names a manifest that is not there. This is the one case
@@ -910,15 +945,15 @@ func Recover(dir string) (State, Recovery, error) {
 	}
 
 	if rec.Truncated {
-		if err := truncateAt(path, rec.TruncatedAt); err != nil {
+		if err := truncateAt(fsys, path, rec.TruncatedAt); err != nil {
 			return State{}, rec, err
 		}
 	}
 	return state, rec, nil
 }
 
-func truncateAt(path string, at int64) error {
-	f, err := FS.OpenFile(path, os.O_WRONLY, 0o644)
+func truncateAt(fsys vfs.FS, path string, at int64) error {
+	f, err := fsys.OpenFile(path, os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("manifest: opening %s to repair: %w", filepath.Base(path), err)
 	}
@@ -933,7 +968,7 @@ func truncateAt(path string, at int64) error {
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("manifest: closing %s after repair: %w", filepath.Base(path), err)
 	}
-	return SyncDir(filepath.Dir(path))
+	return fsys.SyncDir(filepath.Dir(path))
 }
 
 // RemoveObsolete deletes every manifest in dir other than keep.
@@ -941,8 +976,11 @@ func truncateAt(path string, at int64) error {
 // Safe because CURRENT is the only thing that makes a manifest live, and it is
 // switched atomically: any other manifest is either a superseded one or one an
 // interrupted Install left behind.
-func RemoveObsolete(dir string, keep uint64) (int, error) {
-	nums, err := List(dir)
+func RemoveObsolete(dir string, keep uint64) (int, error) { return RemoveObsoleteFS(FS, dir, keep) }
+
+// RemoveObsoleteFS is RemoveObsolete on a filesystem.
+func RemoveObsoleteFS(fsys vfs.FS, dir string, keep uint64) (int, error) {
+	nums, err := ListFS(fsys, dir)
 	if err != nil {
 		return 0, err
 	}
@@ -951,14 +989,14 @@ func RemoveObsolete(dir string, keep uint64) (int, error) {
 		if n == keep {
 			continue
 		}
-		if err := FS.Remove(filepath.Join(dir, Name(n))); err != nil {
+		if err := fsys.Remove(filepath.Join(dir, Name(n))); err != nil {
 			return removed, fmt.Errorf("manifest: removing obsolete %s: %w", Name(n), err)
 		}
 		removed++
 	}
 	// A leftover CURRENT.tmp is an interrupted writeCurrent. It is never read,
 	// so removing it cannot lose anything.
-	if err := FS.Remove(filepath.Join(dir, currentTempName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := fsys.Remove(filepath.Join(dir, currentTempName)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return removed, fmt.Errorf("manifest: removing %s: %w", currentTempName, err)
 	}
 	return removed, nil

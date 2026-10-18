@@ -1,18 +1,19 @@
 package kv
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
 
 	"github.com/adivishall/quorum/internal/raftnode"
-	"github.com/adivishall/quorum/internal/record"
 	"github.com/adivishall/quorum/internal/storage"
-	"github.com/adivishall/quorum/internal/vfs"
 )
 
 // LSMMachine is the replicated state machine held in the storage engine (S2,
@@ -70,21 +71,36 @@ const cycleFlushBytes = 32 << 20
 var ErrMachineClosed = errors.New("kv: the state machine is closed")
 
 var (
-	_ Machine                 = (*LSMMachine)(nil)
-	_ raftnode.DurableApplier = (*LSMMachine)(nil)
+	_ Machine                       = (*LSMMachine)(nil)
+	_ raftnode.DurableApplier       = (*LSMMachine)(nil)
+	_ raftnode.SnapshotStateMachine = (*LSMMachine)(nil)
 )
+
+// ErrLimits is a session limit the LSM machine cannot run under: a MaxUnacked
+// whose fullest session record would not fit one engine value.
+var ErrLimits = errors.New("kv: session limits the engine cannot store")
 
 // OpenLSMMachine opens the machine's engine in dir (creating it) under limits
 // — the same limits every replica of the group uses — and engine options opts,
 // whose key and value limits are set here: a user key is stored one tag byte
 // longer. It loads the session table from the engine's records and refuses a
-// record it did not write (ErrSessionRecord).
+// record it did not write (ErrSessionRecord), or a key under no tag it writes.
+//
+// It refuses a MaxUnacked whose fullest session record would not fit one
+// engine value (ErrLimits): the machine could run until a session filled up,
+// then fail every cycle that flushes it — and every restart, replaying the
+// same entry (S4 closeout review; the in-memory store has no such bound). At
+// the 1 MiB value limit, 21,844 results fit.
 func OpenLSMMachine(dir string, limits Limits, opts storage.Options) (*LSMMachine, error) {
 	if limits.MaxSessions < 1 || limits.MaxUnacked < 1 {
 		return nil, errors.New("kv: session limits must be at least 1")
 	}
 	opts.MaxKeySize = MaxKeyLen + 1
 	opts.MaxValueSize = MaxValueLen
+	if n := maxSessionRecordLen(limits); n > opts.MaxValueSize {
+		return nil, fmt.Errorf("%w: a session may hold %d results, a record of %d bytes; the engine stores values of at most %d bytes (%d results fit)",
+			ErrLimits, limits.MaxUnacked, n, opts.MaxValueSize, maxUnackedFor(opts.MaxValueSize))
+	}
 	// A restore that a crash interrupted may have left the old engine renamed
 	// aside (RestoreSnapshot); it is never read again.
 	if err := removeAll(asidePath(dir)); err != nil {
@@ -105,24 +121,32 @@ func OpenLSMMachine(dir string, limits Limits, opts storage.Options) (*LSMMachin
 	return m, nil
 }
 
-// loadSessions rebuilds the session mirror from the engine's session records.
-// It reads the engine's whole state (S2: the engine has no range scan yet,
-// docs/STORAGE_INTEGRATION.md §8.8); the records themselves are few and small.
+// loadSessions rebuilds the session mirror from the engine's session records,
+// scanning the engine one entry at a time (S4: never its whole state in a
+// map); the records themselves are few and small. A key under no tag the
+// machine writes is refused here, as the snapshot source refuses it — not at
+// the first snapshot, where it would fail the node at every start.
 func (m *LSMMachine) loadSessions() error {
-	all, err := m.db.Snapshot()
-	if err != nil {
-		return fmt.Errorf("kv: reading the engine's session records: %w", err)
-	}
-	for k, v := range all {
-		id, ok := parseSessionKey([]byte(k))
+	err := m.db.Scan(func(k, v []byte) error {
+		if len(k) > 0 && k[0] == tagUser {
+			return nil
+		}
+		id, ok := parseSessionKey(k)
 		if !ok {
-			continue
+			return fmt.Errorf("%w: an engine key %q under no tag the machine writes", ErrSessionRecord, k)
 		}
 		ss, err := decodeSession(id, v, m.sessions.limits)
 		if err != nil {
 			return err
 		}
 		m.sessions.sessions[id] = ss
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrSessionRecord) {
+			return err
+		}
+		return fmt.Errorf("kv: reading the engine's session records: %w", err)
 	}
 	if n := len(m.sessions.sessions); n > m.sessions.limits.MaxSessions {
 		return fmt.Errorf("%w: %d sessions recorded, limit %d", ErrSessionRecord, n, m.sessions.limits.MaxSessions)
@@ -386,85 +410,276 @@ func (m *LSMMachine) contentsLocked() (map[string][]byte, error) {
 }
 
 // EncodeSnapshot returns the state at the engine's applied index, in the
-// snapshot format Store writes (raftnode.SnapshotStateMachine). The driver
-// calls it between cycles, so nothing is staged and the engine's index is the
-// state's.
+// snapshot format Store writes: the snapshot source's bytes (OpenSnapshot),
+// gathered in memory. It is for tests and small states; the driver streams.
 func (m *LSMMachine) EncodeSnapshot() (uint64, []byte, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.closed {
-		return 0, nil, ErrMachineClosed
-	}
-	if m.last.Index != 0 {
-		return 0, nil, fmt.Errorf("kv: a snapshot inside a cycle (entries through %d staged)", m.last.Index)
-	}
-	user, err := m.contentsLocked()
+	src, err := m.OpenSnapshot()
 	if err != nil {
 		return 0, nil, err
 	}
-	return m.engine.Index, encodeState(m.engine.Index, m.sessions.limits, user, m.sessions.sessions), nil
+	defer src.Close()
+	var buf bytes.Buffer
+	if _, err := src.WriteTo(&buf); err != nil {
+		return 0, nil, err
+	}
+	return src.Index(), buf.Bytes(), nil
+}
+
+// OpenSnapshot returns the state at the engine's applied index as a snapshot
+// source (raftnode.SnapshotStateMachine, S4, docs/STORAGE_INTEGRATION.md
+// §10.3–§10.4): an engine checkpoint — the engine flushed and pinned at its
+// durable applied index — which WriteTo streams in the snapshot format Store
+// writes, byte for byte, without the state in memory. The driver calls it
+// between cycles, so nothing is staged and the engine's index is the state's.
+//
+// The format's header needs the key count, so opening the source makes one
+// counting pass over the checkpoint, and checks on it that every engine key
+// is a user key or a session record the machine wrote and that the session
+// records are exactly the machine's session table: a checkpoint that is not
+// the machine's state is never published.
+func (m *LSMMachine) OpenSnapshot() (raftnode.SnapshotSource, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return nil, ErrMachineClosed
+	}
+	if m.last.Index != 0 {
+		return nil, fmt.Errorf("kv: a snapshot inside a cycle (entries through %d staged)", m.last.Index)
+	}
+	ck, err := m.db.Checkpoint()
+	if err != nil {
+		return nil, fmt.Errorf("kv: checkpointing the engine: %w", err)
+	}
+	src := &lsmSource{ck: ck, limits: m.sessions.limits}
+	if a := ck.Applied(); a != m.engine {
+		_ = ck.Close()
+		return nil, fmt.Errorf("kv: the engine's checkpoint is at %+v, the machine at %+v", a, m.engine)
+	}
+	it := ck.Iterator()
+	for it.Next() {
+		k := it.Key()
+		switch {
+		case len(k) > 0 && k[0] == tagUser:
+			src.nKeys++
+		default:
+			id, ok := parseSessionKey(k)
+			if !ok {
+				_ = ck.Close()
+				return nil, fmt.Errorf("%w: an engine key %q under no tag the machine writes", ErrSessionRecord, k)
+			}
+			ss, err := decodeSession(id, it.Value(), m.sessions.limits)
+			if err != nil {
+				_ = ck.Close()
+				return nil, err
+			}
+			if !equalSession(ss, m.sessions.sessions[id]) {
+				_ = ck.Close()
+				return nil, fmt.Errorf("kv: the engine's record of session %d is not the machine's", id)
+			}
+			src.nSessions++
+		}
+	}
+	if err := it.Err(); err != nil {
+		_ = ck.Close()
+		return nil, fmt.Errorf("kv: reading the engine's checkpoint: %w", err)
+	}
+	if src.nSessions != uint64(len(m.sessions.sessions)) {
+		_ = ck.Close()
+		return nil, fmt.Errorf("kv: the engine records %d sessions, the machine holds %d", src.nSessions, len(m.sessions.sessions))
+	}
+	return src, nil
+}
+
+// equalSession reports whether two sessions are the same table entry.
+func equalSession(a, b *session) bool {
+	if a == nil || b == nil || a.last != b.last || a.ackedBelow != b.ackedBelow || len(a.results) != len(b.results) {
+		return false
+	}
+	for rid, e := range a.results {
+		if f, ok := b.results[rid]; !ok || f != e {
+			return false
+		}
+	}
+	return true
+}
+
+// lsmSource is the LSM machine's snapshot source: a pinned engine checkpoint
+// and the counts its encoding's header needs.
+type lsmSource struct {
+	ck               *storage.Checkpoint
+	limits           Limits
+	nKeys, nSessions uint64
+}
+
+func (s *lsmSource) Index() uint64 { return s.ck.Applied().Index }
+func (s *lsmSource) Close() error  { return s.ck.Close() }
+
+// WriteTo writes the state in the snapshot format (encodeState's bytes for the
+// same state): the header, every user key in order, then every session in id
+// order — the engine's own key order under the machine's tags.
+func (s *lsmSource) WriteTo(w io.Writer) (int64, error) {
+	var n int64
+	put := func(b []byte) error {
+		k, err := w.Write(b)
+		n += int64(k)
+		return err
+	}
+	b := binary.AppendUvarint(nil, SnapshotVersion)
+	b = binary.AppendUvarint(b, s.Index())
+	b = binary.AppendUvarint(b, uint64(s.limits.MaxSessions))
+	b = binary.AppendUvarint(b, uint64(s.limits.MaxUnacked))
+	b = binary.AppendUvarint(b, s.nKeys)
+	if err := put(b); err != nil {
+		return n, err
+	}
+	var keys, sessions uint64
+	sessionsBegun := false
+	it := s.ck.Iterator()
+	for it.Next() {
+		k, v := it.Key(), it.Value()
+		b = b[:0]
+		if len(k) > 0 && k[0] == tagUser {
+			if sessionsBegun {
+				return n, fmt.Errorf("kv: a user key after the session records in the engine's order")
+			}
+			keys++
+			b = appendBytes(b, k[1:])
+			b = appendBytes(b, v)
+		} else {
+			id, ok := parseSessionKey(k)
+			if !ok {
+				return n, fmt.Errorf("%w: an engine key %q under no tag the machine writes", ErrSessionRecord, k)
+			}
+			ss, err := decodeSession(id, v, s.limits)
+			if err != nil {
+				return n, err
+			}
+			if !sessionsBegun {
+				sessionsBegun = true
+				b = binary.AppendUvarint(b, s.nSessions)
+			}
+			sessions++
+			b = appendSession(b, id, ss)
+		}
+		if err := put(b); err != nil {
+			return n, err
+		}
+	}
+	if err := it.Err(); err != nil {
+		return n, fmt.Errorf("kv: reading the engine's checkpoint: %w", err)
+	}
+	if !sessionsBegun {
+		if err := put(binary.AppendUvarint(b[:0], s.nSessions)); err != nil {
+			return n, err
+		}
+	}
+	if keys != s.nKeys || sessions != s.nSessions {
+		return n, fmt.Errorf("kv: the checkpoint yielded %d keys and %d sessions, counted %d and %d", keys, sessions, s.nKeys, s.nSessions)
+	}
+	return n, nil
 }
 
 // ValidateSnapshot reports whether RestoreSnapshot would accept data as the
-// state at index: Store's rules, and that the state fits one engine apply
-// batch — the one record a restore is (S2; S4's ingest lifts it).
+// state at index: Store's rules (the one decoder, stateReader). Since S4 there
+// is no size bound beyond the snapshot format's: a restore is an ingest, not
+// one WAL record.
 func (m *LSMMachine) ValidateSnapshot(index uint64, data []byte) error {
-	_, err := m.checkSnapshot(index, data)
-	return err
+	return m.ValidateSnapshotFrom(index, bytes.NewReader(data))
 }
 
-func (m *LSMMachine) checkSnapshot(index uint64, data []byte) (*state, error) {
-	st, err := decodeState(data, m.sessions.limits)
+// ValidateSnapshotFrom reads a snapshot's whole state from r, streaming, and
+// reports whether RestoreSnapshotFrom would accept it as the state at index
+// (raftnode.SnapshotStateMachine). It holds one key or session at a time.
+func (m *LSMMachine) ValidateSnapshotFrom(index uint64, r io.Reader) error {
+	sr, err := newStateReader(r, stateSize(r), m.sessions.limits)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if st.applied != index {
-		return nil, fmt.Errorf("%w: state at index %d, snapshot at %d", ErrSnapshotState, st.applied, index)
+	if sr.applied != index {
+		return fmt.Errorf("%w: state at index %d, snapshot at %d", ErrSnapshotState, sr.applied, index)
 	}
-	if n := restoreBatchBytes(st); n > maxRestoreBytes {
-		return nil, fmt.Errorf("%w: a state of about %d bytes exceeds the %d the LSM machine installs as one batch (S2)", ErrSnapshotState, n, maxRestoreBytes)
+	for {
+		if _, _, ok := sr.nextKey(); !ok {
+			break
+		}
 	}
-	return st, nil
+	for {
+		id, ss, ok := sr.nextSession()
+		if !ok {
+			break
+		}
+		if err := m.fitsTheEngine(id, ss); err != nil {
+			return err
+		}
+	}
+	return sr.end()
 }
 
-// maxRestoreBytes is what a restore's batch may encode to: one WAL record,
-// less room for the record's own framing and the estimate's slack.
-const maxRestoreBytes = record.MaxRecordSize - 1<<20
-
-// restoreBatchBytes bounds the batch a state restores as, from above.
-func restoreBatchBytes(st *state) int {
-	n := 64
-	for k, v := range st.m {
-		n += 1 + 10 + 1 + len(k) + 10 + len(v)
+// fitsTheEngine refuses a session whose record would not fit one engine value.
+// The decoder's rules bound a session by the limits, but a group run with a
+// very large MaxUnacked (above ~21,800 at a 1 MiB value limit) can hold a
+// session the engine cannot store: validating it, then failing to restore it at
+// every start, would leave a node that cannot start (S4 review). The in-memory
+// store has no such bound.
+func (m *LSMMachine) fitsTheEngine(id uint64, ss *session) error {
+	if n := sessionRecordLen(ss); n > m.opts.MaxValueSize {
+		return fmt.Errorf("%w: session %d's record is %d bytes, over the engine's %d-byte value limit (MaxUnacked %d is too large for the LSM machine)",
+			ErrSnapshotState, id, n, m.opts.MaxValueSize, m.sessions.limits.MaxUnacked)
 	}
-	for _, ss := range st.sessions {
-		n += 1 + 10 + sessionKeyLen + 10 + 1 + 16 + 10 + len(ss.results)*sessionResultLen
+	return nil
+}
+
+// sessionRecordLen is len(encodeSession(ss)), without encoding it.
+func sessionRecordLen(ss *session) int {
+	return sessionRecordLenOf(len(ss.results))
+}
+
+// sessionRecordLenOf is the length of a session record holding n results.
+func sessionRecordLenOf(n int) int {
+	return 1 + 16 + uvarintLen(uint64(n)) + n*sessionResultLen
+}
+
+// maxSessionRecordLen is the length of the fullest session record limits allow.
+func maxSessionRecordLen(l Limits) int { return sessionRecordLenOf(l.MaxUnacked) }
+
+// maxUnackedFor is the largest MaxUnacked whose fullest session record fits a
+// value of valueLimit bytes.
+func maxUnackedFor(valueLimit int) int {
+	n := (valueLimit - 1 - 16 - binary.MaxVarintLen64) / sessionResultLen
+	for sessionRecordLenOf(n+1) <= valueLimit {
+		n++
 	}
 	return n
 }
 
-// RestoreSnapshot replaces the state with a snapshot's, taken at (index, term)
-// (raftnode.SnapshotStateMachine). If the engine's applied index is at or
-// above index, the engine's state is at least as new, and nothing changes.
-// Otherwise the engine is replaced: closed, its directory removed, opened
-// fresh, and the whole state — every user key, every session record — recorded
-// as ONE apply batch at (index, term). Under R1 that is atomic: after a crash
-// the engine holds the batch whole, or is empty at index 0, below the published
-// snapshot, which the next open restores again.
+// RestoreSnapshot restores data as the state at (index, term): the stream
+// restore over the bytes.
+func (m *LSMMachine) RestoreSnapshot(index, term uint64, data []byte) error {
+	return m.RestoreSnapshotFrom(index, term, bytes.NewReader(data))
+}
+
+// RestoreSnapshotFrom replaces the state with a snapshot's, read from r and
+// taken at (index, term) (raftnode.SnapshotStateMachine, S4,
+// docs/STORAGE_INTEGRATION.md §10.6). If the engine's applied index is at or
+// above index, the engine's state is at least as new, and nothing changes —
+// decided first, before anything is read: at a restart raftnode restores the
+// published snapshot, which for a node's own snapshot the engine already
+// holds (S3).
 //
-// The no-op is decided first, before the state is decoded or measured: at a
-// restart raftnode restores the published snapshot, which for a node's own
-// snapshot the engine already holds (SyncApplied made it durable before the
-// publish), and a state too large to install as one batch must not stop that
-// node from starting (S3 final review).
-//
-// The old engine is renamed aside, the rename made durable, and only then
-// deleted: deleting a directory in place is not atomic, and a crash part-way
-// left an engine the next open refused (a MANIFEST naming a table or a WAL
-// segment that was gone) before the published snapshot could replace it. Set
-// aside, the engine's directory is the whole old engine or absent, and either
-// opens (S3 final review).
-func (m *LSMMachine) RestoreSnapshot(index, term uint64, data []byte) (err error) {
+// Otherwise the engine INGESTS the state: the decoder streams the snapshot's
+// keys and sessions — every rule Store applies, checked as they pass — into
+// new tables, and one MANIFEST edit replaces the engine's whole contents with
+// them at (index, term). Nothing is held in memory beyond one entry, the
+// session table being rebuilt, and the table being written; there is no size
+// bound but the snapshot format's. Before the commit the old engine is intact:
+// a state that does not validate, or a staging failure, changes nothing and
+// the machine stays as it was. After it the engine holds the new state whole.
+// A failure that leaves the commit in doubt latches the engine, and the
+// machine fails stop — closed, every operation ErrMachineClosed, never
+// absence served from an engine whose contents it cannot vouch for (INV-L7) —
+// and the next open reads whichever state is durable, old or new; raftnode
+// restores the published snapshot again if it is the old.
+func (m *LSMMachine) RestoreSnapshotFrom(index, term uint64, r io.Reader) (err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -473,77 +688,82 @@ func (m *LSMMachine) RestoreSnapshot(index, term uint64, data []byte) (err error
 	if m.engine.Index >= index {
 		return nil
 	}
-	st, err := m.checkSnapshot(index, data)
-	if err != nil {
-		return err
-	}
 	if m.last.Index != 0 {
 		return fmt.Errorf("kv: a restore inside a cycle (entries through %d staged)", m.last.Index)
 	}
-	if err := m.db.Close(); err != nil {
-		return fmt.Errorf("kv: closing the engine to restore: %w", err)
+	sr, err := newStateReader(r, stateSize(r), m.sessions.limits)
+	if err != nil {
+		return err
 	}
-	// From here the engine that held the state at m.applied is closed and being
-	// replaced. A failure leaves no engine that holds it — the old one closed or
-	// set aside, the new one empty or partial — so the machine fails stop:
-	// closed, every operation ErrMachineClosed, never absence served from an
-	// engine that lost the data (INV-L7). raftnode stops the node on the error,
-	// and the next start reopens the engine and restores the snapshot again.
-	defer func() {
-		if err != nil {
+	if sr.applied != index {
+		return fmt.Errorf("%w: state at index %d, snapshot at %d", ErrSnapshotState, sr.applied, index)
+	}
+	src := &restoreSource{sr: sr, sessions: map[uint64]*session{}, fits: m.fitsTheEngine}
+	applied := storage.AppliedIndex{Index: index, Term: term}
+	if _, err := m.db.Ingest(src, applied); err != nil {
+		if m.db.Latched() != nil {
 			_ = m.db.Close()
 			m.closed = true
 		}
-	}()
-	aside := asidePath(m.dir)
-	if err := removeAll(aside); err != nil {
-		return fmt.Errorf("kv: removing an engine an earlier restore set aside: %w", err)
+		return fmt.Errorf("kv: restoring the snapshot at %d: %w", index, err)
 	}
-	if err := os.Rename(m.dir, aside); err != nil {
-		return fmt.Errorf("kv: setting the engine aside to restore: %w", err)
-	}
-	if err := (vfs.OS{}).SyncDir(filepath.Dir(filepath.Clean(m.dir))); err != nil {
-		return fmt.Errorf("kv: syncing the engine's parent after setting it aside: %w", err)
-	}
-	if err := removeAll(aside); err != nil {
-		return fmt.Errorf("kv: removing the engine set aside to restore: %w", err)
-	}
-	db, err := storage.OpenLSMStore(m.dir, m.opts)
-	if err != nil {
-		return fmt.Errorf("kv: reopening the engine to restore: %w", err)
-	}
-	m.db = db
-	keys := make([]string, 0, len(st.m))
-	for k := range st.m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	muts := make([]storage.Mutation, 0, len(keys)+len(st.sessions))
-	for _, k := range keys {
-		muts = append(muts, storage.Mutation{Kind: storage.MutationPut, Key: userKey([]byte(k)), Value: st.m[k]})
-	}
-	ids := make([]uint64, 0, len(st.sessions))
-	for id := range st.sessions {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	for _, id := range ids {
-		muts = append(muts, storage.Mutation{Kind: storage.MutationPut, Key: sessionKey(id), Value: encodeSession(st.sessions[id])})
-	}
-	applied := storage.AppliedIndex{Index: index, Term: term}
-	if err := db.Apply(context.Background(), muts, applied); err != nil {
-		return fmt.Errorf("kv: recording the restored state at %d: %w", index, err)
-	}
-	// The new directory's entry replaces the old one's in the parent; a
-	// restored state the engine fsynced is not durable until that is.
-	if err := (vfs.OS{}).SyncDir(filepath.Dir(filepath.Clean(m.dir))); err != nil {
-		return fmt.Errorf("kv: syncing the engine's parent after a restore: %w", err)
-	}
-	m.sessions.sessions, m.sessions.stats = st.sessions, ApplyStats{}
+	m.sessions.sessions, m.sessions.stats = src.sessions, ApplyStats{}
 	m.engine, m.applied = applied, index
 	m.resetCycle()
 	return nil
 }
+
+// restoreSource is a snapshot's state as engine entries, in the engine's key
+// order: each user key under its tag, then each session's record. It keeps the
+// sessions it passes — the machine's new session table.
+type restoreSource struct {
+	sr       *stateReader
+	fits     func(uint64, *session) error
+	sessions map[uint64]*session
+	key, val []byte
+	inUsers  bool
+	started  bool
+	err      error
+}
+
+func (s *restoreSource) Next() bool {
+	if s.err != nil {
+		return false
+	}
+	if !s.started {
+		s.started, s.inUsers = true, true
+	}
+	if s.inUsers {
+		if k, v, ok := s.sr.nextKey(); ok {
+			s.key = append(append(s.key[:0], tagUser), k...)
+			s.val = v
+			return true
+		}
+		if s.sr.err != nil {
+			s.err = s.sr.err
+			return false
+		}
+		s.inUsers = false
+	}
+	if id, ss, ok := s.sr.nextSession(); ok {
+		if err := s.fits(id, ss); err != nil {
+			s.err = err
+			return false
+		}
+		s.sessions[id] = ss
+		s.key = sessionKey(id)
+		s.val = encodeSession(ss)
+		return true
+	}
+	// The end: nothing may follow the last session, and the stream must report
+	// its own end — for a snapshot file, its checksum and footer proven.
+	s.err = s.sr.end()
+	return false
+}
+
+func (s *restoreSource) Key() []byte   { return s.key }
+func (s *restoreSource) Value() []byte { return s.val }
+func (s *restoreSource) Err() error    { return s.err }
 
 // asidePath is where RestoreSnapshot sets the old engine aside before deleting
 // it: a sibling of the engine's directory, so the rename never crosses a

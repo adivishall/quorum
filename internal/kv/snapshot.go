@@ -5,7 +5,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
+
+	"github.com/adivishall/quorum/internal/raftnode"
 )
 
 // The key-value store's snapshot state (Phase 14, docs/SNAPSHOTS.md §2–§3): the
@@ -40,6 +43,39 @@ func (s *Store) EncodeSnapshot() (index uint64, data []byte, err error) {
 	return s.applied, encodeState(s.applied, s.sessions.limits, s.m, s.sessions.sessions), nil
 }
 
+var _ raftnode.SnapshotStateMachine = (*Store)(nil)
+
+// OpenSnapshot returns the store's state at its applied index as a snapshot
+// source (raftnode.SnapshotStateMachine, S4): its encoding, in memory — the
+// in-memory store holds its state there anyway.
+func (s *Store) OpenSnapshot() (raftnode.SnapshotSource, error) {
+	index, data, err := s.EncodeSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	return raftnode.BytesSource(index, data), nil
+}
+
+// ValidateSnapshotFrom reads a snapshot's whole state and validates it as
+// ValidateSnapshot does (raftnode.SnapshotStateMachine).
+func (s *Store) ValidateSnapshotFrom(index uint64, r io.Reader) error {
+	data, err := raftnode.ReadState(r)
+	if err != nil {
+		return err
+	}
+	return s.ValidateSnapshot(index, data)
+}
+
+// RestoreSnapshotFrom reads a snapshot's whole state and restores it as
+// RestoreSnapshot does (raftnode.SnapshotStateMachine).
+func (s *Store) RestoreSnapshotFrom(index, term uint64, r io.Reader) error {
+	data, err := raftnode.ReadState(r)
+	if err != nil {
+		return err
+	}
+	return s.RestoreSnapshot(index, term, data)
+}
+
 // encodeState renders a state — the map, the session table, the applied index
 // and the limits — in the snapshot format. Both machines encode through it.
 func encodeState(applied uint64, l Limits, m map[string][]byte, sessions map[uint64]*session) []byte {
@@ -70,22 +106,7 @@ func appendSessions(b []byte, sessions map[uint64]*session) []byte {
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	b = binary.AppendUvarint(b, uint64(len(ids)))
 	for _, id := range ids {
-		ss := sessions[id]
-		b = binary.AppendUvarint(b, id)
-		b = binary.AppendUvarint(b, ss.last)
-		b = binary.AppendUvarint(b, ss.ackedBelow)
-		rids := make([]uint64, 0, len(ss.results))
-		for rid := range ss.results {
-			rids = append(rids, rid)
-		}
-		sort.Slice(rids, func(i, j int) bool { return rids[i] < rids[j] })
-		b = binary.AppendUvarint(b, uint64(len(rids)))
-		for _, rid := range rids {
-			e := ss.results[rid]
-			b = binary.AppendUvarint(b, rid)
-			b = binary.AppendUvarint(b, e.index)
-			b = append(b, e.fp[:]...)
-		}
+		b = appendSession(b, id, sessions[id])
 	}
 	return b
 }
@@ -140,107 +161,9 @@ type state struct {
 	sessions map[uint64]*session
 }
 
-// decodeState decodes and validates snapshot state built under limits l.
+// decodeState decodes and validates snapshot state built under limits l. It is
+// the streaming decoder (stateReader, S4) over the bytes: one set of rules,
+// whichever way a state arrives.
 func decodeState(data []byte, l Limits) (*state, error) {
-	d := decoder{b: data}
-	bad := func(format string, args ...any) error {
-		return fmt.Errorf("%w: %s", ErrSnapshotState, fmt.Sprintf(format, args...))
-	}
-	if v := d.uint(); d.err == nil && v != SnapshotVersion {
-		return nil, bad("version %d (this build reads %d)", v, SnapshotVersion)
-	}
-	st := &state{applied: d.uint(), m: map[string][]byte{}, sessions: map[uint64]*session{}}
-	maxS, maxU := d.uint(), d.uint()
-	if d.err == nil && (maxS != uint64(l.MaxSessions) || maxU != uint64(l.MaxUnacked)) {
-		return nil, bad("built under limits %d sessions x %d results; this store runs %d x %d", maxS, maxU, l.MaxSessions, l.MaxUnacked)
-	}
-	nKeys := d.uint()
-	if d.err == nil && nKeys > uint64(len(data)) {
-		return nil, bad("%d keys in %d bytes", nKeys, len(data))
-	}
-	var prev []byte
-	for i := uint64(0); i < nKeys && d.err == nil; i++ {
-		k := d.bytes(MaxKeyLen)
-		v := d.bytes(MaxValueLen)
-		if d.err != nil {
-			break
-		}
-		if len(k) == 0 {
-			return nil, bad("an empty key")
-		}
-		if i > 0 && bytes.Compare(prev, k) >= 0 {
-			return nil, bad("keys not strictly ascending at %q", k)
-		}
-		prev = k
-		st.m[string(k)] = append([]byte{}, v...) // a present empty value stays present
-	}
-	nSessions := d.uint()
-	if d.err == nil && nSessions > uint64(l.MaxSessions) {
-		return nil, bad("%d sessions, limit %d", nSessions, l.MaxSessions)
-	}
-	lasts := map[uint64]bool{}
-	var prevID uint64
-	for i := uint64(0); i < nSessions && d.err == nil; i++ {
-		id, last, acked, nRes := d.uint(), d.uint(), d.uint(), d.uint()
-		if d.err != nil {
-			break
-		}
-		switch {
-		case id == 0 || id > st.applied:
-			return nil, bad("session id %d outside [1, %d]", id, st.applied)
-		case i > 0 && id <= prevID:
-			return nil, bad("session ids not strictly ascending at %d", id)
-		case last < id || last > st.applied:
-			return nil, bad("session %d last command %d outside [%d, %d]", id, last, id, st.applied)
-		case lasts[last]:
-			return nil, bad("two sessions last touched at index %d", last)
-		case acked == 0:
-			return nil, bad("session %d has watermark 0", id)
-		case nRes > uint64(l.MaxUnacked):
-			return nil, bad("session %d holds %d results, limit %d", id, nRes, l.MaxUnacked)
-		}
-		prevID = id
-		lasts[last] = true
-		ss := &session{last: last, ackedBelow: acked, results: map[uint64]execution{}}
-		var prevRID uint64
-		for j := uint64(0); j < nRes && d.err == nil; j++ {
-			rid, idx := d.uint(), d.uint()
-			fp := d.fixed(32)
-			if d.err != nil {
-				break
-			}
-			switch {
-			case rid < acked:
-				return nil, bad("session %d remembers request %d below its watermark %d", id, rid, acked)
-			case j > 0 && rid <= prevRID:
-				return nil, bad("session %d request ids not strictly ascending at %d", id, rid)
-			case idx <= id || idx > last:
-				return nil, bad("session %d request %d executed at %d, outside (%d, %d]", id, rid, idx, id, last)
-			}
-			prevRID = rid
-			var e execution
-			copy(e.fp[:], fp)
-			e.index = idx
-			ss.results[rid] = e
-		}
-		st.sessions[id] = ss
-	}
-	if err := d.done(); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrSnapshotState, err)
-	}
-	return st, nil
-}
-
-// fixed reads exactly n bytes.
-func (d *decoder) fixed(n int) []byte {
-	if d.err != nil {
-		return nil
-	}
-	if len(d.b)-d.i < n {
-		d.err = fmt.Errorf("%w: truncated", ErrProtocol)
-		return nil
-	}
-	out := d.b[d.i : d.i+n]
-	d.i += n
-	return out
+	return readState(bytes.NewReader(data), uint64(len(data)), l)
 }

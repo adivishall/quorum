@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/adivishall/quorum/internal/vfs"
 )
 
 // TestANewEngineDirectoryIsSyncedIntoItsParent: a store that creates its
@@ -18,11 +20,11 @@ func TestANewEngineDirectoryIsSyncedIntoItsParent(t *testing.T) {
 		synced []string
 	)
 	prev := syncDir
-	syncDir = func(dir string) error {
+	syncDir = func(fsys vfs.FS, dir string) error {
 		mu.Lock()
 		synced = append(synced, dir)
 		mu.Unlock()
-		return prev(dir)
+		return prev(fsys, dir)
 	}
 	t.Cleanup(func() { syncDir = prev })
 
