@@ -1,5 +1,7 @@
 # Quorum
 
+[![CI](https://github.com/adivishall/quorum/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/adivishall/quorum/actions/workflows/ci.yml?query=branch%3Amain)
+
 A distributed key-value database built from scratch in Go.
 
 No Raft library, no embedded database, no consensus service — the storage engine and the
@@ -8,104 +10,95 @@ consensus implementation are the project, and they were built in that order.
 **Thesis.** Quorum is a correctness-first distributed key-value database built from scratch.
 Consensus, durability, failure handling and client semantics are implemented independently and
 then connected. The defining engineering problem is integrating the durable LSM engine with the
-replicated state machine without weakening the guarantees already proven.
+replicated state machine without weakening the guarantees the tests already establish.
 
 | Layer | State |
 |---|---|
-| 1. Correctness foundation: Raft, crash recovery, linearizability, sessions, snapshots, membership, Multi-Raft | built, and verified by simulation, crash matrices, recorded histories, real-process chaos, mutation and fuzzing |
-| 2. Durable storage integration: the LSM engine as the replicated state machine | **S1, S2 and S3 of six done:** `dkvd -state-machine lsm` runs each group's state machine on the engine, one apply batch per Raft cycle, recovering from the engine's applied index; the applied index and last sequence are authoritative in the MANIFEST, the WAL is truncated behind each flush, and the Raft log is never compacted past the engine's durable applied index (R2). Every correctness tier passes on both machines. Memory is still the default; engine-backed snapshots (S4) are next. Design and status: [`docs/STORAGE_INTEGRATION.md`](docs/STORAGE_INTEGRATION.md) |
+| 1. Correctness foundation: Raft, crash recovery, linearizability, sessions, snapshots, membership, Multi-Raft | built, and checked by simulation, crash matrices, recorded histories, real-process chaos, mutation and fuzzing |
+| 2. Durable storage integration: the LSM engine as the replicated state machine | **S1, S2 and S3 of six done:** `dkvd -state-machine lsm` runs each group's state machine on the engine, one apply batch per Raft cycle, recovering from the engine's applied index; the applied index and last sequence are authoritative in the MANIFEST, the WAL is truncated behind each flush, and the Raft log is never compacted past the engine's durable applied index (R2). The in-process and real-process tiers pass on both machines; the deterministic simulator and its crash matrices run the in-memory machine. Memory is still the default; engine-backed snapshots (S4) are in review ([#27](https://github.com/adivishall/quorum/pull/27)). Design and status: [`docs/STORAGE_INTEGRATION.md`](docs/STORAGE_INTEGRATION.md) |
 | 3. Distributed performance | baseline measured ([`docs/CLUSTER_BENCHMARKS.md`](docs/CLUSTER_BENCHMARKS.md)); nothing optimized yet |
 | 4. Operational and demo surface | `dkvctl`, health and readiness, chaos and load labs; the rest waits for layers 2 and 3 |
 
 A lower layer comes first ([`docs/ENGINEERING_ROADMAP.md`](docs/ENGINEERING_ROADMAP.md) §0).
 
-> **Status: Phase 16 of 25, with Phase 19's load generator and first cluster baseline — durable single-node LSM engine, a routing library, real node processes on a TCP transport, a local replicated-log model, a working Raft consensus core, deterministic fault injection, a proven crash-recovery model for the Raft node, client-visible linearizability of single-key operations per Raft group, safe client retries (request identity, deduplication at apply and request forwarding), snapshots with log compaction and follower installation, dynamic membership by joint consensus with one Raft group per shard, checked on real client histories; metrics from every layer, a load generator for real clusters, and reproducible cluster experiments with a measured performance report; real-process chaos under a recorded, linearizability-checked workload, and an operator tool with health and readiness.**
->
-> **Implemented:** a write-ahead log, an ordered memtable, immutable on-disk SSTables, Bloom
-> filters, size-tiered compaction, crash-safe MANIFEST-based file publication, and restart
-> recovery across all of it. Acknowledged writes survive the process being killed, including a
-> kill during a flush and a kill during a compaction. A pure consistent-hash routing library
-> (`internal/routing`): `key → shard` and `shard → replica group` metadata, with a ring
-> visualization (`cmd/dkvring`). Phase 7 added real node processes (`cmd/dkvd`) and an internal
-> TCP transport (`internal/transport`): checksummed framing, a version handshake, one
-> bidirectional connection per peer pair, and `Probe`/`ProbeResponse` liveness — proven by three
-> real processes exchanging probes over TCP and shutting down cleanly. Phase 8 adds a **local
-> replicated-log model** (`internal/replication`): an immutable `ReplicaGroup` consumed from the
-> routing metadata, and a small `Log` interface (with an in-memory `MemoryLog`) that Raft drives —
-> 1-based contiguous indexes, deterministic conflicting-suffix replacement that cannot overwrite a
-> committed entry, and monotonic commit/apply bookkeeping. Phase 9 adds **Raft**
-> (`internal/raft`, `internal/raftlog`, `internal/raftnode`): a pure deterministic consensus core
-> (elections, RequestVote, AppendEntries with a term-based conflict hint, the §5.4.2 commit rule,
-> the mandatory election no-op), a durable Raft log + HardState, and a node driver that runs a real
-> group over TCP. Its safety properties (INV-R1..R10) are verified in a deterministic simulation,
-> and durable state survives a real SIGKILL — proven by a 3-process election and a crash-recovery
-> test. Phase 10 adds **fault injection** (`internal/fault`, `internal/raftsim`): a deterministic,
-> seed-replayable simulator that drives the real Raft core, durable log and driver ordering through
-> dropped, duplicated, delayed and reordered messages, partitions, process crashes, a modeled power
-> loss, restarts, pauses and disk failures, checking every safety invariant after every event —
-> plus real-driver and real-process fault tests (SIGKILL, SIGSTOP, TCP-level partitions). It found
-> and fixed three real bugs, including one that let a restarted node acknowledge entries a power
-> loss could still erase. Phase 11 adds the **crash-recovery model** (`docs/CRASH_RECOVERY.md`):
-> named crash points at every boundary of the node's persist → send → advance → apply cycle and
-> between the record writes of one durable-log Save; a bounded exhaustive matrix that kills a node
-> at every point a scenario reaches, in every crash mode, and checks each recovery against an
-> independent record of what was persisted; seeded crash schedules; in-process and real-process
-> (`dkvd -crash-at`, a real SIGKILL at the exact point) crash tests. It found and fixed a window
-> that made a node unable to restart, and pins application as at-least-once across restarts.
-> Phase 12 adds **client-visible linearizability** (`docs/LINEARIZABILITY.md`): a replicated
-> in-memory key-value state machine (`internal/kv`), ReadIndex reads in the pure core, writes
-> acknowledged only when committed and applied in their proposal's term, a minimal test-facing
-> PUT/GET/DELETE protocol (`dkvd -client-listen`), and a linearizability checker
-> (`internal/lincheck`, `cmd/lincheck`) — validated first against an independent oracle, a
-> known-good/known-bad corpus and fuzzing — that checks client histories recorded from real
-> processes (concurrent clients, leader and follower SIGKILL, partitions, a minority leader that
-> still has a follower, a SIGKILL at every point of a write's life), the real driver, and 1,400
-> seeded simulator runs. 27 mutants of ReadIndex, write completion, the client and the checker
-> are killed.
-> Phase 13 makes **retries safe** (`docs/CLIENT_SEMANTICS.md`, `docs/DEDUP.md`, `docs/API.md`): a
-> client registers a session (its ClientID is the log index of the REGISTER entry) and numbers its
-> requests; the replicated state machine decides at apply — identically on every replica, from a
-> bounded session table rebuilt by replay — whether an entry executes or is a duplicate of an earlier
-> one (answered with the original's index), a conflicting reuse, or from an expired session; a
-> non-leader forwards a request one hop to the leader; a session client retries every unknown
-> outcome under the same identity. A request's sends are checked as ONE logical operation: the
-> hardest case (committed, reply lost, new leader, another write, retry) at all eight crash windows
-> of a real process, forwarders killed before relaying, concurrent copies through every node, a
-> full-cluster restart, and 1,200 more seeded simulator runs in which every replica's every
-> apply-time decision matches an independent model. 32 more mutants are killed.
-> Phase 14 adds **snapshots and log compaction** (`docs/SNAPSHOTS.md`): the replicated state —
-> key-value map and session table — in a versioned, checksummed, deterministic snapshot file,
-> published by atomic rename before the log is compacted behind it by an atomic rewrite; a follower
-> whose needed entries are gone catches up by installing the leader's snapshot, streamed in chunks
-> over the transport's InstallSnapshot kind; recovery reconciles the snapshot with the log and
-> refuses every contradiction. A 2,976-crash matrix over every snapshot window (0 failures), seeded
-> snapshot fault schedules, and ten real-process tests — including a SIGKILL after publication and
-> mid-install, and a retry whose entry was compacted away on every node answered as a duplicate.
-> 100,000 writes: a restart replays 1 entry instead of 100,001. 32 more mutants are killed; the
-> 200-seed schedules found a latent core liveness bug that compaction made reachable (a stale
-> rejection stranding a follower), now fixed.
-> Phase 15 adds **dynamic membership and multi-Raft** (`docs/MEMBERSHIP.md`, `docs/MULTI_RAFT.md`):
-> a group adds a learner, promotes it and removes voters — the leader included — one member at a
-> time by Raft §6 joint consensus, with the configuration as replicated state carried by the log
-> and the snapshot; a node hosts one Raft group per shard it serves, each with its own log,
-> snapshot, identity file and state machine, every frame tagged with its group; clients are routed
-> key → shard → group with one session per group. Checked by the membership invariants at every
-> event of 200-seed schedules, a bounded model of every four-step sequence, a 6,660-crash
-> membership matrix (0 failures) and ten real-process tests. 34 more mutants are killed; the
-> schedules found a vote deadlock and a removal that could never finish, now fixed.
->
-> **What that claim is, exactly:** single-key PUT/GET/DELETE, each in its key's Raft group; every
-> recorded finite history linearizable per group, plus an argument with named assumptions — not a
-> proof over every execution; retries are inside the claim for identified writes (at most one
-> execution per request — exactly one if it executes; not exactly-once delivery), and anonymous
-> writes keep Phase 12's semantics. Nothing is claimed across groups. **Not implemented:** the
-> HTTP API, rebalancing or moving shards between groups, a dashboard, the LSM engine as the
-> replicated state machine. See
-> [docs/ROADMAP.md](docs/ROADMAP.md) for exactly what is done and what is not.
->
-> The binary is still called `dkv`; that is the command name, not the project name.
+## Status on `main`
+
+| | |
+|---|---|
+| **Works today** | Raft groups over the project's own TCP transport, one group per shard (`dkvd -cluster`): elections, ReadIndex reads, joint-consensus membership with learners, snapshots and InstallSnapshot; client sessions with deduplication at apply and one-hop forwarding; per-node metrics, `dkvctl` health and readiness, a load generator and a chaos lab |
+| **Opt-in** | `-state-machine lsm`: each group's state machine in the LSM engine — one atomic apply batch per Raft cycle, the applied index authoritative in the MANIFEST, the WAL truncated behind each flush, Raft log compaction clamped to the engine's durable applied index (S1–S3). Memory is still the default |
+| **In review** | S4: engine checkpoints and streamed snapshot installation ([#27](https://github.com/adivishall/quorum/pull/27)) |
+| **Not built** | an HTTP API, a networked `dkv` client, rebalancing, a dashboard, a Docker demo, PreVote/CheckQuorum, TLS and authentication |
+| **The claim** | Single-key PUT/GET/DELETE are linearizable per Raft group on every recorded history checked, with retries inside the claim for identified writes (at most one execution per request). Tested, not proven; nothing is claimed across groups ([docs/CONSISTENCY.md](docs/CONSISTENCY.md), [docs/LINEARIZABILITY.md](docs/LINEARIZABILITY.md)) |
+
+What each phase built, and what it found and fixed: [docs/ROADMAP.md](docs/ROADMAP.md).
+The binary is still called `dkv`; that is the command name, not the project name.
+
+## How correctness is checked
+
+| Tier | What runs | Faults | CI job |
+|---|---|---|---|
+| Deterministic simulation | the real Raft core, durable log and driver ordering in one goroutine, replayable from a seed, every safety invariant checked after every event; bounded exhaustive crash matrices of 1,440, 2,976 and 6,660 crashes with 0 failures ([docs/CRASH_RECOVERY.md](docs/CRASH_RECOVERY.md)) | dropped, duplicated, delayed and reordered messages, partitions, process crash, modeled power loss and torn power loss, disk failures | `check`, `faults` (200 seeds) |
+| Real processes | race-built `dkvd` processes on localhost; client histories recorded under faults and checked by the project's linearizability checker | `SIGKILL` (including at named crash points, `dkvd -crash-at`), `SIGSTOP`, partitions through TCP proxies | `integration`, `integration-lsm` (89 tests each) |
+| Storage engine | real `SIGKILL` mid-flush and mid-compaction; WAL and MANIFEST write and fsync order checked against a software power-loss model (`fault.MemFS`) | a crash at every write and fsync point | `check`, `integration` |
+| The checker itself | agreement with an independent oracle on 20,000 random small histories, a known-good/known-bad corpus, fuzzing | — | `check`, `fuzz` |
+| Mutation and fuzzing | 373 rule-violating edits, each of which its named test must catch; 35 fuzz targets | — | `mutation`, `fuzz` |
+
+**Not tested:** power loss on a real device, and the LSM-backed state machine inside the
+deterministic simulator, which runs the in-memory machine. Everything else the system does not
+do or has not shown is in [docs/LIMITATIONS.md](docs/LIMITATIONS.md).
 
 ---
+
+## Quickstart
+
+Requires Go 1.27.2+ (the patch release `go.mod` pins; with the default `GOTOOLCHAIN=auto` an older Go 1.27 fetches it).
+No other dependencies.
+
+**One seeded chaos run against real processes.** `dkvlab` builds `dkvd`, starts a cluster on
+localhost, applies a fault schedule drawn from the seed (kills, pauses, crashes at driver points,
+snapshots, membership changes) under a recorded client workload, and checks the history for
+linearizability. It takes about 30 seconds on an M4 laptop:
+
+```bash
+go run ./cmd/dkvlab -scenario chaos -seed 1 -runs 1
+```
+
+A cluster by hand: the `dkvd -cluster` example in [What exists today](#what-exists-today), then
+`dkvctl health` ([docs/OPERATIONS.md](docs/OPERATIONS.md)). The full test tiers are under
+[Development](#development).
+
+**The single-node CLI.** `dkv` is the Phase 1 store: in memory, one process, no cluster.
+
+```bash
+make build
+./bin/dkv shell
+```
+
+```
+dkv> put user:123 Adi
+OK
+dkv> get user:123
+Adi
+dkv> delete user:123
+OK
+dkv> get user:123
+(not found)
+dkv> exit
+```
+
+One-shot form, with exit codes a script can branch on
+(`0` ok, `1` not found, `2` usage, `3` invalid input, `4` internal):
+
+```bash
+./bin/dkv put user:123 Adi
+./bin/dkv get user:123
+./bin/dkv delete user:123
+```
+
+**The CLI is in-memory**: each invocation gets a fresh store, so state does not survive
+process exit. The CLI says so on every mutating command. The storage layer is durable; the
+CLI is not wired to it yet (the API + CLI phase is not scheduled, `docs/ROADMAP.md`). Full CLI contract: [docs/CLI.md](docs/CLI.md).
 
 ## What it is meant to do
 
@@ -115,9 +108,10 @@ replicated, when it is committed, and where the bytes physically land.
 
 ```
 client ─▶ framed TCP protocol ─▶ front: key → shard → group ─▶ group leader ─▶ Raft log (fsync)
-                                                                   └─▶ in-memory kv state machine
-LSM engine (WAL · memtable · SSTables · compaction): durable and crash-tested, but standalone —
-no node uses it yet; hosting the replicated state machine on it is on the roadmap
+                                                                   └─▶ state machine: in memory (default)
+                                                                       or the LSM engine (-state-machine lsm)
+LSM engine (WAL · memtable · SSTables · compaction): durable and crash-tested on its own, and since
+S2–S3 able to host each group's state machine; engine-backed snapshots (S4) are in review
 ```
 
 ## What exists today
@@ -218,7 +212,7 @@ The details, including what every crash window leaves on disk: [docs/LSM.md](doc
 Alongside the engine, Phase 6 adds a pure routing library: a key is hashed (SHA-256, first 8
 bytes, big-endian) to a 64-bit token, a consistent-hash ring of the fixed shard set maps that
 token to a shard, and a second ring of the node set assigns each shard an ordered replica
-group — declarative metadata only, because replication and consensus are later phases. A
+group — declarative metadata only, because replication and consensus came in later phases. A
 one-node membership change moves ≈ 1/N of the key space instead of reshuffling it. `dkvring`
 renders the ring (`-format svg|text`) deterministically. The algorithm, golden vectors, and
 the explicit list of what it does *not* do: [docs/ROUTING.md](docs/ROUTING.md).
@@ -253,7 +247,7 @@ apply path. `internal/raftlog` makes its log and HardState durable in the shared
 (a torn tail truncates; any other damage refuses to open). `internal/raftnode` is the driver that
 persists before it replies, sends over the transport, ticks, and applies. A whole simulated
 cluster runs in one goroutine, replayable from a seed, so the paper's figures (including Figure 8)
-are deterministic tests and the safety invariants are checked after every step. What Phase 9 proves
+are deterministic tests and the safety invariants are checked after every step. What Phase 9 establishes
 and — as carefully — what it does not: [docs/RAFT.md](docs/RAFT.md). Run a real 3-node group with
 `dkvd -raft`, or, since Phase 15, one group per shard with `dkvd -cluster` (identical `-shards`,
 `-rf` and `-nodes` on every node) and change a group's members through its JSON-line admin port.
@@ -287,7 +281,7 @@ the real durable log, and the driver's own persist-then-send and recovery functi
 single-goroutine cluster whose every run is a pure function of a seed or a script: traced, hashed,
 replayable, and shrinkable to a minimal failing schedule. Real processes are killed, frozen and
 partitioned through TCP proxies. Persistence failure is fail-stop (`dkvd` exits 1). The fault
-model, what each tier proves, the bugs it found, and what stays untested (real power loss above
+model, what each tier shows, the bugs it found, and what stays untested (real power loss above
 all): [docs/FAULTS.md](docs/FAULTS.md).
 
 ## The one thing this project refuses to do
@@ -303,40 +297,6 @@ Claim a guarantee it has not verified. Specifically:
 - The things it cannot do are enumerated in [docs/LIMITATIONS.md](docs/LIMITATIONS.md) —
   including the ones that are inherent (no Byzantine tolerance, no liveness under full
   asynchrony) and the ones that are a choice (no rebalancing, no transactions).
-
-## Quickstart
-
-Requires Go 1.27.2+ (the patch release `go.mod` pins; with the default `GOTOOLCHAIN=auto` an older Go 1.27 fetches it).
-
-```bash
-make build
-./bin/dkv shell
-```
-
-```
-dkv> put user:123 Adi
-OK
-dkv> get user:123
-Adi
-dkv> delete user:123
-OK
-dkv> get user:123
-(not found)
-dkv> exit
-```
-
-One-shot form, with exit codes a script can branch on
-(`0` ok, `1` not found, `2` usage, `3` invalid input, `4` internal):
-
-```bash
-./bin/dkv put user:123 Adi
-./bin/dkv get user:123
-./bin/dkv delete user:123
-```
-
-**The CLI is in-memory**: each invocation gets a fresh store, so state does not survive
-process exit. The CLI says so on every mutating command. The storage layer is durable; the
-CLI is not wired to it yet (the API + CLI phase is not scheduled, `docs/ROADMAP.md`). Full CLI contract: [docs/CLI.md](docs/CLI.md).
 
 ## Durability, stated exactly
 
@@ -356,21 +316,19 @@ The row that teaches the most is the first one. `sync=off` loses nothing on SIGK
 **Process death is not power loss**, and no test here proves power-loss durability for any
 mode. `docs/WAL.md` §9 spells out what was and was not established.
 
-Cost of each mode, an early development measurement on an Apple M4 (100-byte values, indicative
-only — `docs/BENCHMARKS.md` §3.6 has the Phase 5 numbers with methodology and variance):
+Cost of each mode on one Apple M4 laptop (`docs/BENCHMARKS.md` §3.6: 2,000 sequential 100-byte
+puts, medians over repeated runs; the `batch` arm uses a reduced 16 KiB sync threshold so that it
+actually syncs inside the timed interval):
 
-| Mode | ns/append | approx. appends/s |
-|---|---|---|
-| `off` | 3,879 | 258,000 |
-| `batch` | 5,456 | 183,000 |
-| `sync` | 3,870,493 | 258 |
+| Mode | appends/s (median) | p99 | fsyncs per 2,000 appends |
+|---|---|---|---|
+| `off` | 539,029 | 4.2 µs | 0 |
+| `batch` | 25,879 | 57.9 µs | 15 |
+| `sync` | 239 | 6.54 ms | 2,000 |
 
-A device-level flush per write costs roughly **700×**. That is the honest price of power-loss
-durability, and it is why `batch` is the default.
-
-> **The CLI is not wired to a data directory yet** — it still constructs an in-memory store,
-> so `dkv` remains ephemeral even though the storage layer is not. That wiring belongs to
-> the API + CLI phase, which is not scheduled.
+A device-level flush on every append costs more than three orders of magnitude in throughput on
+this machine. That is the honest price of power-loss durability, and it is why `batch` is the
+default.
 
 ### The storage engine, stated exactly
 
@@ -390,9 +348,9 @@ What is **not** claimed:
 
 | | |
 |---|---|
-| Power-loss durability | Untested in every mode, for the WAL and now the MANIFEST alike. The crash tests destroy a process, which proves the bytes reached the kernel, not the platter. |
+| Power-loss durability | Untested on a real device in every mode, for the WAL and the MANIFEST alike. The crash tests destroy a process, which shows the bytes reached the kernel, not the platter. Since S1 the WAL and MANIFEST write and fsync order is checked against a software power-loss model (`fault.MemFS`) — evidence about the code, not about a disk. |
 | Performance | Reproducible measurements now live in `docs/BENCHMARKS.md` (harness: `internal/bench`, `cmd/dkvbench`). They are a single-machine reference point, not a guarantee or a ceiling. The scattered development numbers below and in `docs/BLOOM.md`, `docs/COMPACTION.md` and `docs/MANIFEST.md` predate that document and are indicative only. |
-| WAL truncation | The log is still never truncated, so startup replays every mutation ever written even though compaction absorbed most of them. The MANIFEST records `SetLogNumber` and does not act on it. |
+| WAL growth | Since S3 every flush records a log number and deletes the WAL segments below it, so startup replays only the unflushed tail; between flushes the active segment still grows ([docs/STORAGE_INTEGRATION.md](docs/STORAGE_INTEGRATION.md) §9). |
 | Startup corruption detection | Startup no longer reads every data block, so damage inside one is found at the read that needs it rather than at open. It is still found, and still reported as corruption rather than as a missing key. `VerifySSTablesOnOpen` restores the old behaviour. |
 
 ### What Bloom filters and compaction actually bought
@@ -436,7 +394,7 @@ it is being answered out of memory.
 
 | Document | What it covers |
 |---|---|
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Layers, ownership boundaries, shard model, concurrency model, request lifecycle |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | The original specification — layers, ownership boundaries, shard model, concurrency model, request lifecycle. Design intent, not a description: parts of it, such as the HTTP API, are not built |
 | [DESIGN.md](docs/DESIGN.md) | On-disk formats, record framing, SSTable layout, Raft state transitions, wire protocol, recovery sequence |
 | [CONSISTENCY.md](docs/CONSISTENCY.md) | The consistency model, its conditions, what is explicitly not claimed, how it gets verified |
 | [FAILURE_MODEL.md](docs/FAILURE_MODEL.md) | Crash/network/clock/disk assumptions and the fault-injection matrix |
@@ -453,7 +411,7 @@ it is being answered out of memory.
 | [ROUTING.md](docs/ROUTING.md) | The token rule, the two consistent-hash rings, ownership/wrap/collision rules, redistribution numbers, the visualization, and what Phase 6 is not |
 | [TRANSPORT.md](docs/TRANSPORT.md) | Framing, handshake, message kinds, sizes, codec, connection model, timeouts, shutdown, ordering semantics, failure behavior, and what Phase 7 is not |
 | [REPLICATION.md](docs/REPLICATION.md) | The replica-group model, the local replicated-log interface and its index/term/copy semantics, conflicting-suffix rules, commit/apply bookkeeping, the state-machine seam, the INV-P invariants, and what Phase 8 explicitly does not guarantee |
-| [RAFT.md](docs/RAFT.md) | The deterministic core, persistent state and election timing, RequestVote/AppendEntries, the conflict hint, the commit rule and no-op, the apply path, persistence ordering and recovery, the simulated network, the INV-R invariants, and what Phase 9 does and does not prove |
+| [RAFT.md](docs/RAFT.md) | The deterministic core, persistent state and election timing, RequestVote/AppendEntries, the conflict hint, the commit rule and no-op, the apply path, persistence ordering and recovery, the simulated network, the INV-R invariants, and what Phase 9 does and does not establish |
 | [FAULTS.md](docs/FAULTS.md) | The fault model and its three tiers, the deterministic simulator, crash/power-loss/persistence-failure semantics, seeds/replay/minimization, the INV-F invariants, the bugs Phase 10 found, and what remains untested |
 | [CRASH_RECOVERY.md](docs/CRASH_RECOVERY.md) | The node's crash points, what each crash window leaves on disk and what recovery makes of it, the exhaustive crash matrix, the INV-CR invariants, and the Save record order Phase 11 fixed |
 | [LINEARIZABILITY.md](docs/LINEARIZABILITY.md) | The client-visible contract: the object model, write completion, ReadIndex and its safety argument, incomplete operations and retries, the checker and how it was validated, every real-process and simulator scenario, the mutants, and exactly what is and is not verified; §15: logical operations under retries and deduplication |
@@ -465,7 +423,7 @@ it is being answered out of memory.
 | [ENGINEERING_ROADMAP.md](docs/ENGINEERING_ROADMAP.md) | The audit of the system as built, its verified defects, and the ranked engineering work that follows |
 | [CHAOS.md](docs/CHAOS.md) | Real-process chaos: seeded fault schedules (kill, stop, crash at a driver point, pause, isolate, cut, snapshot, add-member) under a recorded workload checked for linearizability; what a seed reproduces and what it cannot; partitions; the evidence a failing run leaves |
 | [OPERATIONS.md](docs/OPERATIONS.md) | `dkvctl`: status, leaders, configurations, lag, health and readiness over the admin protocol; the exact health and readiness rules, what each cannot see, and the exit codes |
-| [STORAGE_INTEGRATION.md](docs/STORAGE_INTEGRATION.md) | The design for making the LSM engine the replicated state machine (not yet implemented): who owns order, apply results and the applied index; one apply cycle and its crash windows; exactly-once recovery; the two-log options and what decides between them; snapshots as checkpoints; milestones S1–S6 |
+| [STORAGE_INTEGRATION.md](docs/STORAGE_INTEGRATION.md) | Making the LSM engine the replicated state machine — S1–S3 implemented and opt-in (§7–§9), S4–S6 designed: who owns order, apply results and the applied index; one apply cycle and its crash windows; exactly-once recovery; the two-log options and what decides between them; snapshots as checkpoints; milestones S1–S6 |
 | [LOAD_TESTING.md](docs/LOAD_TESTING.md) | How `dkvload` puts a real cluster under load: closed and open loop (coordinated omission accounted for), exact percentiles, outcome classes, the outage timeline, reproducibility, and the generator's measured ceiling |
 | [API.md](docs/API.md) | The client wire protocol v3: framing, messages, the request's group, operations, validation, status codes, forwarding and redirect-only mode, the session and sharded client libraries |
 | [SNAPSHOTS.md](docs/SNAPSHOTS.md) | Snapshot state and format, creation and compaction order, recovery's reconciliation, crash windows, follower installation, chunking, dedup preservation, corruption policy, measurements, and snapshots with membership |
