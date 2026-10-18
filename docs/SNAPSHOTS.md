@@ -374,7 +374,7 @@ most `every` replayed, independent of how long the node has run — are asserted
   after it — outlasts `SnapshotRetryTicks`, the leader re-offers; the second transfer waits for the
   first (one per peer) and then repeats it. At S4's sizes this is the common case (an ~85 MiB proof
   and ingest take 1–2 s under `-race`; the retry is 1 s at the tests' 25 ms tick), and the repeat
-  used to arrive whole in the follower's transport queue while its actor was busy — a second copy
+  used to arrive whole in the follower's inbound queues while its actor was busy — a second copy
   of the state in memory (66–149 MiB of heap measured during an install, against 10 MiB). Since
   S4's closeout the follower drops it as it arrives (above); the leader still reads and sends it.
 - **Power loss is modeled, not tested** — as everywhere in this project (`docs/FAILURE_MODEL.md`).

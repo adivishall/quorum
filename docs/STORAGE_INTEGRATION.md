@@ -1610,8 +1610,10 @@ state** — tested differentially, and the reason no format changes.
   or removed at startup. A retry starts from offset 0 (no resume): simple, and correct by the rules
   above.
 - **A repeated offer (closeout, §10.15).** "Memory is one chunk" is the receiver's own; frames
-  queue ahead of it — the transport's receive queue (256 frames) and the driver's chunk channel
-  (16) — and fill whenever the actor is busy. The leader re-offers a snapshot its follower has not
+  queue ahead of it — in `dkvd`, the group's inbox at the multiraft host (1,024 frames,
+  `docs/MULTI_RAFT.md`) and the driver's chunk channel (16), behind the transport's receive channel
+  (256, shared by every group), which the host drains without ever blocking on a group — and fill
+  whenever the actor is busy. The leader re-offers a snapshot its follower has not
   answered within `SnapshotRetryTicks`, and proving and ingesting ~85 MiB outlasts that, so the
   whole repeat used to wait there: measured, a second copy of the state in the follower's heap
   during its install. The node's frame pump, off the actor, now drops a chunk of a snapshot no
@@ -1620,8 +1622,13 @@ state** — tested differentially, and the reason no format changes.
   dropped, and a refused proof clears it, so the next offer is received). Only the *same sender's*
   repeat is dropped: another sender's transfer may be a newer leader's, needed if the snapshot being
   proven is a stale leader's that the core then refuses (the independent review, §10.15). A transfer
-  of a *newer* snapshot, or from another sender, arriving during an install still queues, bounded by
-  those 272 frames.
+  of a *newer* snapshot, or from another sender, arriving during an install still queues there. Those
+  queues are bounded by count, not bytes (#24): each queued frame holds its payload — a chunk of up
+  to 1 MiB — so about 1,040 frames per installing group in `dkvd` (272 for a node reading its
+  transport directly, as the raftnode tests do) is about 1 GiB as a capacity-derived estimate,
+  reached only if more than that arrives, during one busy period, from senders the pump cannot
+  drop; beyond its inbox the host drops frames (`inbox_full`, counted), which breaks that transfer,
+  and its leader starts it again after `SnapshotRetryTicks`. The most observed is 149 MiB (§10.15).
 
 ### 10.6 Installation by ingest — the engine's commit point
 
@@ -1739,10 +1746,14 @@ on `manifest.FS`. `vfs.File` gains `ReadAt`, which an SSTable reader needs (`*os
   commit — about three times the state.
 - Creation is three passes over the checkpoint, on the actor. Taking it off the actor is S6.
 - A transfer interrupted part-way restarts from offset 0.
-- Frames queue ahead of the receiver (§10.5): a newer snapshot's transfer arriving during an
-  install, or any traffic while the actor is busy, can hold up to 272 frames (256 in the
-  transport, 16 in the driver) — up to 272 MiB of 1 MiB chunks. A leader's repeat of the same
-  snapshot is dropped; the leader still reads and sends it.
+- Frames queue ahead of the receiver (§10.5) by count, not bytes: a newer snapshot's transfer
+  arriving during an install, or any traffic while the actor is busy, can hold up to about 1,040
+  frames per group in `dkvd` (the host's inbox, 1,024; the driver's chunk channel, 16; the
+  transport's 256-frame channel before them is shared and drained without blocking) — about 1 GiB
+  of 1 MiB chunks as a capacity-derived estimate, not an enforced budget; 272 frames for a node
+  reading its transport directly. Beyond the inbox the host drops frames and the transfer restarts
+  later. The most observed is 149 MiB (§10.15). A leader's repeat of the same snapshot is dropped;
+  the leader still reads and sends it (#24).
 
 ### 10.13 Test plan
 
@@ -1870,7 +1881,7 @@ it, and what the real-process tests had not measured, measured. It found:
   while receiving and proving ~85 MiB and 9–11 MiB while installing it (87–94 MiB resident). But
   whenever the leader had re-offered meanwhile — it does after `SnapshotRetryTicks`, 1 s at the
   tests' tick, and the transfer, proof and ingest took 1.0–1.9 s — the follower held 23–149 MiB
-  during the install and 136–547 MiB resident: the repeat, received whole into its transport queue
+  during the install and 136–547 MiB resident: the repeat, received whole into its inbound queues
   behind the busy actor (§10.5). That is Phase 14's retry meeting Phase 9's queue, not an S4 regression — but
   S4's sizes made it the common case (3 of 4 runs under moderate load), and S4's claim "memory is
   one chunk" held only for the receiver itself. Fixed in the driver, with no change to the core,
@@ -2184,10 +2195,11 @@ and SSTables — is on the model. Modeled power loss is not device certification
   **Simulated power loss is not real-hardware certification.** The real-process tests kill
   processes (SIGKILL), which proves only that data reached the kernel.
 - **Process-level memory in general.** The bound above is the snapshot path's, measured by sampling
-  (5 ms) on one machine under `-race`; frames queued ahead of a busy actor are bounded by count
-  (272), not bytes, so a newer snapshot's transfer arriving during an install can still wait in
-  memory (#24); the in-memory machine holds and decodes the state by design (84 MiB measured at
-  ~350 MiB of heap).
+  (5 ms) on one machine under `-race`; frames queued ahead of a busy actor are bounded by count,
+  not bytes — about 1,040 per installing group in `dkvd`, about 1 GiB of 1 MiB chunks as a
+  capacity-derived estimate, never measured above 149 MiB (§10.5, §10.12) — so a newer snapshot's
+  transfer arriving during an install can still wait in memory (#24); the in-memory machine holds
+  and decodes the state by design (84 MiB measured at ~350 MiB of heap).
 - **The leader's verification before sending.** A transfer proves the published file before
   streaming it; no test corrupts a leader's published snapshot to observe it (the receiver's proof
   is tested, so a corrupt file would still never be installed).
