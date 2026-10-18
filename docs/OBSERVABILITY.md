@@ -139,8 +139,8 @@ both Darwin and Linux. `process_start_time_seconds` is also reported.
   leader keeps reporting itself leader (there is no CheckQuorum). Health and readiness are derived
   across nodes from the admin protocol's status by `dkvctl health` / `dkvctl ready`, with the rules
   in `docs/OPERATIONS.md`; the metrics endpoint serves no health or readiness route.
-- **No storage-engine metrics.** The LSM engine is not behind the node yet
-  (`docs/ENGINEERING_ROADMAP.md` task 5); `dkv_raft_log_bytes` is the Raft log, not an engine WAL.
+- **No storage-engine metrics.** The LSM engine exports none, including when it holds a group's
+  state machine (`-state-machine lsm`, S2); `dkv_raft_log_bytes` is the Raft log, not an engine WAL.
 - **The endpoint is unauthenticated plaintext HTTP.** It reveals node ids, peer counts, group
   layout and traffic volume. Bind `-metrics-listen` to a private interface; the project has no
   security model (`docs/LIMITATIONS.md`).
