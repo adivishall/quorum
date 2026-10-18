@@ -1946,6 +1946,43 @@ it, and what the real-process tests had not measured, measured. It found:
   CheckQuorum (deferred by design), and the history stayed linearizable; the S4 changes are not on
   this path (`internal/raft`, `internal/lab` and the test are byte-identical to `main`).
 
+**A second independent review**, at `6c1b759` (green CI): three reviewers again, one each on the
+engine, the snapshot and driver plumbing, and the machine, reading the code and running probes of
+their own against it. Confirmed and fixed:
+- *A limit the engine cannot store.* The LSM machine opened under any `MaxUnacked`, but a session
+  record holds at most 21,844 results in one 1 MiB engine value, so a replica configured above that
+  ran until a session filled up, then failed the cycle that flushed it (`ErrApply`) and every
+  restart, replaying the same entry. The first review had guarded the restore only (§10.15 above).
+  Reproduced: `EndCycle` failing at index 22,001 with "value too large", the engine stuck at 18,001.
+  The machine refuses to open under such a limit (`ErrLimits`, naming the largest that fits); the
+  restore-side guard stays as a second one, held to the exact record length.
+- *A key under no tag the machine writes* passed the open and was refused by the snapshot source,
+  failing the node at its first snapshot, at every start. The open refuses it.
+- *An engine in doubt served reads.* After an ingest whose MANIFEST edit may or may not be durable,
+  the latch fenced writes while `Get`, `Scan` and `Snapshot` served memory — the old contents, with
+  the disk possibly holding the new. Unreachable through the machine, which fails stop under its
+  own lock before any client read; the storage contract now refuses reads too (`ErrInDoubt`,
+  §10.6).
+- *The pump's drop rule* dropped **any** sender's chunks at or below the snapshot being proven; a
+  newer leader's transfer among them, when the one being proven is a stale leader's the core then
+  refuses, would have cost one retry period. Reasoned, not demonstrated (it needs a one-way
+  partition and a slow proof); the rule is now the narrow one — the same sender's repeat only.
+- *The crash matrix's oracle* held only the injected-error cells to the commit point; a crash cell
+  before the MANIFEST write would have accepted a premature "new". Every cell is now held to it (old
+  before the write, either before the fsync, new after), and the recovered applied index must be
+  the state's. The code passed unchanged: the matrix had logged the right distribution, and now
+  asserts it.
+Recorded, not changed: the background compactor is not gated by the latch and may spend I/O and a
+file number on a store that must be reopened (correctness intact — the orphan is swept at open); an
+empty ingest's `AppliedSeq` names the sequence of a mutation the ingest discarded (replay seeds
+correctly); a repeat's partial `.snap.recv` may keep one descriptor open until the next transfer; a
+chunk is copied about three times in transit (transient). Cleared with a trace, among much else:
+checkpoint consistency under concurrent flush and compaction, the commit point's ordering and
+sequence numbers, a checkpoint held across an ingest and across the store's close, the streaming
+reader's every check against `Decode`, the install's recovery at each boundary, the `answer` helper
+at each call site, byte identity of the two machines' snapshots on adversarial keys, and dedup with
+the original index after a restore and a reopen.
+
 ### 10.16 Tests, mutants, fuzzing
 
 | Concern | Test |
@@ -1958,7 +1995,7 @@ it, and what the real-process tests had not measured, measured. It found:
 | 80 MiB ingested, past the 64 MiB WAL record; ingested tables are not compacted away | `TestAnIngestLargerThanOneWALRecord`, `TestIngestedTablesAreNotCompactedAway` |
 | A commit in doubt latches, never moves the durable watermark, and reopens old or new; a latched store refuses `SetAppliedIndex` | `TestAFailedIngestCommitLatchesAndReopensOldOrNew`, `TestALatchedStoreRefusesSetAppliedIndex` |
 | A checkpoint closed from many goroutines releases its version once | `TestACheckpointClosedFromManyGoroutinesReleasesOnce` |
-| Crash safety of the ingest at every filesystem operation, with the whole engine on the model, in `sync` and `batch` WAL modes (§10.17) | `TestIngestCrashMatrix` |
+| Crash safety of the ingest at every filesystem operation, with the whole engine on the model, in `sync` and `batch` WAL modes; every cell held to the commit point and to its state's applied index (§10.17) | `TestIngestCrashMatrix` |
 | The streamed writer equals `Encode` at every data-record boundary; refuses an oversized state before writing; refuses a source that does not reproduce itself | `TestWriteIsByteIdenticalToEncode`, `TestWriteRefusesAStateOverTheBoundBeforeWritingAnything`, `TestWriteRefusesASourceThatDoesNotReproduceItself` |
 | The streaming reader agrees with `Decode` on the corpus, every truncation and bit flip, and under fuzzing; reports the end only once the file is proven; reports a failing disk as itself, not as corruption | `TestReaderAgreesWithDecodeOnTheCorpus`, `FuzzReaderAgreesWithDecode`, `TestReaderReportsEndOnlyOnceTheFileIsProven`, `TestAReadFailureIsReportedAsItselfNotAsCorruption` |
 | A streamed publish is atomic under every crash (process, power loss); a refused one publishes nothing | `TestPublishFromIsByteIdenticalAndAtomicUnderEveryCrash`, `TestARefusedStreamedPublishPublishesNothing` |
@@ -1968,6 +2005,9 @@ it, and what the real-process tests had not measured, measured. It found:
 | The restore reads only the snapshot it was asked for; the install streams its restore from the published file after the boundary | `TestARestoreReadsOnlyTheSnapshotItWasAskedFor`, `TestInstallOrderIsTermPublishBoundary` |
 | One decoder for both machines: every corpus state judged alike, with the same reason; restores equal; the decoder is the frozen S3 decoder's equal on the corpus, every truncation and bit flip, and under fuzzing | `TestBothMachinesJudgeTheSnapshotCorpusAlike`, the Phase 14 corpus tests (`TestRestoreRefusesImpossibleState`, …) now through the stream decoder, `TestTheStreamDecoderIsTheS3Decoder`, `FuzzStreamDecoderMatchesS3` |
 | The LSM machine refuses at validation a session whose record its engine cannot store, sizing it exactly as `encodeSession` writes it | `TestLSMMachineRefusesASessionItsEngineCannotStore`, `TestSessionRecordLenIsTheEncodedLength` |
+| The LSM machine refuses to open under a `MaxUnacked` whose fullest session record exceeds one engine value, and names the largest that fits; the restore-side guard refuses a record one result over; a key under no tag the machine writes is refused at open | `TestLSMMachineRefusesALimitItsEngineCannotStore`, `TestLSMMachineRefusesAKeyUnderNoTagItWritesAtOpen` |
+| An engine whose ingest commit is in doubt refuses reads — `Get`, `Scan`, `Snapshot`, `Checkpoint` — as well as writes | `TestAFailedIngestCommitLatchesAndReopensOldOrNew` |
+| Only the same sender's repeated offer is dropped while a snapshot is proven or installed; another sender's transfer, and a newer snapshot, pass | `TestOnlyTheSendersOwnRepeatIsDropped`, `TestInstallingCoversExactlyTheProofAndTheInstall` |
 | A chaos fault aimed at "the leader" waits out an election and records the wait; a group still leaderless at the bound is an error that fails the run, never a skip | `TestALeaderFaultWaitsOutAnElection`, `TestALeaderFaultWithoutALeaderFailsTheRun` (`internal/lab`) |
 | An answer the node gave before it stopped is a request's outcome, over `ErrStopped`; nothing answered is `ErrStopped`; the caller's deadline still holds | `TestAnAnswerGivenBeforeTheStopIsTheOutcome`, `TestNoAnswerBeforeTheStopIsStopped`, with `TestApplyFailureStopsTheNode` (the contract) and `TestProposeHonoursContextDuringSlowFsync` |
 | A leader's repeated offer, arriving while the follower proves or installs the first copy, is dropped where it arrives — one proof, not one per offer — and the follower still catches up; "installing" spans exactly the proof and the install (never a transfer still arriving, never a refused proof) | `TestARepeatedOfferIsDroppedWhileTheFirstIsProven`, `TestInstallingCoversExactlyTheProofAndTheInstall` |
@@ -1983,9 +2023,10 @@ rule that now holds (§10.15): the oversized state validates; the restart test p
 reads nothing; the set-aside crash test is a crash during the ingest; the fail-stop test is split
 into a refused restore (harmless) and a commit in doubt (still fail-stop).
 
-**Mutation.** Thirty-nine S4 mutants (372–411), one for the Phase 12 race CI found (412) and two
-for the chaos scheduler's leader target CI found (413–414; 415 in the script), each killed by its
-intended test and none by an unrelated failure. Twenty-six (372–398) are the faulty variants of the S4 brief
+**Mutation.** Thirty-nine S4 mutants (372–411), one for the Phase 12 race CI found (412), two for
+the chaos scheduler's leader target CI found (413–414) and four for the second independent
+review's fixes (415–418; 419 in the script), each killed by its intended test and none by an
+unrelated failure. Twenty-six (372–398) are the faulty variants of the S4 brief
 that apply to this design: publishing a
 snapshot before its bytes are durable, a source that changes, the streamed reader's checksum,
 length, footer and trailing-bytes checks, a receiver that does not prove the staged file, a retried
@@ -1996,8 +2037,10 @@ a commit in doubt deleting its tables, the old log retired before the commit, th
 out of order, a state at the wrong index, the session table dropped from a snapshot, a checkpoint
 that is not the machine's state, a refused restore failing stop, trailing state bytes, and a session
 scan that stops early. Seven (399–405) revert the review's fixes, six (406–411) the
-closeout's, 412 the fix for the race CI found, and 413–414 the chaos scheduler's (§10.15); 14
-(Propose honours its deadline) is re-anchored to the helper every request now waits in. One candidate (385: ignoring a failed rename of a staged table) survived and
+closeout's, 412 the fix for the race CI found, 413–414 the chaos scheduler's, and 415–418 the
+second independent review's (§10.15); 14 (Propose honours its deadline) is re-anchored to the
+helper every request now waits in, and 342, 389, 405, 406 and 408–410 to the code the review's
+fixes moved. One candidate (385: ignoring a failed rename of a staged table) survived and
 was investigated: it is equivalent — the reader open that follows opens the table by its final name,
 so a rename that did not happen fails the ingest there, and no other file can hold that name (numbers
 are never reused; open sweeps unreferenced tables) — and is recorded rather than kept. Ten older
@@ -2013,29 +2056,31 @@ and `FuzzStreamDecoderMatchesS3` (the state decoder against the frozen S3 decode
 
 ### 10.17 Evidence
 
-Every gate below ran sequentially on `1d3d8f0` (Apple M4, macOS, **go1.27.2**, the machine kept
+Every gate below ran sequentially on `11dec6c` (Apple M4, macOS, **go1.27.2**, the machine kept
 awake, no other test running), the last commit that changes code or tests: the S4 code, the
-closeout's fixes, the fix for the race CI found, the membership test's premise, and the chaos
-scheduler's leader target (§10.15). The commit after it is this evidence — documentation only
-(`git diff 1d3d8f0 HEAD` names only files under `docs/`). CI runs every gate again on the final
-commit. Earlier runs are not reported as evidence: the same gates passed on `ecf046d`, `2509012`
-and `16bdb2f`, the revisions CI then found the race, the premise and the scheduler's one look on;
-one earlier run is history worth stating — see *An unrelated failure* below.
+closeout's fixes, the fixes for what CI found, and the second independent review's fixes (§10.15).
+The commit after it is this evidence — documentation only (`git diff 11dec6c HEAD` names only
+files under `docs/`). CI runs every gate again on the final commit. Earlier runs are not reported
+as evidence: the same gates passed on `ecf046d`, `2509012`, `16bdb2f` and `1d3d8f0` — the
+revisions CI then found the race, the premise and the scheduler's one look on, and the one the
+second review read — and one earlier run is history worth stating — see *An unrelated failure*
+below.
 
 | Gate | What it covers | Result |
 |---|---|---|
-| `make check` (fmt, ignore, vet, every unit package under `-race`) | storage — including the ingest crash matrix in both WAL modes — WAL, MANIFEST, snapshot, kv on the in-memory machine, raftnode, raftsim, multiraft, lab; 37 packages | pass, 203 s |
-| `make race-lsm` | every `internal/kv` test again with the group's machine in the engine | pass, 72 s |
+| `make check` (fmt, ignore, vet, every unit package under `-race`) | storage — including the ingest crash matrix in both WAL modes — WAL, MANIFEST, snapshot, kv on the in-memory machine, raftnode, raftsim, multiraft, lab; 37 packages | pass, 204 s |
+| `make race-lsm` | every `internal/kv` test again with the group's machine in the engine | pass, 77 s |
 | staticcheck (`SA*`, the CI pin, #25) and govulncheck v1.8.0 | correctness checks; known vulnerabilities in the code's call graph and imports | pass (no findings); **"No vulnerabilities found."** |
-| `make integration` | 93 real-process tests on the in-memory machine: linearizability, dedup/retry, snapshots — the four large-snapshot tests included — membership, chaos, the engine crash tests | 93 pass, 440 s |
-| `make integration-lsm` | the same 93 tests with every `dkvd` on the LSM machine | 93 pass, 452 s |
-| `make faults FAULT_SEEDS=200` | the deterministic simulator: 200-seed fault schedules, the crash, snapshot and membership matrices, seeded KV histories checked for linearizability, multi-group isolation, the bounded membership model at depth 4, the pinned trace hash | pass, 154 s |
+| `make integration` | 93 real-process tests on the in-memory machine: linearizability, dedup/retry, snapshots — the four large-snapshot tests included — membership, chaos, the engine crash tests | 93 pass, 443 s |
+| `make integration-lsm` | the same 93 tests with every `dkvd` on the LSM machine | 93 pass, 460 s |
+| `make faults FAULT_SEEDS=200` | the deterministic simulator: 200-seed fault schedules, the crash, snapshot and membership matrices, seeded KV histories checked for linearizability, multi-group isolation, the bounded membership model at depth 4, the pinned trace hash | pass, 151 s |
 | `make fuzz` | 37 of 37 fuzz targets, 10 s each — `FuzzReaderAgreesWithDecode` and `FuzzStreamDecoderMatchesS3` (S4) among them | pass, 406 s |
-| `make mutation` | all 415 mutants — the thirty-nine S4 mutants (372–411), 412 for the race CI found, 413–414 for the chaos scheduler's leader target, and 344c and 14 retargeted (§10.15, §10.16) among them; each killed by its intended test, none by an unrelated failure | **415 / 415 killed**, 994 s |
+| `make mutation` | all 419 mutants — the thirty-nine S4 mutants (372–411), 412 for the race CI found, 413–414 for the chaos scheduler's leader target, 415–418 for the second independent review's fixes, and 344c and 14 retargeted (§10.15, §10.16) among them; each killed by its intended test, none by an unrelated failure | **419 / 419 killed**, 4901 s (82 min against 17 on the earlier revisions: host contention of unknown origin during this run; the result is the same) |
 | `TestIngestCrashMatrix -v` (under `-race`; it also runs inside `make check`) | the ingest's crash matrix, verbose, for the per-mode record below | **1192 / 1192 cells** recover exactly one whole state |
 | `TestRealFollowerInstallsASnapshotAboveTheS3Limit`, alone, on each machine | the S4 exit criterion once more, outside the suites (below) | pass on both |
 | `TestApplyFailureStopsTheNode` and `TestAnAnswerGivenBeforeTheStopIsTheOutcome`, `-count=50 -cpu=1,2` under `-race` | the race CI found (§10.15), 100 runs of each | pass |
 | `TestRealOneGroupBrokenTheOtherContinues`, `-count=5` under `-race`, each machine | the premise CI found (§10.15) | pass on both |
+| `TestChaosLeaderLossUnderLoadIsLinearizable`, `-count=3` under `-race`, each machine; the lab's scheduler tests, `-count=5` | the chaos scheduler's leader target CI found (§10.15) | pass on both; pass |
 | `TestChaosLeaderLossUnderLoadIsLinearizable`, `-count=3` under `-race`, each machine; the lab's scheduler tests, `-count=5` | the chaos scheduler's leader target CI found (§10.15) | pass on both; pass |
 
 **The S4 exit criterion, on real processes.** Real `dkvd` processes
@@ -2045,12 +2090,12 @@ with it:
 
 | Test | In-memory machine | LSM machine |
 |---|---|---|
-| `TestRealFollowerInstallsASnapshotAboveTheS3Limit` | 84 MiB installed from n2, 1.2 s; one transfer streamed (two earlier attempts had failed); restart, writes, duplicate retry: pass | 83 MiB installed from n2, 0.9 s; heap ≤ 8 MiB receiving and proving, ≤ 9 MiB installing (sampled), 90 MiB peak resident; one transfer streamed, none failed; restart, writes, duplicate retry: pass; every engine at the durable state's index, durable at or above its snapshot |
+| `TestRealFollowerInstallsASnapshotAboveTheS3Limit` | 84 MiB installed from n3, 1.2 s; two transfers streamed by the leader, the second a repeat (two earlier attempts had failed); restart, writes, duplicate retry: pass | 85 MiB installed from n3, 1.0 s; heap ≤ 8 MiB receiving and proving, ≤ 9 MiB installing (sampled), 90 MiB peak resident; one transfer streamed (two earlier attempts had failed); restart, writes, duplicate retry: pass; every engine at the durable state's index, durable at or above its snapshot |
 | `TestRealFollowerDiesBetweenALargeInstallsBoundaryAndItsRestore` | pass | pass; the restart ingests the published snapshot; engines at 104 |
-| `TestRealFollowerKilledDuringALargeInstallRecovers` | killed with snapshot 97 published, install incomplete: pass | killed with snapshot 97 published, install incomplete: pass; engines at 102 |
-| `TestRealFollowerKilledMidTransferOfALargeSnapshotRecovers` | killed with 4 MiB of an 85 MiB snapshot received; restart installs 84 MiB: pass | n2 killed 4 MiB in; nothing published, engine ≤ 7 (offline); restart installs 85 MiB from n3: pass; engines at 102 |
+| `TestRealFollowerKilledDuringALargeInstallRecovers` | killed with snapshot 96 published, install incomplete: pass | killed with snapshot 97 published, install incomplete: pass; engines at 104 |
+| `TestRealFollowerKilledMidTransferOfALargeSnapshotRecovers` | killed with 4 MiB of an 87 MiB snapshot received; restart installs 86 MiB: pass | n2 killed 4 MiB in; nothing published, engine ≤ 7 (offline); restart installs 84 MiB from n1: pass; engines at 104 |
 
-The in-memory machine's follower held 353 MiB of heap (1079 MiB resident) installing
+The in-memory machine's follower held 366 MiB of heap (1260 MiB resident) installing
 84 MiB: it decodes and holds the state by design; nothing is asserted there. (CI's run of the same
 suite on `ef0a6a4`, on a runner about three times slower, installed 83 MiB in 5.5 s with one
 repeated offer — "2 sent, 1 failed" — and a 348–352 MiB heap on that machine; its figures are not
@@ -2083,7 +2128,7 @@ and SSTables — is on the model. Modeled power loss is not device certification
 
 ### 10.18 What S4 proves, and what it does not
 
-**PROVEN WITHIN THE TEST MODEL** (the tests and mutants of §10.16, passing on `1d3d8f0`, §10.17):
+**PROVEN WITHIN THE TEST MODEL** (the tests and mutants of §10.16, passing on `11dec6c`, §10.17):
 - **A follower installs, and restarts on, a snapshot larger than the S3 limit.** Real `dkvd`
   processes on both machines: a follower behind every other node's compaction boundary is sent an
   83–86 MiB snapshot (above the ~63 MiB one-WAL-record limit S3 left) by whichever node leads,
