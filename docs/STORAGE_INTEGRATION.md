@@ -2070,9 +2070,9 @@ and `FuzzStreamDecoderMatchesS3` (the state decoder against the frozen S3 decode
 Every gate below ran sequentially on `11dec6c` (Apple M4, macOS, **go1.27.2**, the machine kept
 awake, no other test running), the last commit that changes code or tests: the S4 code, the
 closeout's fixes, the fixes for what CI found, and the second independent review's fixes (§10.15).
-The commits after it are this evidence and a correction of two of its lines — documentation
-only (`git diff 11dec6c HEAD` names only files under `docs/`). CI runs every gate again on the
-final commit. Earlier runs are not reported
+The commits after it are documentation only — this evidence and corrections to the documentation
+(`git diff 11dec6c HEAD` names only files under `docs/`). CI runs every gate again on the final
+commit. Earlier runs are not reported
 as evidence: the same gates passed on `ecf046d`, `2509012`, `16bdb2f` and `1d3d8f0` — the
 revisions CI then found the race, the premise and the scheduler's one look on, and the one the
 second review read — and one earlier run is history worth stating — see *An unrelated failure*
