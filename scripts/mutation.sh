@@ -2898,14 +2898,18 @@ mutant "user-keys-are-tagged" internal/kv/namespace.go \
 # 342. S2: the session records are not loaded at open — a restart forgets every
 #      session.
 mutant "session-records-load-at-open" internal/kv/lsm.go \
-  '		id, ok := parseSessionKey(k)
-		if !ok {
-			return nil
-		}' \
-  '		id, ok := parseSessionKey(k)
-		if !ok || true {
-			return nil
-		}' \
+  '		ss, err := decodeSession(id, v, m.sessions.limits)
+		if err != nil {
+			return err
+		}
+		m.sessions.sessions[id] = ss
+		return nil' \
+  '		ss, err := decodeSession(id, v, m.sessions.limits)
+		if err != nil {
+			return err
+		}
+		_ = ss
+		return nil' \
   ./internal/kv '^TestLSMMachineMatchesTheStoreOnAScript$'
 
 # 343. S2: a group whose state machine cannot be made leaves its directory behind,
@@ -3386,9 +3390,9 @@ mutant "a-commit-in-doubt-keeps-its-tables" internal/storage/checkpoint.go \
   '		for _, t := range staged {
 			_ = t.r.Close()
 		}
-		s.flushErr = fmt.Errorf("lsm: recording an ingest at %d in the manifest: %w", a.Index, err)' \
+		s.flushErr = fmt.Errorf("%w: recording an ingest at %d in the manifest: %w", ErrInDoubt, a.Index, err)' \
   '		discard()
-		s.flushErr = fmt.Errorf("lsm: recording an ingest at %d in the manifest: %w", a.Index, err)' \
+		s.flushErr = fmt.Errorf("%w: recording an ingest at %d in the manifest: %w", ErrInDoubt, a.Index, err)' \
   ./internal/storage '^TestAFailedIngestCommitLatchesAndReopensOldOrNew$'
 
 # 390. S4: an ingest retires the old log before its commit — a crash before the
@@ -3531,19 +3535,21 @@ mutant "a-latched-store-refuses-set-applied-index" internal/storage/lsmstore.go 
   ./internal/storage '^TestALatchedStoreRefusesSetAppliedIndex$'
 
 # 405. S4 (review): the LSM machine validates a session its engine cannot store,
-#      then fails to restore it at every start.
+#      then fails to restore it at every start. Since the independent review
+#      the limit is refused at open (415) and this guard is the second one,
+#      held directly.
 mutant "a-session-must-fit-the-engine" internal/kv/lsm.go \
   '	if n := sessionRecordLen(ss); n > m.opts.MaxValueSize {' \
   '	if n := sessionRecordLen(ss); false && n > m.opts.MaxValueSize {' \
-  ./internal/kv '^TestLSMMachineRefusesASessionItsEngineCannotStore$'
+  ./internal/kv '^TestLSMMachineRefusesALimitItsEngineCannotStore$'
 
 # 406. S4 (closeout): the engine-fit check sizes a session one byte short — a
 #      session within a byte of the value limit validates, then cannot be
 #      restored. The boundary test above is 4 bytes over the limit and does
 #      not see it; the exact-length test does.
 mutant "a-session-record-is-sized-exactly" internal/kv/lsm.go \
-  '	return 1 + 16 + uvarintLen(uint64(len(ss.results))) + len(ss.results)*sessionResultLen' \
-  '	return 16 + uvarintLen(uint64(len(ss.results))) + len(ss.results)*sessionResultLen' \
+  '	return 1 + 16 + uvarintLen(uint64(n)) + n*sessionResultLen' \
+  '	return 16 + uvarintLen(uint64(n)) + n*sessionResultLen' \
   ./internal/kv '^TestSessionRecordLenIsTheEncodedLength$'
 
 # 407. S4 (closeout): a leader's repeated offer, sent while its follower is
