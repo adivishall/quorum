@@ -1839,7 +1839,8 @@ mutant that reverts the fix (399–405):
   reader now reports the stream's own error (`TestAReadFailureIsReportedAsItselfNotAsCorruption`).
 - *A session the engine cannot store* (a group run with `-session-max-unacked` above ~21,800, at the
   1 MiB value limit) was validated by the LSM machine and then failed to restore at every start —
-  since S2. It is now refused at validation (`TestLSMMachineRefusesASessionItsEngineCannotStore`).
+  since S2. It is now refused at validation — and, since the second review below, at open
+  (`TestLSMMachineRefusesALimitItsEngineCannotStore`, which holds both guards).
 - *The decoder's oracle was circular*: `decodeState` delegates to the new decoder. The S3 decoder is
   frozen in a test and the new one held to it (`TestTheStreamDecoderIsTheS3Decoder`,
   `FuzzStreamDecoderMatchesS3`).
@@ -2004,8 +2005,7 @@ the original index after a restore and a reopen.
 | Bounded memory: a 96 MiB snapshot published, sent, received and read back grows the live heap by ~3 MiB | `TestStreamingHoldsOneRecordAtATime` |
 | The restore reads only the snapshot it was asked for; the install streams its restore from the published file after the boundary | `TestARestoreReadsOnlyTheSnapshotItWasAskedFor`, `TestInstallOrderIsTermPublishBoundary` |
 | One decoder for both machines: every corpus state judged alike, with the same reason; restores equal; the decoder is the frozen S3 decoder's equal on the corpus, every truncation and bit flip, and under fuzzing | `TestBothMachinesJudgeTheSnapshotCorpusAlike`, the Phase 14 corpus tests (`TestRestoreRefusesImpossibleState`, …) now through the stream decoder, `TestTheStreamDecoderIsTheS3Decoder`, `FuzzStreamDecoderMatchesS3` |
-| The LSM machine refuses at validation a session whose record its engine cannot store, sizing it exactly as `encodeSession` writes it | `TestLSMMachineRefusesASessionItsEngineCannotStore`, `TestSessionRecordLenIsTheEncodedLength` |
-| The LSM machine refuses to open under a `MaxUnacked` whose fullest session record exceeds one engine value, and names the largest that fits; the restore-side guard refuses a record one result over; a key under no tag the machine writes is refused at open | `TestLSMMachineRefusesALimitItsEngineCannotStore`, `TestLSMMachineRefusesAKeyUnderNoTagItWritesAtOpen` |
+| The LSM machine refuses to open under a `MaxUnacked` whose fullest session record exceeds one engine value, and names the largest that fits; the restore-side guard refuses a record one result over, sizing it exactly as `encodeSession` writes it; a key under no tag the machine writes is refused at open | `TestLSMMachineRefusesALimitItsEngineCannotStore`, `TestSessionRecordLenIsTheEncodedLength`, `TestLSMMachineRefusesAKeyUnderNoTagItWritesAtOpen` |
 | An engine whose ingest commit is in doubt refuses reads — `Get`, `Scan`, `Snapshot`, `Checkpoint` — as well as writes | `TestAFailedIngestCommitLatchesAndReopensOldOrNew` |
 | Only the same sender's repeated offer is dropped while a snapshot is proven or installed; another sender's transfer, and a newer snapshot, pass | `TestOnlyTheSendersOwnRepeatIsDropped`, `TestInstallingCoversExactlyTheProofAndTheInstall` |
 | A chaos fault aimed at "the leader" waits out an election and records the wait; a group still leaderless at the bound is an error that fails the run, never a skip | `TestALeaderFaultWaitsOutAnElection`, `TestALeaderFaultWithoutALeaderFailsTheRun` (`internal/lab`) |
@@ -2059,8 +2059,9 @@ and `FuzzStreamDecoderMatchesS3` (the state decoder against the frozen S3 decode
 Every gate below ran sequentially on `11dec6c` (Apple M4, macOS, **go1.27.2**, the machine kept
 awake, no other test running), the last commit that changes code or tests: the S4 code, the
 closeout's fixes, the fixes for what CI found, and the second independent review's fixes (§10.15).
-The commit after it is this evidence — documentation only (`git diff 11dec6c HEAD` names only
-files under `docs/`). CI runs every gate again on the final commit. Earlier runs are not reported
+The commits after it are this evidence and a correction of two of its lines — documentation
+only (`git diff 11dec6c HEAD` names only files under `docs/`). CI runs every gate again on the
+final commit. Earlier runs are not reported
 as evidence: the same gates passed on `ecf046d`, `2509012`, `16bdb2f` and `1d3d8f0` — the
 revisions CI then found the race, the premise and the scheduler's one look on, and the one the
 second review read — and one earlier run is history worth stating — see *An unrelated failure*
@@ -2080,7 +2081,6 @@ below.
 | `TestRealFollowerInstallsASnapshotAboveTheS3Limit`, alone, on each machine | the S4 exit criterion once more, outside the suites (below) | pass on both |
 | `TestApplyFailureStopsTheNode` and `TestAnAnswerGivenBeforeTheStopIsTheOutcome`, `-count=50 -cpu=1,2` under `-race` | the race CI found (§10.15), 100 runs of each | pass |
 | `TestRealOneGroupBrokenTheOtherContinues`, `-count=5` under `-race`, each machine | the premise CI found (§10.15) | pass on both |
-| `TestChaosLeaderLossUnderLoadIsLinearizable`, `-count=3` under `-race`, each machine; the lab's scheduler tests, `-count=5` | the chaos scheduler's leader target CI found (§10.15) | pass on both; pass |
 | `TestChaosLeaderLossUnderLoadIsLinearizable`, `-count=3` under `-race`, each machine; the lab's scheduler tests, `-count=5` | the chaos scheduler's leader target CI found (§10.15) | pass on both; pass |
 
 **The S4 exit criterion, on real processes.** Real `dkvd` processes
