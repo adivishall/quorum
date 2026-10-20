@@ -1,0 +1,146 @@
+# Three dkvd processes on loopback, one Raft group per shard (4 shards, replication factor 3).
+# The first start of each node initializes its data directory (-init -cluster-id).
+$ dkvd -id n1 -listen 127.0.0.1:7001 -peers n2=127.0.0.1:7002,n3=127.0.0.1:7003 -data-dir data/n1 -init -cluster-id demo -cluster -shards 4 -rf 3 -client-listen 127.0.0.1:8001 -admin-listen 127.0.0.1:9001 -metrics-listen 127.0.0.1:9101 >logs/n1.log 2>&1 &
+$ dkvd -id n2 -listen 127.0.0.1:7002 -peers n1=127.0.0.1:7001,n3=127.0.0.1:7003 -data-dir data/n2 -init -cluster-id demo -cluster -shards 4 -rf 3 -client-listen 127.0.0.1:8002 -admin-listen 127.0.0.1:9002 -metrics-listen 127.0.0.1:9102 >logs/n2.log 2>&1 &
+$ dkvd -id n3 -listen 127.0.0.1:7003 -peers n1=127.0.0.1:7001,n2=127.0.0.1:7002 -data-dir data/n3 -init -cluster-id demo -cluster -shards 4 -rf 3 -client-listen 127.0.0.1:8003 -admin-listen 127.0.0.1:9003 -metrics-listen 127.0.0.1:9103 >logs/n3.log 2>&1 &
+
+# Wait until every group has a confirmed leader (dkvctl health exits 0).
+$ dkvctl -nodes n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 health
+cluster: healthy
+GROUP  VERDICT  LEADER  TERM  CONFIRMED  REASONS
+0      healthy  n3      1     3/2        
+1      healthy  n1      1     3/2        
+2      healthy  n1      1     3/2        
+3      healthy  n3      1     3/2        
+NODE  READINESS  REASONS
+n1    ready      
+n2    ready      
+n3    ready      
+
+$ dkvctl -nodes n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 leader
+GROUP  LEADER  TERM  CONFIRMED BY   VERDICT
+0      n3      1     3 of quorum 2  healthy
+1      n1      1     3 of quorum 2  healthy
+2      n1      1     3 of quorum 2  healthy
+3      n3      1     3 of quorum 2  healthy
+
+$ dkvctl -nodes n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 groups
+GROUP  VOTERS    LEARNERS  JOINT (OUTGOING)  CONF INDEX  PENDING  HOSTED ON
+0      n1,n2,n3  -         -                 0           false    n1,n2,n3
+1      n1,n2,n3  -         -                 0           false    n1,n2,n3
+2      n1,n2,n3  -         -                 0           false    n1,n2,n3
+3      n1,n2,n3  -         -                 0           false    n1,n2,n3
+
+# A real client workload through the binary client protocol: identified requests,
+# sessions per group, 50% reads, open loop at 100 operations per second for 5 s.
+$ dkvload -endpoints n1=127.0.0.1:8001,n2=127.0.0.1:8002,n3=127.0.0.1:8003 -shards 4 -rf 3 -nodes n1,n2,n3 -clients 4 -rate 100 -duration 5s -warmup 1s -read 50 -keys 1000 -value 100 -seed 1
+4 clients, open loop at 100 ops/s, 5s measured after 1s warmup; 1000 keys (uniform), 50% get, 0% delete, 100-byte values
+completed 100 ops/s in the window; outcomes map[not_found:208 ok:292]; late 0; longest outage 0s; generator CPU 100ms
+op          count    p50 µs       p90       p95       p99     p99.9       max
+get           248      1524     16074     24988     36207     45180     45180
+put           252     25207     40484     43983     50063     56033     56033
+
+$ dkvctl -nodes n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 status
+NODE  GROUP  ROLE      TERM  LEADER  COMMIT  APPLIED  LAST  SNAPSHOT  BOUNDARY  VOTER  PENDING W/R
+n1    0      Follower  1     n3      84      84       84    0         0         true   0/0
+n1    1      Leader    1     n1      89      89       89    0         0         true   0/0
+n1    2      Leader    1     n1      75      75       75    0         0         true   0/0
+n1    3      Follower  1     n3      72      72       73    0         0         true   0/0
+n2    0      Follower  1     n3      84      84       84    0         0         true   0/0
+n2    1      Follower  1     n1      89      89       89    0         0         true   0/0
+n2    2      Follower  1     n1      75      75       75    0         0         true   0/0
+n2    3      Follower  1     n3      72      72       73    0         0         true   0/0
+n3    0      Leader    1     n3      84      84       84    0         0         true   0/0
+n3    1      Follower  1     n1      89      89       89    0         0         true   0/0
+n3    2      Follower  1     n1      75      75       75    0         0         true   0/0
+n3    3      Leader    1     n3      73      73       73    0         0         true   0/0
+
+# Each node serves its own Prometheus metrics; nothing aggregates them.
+$ curl -s http://127.0.0.1:9102/metrics | grep -E '^dkv_(raft_role.*leader"} 1|kv_requests_total)' | head -14
+dkv_kv_requests_total{group="0",op="get",status="not_found"} 2
+dkv_kv_requests_total{group="0",op="put",status="ok"} 2
+dkv_kv_requests_total{group="1",op="get",status="not_found"} 1
+dkv_kv_requests_total{group="1",op="put",status="ok"} 3
+dkv_kv_requests_total{group="2",op="get",status="not_found"} 1
+dkv_kv_requests_total{group="2",op="put",status="ok"} 3
+dkv_kv_requests_total{group="3",op="get",status="not_found"} 2
+dkv_kv_requests_total{group="3",op="put",status="ok"} 2
+
+# Kill n1 with SIGKILL (no clean shutdown), then look at the cluster.
+$ kill -9 $PID_N1
+$ dkvctl -nodes n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 health
+cluster: degraded
+GROUP  VERDICT   LEADER  TERM  CONFIRMED  REASONS
+0      degraded  n3      1     2/2        n1 is unreachable
+1      degraded  n3      2     2/2        n1 is unreachable
+2      degraded  n3      2     2/2        n1 is unreachable
+3      degraded  n3      1     2/2        n1 is unreachable
+NODE  READINESS    REASONS
+n1    unreachable  dial tcp 127.0.0.1:9001: connect: connection refused
+n2    ready        
+n3    ready        
+exit code 1
+
+# Restart n1 from its data directory: the same command without -init.
+$ dkvd -id n1 -listen 127.0.0.1:7001 -peers n2=127.0.0.1:7002,n3=127.0.0.1:7003 -data-dir data/n1 -cluster -shards 4 -rf 3 -client-listen 127.0.0.1:8001 -admin-listen 127.0.0.1:9001 -metrics-listen 127.0.0.1:9101 >>logs/n1.log 2>&1 &
+$ dkvctl -nodes n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 health
+cluster: healthy
+GROUP  VERDICT  LEADER  TERM  CONFIRMED  REASONS
+0      healthy  n3      1     3/2        
+1      healthy  n3      2     3/2        
+2      healthy  n3      2     3/2        
+3      healthy  n3      1     3/2        
+NODE  READINESS  REASONS
+n1    ready      
+n2    ready      
+n3    ready      
+
+$ dkvctl -nodes n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 lag
+GROUP  LEADER  TERM  VOTER  STATE      LAG (ENTRIES)
+0      n3      1     n1     following  0
+0      n3      1     n2     following  0
+0      n3      1     n3     leading    -
+1      n3      2     n1     following  0
+1      n3      2     n2     following  0
+1      n3      2     n3     leading    -
+2      n3      2     n1     following  0
+2      n3      2     n2     following  0
+2      n3      2     n3     leading    -
+3      n3      1     n1     following  0
+3      n3      1     n2     following  0
+3      n3      1     n3     leading    -
+
+NODE  GROUP  COMMIT  APPLIED  APPLY LAG
+n1    0      84      84       0
+n1    1      90      90       0
+n1    2      76      76       0
+n1    3      73      73       0
+n2    0      84      84       0
+n2    1      90      90       0
+n2    2      76      76       0
+n2    3      73      73       0
+n3    0      84      84       0
+n3    1      90      90       0
+n3    2      76      76       0
+n3    3      73      73       0
+
+# What n1 logged while recovering (structured events, one per line; only lines written after the restart).
+$ grep -E 'event=(node_started|data_dir|group_started|raft_started|raft_(leader|follower|snapshot_restored))' logs/n1.log | head -14
+event=data_dir node=n1 dir=data/n1 cluster=demo state=running
+event=node_started node=n1 listen=127.0.0.1:7001 peers=2
+event=raft_started node=n1 peers=3 term=1 lastIndex=84 group=0 conf="voters=[n1 n2 n3]"
+event=group_started node=n1 group=0
+event=raft_started node=n1 peers=3 term=1 lastIndex=89 group=1 conf="voters=[n1 n2 n3]"
+event=group_started node=n1 group=1
+event=raft_started node=n1 peers=3 term=1 lastIndex=75 group=2 conf="voters=[n1 n2 n3]"
+event=group_started node=n1 group=2
+event=raft_started node=n1 peers=3 term=1 lastIndex=73 group=3 conf="voters=[n1 n2 n3]"
+event=group_started node=n1 group=3
+event=raft_follower node=n1 term=1 leader=n3 group=0
+event=raft_follower node=n1 term=2 leader=n3 group=1
+event=raft_follower node=n1 term=2 leader=n3 group=2
+event=raft_follower node=n1 term=1 leader=n3 group=3
+
+# Clean shutdown.
+$ kill -TERM $PID_N1 $PID_N2 $PID_N3
+all three processes exited
