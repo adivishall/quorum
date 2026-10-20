@@ -1,0 +1,834 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'none'; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="description" content="Quorum is a distributed key-value database built from scratch in Go: its own Raft, durable log, LSM storage engine, snapshots, membership and multi-Raft, verified by simulation, crash matrices, recorded histories, chaos, mutation and fuzzing. A static project site; no cluster runs behind it.">
+<meta name="color-scheme" content="light dark">
+<title>Quorum — a distributed key-value database built from scratch in Go</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<a class="skip" href="#overview">Skip to content</a>
+
+<header class="site-header">
+  <div class="bar">
+    <a class="brand" href="#top"><span>●</span> Quorum</a>
+    <nav class="site-nav" aria-label="Sections">
+      <ul>
+        <li><a href="#overview">Overview</a></li>
+        <li><a href="#architecture">Architecture</a></li>
+        <li><a href="#subsystems">Subsystems</a></li>
+        <li><a href="#storage">Storage integration</a></li>
+        <li><a href="#evidence">Evidence</a></li>
+        <li><a href="#quickstart">Quick start</a></li>
+        <li><a href="#status">Status</a></li>
+        <li><a href="#limitations">Limitations</a></li>
+        <li><a href="https://github.com/adivishall/quorum">GitHub ↗</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+<section class="hero" aria-labelledby="hero-title">
+  <p class="kicker">Distributed systems · Go · consensus and storage from scratch</p>
+  <h1 id="hero-title">Quorum: a distributed key-value database built from scratch in Go</h1>
+  <p class="lede">No Raft library, no embedded database, no consensus service. The storage engine and the
+  consensus implementation <em>are</em> the project, and every guarantee the documentation states is
+  bound to a test that checks it. The defining problem is integrating the durable LSM engine with the
+  replicated state machine without weakening the guarantees already proven.</p>
+  <div class="actions">
+    <a class="btn primary" href="https://github.com/adivishall/quorum">Source on GitHub</a>
+    <a class="btn" href="https://github.com/adivishall/quorum/blob/main/README.md">README</a>
+    <a class="btn" href="https://github.com/adivishall/quorum/tree/main/docs">35 design documents</a>
+    <a class="btn" href="#quickstart">Run it locally</a>
+  </div>
+  <ul class="facts" aria-label="Figures from the main branch at commit a3c886f">
+    <li><b>43</b><span>Go packages, 349 files</span></li>
+    <li><b>43k / 58k</b><span>lines of code / lines of tests</span></li>
+    <li><b>373 / 373</b><span>mutants killed in CI</span></li>
+    <li><b>125</b><span>numbered invariants, each naming its test</span></li>
+    <li><b>11,076</b><span>cells in three crash matrices, 0 failures</span></li>
+    <li><b>6 / 6</b><span>CI jobs green on <code>main</code></span></li>
+  </ul>
+  <div class="notice">
+    <p><strong>This is a static project site.</strong> It describes the system at the repository's
+    <code>main</code> branch (commit <code>a3c886f</code>). No Quorum node runs behind this page: there
+    is no live cluster, no hosted API and no telemetry here. The terminal transcript further down was
+    recorded on a laptop with the project's real binaries and is labelled as such.</p>
+  </div>
+</section>
+
+<section id="overview" aria-labelledby="overview-title">
+  <h2 id="overview-title">Overview</h2>
+  <div class="two-col">
+    <div>
+      <h3>What it is</h3>
+      <p>A replicated, sharded key-value store with exactly three operations on opaque byte keys and
+      values: <code>PUT</code>, <code>GET</code> and <code>DELETE</code>. Keys are at most 4 KiB, values at
+      most 1 MiB. There are no transactions, range scans, secondary indexes or multi-key atomicity. That
+      restriction is deliberate: it is what makes the consistency claim defensible.</p>
+      <p>A client talks to any node over a framed binary TCP protocol. The node routes the key to its shard,
+      the shard to its Raft group, and the request to that group's leader (forwarding one hop if it is not
+      the leader itself). A write is acknowledged only once it is committed <em>and applied</em> in the
+      term it was proposed in; a read is served through Raft's ReadIndex, never from a stale leader's
+      local state. The documented model is <strong>linearizable single-key operations, per Raft group</strong>,
+      verified on recorded histories rather than asserted
+      (<a href="https://github.com/adivishall/quorum/blob/main/docs/CONSISTENCY.md">CONSISTENCY.md</a>,
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/LINEARIZABILITY.md">LINEARIZABILITY.md</a>).</p>
+    </div>
+    <div>
+      <h3>Why build consensus and storage from scratch</h3>
+      <p>Because the point is to own the correctness argument end to end. Raft, the durable log, crash
+      recovery, snapshots, membership, the LSM engine (WAL, memtable, SSTables, Bloom filters, compaction,
+      MANIFEST), the client protocol and the deduplication of retried requests are each implemented
+      independently, then connected, in the order in which the next layer can be tested honestly: storage
+      before networking, networking before replication, fault injection immediately after Raft, snapshots
+      only after consistency testing
+      (<a href="https://github.com/adivishall/quorum/blob/main/docs/ROADMAP.md">ROADMAP.md</a>).</p>
+      <h3>Intended use</h3>
+      <p>A reference implementation and an engineering exercise: something another engineer can read, run on
+      a laptop, break with the included fault tools, and check against its own invariants. It is explicitly
+      <a href="#limitations">not production-ready</a> and has never run in production.</p>
+    </div>
+  </div>
+  <h3>The one rule the project applies everywhere</h3>
+  <p>Never claim a guarantee that has not been verified. Every guarantee maps to a numbered invariant in
+  <a href="https://github.com/adivishall/quorum/blob/main/docs/INVARIANTS.md">INVARIANTS.md</a>, and
+  every invariant names the test that checks it. Of the 125 invariants, two are still marked
+  <code>PLANNED</code> and one is structural; a planned invariant may not be cited as a guarantee anywhere
+  else. The things the system cannot do are enumerated in
+  <a href="https://github.com/adivishall/quorum/blob/main/docs/LIMITATIONS.md">LIMITATIONS.md</a>, and
+  the <a href="https://github.com/adivishall/quorum/blob/main/docs/ENGINEERING_ROADMAP.md">engineering
+  roadmap</a> is an audit of the system as built, with its verified defects listed and ranked.</p>
+</section>
+
+<section id="architecture" aria-labelledby="arch-title">
+  <h2 id="arch-title">Architecture: the real path of a request</h2>
+  <p>The diagram shows what <code>dkvd</code> actually runs today, package by package. Solid boxes are
+  on every request's path; the dashed box is the LSM-backed state machine, which exists and passes every
+  correctness tier but is opt-in (<code>-state-machine lsm</code>) while the in-memory machine remains the
+  default. There is no HTTP API, dashboard or rebalancing: those are design only.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 980 560" role="img" aria-labelledby="diag-title diag-desc">
+      <title id="diag-title">Request flow through a Quorum node</title>
+      <desc id="diag-desc">A client sends a framed TCP request to a node's client port. The front routes the key to a shard and the shard to a Raft group, and the group's server proposes the command to the Raft driver, which persists it to the durable log, replicates it to peers over the transport, commits it with a majority, applies it to the state machine, and replies. The state machine is in memory by default or in the LSM engine when opted in. Snapshots compact the log; recovery reconciles the log, snapshot and engine at start. An admin port and a metrics port sit beside the client port.</desc>
+      <defs>
+        <marker id="arrowhead" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+
+      <!-- Row 1: client, front, server -->
+      <rect class="box ext" x="20" y="30" width="190" height="78" rx="6"/>
+      <text x="115" y="56" text-anchor="middle">Client</text>
+      <text class="mono" x="115" y="74" text-anchor="middle">kv.Client / kv.Session</text>
+      <text class="small" x="115" y="92" text-anchor="middle">binary TCP, wire v3, retries by identity</text>
+
+      <rect class="box" x="270" y="30" width="230" height="78" rx="6"/>
+      <text x="385" y="54" text-anchor="middle">1 · Route</text>
+      <text class="mono" x="385" y="72" text-anchor="middle">kv.Front · internal/routing</text>
+      <text class="small" x="385" y="92" text-anchor="middle">key → SHA-256 token → shard → group</text>
+
+      <rect class="box" x="560" y="30" width="230" height="78" rx="6"/>
+      <text x="675" y="54" text-anchor="middle">2 · Group server</text>
+      <text class="mono" x="675" y="72" text-anchor="middle">kv.Server (one per group)</text>
+      <text class="small" x="675" y="92" text-anchor="middle">sessions · dedup at apply · forwarding</text>
+
+      <rect class="box ext" x="840" y="20" width="120" height="46" rx="6"/>
+      <text class="small" x="900" y="39" text-anchor="middle">-admin-listen</text>
+      <text class="small" x="900" y="55" text-anchor="middle">JSON lines · dkvctl</text>
+      <rect class="box ext" x="840" y="74" width="120" height="46" rx="6"/>
+      <text class="small" x="900" y="93" text-anchor="middle">-metrics-listen</text>
+      <text class="small" x="900" y="109" text-anchor="middle">GET /metrics</text>
+
+      <path class="arrow" d="M210 69 H262"/>
+      <path class="arrow" d="M500 69 H552"/>
+
+      <!-- Row 2: the Raft driver -->
+      <rect class="box core" x="270" y="150" width="520" height="150" rx="6"/>
+      <text x="530" y="174" text-anchor="middle">3 · Consensus: the driver and its pure core</text>
+      <text class="mono" x="530" y="192" text-anchor="middle">internal/raftnode · internal/raft · internal/raftlog</text>
+
+      <rect class="box" x="290" y="206" width="150" height="76" rx="5"/>
+      <text class="small" x="365" y="226" text-anchor="middle">raft core (pure)</text>
+      <text class="small" x="365" y="242" text-anchor="middle">no I/O, no clock</text>
+      <text class="small" x="365" y="258" text-anchor="middle">elections · AppendEntries</text>
+      <text class="small" x="365" y="274" text-anchor="middle">§5.4.2 commit · ReadIndex</text>
+
+      <rect class="box" x="455" y="206" width="150" height="76" rx="5"/>
+      <text class="small" x="530" y="226" text-anchor="middle">durable log</text>
+      <text class="small" x="530" y="242" text-anchor="middle">entries + HardState</text>
+      <text class="small" x="530" y="258" text-anchor="middle">fsync before reply</text>
+      <text class="small" x="530" y="274" text-anchor="middle">torn tail truncates</text>
+
+      <rect class="box" x="620" y="206" width="150" height="76" rx="5"/>
+      <text class="small" x="695" y="226" text-anchor="middle">actor loop</text>
+      <text class="small" x="695" y="242" text-anchor="middle">persist → send →</text>
+      <text class="small" x="695" y="258" text-anchor="middle">advance → apply</text>
+      <text class="small" x="695" y="274" text-anchor="middle">named crash points</text>
+
+      <path class="arrow" d="M675 108 V142"/>
+      <text class="small" x="690" y="130">propose</text>
+
+      <!-- Transport / peers -->
+      <rect class="box" x="840" y="150" width="120" height="150" rx="6"/>
+      <text x="900" y="176" text-anchor="middle">4 · Peers</text>
+      <text class="mono" x="900" y="196" text-anchor="middle">transport</text>
+      <text class="small" x="900" y="216" text-anchor="middle">framed TCP</text>
+      <text class="small" x="900" y="232" text-anchor="middle">one conn per pair</text>
+      <text class="small" x="900" y="248" text-anchor="middle">group envelope</text>
+      <text class="small" x="900" y="264" text-anchor="middle">multiraft host</text>
+      <text class="small" x="900" y="280" text-anchor="middle">demux → inbox</text>
+      <path class="arrow" d="M790 215 H832"/>
+      <path class="arrow" d="M832 245 H790"/>
+      <text class="small" x="811" y="208" text-anchor="middle">replicate</text>
+      <text class="small" x="811" y="262" text-anchor="middle">majority</text>
+
+      <!-- Row 3: apply -->
+      <path class="arrow" d="M530 300 V342"/>
+      <text class="small" x="545" y="326">5 · apply committed entries, in log order</text>
+
+      <rect class="box sm" x="270" y="350" width="250" height="110" rx="6"/>
+      <text x="395" y="374" text-anchor="middle">State machine (default)</text>
+      <text class="mono" x="395" y="392" text-anchor="middle">kv.Store — in memory</text>
+      <text class="small" x="395" y="412" text-anchor="middle">key-value map + session table</text>
+      <text class="small" x="395" y="428" text-anchor="middle">rebuilt at start from the latest</text>
+      <text class="small" x="395" y="444" text-anchor="middle">snapshot plus the log behind it</text>
+
+      <rect class="box optin" x="540" y="350" width="250" height="110" rx="6"/>
+      <text x="665" y="374" text-anchor="middle">State machine (opt-in)</text>
+      <text class="mono" x="665" y="392" text-anchor="middle">kv.LSMMachine · internal/storage</text>
+      <text class="small" x="665" y="412" text-anchor="middle">WAL → memtable → SSTables → compaction</text>
+      <text class="small" x="665" y="428" text-anchor="middle">one apply batch per Raft cycle (S1)</text>
+      <text class="small" x="665" y="444" text-anchor="middle">applied index in the MANIFEST (S3)</text>
+
+      <!-- Row 4: snapshots and recovery -->
+      <rect class="box" x="20" y="150" width="190" height="150" rx="6"/>
+      <text x="115" y="176" text-anchor="middle">Snapshots</text>
+      <text class="mono" x="115" y="194" text-anchor="middle">internal/snapshot</text>
+      <text class="small" x="115" y="214" text-anchor="middle">CRC-32C records, SHA-256</text>
+      <text class="small" x="115" y="230" text-anchor="middle">atomic publish, then</text>
+      <text class="small" x="115" y="246" text-anchor="middle">log compaction</text>
+      <text class="small" x="115" y="262" text-anchor="middle">followers install chunks</text>
+      <text class="small" x="115" y="278" text-anchor="middle">over InstallSnapshot</text>
+      <path class="arrow dashed" d="M262 225 H218"/>
+
+      <rect class="box" x="20" y="350" width="190" height="110" rx="6"/>
+      <text x="115" y="374" text-anchor="middle">Recovery at start</text>
+      <text class="small" x="115" y="396" text-anchor="middle">log, HardState, snapshot</text>
+      <text class="small" x="115" y="412" text-anchor="middle">and engine reconciled;</text>
+      <text class="small" x="115" y="428" text-anchor="middle">every contradiction refused;</text>
+      <text class="small" x="115" y="444" text-anchor="middle">persistence failure = fail-stop</text>
+      <path class="arrow dashed" d="M262 405 H218"/>
+
+      <!-- Reply -->
+      <path class="arrow" d="M300 460 V500 H115 V116"/>
+      <text class="small" x="400" y="492" text-anchor="start">6 · reply: committed and applied in the proposal's term (a read: after ReadIndex is confirmed)</text>
+
+      <text class="small" x="20" y="540">Solid: on every request's path on main. Dashed: opt-in (-state-machine lsm) and start-up paths. Ports: client, admin and metrics are separate listeners.</text>
+    </svg>
+    <figcaption>Traced from <code>cmd/dkvd</code>, <code>internal/multiraft</code>, <code>internal/kv</code>,
+    <code>internal/raftnode</code>, <code>internal/raft</code>, <code>internal/raftlog</code>,
+    <code>internal/snapshot</code>, <code>internal/storage</code> and <code>internal/transport</code> on
+    <code>main</code>. The step numbers are the order in which one write proceeds.</figcaption>
+  </figure>
+
+  <h3>The same flow in words, with the code that does it</h3>
+  <ol>
+    <li><strong>Client request.</strong> A client opens a plain TCP connection to a node's
+      <code>-client-listen</code> port and sends one checksummed frame: op, group, client ID, request ID,
+      acknowledgement watermark, timeout, key and (for PUT) value. No HTTP, no TLS, no authentication.
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/API.md">API.md</a> ·
+      <a href="https://github.com/adivishall/quorum/blob/main/internal/kv/wire.go">kv/wire.go</a></li>
+    <li><strong>Shard routing and group selection.</strong> The key is hashed (SHA-256, first 8 bytes) to a
+      token; a consistent-hash ring over the fixed shard set maps it to a shard, and in <code>-cluster</code>
+      mode group id equals shard id. A node that does not lead the group forwards the request one hop over
+      the internal transport, or answers <code>NOT_LEADER</code> with a hint.
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/ROUTING.md">ROUTING.md</a> ·
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/MULTI_RAFT.md">MULTI_RAFT.md</a> ·
+      <a href="https://github.com/adivishall/quorum/blob/main/internal/kv/front.go">kv/front.go</a></li>
+    <li><strong>Replication and commit.</strong> The group's server proposes the command to the Raft
+      driver. The driver appends it to the durable log and fsyncs before anything is sent, replicates it
+      with AppendEntries over the framed transport, and commits it when a majority has it, following the
+      Raft §5.4.2 rule. The core itself performs no I/O and reads no clock, so the whole algorithm is also
+      run inside a deterministic simulator.
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/RAFT.md">RAFT.md</a> ·
+      <a href="https://github.com/adivishall/quorum/blob/main/internal/raft/raft.go">raft/raft.go</a> ·
+      <a href="https://github.com/adivishall/quorum/blob/main/internal/raftnode/node.go">raftnode/node.go</a></li>
+    <li><strong>State machine application.</strong> Committed entries are applied in log order. The
+      replicated state is the key-value map plus a bounded session table that decides, identically on every
+      replica, whether an identified write executes or is a duplicate of an earlier one. By default this
+      state lives in memory (<code>kv.Store</code>); with <code>-state-machine lsm</code> it lives in the
+      storage engine, one apply batch per Raft cycle, with the applied index recorded atomically in the
+      engine's MANIFEST.
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/DEDUP.md">DEDUP.md</a> ·
+      <a href="https://github.com/adivishall/quorum/blob/main/internal/kv/store.go">kv/store.go</a> ·
+      <a href="https://github.com/adivishall/quorum/blob/main/internal/kv/lsm.go">kv/lsm.go</a></li>
+    <li><strong>Persistence, snapshots and recovery.</strong> Every <code>-snapshot-every</code> applied
+      entries a node writes its state to a versioned, checksummed snapshot file, publishes it by atomic
+      rename, then compacts the Raft log behind it by an atomic rewrite. A follower too far behind installs
+      the leader's snapshot, streamed in 1 MiB chunks. At start, recovery reconciles the log, the snapshot
+      and (in LSM mode) the engine's durable applied index, refusing any contradiction; a failed persist
+      stops the node rather than continuing in doubt.
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/SNAPSHOTS.md">SNAPSHOTS.md</a> ·
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/CRASH_RECOVERY.md">CRASH_RECOVERY.md</a> ·
+      <a href="https://github.com/adivishall/quorum/blob/main/internal/snapshot">internal/snapshot</a></li>
+  </ol>
+
+  <h3>Two state-machine paths, stated exactly</h3>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th></th><th>In-memory machine <span class="badge done">default</span></th><th>LSM-backed machine <span class="badge optin">opt-in</span></th></tr></thead>
+    <tbody>
+      <tr><td>Code</td><td><code>kv.Store</code> (<a href="https://github.com/adivishall/quorum/blob/main/internal/kv/store.go">internal/kv/store.go</a>)</td><td><code>kv.LSMMachine</code> over <code>storage.LSMStore</code> (<a href="https://github.com/adivishall/quorum/blob/main/internal/kv/lsm.go">internal/kv/lsm.go</a>, <a href="https://github.com/adivishall/quorum/tree/main/internal/storage">internal/storage</a>)</td></tr>
+      <tr><td>Flag</td><td><code>-state-machine memory</code></td><td><code>-state-machine lsm</code></td></tr>
+      <tr><td>Where the state lives</td><td>Process memory; the Raft log and snapshot file are the durable copy</td><td>The engine under the group's directory: WAL, memtable, SSTables, MANIFEST</td></tr>
+      <tr><td>Restart</td><td>Restores the latest snapshot, replays the log behind it</td><td>Opens the engine, reads its durable applied index from the MANIFEST, replays only the entries above it (S1–S3)</td></tr>
+      <tr><td>Snapshot of the state</td><td>Encodes the whole state into the snapshot file</td><td>Same format and same decoder; on <code>main</code> a snapshot is still built from a full state read, which bounds installs to about 63 MiB. Engine checkpoints and streamed installs are S4, <a href="https://github.com/adivishall/quorum/pull/27">in review</a>.</td></tr>
+      <tr><td>Verification</td><td>Every integration, linearizability, membership and chaos tier</td><td>The same tiers, run again with every node on the engine (<code>make integration-lsm</code>, <code>make race-lsm</code>); the ingest and apply crash matrices on a modeled disk</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section id="subsystems" aria-labelledby="subsystems-title">
+  <h2 id="subsystems-title">Subsystems, matched to what is implemented</h2>
+  <p>Each card says what the component does, how it is verified, and where to read the exact claim. The
+  figures are the ones the documents and the CI logs state for <code>main</code>.</p>
+  <ul class="cards">
+    <li class="card">
+      <h3>Raft consensus <span class="badge done">implemented</span></h3>
+      <p>A pure, deterministic core: randomized election timeouts from an injected source, RequestVote and
+      AppendEntries with a term-based conflict hint, the §5.4.2 commit rule and the mandatory election
+      no-op, ReadIndex for reads. A durable log and HardState make it crash-safe; a node driver runs a real
+      group over TCP, persisting before it replies.</p>
+      <p class="ev">Evidence: INV-R1..R10 checked after every event of seeded, replayable simulations; the
+      paper's figures reproduced as tests; real three-process election and SIGKILL recovery.
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/RAFT.md">RAFT.md</a> ·
+      <a href="https://github.com/adivishall/quorum/tree/main/internal/raft">internal/raft</a></p>
+    </li>
+    <li class="card">
+      <h3>Replication and transport <span class="badge done">implemented</span></h3>
+      <p>One framed, checksummed TCP connection per peer pair (the lower id dials), a version handshake
+      carrying the cluster id and a digest of the replicated settings, automatic reconnect, and a group
+      envelope on every frame. The transport carries bytes tagged with a kind and knows nothing of terms or
+      leaders; faults are injected around it, never inside the core.</p>
+      <p class="ev">Evidence: INV-T1..T6; real-process partition, kill and freeze tests through TCP proxies.
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/TRANSPORT.md">TRANSPORT.md</a> ·
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/FAULTS.md">FAULTS.md</a></p>
+    </li>
+    <li class="card">
+      <h3>Crash recovery <span class="badge done">implemented</span></h3>
+      <p>Named crash points at every boundary of the driver's persist → send → advance → apply cycle and
+      between the record writes of one durable-log save. A bounded exhaustive matrix kills a node at every
+      point a scenario reaches, in every crash mode, and checks each recovery against an independent record
+      of what was persisted. Real processes kill themselves at the exact point with <code>dkvd -crash-at</code>.</p>
+      <p class="ev">Evidence: three crash matrices of 1,440, 2,976 and 6,660 cells (node, snapshot and
+      membership windows), 0 failures; the save-order window that bricked a node was found and fixed.
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/CRASH_RECOVERY.md">CRASH_RECOVERY.md</a></p>
+    </li>
+    <li class="card">
+      <h3>Snapshots and log compaction <span class="badge done">implemented</span></h3>
+      <p>The replicated state, session table included, in a versioned, deterministic file of CRC-32C
+      records with a SHA-256 over the state and nothing after the footer. Published by atomic rename, then
+      the log is compacted behind it by an atomic rewrite. Followers whose entries are gone install the
+      leader's snapshot in 1 MiB chunks; recovery reconciles snapshot and log and refuses every contradiction.</p>
+      <p class="ev">Evidence: a 2,976-cell crash matrix over every snapshot window; ten real-process tests
+      including a SIGKILL mid-install; 100,000 writes, then a restart that replays 1 entry instead of 100,001.
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/SNAPSHOTS.md">SNAPSHOTS.md</a></p>
+    </li>
+    <li class="card">
+      <h3>Membership and multi-Raft <span class="badge done">implemented</span></h3>
+      <p>A group adds a learner, promotes it and removes voters, the leader included, one member at a time
+      by Raft §6 joint consensus, with the configuration carried as replicated state in the log and the
+      snapshot. A node hosts one Raft group per shard it serves, each with its own log, snapshot, identity
+      file and state machine; clients hold one session per group. Changes are operator-driven through the
+      admin protocol.</p>
+      <p class="ev">Evidence: INV-MB1..MB10 at every event of 200-seed schedules, a bounded model of every
+      four-step sequence, a 6,660-cell crash matrix, ten real-process tests.
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/MEMBERSHIP.md">MEMBERSHIP.md</a> ·
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/MULTI_RAFT.md">MULTI_RAFT.md</a></p>
+    </li>
+    <li class="card">
+      <h3>Client semantics and deduplication <span class="badge done">implemented</span></h3>
+      <p>A client registers a session (its ID is the log index of the <code>REGISTER</code> entry) and
+      numbers its requests. The state machine decides at apply, identically on every replica, whether an
+      identified write executes or is a duplicate answered with the original's index. Retried identified
+      writes execute at most once; anonymous writes keep the plain semantics. Nothing is claimed across groups.</p>
+      <p class="ev">Evidence: the hardest retry case at all eight crash windows of a real process; 1,200
+      seeded runs in which every replica's apply-time decision matches an independent model.
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/CLIENT_SEMANTICS.md">CLIENT_SEMANTICS.md</a> ·
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/DEDUP.md">DEDUP.md</a></p>
+    </li>
+    <li class="card">
+      <h3>Linearizability checking <span class="badge done">implemented</span></h3>
+      <p>A checker, validated first against an independent oracle, a known-good and known-bad corpus and
+      fuzzing, checks client histories recorded from real processes under faults, from the in-process
+      driver, and from thousands of seeded simulator runs. A failing test leaves its history as an artifact
+      that <code>lincheck</code> re-checks, minimizes and explains offline.</p>
+      <p class="ev">Evidence: INV-X1..X14; 1,400 seeded runs for the base model and 1,200 for request identity.
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/LINEARIZABILITY.md">LINEARIZABILITY.md</a> ·
+      <a href="https://github.com/adivishall/quorum/tree/main/internal/lincheck">internal/lincheck</a></p>
+    </li>
+    <li class="card">
+      <h3>LSM storage engine <span class="badge done">implemented</span></h3>
+      <p>Write-ahead log with CRC records, segmentation and torn-tail repair; an ordered memtable;
+      immutable checksummed SSTables with Bloom filters; size-tiered compaction; a MANIFEST that decides
+      which files are the database, so a file is part of it at exactly one instant. Acknowledged writes
+      survive SIGKILL, including a kill during a flush or a compaction.</p>
+      <p class="ev">Evidence: INV-W, INV-L, INV-B, INV-C and INV-M families; real-process kill tests that fail
+      if the crash window was never hit. Standalone benchmarks in
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/BENCHMARKS.md">BENCHMARKS.md</a>.
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/LSM.md">LSM.md</a> ·
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/WAL.md">WAL.md</a> ·
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/MANIFEST.md">MANIFEST.md</a></p>
+    </li>
+    <li class="card">
+      <h3>Fault injection and chaos <span class="badge done">implemented</span></h3>
+      <p>A deterministic simulator drives the real core, the real durable log on a crash-modeling disk and
+      the driver's own ordering through seeded schedules of dropped, duplicated, delayed and reordered
+      messages, partitions, crashes, modeled power loss and disk failures, checking every invariant after
+      every event. Real processes are killed, frozen, partitioned and crashed at chosen points under a
+      recorded workload that is then checked for linearizability.</p>
+      <p class="ev">Evidence: <code>make faults</code> with 200 seeds in CI; <code>make chaos</code>; the simulator
+      found and fixed three real bugs, one of which let a restarted node acknowledge entries a power loss could erase.
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/FAULTS.md">FAULTS.md</a> ·
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/CHAOS.md">CHAOS.md</a></p>
+    </li>
+    <li class="card">
+      <h3>Observability and operations <span class="badge done">implemented</span></h3>
+      <p>Every node serves Prometheus-format metrics from every layer on <code>-metrics-listen</code>, each
+      incremented where the event happens and verified against ground truth. <code>dkvctl</code> reads the
+      JSON-lines admin protocol for status, leaders, configurations, lag, health and readiness, with exit
+      codes a probe can branch on. Nothing aggregates, stores or alerts on any of it.</p>
+      <p class="ev">
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/OBSERVABILITY.md">OBSERVABILITY.md</a> ·
+      <a href="https://github.com/adivishall/quorum/blob/main/docs/OPERATIONS.md">OPERATIONS.md</a> ·
+      <a href="https://github.com/adivishall/quorum/tree/main/cmd/dkvctl">cmd/dkvctl</a></p>
+    </li>
+  </ul>
+</section>
+
+<section id="storage" aria-labelledby="storage-title">
+  <h2 id="storage-title">Storage integration: where the flagship work stands</h2>
+  <p>The engine and the replicated state machine were built separately. Making the LSM engine <em>the</em>
+  state machine, without weakening any guarantee already proven, is organised as six milestones in
+  <a href="https://github.com/adivishall/quorum/blob/main/docs/STORAGE_INTEGRATION.md">STORAGE_INTEGRATION.md</a>.
+  The rule applied throughout: Raft decides order; the engine makes the result of applying that order
+  durable; the engine never invents an order of its own.</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Milestone</th><th>What it establishes</th><th>State on <code>main</code></th></tr></thead>
+    <tbody>
+      <tr><td><strong>S1</strong> Atomic apply batches</td><td>A Raft cycle's mutations and its applied index are recorded in the engine as one unit (rule R1), proven in isolation by a deterministic crash and power-loss matrix over a modeled disk.</td><td><span class="badge done">merged</span></td></tr>
+      <tr><td><strong>S2</strong> The engine behind the state-machine interface</td><td><code>dkvd -state-machine lsm</code>: each group's state in the engine under its directory, sessions under a reserved key tag, one apply batch per Raft cycle, recovery from the engine's applied index. Every linearizability, dedup, snapshot, membership and chaos tier passes on both machines.</td><td><span class="badge done">merged</span></td></tr>
+      <tr><td><strong>S3</strong> Durable watermarks</td><td>The applied index and last sequence are authoritative in the MANIFEST; the WAL is truncated behind each flush; the Raft log is never compacted past the engine's durable applied index (rule R2).</td><td><span class="badge done">merged</span></td></tr>
+      <tr><td><strong>S4</strong> Engine checkpoints and streamed installs</td><td>Snapshots taken from a pinned engine checkpoint and installed by streaming into the engine, removing the ~63 MiB one-record install limit.</td><td><span class="badge review">in review, <a href="https://github.com/adivishall/quorum/pull/27">PR #27</a></span></td></tr>
+      <tr><td><strong>S5</strong> The two-log measurement</td><td>Whether the Raft log and the engine's WAL should stay two logs, decided by measurement (<a href="https://github.com/adivishall/quorum/blob/main/docs/DECISIONS.md">ADR-006</a>).</td><td><span class="badge planned">planned</span></td></tr>
+      <tr><td><strong>S6</strong> Snapshot work off the actor</td><td>Moving snapshot creation and the engine flush off the Raft node's actor, where today they pause Raft processing and can cost a leader its term under fsync-heavy load.</td><td><span class="badge planned">planned</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="notice warn">
+    <p><strong>What this means in practice.</strong> On <code>main</code> the in-memory machine is the
+    default and the LSM-backed machine is opt-in. Both pass the same correctness tiers. The LSM path is not
+    yet the recommended configuration: its snapshots are bounded in size until S4 merges, and the
+    actor-bound snapshot flush (S6) is a measured liveness cost. Nothing on this page describes S4–S6 as done.</p>
+  </div>
+</section>
+
+<section id="evidence" aria-labelledby="evidence-title">
+  <h2 id="evidence-title">Evidence</h2>
+  <p>Every claim above is tied to a test, a recorded history, a matrix or a measurement in the repository.
+  This section links the primary sources and says what each does and does not establish.</p>
+
+  <h3>Continuous integration on <code>main</code></h3>
+  <p>The workflow <a href="https://github.com/adivishall/quorum/blob/main/.github/workflows/ci.yml">ci.yml</a>
+  runs six independent jobs on every push and pull request. The latest run on <code>main</code>,
+  <a href="https://github.com/adivishall/quorum/actions/runs/38166080406">run 38166080406</a> on commit
+  <code>a3c886f</code> (2026-10-11), passed all six; the figures below are read from its logs.</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Job</th><th>What it runs</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td><code>check</code></td><td><code>gofmt</code>, the <code>.gitignore</code> guard, <code>go vet</code>, every unit package under the race detector, then the key-value package again with the LSM machine</td><td>pass</td></tr>
+      <tr><td><code>integration</code></td><td>Real <code>dkvd</code> processes: SIGKILL recovery, Raft over TCP, kill/stop/partition faults, linearizability, membership, metrics, load and the lab; 89 top-level tests</td><td>pass</td></tr>
+      <tr><td><code>integration-lsm</code></td><td>The same suite with every node on the LSM machine</td><td>pass</td></tr>
+      <tr><td><code>faults</code></td><td>The deterministic simulator at 200 seeds: fault schedules, the crash, snapshot and membership matrices, seeded histories checked for linearizability, the bounded membership model</td><td>pass</td></tr>
+      <tr><td><code>fuzz</code></td><td>Every fuzz target in the repository, 5 s each on CI (10 s locally)</td><td>35 / 35</td></tr>
+      <tr><td><code>mutation</code></td><td><a href="https://github.com/adivishall/quorum/blob/main/scripts/mutation.sh">scripts/mutation.sh</a>: deliberate rule-violating edits to the source, each of which a named test must catch</td><td>373 / 373 killed</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p><strong>What this establishes.</strong> The documented invariants hold on every path the tests reach:
+  simulated schedules, exact-boundary crashes, recorded real-process histories, and the LSM-backed
+  configuration. <strong>What it does not.</strong> It is not a proof over every execution; histories are
+  finite and small (at most five nodes and eight clients); power loss is a software model, so no test proves
+  that a device keeps fsynced bytes; and real partitions are connection resets, never silent packet loss.
+  These bounds are stated in <a href="https://github.com/adivishall/quorum/blob/main/docs/ENGINEERING_ROADMAP.md">ENGINEERING_ROADMAP.md</a> §1.5
+  and <a href="https://github.com/adivishall/quorum/blob/main/docs/FAULTS.md">FAULTS.md</a>.</p>
+
+  <h3>Cluster baseline: real processes, one machine</h3>
+  <p>From <a href="https://github.com/adivishall/quorum/blob/main/docs/CLUSTER_BENCHMARKS.md">CLUSTER_BENCHMARKS.md</a>,
+  recorded 2026-09-29 by <code>dkvlab</code> on an Apple M4 laptop (10 cores, 16 GiB, macOS), every node and
+  the load generator on loopback, with every Raft persist a full drive-cache flush. The raw JSON of every
+  run is committed under <a href="https://github.com/adivishall/quorum/tree/main/bench/cluster">bench/cluster/</a>.
+  Values are medians of three runs. <strong>None of them is a capacity:</strong> a closed-loop throughput
+  belongs to its concurrency, all nodes share one disk and one CPU with the generator, and loopback has no
+  network latency.</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Configuration</th><th class="num">ok/s</th><th>GET p50 / p99</th><th>PUT p50 / p99</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>1 node, 95% reads, closed loop, 16 clients</td><td class="num">4,895</td><td>0.5 / 16.0 ms</td><td>4.2 / 16.1 ms</td><td>one group</td></tr>
+      <tr><td>3 nodes, 95% reads, closed loop, 16 clients</td><td class="num">1,046</td><td>11.5 / 61.1 ms</td><td>28.1 / 75.1 ms</td><td>mean persist 7.5 ms, mean commit 28.3 ms</td></tr>
+      <tr><td>3 nodes, 50% reads, closed loop, 16 clients</td><td class="num">119</td><td>125.7 / 195.9 ms</td><td>143.5 / 219.8 ms</td><td>every write is its own fsync (no group commit yet)</td></tr>
+      <tr><td>5 nodes, 95% reads, closed loop, 16 clients</td><td class="num">778</td><td>16.3 / 69.1 ms</td><td>36.0 / 89.0 ms</td><td>widest spread of the matrix</td></tr>
+      <tr><td>3 nodes, 16 groups, 50% reads</td><td class="num">214</td><td>24.2 / 174.9 ms</td><td>100.6 / 254.1 ms</td><td>1.9× one group's 115 ok/s; fsyncs share one disk</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Under an open-loop load of 50 ops/s on three nodes, killing the leader with SIGKILL cost a median
+  <strong>521 ms</strong> to a new leader (p95 617 ms over ten runs) and a <strong>450 ms</strong> outage, with
+  zero unknown outcomes in every run at a 2 s attempt timeout. Those numbers describe this laptop and this
+  configuration; a fast network and separate disks would move them, and the project has not measured that.</p>
+
+  <h3>Storage engine, standalone</h3>
+  <p><a href="https://github.com/adivishall/quorum/blob/main/docs/BENCHMARKS.md">BENCHMARKS.md</a> characterises
+  the engine on its own with a reproducible harness (<code>cmd/dkvbench</code>, raw results in
+  <a href="https://github.com/adivishall/quorum/blob/main/bench/phase5-baseline.json">bench/phase5-baseline.json</a>).
+  Two figures the README keeps because they are properties of the algorithm rather than of the machine:
+  with the Bloom filters on, 4,000 lookups over 17 SSTables read <strong>2,395</strong> data blocks instead of
+  52,329 (95.4% avoided, at 10.00 bits per key); and a device-level flush per write costs roughly
+  <strong>700×</strong> a buffered append (an early measurement: about 258 appends/s in <code>sync</code> mode
+  against about 183,000 in the default <code>batch</code> mode), which is the honest price of power-loss
+  durability and why <code>batch</code> is the default.</p>
+
+  <h3>Where to look in the tree</h3>
+  <dl class="kv">
+    <dt>Tests</dt><dd><a href="https://github.com/adivishall/quorum/tree/main/tests/integration">tests/integration</a> (real processes) and the <code>_test.go</code> files beside every package; 195 test files, about 58,000 lines.</dd>
+    <dt>Simulator</dt><dd><a href="https://github.com/adivishall/quorum/tree/main/internal/raftsim">internal/raftsim</a>, <a href="https://github.com/adivishall/quorum/tree/main/internal/fault">internal/fault</a></dd>
+    <dt>Invariants</dt><dd><a href="https://github.com/adivishall/quorum/blob/main/docs/INVARIANTS.md">docs/INVARIANTS.md</a>: 125 numbered, falsifiable statements, each bound to its test</dd>
+    <dt>Decisions</dt><dd><a href="https://github.com/adivishall/quorum/blob/main/docs/DECISIONS.md">docs/DECISIONS.md</a>: architecture decision records, with the alternatives that lost and what each choice costs</dd>
+    <dt>Audit</dt><dd><a href="https://github.com/adivishall/quorum/blob/main/docs/ENGINEERING_ROADMAP.md">docs/ENGINEERING_ROADMAP.md</a>: the system as built, its verified defects, and the ranked work that follows</dd>
+  </dl>
+</section>
+
+<section id="quickstart" aria-labelledby="quickstart-title">
+  <h2 id="quickstart-title">Quick start</h2>
+  <p>Requires Go 1.27.2 or later (<code>go.mod</code> pins the patch release; with the default
+  <code>GOTOOLCHAIN=auto</code> an older Go 1.27 fetches it). Everything below runs on one laptop.</p>
+
+  <h3>Clone, build, run the gate</h3>
+<pre><code>git clone https://github.com/adivishall/quorum.git
+cd quorum
+make build          # every command into bin/
+make check          # gofmt, .gitignore guard, go vet, every unit package under -race: the phase gate
+make integration    # real-process tests (several minutes)
+make faults         # the deterministic fault schedules and crash matrices at 200 seeds</code></pre>
+  <p>Slower tiers: <code>make mutation</code>, <code>make fuzz</code>, <code>make chaos</code>. The
+  <a href="https://github.com/adivishall/quorum/blob/main/Makefile">Makefile</a> documents each.</p>
+
+  <h3>A three-node cluster on your machine</h3>
+  <p>Three <code>dkvd</code> processes on loopback, one Raft group per shard (4 shards, replication factor 3),
+  the default in-memory state machine. The first start of each node initialises its data directory;
+  every later start omits <code>-init</code>. Add <code>-state-machine lsm</code> to every node to run the
+  LSM-backed machine instead; the flag is part of the replicated state machine's definition and must match
+  on every node.</p>
+<pre><code>go build -o bin/ ./cmd/dkvd ./cmd/dkvctl ./cmd/dkvload
+export PATH="$PWD/bin:$PATH"
+mkdir -p data logs
+
+dkvd -id n1 -listen 127.0.0.1:7001 -peers n2=127.0.0.1:7002,n3=127.0.0.1:7003 -data-dir data/n1 \
+     -init -cluster-id demo -cluster -shards 4 -rf 3 \
+     -client-listen 127.0.0.1:8001 -admin-listen 127.0.0.1:9001 -metrics-listen 127.0.0.1:9101 &gt;logs/n1.log 2&gt;&amp;1 &amp;
+dkvd -id n2 -listen 127.0.0.1:7002 -peers n1=127.0.0.1:7001,n3=127.0.0.1:7003 -data-dir data/n2 \
+     -init -cluster-id demo -cluster -shards 4 -rf 3 \
+     -client-listen 127.0.0.1:8002 -admin-listen 127.0.0.1:9002 -metrics-listen 127.0.0.1:9102 &gt;logs/n2.log 2&gt;&amp;1 &amp;
+dkvd -id n3 -listen 127.0.0.1:7003 -peers n1=127.0.0.1:7001,n2=127.0.0.1:7002 -data-dir data/n3 \
+     -init -cluster-id demo -cluster -shards 4 -rf 3 \
+     -client-listen 127.0.0.1:8003 -admin-listen 127.0.0.1:9003 -metrics-listen 127.0.0.1:9103 &gt;logs/n3.log 2&gt;&amp;1 &amp;
+
+# Health, leaders and configurations, over the admin protocol (exit 0 = healthy).
+dkvctl -nodes n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 health
+dkvctl -nodes n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 status
+
+# A real client workload through the binary client protocol.
+dkvload -endpoints n1=127.0.0.1:8001,n2=127.0.0.1:8002,n3=127.0.0.1:8003 \
+        -shards 4 -rf 3 -nodes n1,n2,n3 -clients 4 -rate 100 -duration 5s -read 50
+
+# One node's metrics.
+curl -s http://127.0.0.1:9101/metrics | grep -E '^dkv_raft_role'</code></pre>
+  <p>The client protocol has no command-line client yet (<code>bin/dkv</code> is an in-memory CLI from
+  Phase 1, not a network client). <code>dkvload</code> is the supported way to put real requests through a
+  cluster from the shell; the Go client library is <code>kv.Client</code> and <code>kv.Session</code> in
+  <a href="https://github.com/adivishall/quorum/tree/main/internal/kv">internal/kv</a>.</p>
+
+  <h3>Recorded transcript: the commands above, run for real</h3>
+  <div class="notice">
+    <p><strong>Recorded locally, not a live system.</strong> Produced on 2026-10-20 by a script that runs
+    exactly the commands shown, against binaries built from <code>main</code> at <code>a3c886f</code> with
+    Go 1.27.2 on an Apple M4 laptop running macOS 27.0.1. Every line below the <code>$</code> prompts is the
+    tools' own output. The session also kills one node with SIGKILL, shows the cluster degraded, restarts
+    the node from its data directory and shows it caught up. Latencies are those of one laptop with all
+    three nodes and the load generator sharing one disk.</p>
+  </div>
+<pre class="transcript"><code><span class="cmt"># Three dkvd processes on loopback, one Raft group per shard (4 shards, replication factor 3).</span>
+<span class="cmt"># The first start of each node initializes its data directory (-init -cluster-id).</span>
+<span class="cmd">$ dkvd -id n1 -listen 127.0.0.1:7001 -peers n2=127.0.0.1:7002,n3=127.0.0.1:7003 -data-dir data/n1 -init -cluster-id demo -cluster -shards 4 -rf 3 -client-listen 127.0.0.1:8001 -admin-listen 127.0.0.1:9001 -metrics-listen 127.0.0.1:9101 &gt;logs/n1.log 2&gt;&amp;1 &amp;</span>
+<span class="cmd">$ dkvd -id n2 -listen 127.0.0.1:7002 -peers n1=127.0.0.1:7001,n3=127.0.0.1:7003 -data-dir data/n2 -init -cluster-id demo -cluster -shards 4 -rf 3 -client-listen 127.0.0.1:8002 -admin-listen 127.0.0.1:9002 -metrics-listen 127.0.0.1:9102 &gt;logs/n2.log 2&gt;&amp;1 &amp;</span>
+<span class="cmd">$ dkvd -id n3 -listen 127.0.0.1:7003 -peers n1=127.0.0.1:7001,n2=127.0.0.1:7002 -data-dir data/n3 -init -cluster-id demo -cluster -shards 4 -rf 3 -client-listen 127.0.0.1:8003 -admin-listen 127.0.0.1:9003 -metrics-listen 127.0.0.1:9103 &gt;logs/n3.log 2&gt;&amp;1 &amp;</span>
+
+<span class="cmt"># Wait until every group has a confirmed leader (dkvctl health exits 0).</span>
+<span class="cmd">$ dkvctl -nodes n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 health</span>
+cluster: healthy
+GROUP  VERDICT  LEADER  TERM  CONFIRMED  REASONS
+0      healthy  n3      1     3/2        
+1      healthy  n1      1     3/2        
+2      healthy  n1      1     3/2        
+3      healthy  n3      1     3/2        
+NODE  READINESS  REASONS
+n1    ready      
+n2    ready      
+n3    ready      
+
+<span class="cmd">$ dkvctl -nodes n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 leader</span>
+GROUP  LEADER  TERM  CONFIRMED BY   VERDICT
+0      n3      1     3 of quorum 2  healthy
+1      n1      1     3 of quorum 2  healthy
+2      n1      1     3 of quorum 2  healthy
+3      n3      1     3 of quorum 2  healthy
+
+<span class="cmd">$ dkvctl -nodes n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 groups</span>
+GROUP  VOTERS    LEARNERS  JOINT (OUTGOING)  CONF INDEX  PENDING  HOSTED ON
+0      n1,n2,n3  -         -                 0           false    n1,n2,n3
+1      n1,n2,n3  -         -                 0           false    n1,n2,n3
+2      n1,n2,n3  -         -                 0           false    n1,n2,n3
+3      n1,n2,n3  -         -                 0           false    n1,n2,n3
+
+<span class="cmt"># A real client workload through the binary client protocol: identified requests,</span>
+<span class="cmt"># sessions per group, 50% reads, open loop at 100 operations per second for 5 s.</span>
+<span class="cmd">$ dkvload -endpoints n1=127.0.0.1:8001,n2=127.0.0.1:8002,n3=127.0.0.1:8003 -shards 4 -rf 3 -nodes n1,n2,n3 -clients 4 -rate 100 -duration 5s -warmup 1s -read 50 -keys 1000 -value 100 -seed 1</span>
+4 clients, open loop at 100 ops/s, 5s measured after 1s warmup; 1000 keys (uniform), 50% get, 0% delete, 100-byte values
+completed 100 ops/s in the window; outcomes map[not_found:208 ok:292]; late 0; longest outage 0s; generator CPU 100ms
+op          count    p50 µs       p90       p95       p99     p99.9       max
+get           248      1524     16074     24988     36207     45180     45180
+put           252     25207     40484     43983     50063     56033     56033
+
+<span class="cmd">$ dkvctl -nodes n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 status</span>
+NODE  GROUP  ROLE      TERM  LEADER  COMMIT  APPLIED  LAST  SNAPSHOT  BOUNDARY  VOTER  PENDING W/R
+n1    0      Follower  1     n3      84      84       84    0         0         true   0/0
+n1    1      Leader    1     n1      89      89       89    0         0         true   0/0
+n1    2      Leader    1     n1      75      75       75    0         0         true   0/0
+n1    3      Follower  1     n3      72      72       73    0         0         true   0/0
+n2    0      Follower  1     n3      84      84       84    0         0         true   0/0
+n2    1      Follower  1     n1      89      89       89    0         0         true   0/0
+n2    2      Follower  1     n1      75      75       75    0         0         true   0/0
+n2    3      Follower  1     n3      72      72       73    0         0         true   0/0
+n3    0      Leader    1     n3      84      84       84    0         0         true   0/0
+n3    1      Follower  1     n1      89      89       89    0         0         true   0/0
+n3    2      Follower  1     n1      75      75       75    0         0         true   0/0
+n3    3      Leader    1     n3      73      73       73    0         0         true   0/0
+
+<span class="cmt"># Each node serves its own Prometheus metrics; nothing aggregates them.</span>
+<span class="cmd">$ curl -s http://127.0.0.1:9102/metrics | grep -E '^dkv_(raft_role.*leader"} 1|kv_requests_total)' | head -14</span>
+dkv_kv_requests_total{group="0",op="get",status="not_found"} 2
+dkv_kv_requests_total{group="0",op="put",status="ok"} 2
+dkv_kv_requests_total{group="1",op="get",status="not_found"} 1
+dkv_kv_requests_total{group="1",op="put",status="ok"} 3
+dkv_kv_requests_total{group="2",op="get",status="not_found"} 1
+dkv_kv_requests_total{group="2",op="put",status="ok"} 3
+dkv_kv_requests_total{group="3",op="get",status="not_found"} 2
+dkv_kv_requests_total{group="3",op="put",status="ok"} 2
+
+<span class="cmt"># Kill n1 with SIGKILL (no clean shutdown), then look at the cluster.</span>
+<span class="cmd">$ kill -9 $PID_N1</span>
+<span class="cmd">$ dkvctl -nodes n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 health</span>
+cluster: degraded
+GROUP  VERDICT   LEADER  TERM  CONFIRMED  REASONS
+0      degraded  n3      1     2/2        n1 is unreachable
+1      degraded  n3      2     2/2        n1 is unreachable
+2      degraded  n3      2     2/2        n1 is unreachable
+3      degraded  n3      1     2/2        n1 is unreachable
+NODE  READINESS    REASONS
+n1    unreachable  dial tcp 127.0.0.1:9001: connect: connection refused
+n2    ready        
+n3    ready        
+exit code 1
+
+<span class="cmt"># Restart n1 from its data directory: the same command without -init.</span>
+<span class="cmd">$ dkvd -id n1 -listen 127.0.0.1:7001 -peers n2=127.0.0.1:7002,n3=127.0.0.1:7003 -data-dir data/n1 -cluster -shards 4 -rf 3 -client-listen 127.0.0.1:8001 -admin-listen 127.0.0.1:9001 -metrics-listen 127.0.0.1:9101 &gt;&gt;logs/n1.log 2&gt;&amp;1 &amp;</span>
+<span class="cmd">$ dkvctl -nodes n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 health</span>
+cluster: healthy
+GROUP  VERDICT  LEADER  TERM  CONFIRMED  REASONS
+0      healthy  n3      1     3/2        
+1      healthy  n3      2     3/2        
+2      healthy  n3      2     3/2        
+3      healthy  n3      1     3/2        
+NODE  READINESS  REASONS
+n1    ready      
+n2    ready      
+n3    ready      
+
+<span class="cmd">$ dkvctl -nodes n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 lag</span>
+GROUP  LEADER  TERM  VOTER  STATE      LAG (ENTRIES)
+0      n3      1     n1     following  0
+0      n3      1     n2     following  0
+0      n3      1     n3     leading    -
+1      n3      2     n1     following  0
+1      n3      2     n2     following  0
+1      n3      2     n3     leading    -
+2      n3      2     n1     following  0
+2      n3      2     n2     following  0
+2      n3      2     n3     leading    -
+3      n3      1     n1     following  0
+3      n3      1     n2     following  0
+3      n3      1     n3     leading    -
+
+NODE  GROUP  COMMIT  APPLIED  APPLY LAG
+n1    0      84      84       0
+n1    1      90      90       0
+n1    2      76      76       0
+n1    3      73      73       0
+n2    0      84      84       0
+n2    1      90      90       0
+n2    2      76      76       0
+n2    3      73      73       0
+n3    0      84      84       0
+n3    1      90      90       0
+n3    2      76      76       0
+n3    3      73      73       0
+
+<span class="cmt"># What n1 logged while recovering (structured events, one per line; only lines written after the restart).</span>
+<span class="cmd">$ grep -E 'event=(node_started|data_dir|group_started|raft_started|raft_(leader|follower|snapshot_restored))' logs/n1.log | head -14</span>
+event=data_dir node=n1 dir=data/n1 cluster=demo state=running
+event=node_started node=n1 listen=127.0.0.1:7001 peers=2
+event=raft_started node=n1 peers=3 term=1 lastIndex=84 group=0 conf="voters=[n1 n2 n3]"
+event=group_started node=n1 group=0
+event=raft_started node=n1 peers=3 term=1 lastIndex=89 group=1 conf="voters=[n1 n2 n3]"
+event=group_started node=n1 group=1
+event=raft_started node=n1 peers=3 term=1 lastIndex=75 group=2 conf="voters=[n1 n2 n3]"
+event=group_started node=n1 group=2
+event=raft_started node=n1 peers=3 term=1 lastIndex=73 group=3 conf="voters=[n1 n2 n3]"
+event=group_started node=n1 group=3
+event=raft_follower node=n1 term=1 leader=n3 group=0
+event=raft_follower node=n1 term=2 leader=n3 group=1
+event=raft_follower node=n1 term=2 leader=n3 group=2
+event=raft_follower node=n1 term=1 leader=n3 group=3
+
+<span class="cmt"># Clean shutdown.</span>
+<span class="cmd">$ kill -TERM $PID_N1 $PID_N2 $PID_N3</span>
+all three processes exited</code></pre>
+  <p><a href="demo-transcript.txt">The transcript as a plain text file</a> ·
+  <a href="https://github.com/adivishall/quorum/blob/main/docs/OPERATIONS.md">what each <code>dkvctl</code> verdict means</a> ·
+  <a href="https://github.com/adivishall/quorum/blob/main/docs/LOAD_TESTING.md">how <code>dkvload</code> measures</a></p>
+</section>
+
+<section id="status" aria-labelledby="status-title">
+  <h2 id="status-title">Implementation status</h2>
+  <p>From <a href="https://github.com/adivishall/quorum/blob/main/docs/ROADMAP.md">ROADMAP.md</a> and the
+  code on <code>main</code>. Since the project was reframed around its thesis, work is ordered by four
+  layers, lower first (<a href="https://github.com/adivishall/quorum/blob/main/docs/ENGINEERING_ROADMAP.md">ENGINEERING_ROADMAP.md</a> §0).</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Layer</th><th>Holds</th><th>State</th></tr></thead>
+    <tbody>
+      <tr><td>1 · Correctness foundation</td><td>Raft, durable log, crash recovery, linearizability, sessions and deduplication, snapshots, membership, multi-Raft</td><td><span class="badge done">built and verified</span></td></tr>
+      <tr><td>2 · Durable storage integration</td><td>The LSM engine as the replicated state machine</td><td><span class="badge partial">S1–S3 merged</span> <span class="badge review">S4 in review</span> <span class="badge planned">S5–S6</span></td></tr>
+      <tr><td>3 · Distributed performance</td><td>Group commit, replication pipelining, batched apply, each measured before and after</td><td><span class="badge partial">baseline measured, nothing optimised</span></td></tr>
+      <tr><td>4 · Operational and demo surface</td><td><code>dkvctl</code>, health and readiness, chaos and load labs; then a network client, Docker Compose, a dashboard, the write-ups</td><td><span class="badge partial">operator tool and labs built; the rest waits for layers 2 and 3</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Capabilities</h3>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Capability</th><th>State</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td>LSM storage engine: WAL, memtable, SSTables, Bloom filters, compaction, MANIFEST, restart recovery</td><td><span class="badge done">complete</span></td><td><a href="https://github.com/adivishall/quorum/tree/main/internal/storage">internal/storage</a></td></tr>
+      <tr><td>Consistent-hash routing: key → shard → replica group</td><td><span class="badge done">complete</span></td><td><a href="https://github.com/adivishall/quorum/tree/main/internal/routing">internal/routing</a>, <code>cmd/dkvring</code></td></tr>
+      <tr><td>Node processes and the framed TCP transport</td><td><span class="badge done">complete</span></td><td><a href="https://github.com/adivishall/quorum/tree/main/internal/transport">internal/transport</a>, <a href="https://github.com/adivishall/quorum/tree/main/cmd/dkvd">cmd/dkvd</a></td></tr>
+      <tr><td>Raft: pure core, durable log, node driver</td><td><span class="badge done">complete</span></td><td><a href="https://github.com/adivishall/quorum/tree/main/internal/raft">internal/raft</a>, <a href="https://github.com/adivishall/quorum/tree/main/internal/raftlog">raftlog</a>, <a href="https://github.com/adivishall/quorum/tree/main/internal/raftnode">raftnode</a></td></tr>
+      <tr><td>Deterministic fault injection and simulator</td><td><span class="badge done">complete</span></td><td><a href="https://github.com/adivishall/quorum/tree/main/internal/fault">internal/fault</a>, <a href="https://github.com/adivishall/quorum/tree/main/internal/raftsim">internal/raftsim</a></td></tr>
+      <tr><td>Crash-recovery model and matrices</td><td><span class="badge done">complete</span></td><td><a href="https://github.com/adivishall/quorum/blob/main/docs/CRASH_RECOVERY.md">docs/CRASH_RECOVERY.md</a></td></tr>
+      <tr><td>Client-visible linearizability and the checker</td><td><span class="badge done">complete</span></td><td><a href="https://github.com/adivishall/quorum/tree/main/internal/lincheck">internal/lincheck</a>, <code>cmd/lincheck</code></td></tr>
+      <tr><td>Request identity, deduplication, forwarding, session client</td><td><span class="badge done">complete</span></td><td><a href="https://github.com/adivishall/quorum/tree/main/internal/kv">internal/kv</a></td></tr>
+      <tr><td>Snapshots, log compaction, follower installation</td><td><span class="badge done">complete</span></td><td><a href="https://github.com/adivishall/quorum/tree/main/internal/snapshot">internal/snapshot</a></td></tr>
+      <tr><td>Dynamic membership by joint consensus; one Raft group per shard</td><td><span class="badge done">complete</span></td><td><a href="https://github.com/adivishall/quorum/tree/main/internal/multiraft">internal/multiraft</a></td></tr>
+      <tr><td>Metrics from every layer</td><td><span class="badge done">complete</span></td><td><a href="https://github.com/adivishall/quorum/tree/main/internal/metrics">internal/metrics</a></td></tr>
+      <tr><td>Operator tool, health and readiness</td><td><span class="badge done">complete</span></td><td><a href="https://github.com/adivishall/quorum/tree/main/cmd/dkvctl">cmd/dkvctl</a></td></tr>
+      <tr><td>LSM engine as the replicated state machine</td><td><span class="badge partial">S1–S3 merged, opt-in</span></td><td><a href="https://github.com/adivishall/quorum/blob/main/docs/STORAGE_INTEGRATION.md">docs/STORAGE_INTEGRATION.md</a></td></tr>
+      <tr><td>Load generator and cluster experiments</td><td><span class="badge partial">in progress</span></td><td><a href="https://github.com/adivishall/quorum/tree/main/internal/load">internal/load</a>, <a href="https://github.com/adivishall/quorum/tree/main/internal/lab">internal/lab</a></td></tr>
+      <tr><td>Correctness and chaos suite from a clean clone</td><td><span class="badge partial">in progress</span></td><td><a href="https://github.com/adivishall/quorum/blob/main/docs/CHAOS.md">docs/CHAOS.md</a></td></tr>
+      <tr><td>HTTP API and a network command-line client</td><td><span class="badge planned">not scheduled</span></td><td>the client protocol is binary TCP; <code>dkv</code> is an in-memory CLI</td></tr>
+      <tr><td>Dashboard, Docker Compose demo</td><td><span class="badge planned">not started</span></td><td>wait for layers 2 and 3</td></tr>
+      <tr><td>Hardening (limits, timeouts, graceful shutdown audit), demo script, write-ups</td><td><span class="badge planned">not started</span></td><td>—</td></tr>
+      <tr><td>Shard rebalancing, cross-shard transactions, TLS and authentication, compression, block cache, leveled compaction, leader leases, PreVote and CheckQuorum</td><td><span class="badge planned">deliberately deferred</span></td><td><a href="https://github.com/adivishall/quorum/blob/main/docs/LIMITATIONS.md">docs/LIMITATIONS.md</a></td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section id="limitations" aria-labelledby="limitations-title">
+  <h2 id="limitations-title">Limitations, stated plainly</h2>
+  <p>From <a href="https://github.com/adivishall/quorum/blob/main/docs/LIMITATIONS.md">LIMITATIONS.md</a>,
+  which keeps the full list with the reason for each.</p>
+  <div class="notice warn">
+    <p><strong>Not production-ready.</strong> The project's own words: this system has not run in production,
+    has no operational tooling, no backup/restore, no upgrade path, no security model, and no track record.
+    It is an engineering exercise built to be correct and explainable, not to be deployed.</p>
+  </div>
+  <ul>
+    <li><strong>Every port is unauthenticated plaintext TCP.</strong> Anyone who reaches the client port can
+      read, write and delete any key; the admin port can remove voters and stop groups, which is why it binds
+      to loopback unless <code>-admin-allow-remote</code> is given. There is no TLS and no identity beyond a
+      protocol label.</li>
+    <li><strong>Power-loss durability is untested on a real device, in every mode.</strong> The crash tests
+      destroy a process with SIGKILL, which proves bytes reached the kernel, not the platter; power loss
+      exists only as a software model.</li>
+    <li><strong>Linearizability is verified on recorded, finite histories</strong>, not proven for every
+      execution, and only per Raft group; nothing is claimed across groups.</li>
+    <li><strong>No PreVote or CheckQuorum.</strong> A leader cut off from its peers keeps accepting requests
+      it can never complete until its clients' deadlines expire, and a rejoining partitioned node forces one
+      extra election.</li>
+    <li><strong>The replicated state machine is in memory by default.</strong> The LSM-backed machine is
+      opt-in and its snapshots are size-bounded until S4 merges.</li>
+    <li><strong>An LSM leader flushes its engine at every snapshot on its Raft actor</strong>, which under
+      fsync-heavy load was measured to cost it its term in 7–10 of 60 runs. S6 moves that work off the actor.</li>
+    <li><strong>WAL segment and SSTable numbers are six digits and never reused</strong>, so a node under
+      sustained load runs out after weeks, then fail-stops without loss. Tracked as
+      <a href="https://github.com/adivishall/quorum/issues/20">#20</a>.</li>
+    <li><strong>Routing is fixed at bootstrap</strong> and must be identical on every node; there is no
+      rebalancing, no data movement between groups, and membership changes are operator-driven, one member
+      at a time.</li>
+    <li><strong>Concurrent writes share nothing yet</strong>: every write costs its own fsync, which is what
+      the cluster baseline measures and what layer 3 exists to change.</li>
+    <li><strong>Metrics are per node, pull-only and in memory</strong>; nothing aggregates, stores or alerts.</li>
+  </ul>
+  <p>Open follow-ups are tracked as GitHub issues: file-number exhaustion
+  (<a href="https://github.com/adivishall/quorum/issues/20">#20</a>), an intermittent read rejection seen once
+  on CI (<a href="https://github.com/adivishall/quorum/issues/21">#21</a>), the actor-bound snapshot flush
+  (<a href="https://github.com/adivishall/quorum/issues/22">#22</a>) and queued snapshot-frame memory
+  (<a href="https://github.com/adivishall/quorum/issues/24">#24</a>), among others.</p>
+</section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="bar">
+    <p>Quorum by <a href="https://github.com/adivishall">Adi Vishal</a>. This page describes the repository's
+    <code>main</code> branch at commit <code>a3c886f</code> and was last revised on 2026-10-20. It is a static
+    site with no scripts, no analytics and no backend; it is served from the
+    <a href="https://github.com/adivishall/quorum/tree/main/site">site/</a> directory of the repository.
+    License: not yet chosen (see the README).</p>
+  </div>
+</footer>
+</body>
+</html>

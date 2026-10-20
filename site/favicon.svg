@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Quorum">
+  <rect width="64" height="64" rx="12" fill="#0f5d6b"/>
+  <circle cx="32" cy="18" r="6" fill="#fbfaf7"/>
+  <circle cx="18" cy="42" r="6" fill="#fbfaf7"/>
+  <circle cx="46" cy="42" r="6" fill="#fbfaf7"/>
+  <path d="M32 24v12M26 38l-3 0M38 38l3 0" stroke="#fbfaf7" stroke-width="3" stroke-linecap="round"/>
+  <path d="M24 42h16" stroke="#fbfaf7" stroke-width="3" stroke-linecap="round"/>
+</svg>
